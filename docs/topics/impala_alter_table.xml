@@ -102,7 +102,7 @@ ALTER TABLE <varname>name</varname> [PARTITION (<varname>partition_spec</varname
   | SERDEPROPERTIES (<varname>serde_properties</varname>) }
 
 <ph rev="2.6.0 IMPALA-3369">ALTER TABLE <varname>name</varname> <varname>colname</varname>
-  ('<varname>statsKey</varname>'='<varname>val</varname>, ...)
+  ('<varname>statsKey</varname>'='<varname>val</varname>', ...)
 
 statsKey ::= numDVs | numNulls | avgSize | maxSize</ph>
 
@@ -512,6 +512,27 @@ ALTER TABLE <varname>table_name</varname> SET SERDEPROPERTIES ('<varname>key1</v
     </p>
 
     <p>
+      <b>To specify a sort order for new records that are added to the table:</b>
+    </p>
+
+<codeblock>ALTER TABLE <varname>table_name</varname> SORT BY [LEXICAL|ZORDER](<varname>column_name1</varname>[, <varname>column_name2</varname> ...]);</codeblock>
+
+    <p>
+      Specifying the sort order is optional. The default sort order is <codeph>LEXICAL</codeph>.
+      Setting the <codeph>SORT BY</codeph> property will not rewrite existing data files,
+      but subsequent inserts will be ordered. Sorting is always ascending.
+    </p>
+
+    <p>
+      Use the <codeph>DESCRIBE FORMATTED</codeph> statement to see the current sort
+      properties ('<codeph>sort.columns</codeph>' and '<codeph>sort.order</codeph>')
+      for an existing table. They can also be set using <codeph>SET TBLPROPERTIES</codeph>.
+    </p>
+    <p>
+      For details about sort order see <xref href="impala_create_table.xml#create_table"/>.
+    </p>
+
+    <p>
       <b>To manually set or update table or column statistics:</b>
     </p>
 
@@ -736,7 +757,7 @@ optional int32 x [i:1 d:1 r:0]
     <p>
       Use an <codeph>ALTER TABLE ... SET FILEFORMAT</codeph> clause. You can include an optional
       <codeph>PARTITION (<varname>col1</varname>=<varname>val1</varname>,
-      <varname>col2</varname>=<varname>val2</varname>, ...</codeph> clause so that the file
+      <varname>col2</varname>=<varname>val2</varname>, ...</codeph>) clause so that the file
       format is changed for a specific partition rather than the entire table.
     </p>
 
@@ -1096,7 +1117,7 @@ alter table sales_data add partition (zipcode = cast(9021 * 10 as string));</cod
           the metastore database that Impala uses to refer to the table. To change which
           underlying Kudu table is associated with an Impala table name, you must change the
           <codeph>TBLPROPERTIES</codeph> property of the table: <codeph>SET
-          TBLPROPERTIES('kudu.table_name'='<varname>kudu_tbl_name</varname>)</codeph>. You can
+          TBLPROPERTIES('kudu.table_name'='<varname>kudu_tbl_name</varname>')</codeph>. You can
           only change underlying Kudu tables for the external tables.
         </li>
       </ul>

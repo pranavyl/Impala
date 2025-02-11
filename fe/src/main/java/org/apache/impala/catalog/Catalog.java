@@ -44,13 +44,16 @@ import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.THdfsPartition;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TPrincipalType;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.thrift.TUniqueId;
+import org.apache.impala.util.EventSequence;
 import org.apache.impala.util.PatternMatcher;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 
@@ -78,7 +81,7 @@ public abstract class Catalog implements AutoCloseable {
   public static final TUniqueId INITIAL_CATALOG_SERVICE_ID = new TUniqueId(0L, 0L);
   public static final String DEFAULT_DB = "default";
 
-  private final MetaStoreClientPool metaStoreClientPool_;
+  private MetaStoreClientPool metaStoreClientPool_;
 
   // Cache of authorization policy metadata. Populated from data retried from the
   // Sentry Service, if configured.
@@ -232,20 +235,30 @@ public abstract class Catalog implements AutoCloseable {
   }
 
   /**
-   * Returns all tables in 'dbName' that match 'matcher'.
+   * Returns all tables and views in 'dbName' that match 'matcher'.
+   */
+  public List<String> getTableNames(String dbName, PatternMatcher matcher)
+      throws DatabaseNotFoundException {
+    return getTableNames(dbName, matcher, /*tableTypes*/ Collections.emptySet());
+  }
+
+  /**
+   * Returns all tables of types specified in 'tableTypes' under the database 'dbName'
+   * that match 'matcher'.
    *
    * dbName must not be null.
    *
    * Table names are returned unqualified.
    */
-  public List<String> getTableNames(String dbName, PatternMatcher matcher)
+  public List<String> getTableNames(String dbName, PatternMatcher matcher,
+      Set<TImpalaTableType> tableTypes)
       throws DatabaseNotFoundException {
     Preconditions.checkNotNull(dbName);
     Db db = getDb(dbName);
     if (db == null) {
       throw new DatabaseNotFoundException("Database '" + dbName + "' not found");
     }
-    return filterStringsByPattern(db.getAllTableNames(), matcher);
+    return filterStringsByPattern(db.getAllTableNames(tableTypes), matcher);
   }
 
   /**
@@ -258,8 +271,7 @@ public abstract class Catalog implements AutoCloseable {
   }
 
   /**
-   * Adds a data source to the in-memory map of data sources. It is not
-   * persisted to the metastore.
+   * Adds a data source to the in-memory map of data sources.
    * @return true if this item was added or false if the existing value was preserved.
    */
   public boolean addDataSource(DataSource dataSource) {
@@ -391,10 +403,35 @@ public abstract class Catalog implements AutoCloseable {
   @Override
   public void close() { metaStoreClientPool_.close(); }
 
+  @VisibleForTesting
+  public MetaStoreClientPool getMetaStoreClientPool() { return metaStoreClientPool_; }
+
+  @VisibleForTesting
+  public void setMetaStoreClientPool(MetaStoreClientPool pool) {
+    metaStoreClientPool_ = pool;
+  }
+
   /**
    * Returns a managed meta store client from the client connection pool.
    */
   public MetaStoreClient getMetaStoreClient() { return metaStoreClientPool_.getClient(); }
+
+  /**
+   * Same as the above but also update the given 'timeline'.
+   */
+  public MetaStoreClient getMetaStoreClient(EventSequence timeline) {
+    MetaStoreClient client = getMetaStoreClient();
+    timeline.markEvent("Got Metastore client");
+    return client;
+  }
+
+  public int getNumHmsClientsIdle() {
+    return metaStoreClientPool_.getNumHmsClientsIdle();
+  }
+
+  public int getNumHmsClientsInUse() {
+    return metaStoreClientPool_.getNumHmsClientsInUse();
+  }
 
   /**
    * Return all members of 'candidates' that match 'matcher'.
@@ -500,6 +537,23 @@ public abstract class Catalog implements AutoCloseable {
    */
   public TCatalogObject getTCatalogObject(TCatalogObject objectDesc)
       throws CatalogException {
+    return getTCatalogObject(objectDesc, false);
+  }
+
+  /**
+   * Gets the thrift representation of a catalog object, given the "object
+   * description". The object description is just a TCatalogObject with only the
+   * catalog object type and object name set.
+   * If the object is not found, a CatalogException is thrown.
+   * @param objectDesc the object description.
+   * @param isHumanReadable whether the request is for human readable purpose or not.
+   *                        If False, return full object. Otherwise, return smaller
+   *                        catalog object that omit some field.
+   * @return the requested catalog object.
+   * @throws CatalogException
+   */
+  public TCatalogObject getTCatalogObject(
+      TCatalogObject objectDesc, boolean isHumanReadable) throws CatalogException {
     TCatalogObject result = new TCatalogObject();
     switch (objectDesc.getType()) {
       case DATABASE: {
@@ -510,6 +564,7 @@ public abstract class Catalog implements AutoCloseable {
         }
         result.setType(db.getCatalogObjectType());
         result.setCatalog_version(db.getCatalogVersion());
+        result.setLast_modified_time_ms(db.getLastLoadedTimeMs());
         result.setDb(db.toThrift());
         break;
       }
@@ -525,7 +580,9 @@ public abstract class Catalog implements AutoCloseable {
         try {
           result.setType(table.getCatalogObjectType());
           result.setCatalog_version(table.getCatalogVersion());
-          result.setTable(table.toThrift());
+          result.setLast_modified_time_ms(table.getLastLoadedTimeMs());
+          result.setTable(
+              isHumanReadable ? table.toHumanReadableThrift() : table.toThrift());
         } finally {
           table.releaseReadLock();
         }
@@ -541,6 +598,7 @@ public abstract class Catalog implements AutoCloseable {
         }
         result.setType(fn.getCatalogObjectType());
         result.setCatalog_version(fn.getCatalogVersion());
+        result.setLast_modified_time_ms(fn.getLastLoadedTimeMs());
         result.setFn(fn.toThrift());
         break;
       }
@@ -552,6 +610,7 @@ public abstract class Catalog implements AutoCloseable {
         }
         result.setType(dataSrc.getCatalogObjectType());
         result.setCatalog_version(dataSrc.getCatalogVersion());
+        result.setLast_modified_time_ms(dataSrc.getLastLoadedTimeMs());
         result.setData_source(dataSrc.toThrift());
         break;
       }
@@ -563,6 +622,7 @@ public abstract class Catalog implements AutoCloseable {
         }
         result.setType(pool.getCatalogObjectType());
         result.setCatalog_version(pool.getCatalogVersion());
+        result.setLast_modified_time_ms(pool.getLastLoadedTimeMs());
         result.setCache_pool(pool.toThrift());
         break;
       }
@@ -638,10 +698,13 @@ public abstract class Catalog implements AutoCloseable {
       case DATABASE:
         return "DATABASE:" + catalogObject.getDb().getDb_name().toLowerCase();
       case TABLE:
-      case VIEW:
         TTable tbl = catalogObject.getTable();
         return "TABLE:" + tbl.getDb_name().toLowerCase() + "." +
             tbl.getTbl_name().toLowerCase();
+      case VIEW:
+        TTable view = catalogObject.getTable();
+        return "VIEW:" + view.getDb_name().toLowerCase() + "." +
+            view.getTbl_name().toLowerCase();
       case HDFS_PARTITION:
         THdfsPartition part = catalogObject.getHdfs_partition();
         return "HDFS_PARTITION:" + part.getDb_name().toLowerCase() + "." +
@@ -710,11 +773,14 @@ public abstract class Catalog implements AutoCloseable {
    * 'releaseTableLock()'.
    * @param dbName Name of the DB where the particular table is.
    * @param tableName Name of the table where the lock is acquired.
+   * @param lockMaxWaitTime Maximum wait time on the ACID lock.
    * @throws TransactionException
    */
-  public long lockTableStandalone(String dbName, String tableName, HeartbeatContext ctx)
+  public long lockTableStandalone(String dbName, String tableName, HeartbeatContext ctx,
+      int lockMaxWaitTime)
       throws TransactionException {
-    return lockTableInternal(dbName, tableName, 0L, DataOperationType.NO_TXN, ctx);
+    return lockTableInternal(dbName, tableName, 0L, DataOperationType.NO_TXN, ctx,
+        lockMaxWaitTime);
   }
 
   /**
@@ -724,13 +790,16 @@ public abstract class Catalog implements AutoCloseable {
    * @param dbName Name of the DB where the particular table is.
    * @param tableName Name of the table where the lock is acquired.
    * @param transaction the transaction that needs to lock the table.
+   * @param lockMaxWaitTime Maximum wait time on the ACID lock.
    * @throws TransactionException
    */
   public void lockTableInTransaction(String dbName, String tableName,
-      Transaction transaction, DataOperationType opType, HeartbeatContext ctx)
+      Transaction transaction, DataOperationType opType, HeartbeatContext ctx,
+      int lockMaxWaitTime)
       throws TransactionException {
     Preconditions.checkState(transaction.getId() > 0);
-    lockTableInternal(dbName, tableName, transaction.getId(), opType, ctx);
+    lockTableInternal(dbName, tableName, transaction.getId(), opType, ctx,
+        lockMaxWaitTime);
   }
 
   /**
@@ -739,10 +808,12 @@ public abstract class Catalog implements AutoCloseable {
    * @param dbName Name of the DB where the particular table is.
    * @param tableName Name of the table where the lock is acquired.
    * @param txnId id of the transaction, 0 for standalone locks.
+   * @param lockMaxWaitTime Maximum wait time on the ACID lock.
    * @throws TransactionException
    */
   private long lockTableInternal(String dbName, String tableName, long txnId,
-      DataOperationType opType, HeartbeatContext ctx) throws TransactionException {
+      DataOperationType opType, HeartbeatContext ctx, int lockMaxWaitTime)
+      throws TransactionException {
     Preconditions.checkState(txnId >= 0);
     LockComponent lockComponent = new LockComponent();
     lockComponent.setDbname(dbName);
@@ -753,7 +824,8 @@ public abstract class Catalog implements AutoCloseable {
     List<LockComponent> lockComponents = Arrays.asList(lockComponent);
     long lockId = -1L;
     try (MetaStoreClient client = metaStoreClientPool_.getClient()) {
-      lockId = MetastoreShim.acquireLock(client.getHiveClient(), txnId, lockComponents);
+      lockId = MetastoreShim.acquireLock(client.getHiveClient(), txnId, lockComponents,
+          lockMaxWaitTime);
       if (txnId == 0L) transactionKeepalive_.addLock(lockId, ctx);
     }
     return lockId;

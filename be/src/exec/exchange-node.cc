@@ -121,7 +121,14 @@ void ExchangePlanNode::Codegen(FragmentState* state) {
   if (IsNodeCodegenDisabled()) return;
 
   if (row_comparator_config_ != nullptr) {
-    AddCodegenStatus(row_comparator_config_->Codegen(state));
+    Status codegen_status;
+    llvm::Function* compare_fn = nullptr;
+    codegen_status = row_comparator_config_->Codegen(state, &compare_fn);
+    if (codegen_status.ok()) {
+      codegen_status =
+          SortedRunMerger::Codegen(state, compare_fn, &codegend_heapify_helper_fn_);
+    }
+    AddCodegenStatus(codegen_status);
   }
 }
 
@@ -131,11 +138,13 @@ Status ExchangeNode::Open(RuntimeState* state) {
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   if (is_merging_) {
+    const ExchangePlanNode& pnode = static_cast<const ExchangePlanNode&>(plan_node_);
     // CreateMerger() will populate its merging heap with batches from the stream_recvr_,
     // so it is not necessary to call FillInputRowBatch().
     RETURN_IF_ERROR(
         less_than_->Open(pool_, state, expr_perm_pool(), expr_results_pool()));
-    RETURN_IF_ERROR(stream_recvr_->CreateMerger(*less_than_.get()));
+    RETURN_IF_ERROR(stream_recvr_->CreateMerger(*less_than_.get(),
+        pnode.codegend_heapify_helper_fn_));
   } else {
     RETURN_IF_ERROR(FillInputRowBatch(state));
   }
@@ -193,23 +202,24 @@ Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* 
       SCOPED_TIMER(convert_row_batch_timer_);
       RETURN_IF_CANCELLED(state);
       RETURN_IF_ERROR(QueryMaintenance(state));
-      // copy rows until we hit the limit/capacity or until we exhaust input_batch_
-      while (!ReachedLimit() && !output_batch->AtCapacity()
-          && input_batch_ != NULL && next_row_idx_ < input_batch_->num_rows()) {
-        TupleRow* src = input_batch_->GetRow(next_row_idx_);
-        ++next_row_idx_;
-        int j = output_batch->AddRow();
-        TupleRow* dest = output_batch->GetRow(j);
-        // if the input row is shorter than the output row, make sure not to leave
-        // uninitialized Tuple* around
-        output_batch->ClearRow(dest);
-        // this works as expected if rows from input_batch form a prefix of
-        // rows in output_batch
-        input_batch_->CopyRow(src, dest);
-        output_batch->CommitLastRow();
-        IncrementNumRowsReturned(1);
+      if (input_batch_ != nullptr) {
+        // copy rows until we hit the limit/capacity or until we exhaust input_batch_
+        int available_in_input = input_batch_->num_rows() - next_row_idx_;
+        int free_in_output = output_batch->capacity() - output_batch->num_rows();
+        int rows_to_copy = std::min(available_in_input, free_in_output);
+        if (limit_ != -1) {
+          rows_to_copy =
+              static_cast<int>(std::min<int64_t>(rows_to_copy, limit_ - rows_returned()));
+        }
+        if (rows_to_copy > 0) {
+          int dst_offset = output_batch->AddRows(rows_to_copy);
+          output_batch->CopyRows(input_batch_, rows_to_copy, next_row_idx_, dst_offset);
+          next_row_idx_ += rows_to_copy;
+          output_batch->CommitRows(rows_to_copy);
+          IncrementNumRowsReturned(rows_to_copy);
+          COUNTER_SET(rows_returned_counter_, rows_returned());
+        }
       }
-      COUNTER_SET(rows_returned_counter_, rows_returned());
 
       if (ReachedLimit()) {
         ReleaseRecvrResources(output_batch);

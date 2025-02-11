@@ -226,26 +226,6 @@ PhjBuilder::~PhjBuilder() {}
 
 Status PhjBuilder::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
   RETURN_IF_ERROR(DataSink::Prepare(state, parent_mem_tracker));
-  if (is_separate_build_) {
-    const TDebugOptions& instance_debug_options = state->instance_ctx().debug_options;
-    bool debug_option_enabled = instance_debug_options.node_id == -1
-        || instance_debug_options.node_id == join_node_id_;
-    // SET_DENY_RESERVATION_PROBABILITY should behave the same as if it were applied to
-    // the join node.
-    reservation_manager_.Init(Substitute("$0 ptr=$1", name_, this), profile(),
-        state->instance_buffer_reservation(), mem_tracker_.get(), *resource_profile_,
-        debug_option_enabled ? instance_debug_options : TDebugOptions());
-  }
-
-  RETURN_IF_ERROR(HashTableCtx::Create(&obj_pool_, state, hash_table_config_, hash_seed_,
-      MAX_PARTITION_DEPTH, row_desc_->tuple_descriptors().size(), expr_perm_pool_.get(),
-      expr_results_pool_.get(), expr_results_pool_.get(), &ht_ctx_));
-
-  DCHECK_EQ(filter_exprs_.size(), filter_ctxs_.size());
-  for (int i = 0; i < filter_exprs_.size(); ++i) {
-    RETURN_IF_ERROR(ScalarExprEvaluator::Create(*filter_exprs_[i], state, &obj_pool_,
-        expr_perm_pool_.get(), expr_results_pool_.get(), &filter_ctxs_[i].expr_eval));
-  }
 
   partitions_created_ = ADD_COUNTER(profile(), "PartitionsCreated", TUnit::UNIT);
   largest_partition_percent_ =
@@ -261,6 +241,29 @@ Status PhjBuilder::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) 
   num_hash_table_builds_skipped_ =
       ADD_COUNTER(profile(), "NumHashTableBuildsSkipped", TUnit::UNIT);
   repartition_timer_ = ADD_TIMER(profile(), "RepartitionTime");
+
+  if (is_separate_build_) {
+    const TDebugOptions& instance_debug_options = state->instance_ctx().debug_options;
+    bool debug_option_enabled = instance_debug_options.node_id == -1
+        || instance_debug_options.node_id == join_node_id_;
+    // SET_DENY_RESERVATION_PROBABILITY should behave the same as if it were applied to
+    // the join node.
+    reservation_manager_.Init(Substitute("$0 ptr=$1", name_, this), profile(),
+        state->instance_buffer_reservation(), mem_tracker_.get(), *resource_profile_,
+        debug_option_enabled ? instance_debug_options : TDebugOptions());
+  }
+
+  RETURN_IF_ERROR(HashTableCtx::Create(&obj_pool_, state, hash_table_config_, hash_seed_,
+      MAX_PARTITION_DEPTH, row_desc_->tuple_descriptors().size(), expr_perm_pool_.get(),
+      expr_results_pool_.get(), expr_results_pool_.get(), &ht_ctx_));
+
+  RETURN_IF_ERROR(DebugAction(state->query_options(), "PHJ_BUILDER_PREPARE"));
+
+  DCHECK_EQ(filter_exprs_.size(), filter_ctxs_.size());
+  for (int i = 0; i < filter_exprs_.size(); ++i) {
+    RETURN_IF_ERROR(ScalarExprEvaluator::Create(*filter_exprs_[i], state, &obj_pool_,
+        expr_perm_pool_.get(), expr_results_pool_.get(), &filter_ctxs_[i].expr_eval));
+  }
   return Status::OK();
 }
 
@@ -936,17 +939,21 @@ void PhjBuilder::AllocateRuntimeFilters() {
   DCHECK(join_op_ != TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN || filter_ctxs_.size() == 0)
       << "Runtime filters not supported with NULL_AWARE_LEFT_ANTI_JOIN";
   DCHECK(ht_ctx_ != nullptr);
-  for (int i = 0; i < filter_ctxs_.size(); ++i) {
-    if (filter_ctxs_[i].filter->is_bloom_filter()) {
-      filter_ctxs_[i].local_bloom_filter =
+  for (FilterContext& filter_ctx : filter_ctxs_) {
+    if (filter_ctx.filter->is_bloom_filter()) {
+      filter_ctx.local_bloom_filter =
           runtime_state_->filter_bank()->AllocateScratchBloomFilter(
-              filter_ctxs_[i].filter->id());
-    } else {
-      DCHECK(filter_ctxs_[i].filter->is_min_max_filter());
-      filter_ctxs_[i].local_min_max_filter =
+              filter_ctx.filter->id());
+    } else if (filter_ctx.filter->is_min_max_filter()) {
+      filter_ctx.local_min_max_filter =
           runtime_state_->filter_bank()->AllocateScratchMinMaxFilter(
-              filter_ctxs_[i].filter->id(), filter_ctxs_[i].expr_eval->root().type());
-      minmax_filter_ctxs_.push_back(&filter_ctxs_[i]);
+              filter_ctx.filter->id(), filter_ctx.expr_eval->root().type());
+      minmax_filter_ctxs_.push_back(&filter_ctx);
+    } else {
+      DCHECK(filter_ctx.filter->is_in_list_filter());
+      filter_ctx.local_in_list_filter =
+          runtime_state_->filter_bank()->AllocateScratchInListFilter(
+              filter_ctx.filter->id(), filter_ctx.expr_eval->root().type());
     }
   }
 
@@ -1357,7 +1364,7 @@ void PhjBuilderConfig::Codegen(FragmentState* state) {
 
 string PhjBuilder::DebugString() const {
   stringstream ss;
-  ss << " PhjBuilder op=" << PrintThriftEnum(join_op_)
+  ss << " PhjBuilder op=" << join_op_
      << " is_separate_build=" << is_separate_build_
      << " num_probe_threads=" << num_probe_threads_
      << " state=" << PrintState(state_)
@@ -1375,6 +1382,10 @@ string PhjBuilder::DebugString() const {
   }
   ss << " buffer_pool_client=" << buffer_pool_client_->DebugString();
   return ss.str();
+}
+void PhjBuilder::UnregisterThreadFromBarrier() const {
+  DCHECK(probe_barrier_ != nullptr);
+  probe_barrier_->Unregister();
 }
 
 Status PhjBuilderConfig::CodegenProcessBuildBatch(LlvmCodeGen* codegen,

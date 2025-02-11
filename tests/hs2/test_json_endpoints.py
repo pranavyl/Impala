@@ -17,11 +17,15 @@
 #
 # Tests for query expiration.
 
+from __future__ import absolute_import, division, print_function
 import json
 import pytest
 from time import time
 
-from urllib2 import urlopen
+try:
+  from urllib.request import urlopen
+except ImportError:
+  from urllib2 import urlopen
 
 from tests.common.environ import IS_DOCKERIZED_TEST_CLUSTER
 from tests.common.impala_cluster import ImpalaCluster

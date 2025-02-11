@@ -22,6 +22,7 @@ import java.io.File;
 import java.io.IOException;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -96,9 +97,8 @@ public class AllocationFileLoaderService extends AbstractService {
   public AllocationFileLoaderService(Clock clock) {
     super(AllocationFileLoaderService.class.getName());
     this.clock = clock;
-    
   }
-  
+
   @Override
   public void serviceInit(Configuration conf) throws Exception {
     this.allocFile = getAllocationFile(conf);
@@ -142,7 +142,7 @@ public class AllocationFileLoaderService extends AbstractService {
     }
     super.serviceInit(conf);
   }
-  
+
   @Override
   public void serviceStart() throws Exception {
     if (reloadThread != null) {
@@ -150,7 +150,7 @@ public class AllocationFileLoaderService extends AbstractService {
     }
     super.serviceStart();
   }
-  
+
   @Override
   public void serviceStop() throws Exception {
     running = false;
@@ -164,7 +164,7 @@ public class AllocationFileLoaderService extends AbstractService {
     }
     super.serviceStop();
   }
-  
+
   /**
    * Path to XML file containing allocations. If the
    * path is relative, it is searched for in the
@@ -189,11 +189,73 @@ public class AllocationFileLoaderService extends AbstractService {
     }
     return allocFile;
   }
-  
+
   public synchronized void setReloadListener(Listener reloadListener) {
     this.reloadListener = reloadListener;
   }
-  
+
+
+  /**
+   * Add a user or group query limit to the limits Map.
+   * @param queueName the name of the queue name.
+   * @param element the element containing the definition.
+   * @param parentName for diagnostics, the enclosing tag name
+   * @param limitsMap where the Map will be inserted
+   * @param tagName the name of the tag "user" or "group"
+   * @throws AllocationConfigurationException if parsing fails.
+   */
+  @VisibleForTesting
+  public static void addQueryLimits(String queueName, Element element, String parentName,
+      Map<String, Map<String, Integer>> limitsMap, String tagName)
+      throws AllocationConfigurationException {
+    Map<String, Integer> limits =
+        limitsMap.computeIfAbsent(queueName, k -> new HashMap<>());
+    int number = -1;
+    List<String> nameList = new ArrayList<>();
+    NodeList fields = element.getChildNodes();
+    for (int j = 0; j < fields.getLength(); j++) {
+      Node fieldNode = fields.item(j);
+      if (!(fieldNode instanceof Element)) continue;
+      Element field = (Element) fieldNode;
+      if (tagName.equals(field.getTagName())) {
+        String name = ((Text) field.getFirstChild()).getData().trim();
+        if (nameList.contains(name)) {
+          throw new AllocationConfigurationException(
+              "Duplicate value given for name " + name);
+        }
+        nameList.add(name);
+      } else if ("totalCount".equals(field.getTagName())) {
+        String numberStr = ((Text) field.getFirstChild()).getData().trim();
+        if (number != -1) {
+          throw new AllocationConfigurationException(
+              "Duplicate totalCount tags for " + parentName + "/" + field.getTagName());
+        }
+        try {
+          number = Integer.parseInt(numberStr);
+        } catch (NumberFormatException e) {
+          throw new AllocationConfigurationException(
+              "Could not parse query totalCount for " + parentName + "/"
+                  + field.getTagName(),
+              e);
+        }
+      }
+      if (nameList.isEmpty()) {
+        throw new AllocationConfigurationException("Empty user names for " + parentName);
+      }
+    }
+    if (number == -1) {
+      throw new AllocationConfigurationException("No totalCount for " + parentName);
+    }
+    for (String name : nameList) {
+      Integer oldVal = limits.put(name, number);
+      if (oldVal != null) {
+        throw new AllocationConfigurationException("Duplicate entry for " + tagName + " '"
+            + name + "' in pool '" + queueName + "' has multiple values " + oldVal
+            + " and " + number);
+      }
+    }
+  }
+
   /**
    * Updates the allocation list from the allocation config file. This file is
    * expected to be in the XML format specified in the design doc.
@@ -224,6 +286,8 @@ public class AllocationFileLoaderService extends AbstractService {
     Map<String, Long> fairSharePreemptionTimeouts = new HashMap<>();
     Map<String, Float> fairSharePreemptionThresholds = new HashMap<>();
     Map<String, Map<QueueACL, AccessControlList>> queueAcls = new HashMap<>();
+    Map<String, Map<String, Integer>> userQueryLimits = new HashMap<>();
+    Map<String, Map<String, Integer>> groupQueryLimits = new HashMap<>();
     Set<String> nonPreemptableQueues = new HashSet<>();
     int userMaxAppsDefault = Integer.MAX_VALUE;
     int queueMaxAppsDefault = Integer.MAX_VALUE;
@@ -351,8 +415,8 @@ public class AllocationFileLoaderService extends AbstractService {
       loadQueue(parent, element, minQueueResources, maxQueueResources,
           maxChildQueueResources, queueMaxApps, userMaxApps, queueMaxAMShares,
           queueWeights, queuePolicies, minSharePreemptionTimeouts,
-          fairSharePreemptionTimeouts, fairSharePreemptionThresholds,
-          queueAcls, configuredQueues, nonPreemptableQueues);
+          fairSharePreemptionTimeouts, fairSharePreemptionThresholds, queueAcls,
+          userQueryLimits, groupQueryLimits, configuredQueues, nonPreemptableQueues);
     }
 
     // Load placement policy and pass it configured queues
@@ -381,20 +445,23 @@ public class AllocationFileLoaderService extends AbstractService {
           defaultFairSharePreemptionThreshold);
     }
 
-    AllocationConfiguration info =
-        new AllocationConfiguration(minQueueResources, maxQueueResources,
-        maxChildQueueResources, queueMaxApps, userMaxApps, queueWeights,
-        queueMaxAMShares, userMaxAppsDefault, queueMaxAppsDefault,
+    AllocationConfiguration info = new AllocationConfiguration(minQueueResources,
+        maxQueueResources, maxChildQueueResources, queueMaxApps, userMaxApps,
+        queueWeights, queueMaxAMShares, userMaxAppsDefault, queueMaxAppsDefault,
         queueMaxResourcesDefault, queueMaxAMShareDefault, queuePolicies,
-        defaultSchedPolicy, minSharePreemptionTimeouts,
-        fairSharePreemptionTimeouts, fairSharePreemptionThresholds, queueAcls,
+        defaultSchedPolicy, minSharePreemptionTimeouts, fairSharePreemptionTimeouts,
+        fairSharePreemptionThresholds, queueAcls, userQueryLimits, groupQueryLimits,
         newPlacementPolicy, configuredQueues, nonPreemptableQueues);
     lastSuccessfulReload = clock.getTime();
     lastReloadAttemptFailed = false;
 
+    verifyConfiguration(info);
+    LOG.info("Completed loading allocation file " + allocFile);
+
     reloadListener.onReload(info);
   }
-  
+
+
   /**
    * Loads a queue from a queue element in the configuration file
    */
@@ -411,10 +478,11 @@ public class AllocationFileLoaderService extends AbstractService {
       Map<String, Long> fairSharePreemptionTimeouts,
       Map<String, Float> fairSharePreemptionThresholds,
       Map<String, Map<QueueACL, AccessControlList>> queueAcls,
+      Map<String, Map<String, Integer>> userQueryLimits,
+      Map<String, Map<String, Integer>> groupQueryLimits,
       Map<FSQueueType, Set<String>> configuredQueues,
       Set<String> nonPreemptableQueues)
       throws AllocationConfigurationException {
-
     String queueName = CharMatcher.whitespace().trimFrom(element.getAttribute("name"));
 
     if (queueName.contains(".")) {
@@ -490,6 +558,10 @@ public class AllocationFileLoaderService extends AbstractService {
       } else if ("aclSubmitApps".equals(field.getTagName())) {
         String text = ((Text)field.getFirstChild()).getData();
         acls.put(QueueACL.SUBMIT_APPLICATIONS, new AccessControlList(text));
+      } else if ("userQueryLimit".equals(field.getTagName())) {
+        addQueryLimits(queueName, field, "userQueryLimit", userQueryLimits, "user");
+      } else if ("groupQueryLimit".equals(field.getTagName())) {
+        addQueryLimits(queueName, field, "groupQueryLimit", groupQueryLimits, "group");
       } else if ("aclAdministerApps".equals(field.getTagName())) {
         String text = ((Text)field.getFirstChild()).getData();
         acls.put(QueueACL.ADMINISTER_QUEUE, new AccessControlList(text));
@@ -498,13 +570,13 @@ public class AllocationFileLoaderService extends AbstractService {
         if (!Boolean.parseBoolean(text)) {
           nonPreemptableQueues.add(queueName);
         }
-      } else if ("queue".endsWith(field.getTagName()) || 
+      } else if ("queue".endsWith(field.getTagName()) ||
           "pool".equals(field.getTagName())) {
         loadQueue(queueName, field, minQueueResources, maxQueueResources,
             maxChildQueueResources, queueMaxApps, userMaxApps, queueMaxAMShares,
             queueWeights, queuePolicies, minSharePreemptionTimeouts,
-            fairSharePreemptionTimeouts, fairSharePreemptionThresholds,
-            queueAcls, configuredQueues, nonPreemptableQueues);
+            fairSharePreemptionTimeouts, fairSharePreemptionThresholds, queueAcls,
+            userQueryLimits, groupQueryLimits, configuredQueues, nonPreemptableQueues);
         configuredQueues.get(FSQueueType.PARENT).add(queueName);
         isLeaf = false;
       }
@@ -529,8 +601,71 @@ public class AllocationFileLoaderService extends AbstractService {
               minQueueResources.get(queueName)));
     }
   }
-  
-  public interface Listener {
-    public void onReload(AllocationConfiguration info);
+
+  /**
+   * After the AllocationConfiguration has been loaded, run some global
+   * consistency checks
+   */
+  public void verifyConfiguration(AllocationConfiguration allocationConfiguration) {
+    Map<FSQueueType, Set<String>> configuredQueues =
+        allocationConfiguration.getConfiguredQueues();
+    Set<String> parentQueues = configuredQueues.get(FSQueueType.PARENT);
+    Set<String> leafQueues = configuredQueues.get(FSQueueType.LEAF);
+    String root = "root";
+    if (parentQueues.size() == 1 && parentQueues.contains(root)) {
+      Map<String, Integer> rootUserQueryLimits =
+          allocationConfiguration.getUserQueryLimits(root);
+      Map<String, Integer> rootGroupQueryLimits =
+          allocationConfiguration.getGroupQueryLimits(root);
+      for (String leafQueue : leafQueues) {
+        if (leafQueue.startsWith(root)) {
+          Map<String, Integer> groupQueryLimits =
+              allocationConfiguration.getGroupQueryLimits(leafQueue);
+          Map<String, Integer> userQueryLimits =
+              allocationConfiguration.getUserQueryLimits(leafQueue);
+          verifyQueryLimits(leafQueue, "user", rootUserQueryLimits, userQueryLimits);
+          verifyQueryLimits(leafQueue, "group", rootGroupQueryLimits, groupQueryLimits);
+
+          verifyLeafAcls(allocationConfiguration, leafQueue);
+        }
+      }
+    }
   }
+
+  /**
+   * Look for the case where a leaf level User Quota will have no effect
+   * because of a root level quota. Log warnings when this case is found.
+   */
+  private void verifyQueryLimits(String leafQueue, String type,
+      Map<String, Integer> rootQueryLimits, Map<String, Integer> queryLimits) {
+    for (Map.Entry<String, Integer> stringIntegerEntry : rootQueryLimits.entrySet()) {
+      String key = stringIntegerEntry.getKey();
+      int rootLimit = stringIntegerEntry.getValue();
+      Integer leafLimit = queryLimits.get(key);
+      if (leafLimit != null && leafLimit > rootLimit) {
+        LOG.warn("Potential misconfiguration in queue '" + leafQueue + "': the " + type
+            + " limit for '" + key + "' of " + leafLimit
+            + " is greater than the root limit " + rootLimit
+            + " and so will have no effect");
+      }
+    }
+  }
+
+  /**
+   * Look for the case where the queue has no SUBMIT acl and log a Warning.
+   */
+  private static void verifyLeafAcls(
+      AllocationConfiguration allocationConfiguration, String leafQueue) {
+    AccessControlList queueAcl =
+        allocationConfiguration.getQueueAcl(leafQueue, QueueACL.SUBMIT_APPLICATIONS);
+    Collection<String> users = queueAcl.getUsers();
+    Collection<String> groups = queueAcl.getGroups();
+    if (!queueAcl.isAllAllowed() && users.isEmpty() && groups.isEmpty()) {
+      LOG.warn("Potential misconfiguration in queue '" + leafQueue
+          + "': no aclSubmitApps permissions were "
+          + "found, this will prevent query submission on this queue");
+    }
+  }
+
+  public interface Listener { public void onReload(AllocationConfiguration info); }
 }

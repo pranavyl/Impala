@@ -34,12 +34,15 @@
 #include "exec/empty-set-node.h"
 #include "exec/exchange-node.h"
 #include "exec/exec-node-util.h"
-#include "exec/hbase-scan-node.h"
+#include "exec/hbase/hbase-scan-node.h"
 #include "exec/hdfs-scan-node-mt.h"
 #include "exec/hdfs-scan-node.h"
-#include "exec/kudu-scan-node-mt.h"
-#include "exec/kudu-scan-node.h"
-#include "exec/kudu-util.h"
+#include "exec/iceberg-delete-node.h"
+#include "exec/iceberg-merge-node.h"
+#include "exec/iceberg-metadata/iceberg-metadata-scan-node.h"
+#include "exec/kudu/kudu-scan-node-mt.h"
+#include "exec/kudu/kudu-scan-node.h"
+#include "exec/kudu/kudu-util.h"
 #include "exec/nested-loop-join-node.h"
 #include "exec/partial-sort-node.h"
 #include "exec/partitioned-hash-join-node.h"
@@ -49,6 +52,7 @@
 #include "exec/streaming-aggregation-node.h"
 #include "exec/subplan-node.h"
 #include "exec/topn-node.h"
+#include "exec/tuple-cache-node.h"
 #include "exec/union-node.h"
 #include "exec/unnest-node.h"
 #include "exprs/expr.h"
@@ -82,6 +86,18 @@ Status PlanNode::Init(const TPlanNode& tnode, FragmentState* state) {
     // In Agg node the conjuncts are executed by the Aggregators.
     RETURN_IF_ERROR(
         ScalarExpr::Create(tnode_->conjuncts, *row_descriptor_, state, &conjuncts_));
+  }
+
+  if (state->query_options().compute_processing_cost) {
+    DCHECK_GT(state->fragment().effective_instance_count, 0);
+    is_mt_fragment_ = true;
+    num_instances_per_node_ = state->fragment().effective_instance_count;
+  } else if (state->query_options().mt_dop > 0) {
+    is_mt_fragment_ = true;
+    num_instances_per_node_ = state->query_options().mt_dop;
+  } else {
+    is_mt_fragment_ = false;
+    num_instances_per_node_ = 1;
   }
   return Status::OK();
 }
@@ -161,6 +177,7 @@ Status PlanNode::CreatePlanNode(
     case TPlanNodeType::HBASE_SCAN_NODE:
     case TPlanNodeType::DATA_SOURCE_NODE:
     case TPlanNodeType::KUDU_SCAN_NODE:
+    case TPlanNodeType::SYSTEM_TABLE_SCAN_NODE:
       *node = pool->Add(new ScanPlanNode());
       break;
     case TPlanNodeType::AGGREGATION_NODE:
@@ -210,6 +227,18 @@ Status PlanNode::CreatePlanNode(
     case TPlanNodeType::CARDINALITY_CHECK_NODE:
       *node = pool->Add(new CardinalityCheckPlanNode());
       break;
+    case TPlanNodeType::ICEBERG_DELETE_NODE:
+      *node = pool->Add(new IcebergDeletePlanNode());
+      break;
+    case TPlanNodeType::ICEBERG_METADATA_SCAN_NODE:
+      *node = pool->Add(new IcebergMetadataScanPlanNode());
+      break;
+    case TPlanNodeType::TUPLE_CACHE_NODE:
+      *node = pool->Add(new TupleCachePlanNode());
+      break;
+    case TPlanNodeType::ICEBERG_MERGE_NODE:
+      *node = pool->Add(new IcebergMergePlanNode());
+      break;
     default:
       map<int, const char*>::const_iterator i =
           _TPlanNodeType_VALUES_TO_NAMES.find(tnode.node_type);
@@ -244,7 +273,7 @@ ExecNode::ExecNode(ObjectPool* pool, const PlanNode& pnode, const DescriptorTbl&
     resource_profile_(pnode.tnode_->resource_profile),
     limit_(pnode.tnode_->limit),
     runtime_profile_(RuntimeProfile::Create(
-        pool_, Substitute("$0 (id=$1)", PrintThriftEnum(type_), id_))),
+        pool_, Substitute("$0 (id=$1)", PrintValue(type_), id_))),
     rows_returned_counter_(nullptr),
     rows_returned_rate_(nullptr),
     containing_subplan_(nullptr),
@@ -277,7 +306,7 @@ Status ExecNode::Prepare(RuntimeState* state) {
     RETURN_IF_ERROR(children_[i]->Prepare(state));
   }
   reservation_manager_.Init(
-      Substitute("$0 id=$1 ptr=$2", PrintThriftEnum(type_), id_, this), runtime_profile_,
+      Substitute("$0 id=$1 ptr=$2", PrintValue(type_), id_, this), runtime_profile_,
       state->instance_buffer_reservation(), mem_tracker_.get(), resource_profile_,
       debug_options_);
   if (!IsInSubplan()) {
@@ -290,9 +319,6 @@ Status ExecNode::Prepare(RuntimeState* state) {
 Status ExecNode::Open(RuntimeState* state) {
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
   DCHECK_EQ(conjunct_evals_.size(), conjuncts_.size());
-  for (const string& codegen_msg : plan_node_.codegen_status_msgs_) {
-    runtime_profile_->AppendExecOption(codegen_msg);
-  }
   return ScalarExprEvaluator::Open(conjunct_evals_, state);
 }
 
@@ -330,6 +356,11 @@ void ExecNode::Close(RuntimeState* state) {
     }
     mem_tracker_->Close();
   }
+
+  for (const string& codegen_msg : plan_node_.codegen_status_msgs_) {
+    runtime_profile_->AppendExecOption(codegen_msg);
+  }
+
   if (events_ != nullptr) events_->MarkEvent("Closed");
 }
 

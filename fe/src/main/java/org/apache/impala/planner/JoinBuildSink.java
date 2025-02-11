@@ -22,6 +22,7 @@ import java.util.List;
 
 import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.Expr;
+import org.apache.impala.common.ThriftSerializationCtx;
 import org.apache.impala.planner.RuntimeFilterGenerator.RuntimeFilter;
 import org.apache.impala.thrift.TDataSink;
 import org.apache.impala.thrift.TDataSinkType;
@@ -84,8 +85,14 @@ public class JoinBuildSink extends DataSink {
           ((HashJoinNode)joinNode_).getThriftEquiJoinConjuncts());
       tBuildSink.setHash_seed(joinNode_.getFragment().getHashSeed());
     }
+    if (joinNode_ instanceof IcebergDeleteNode) {
+      tBuildSink.setEq_join_conjuncts(
+          ((IcebergDeleteNode) joinNode_).getThriftEquiJoinConjuncts());
+      tBuildSink.setHash_seed(joinNode_.getFragment().getHashSeed());
+    }
     for (RuntimeFilter filter : runtimeFilters_) {
-      tBuildSink.addToRuntime_filters(filter.toThrift());
+      tBuildSink.addToRuntime_filters(
+          filter.toThrift(new ThriftSerializationCtx(), null));
     }
     tBuildSink.setShare_build(joinNode_.canShareBuild());
     tsink.setJoin_build_sink(tBuildSink);
@@ -95,9 +102,11 @@ public class JoinBuildSink extends DataSink {
   protected TDataSinkType getSinkType() {
     if (joinNode_ instanceof HashJoinNode) {
       return TDataSinkType.HASH_JOIN_BUILDER;
-    } else {
-      Preconditions.checkState(joinNode_ instanceof NestedLoopJoinNode);
+    } else if (joinNode_ instanceof NestedLoopJoinNode) {
       return TDataSinkType.NESTED_LOOP_JOIN_BUILDER;
+    } else {
+      Preconditions.checkState(joinNode_ instanceof IcebergDeleteNode);
+      return TDataSinkType.ICEBERG_DELETE_BUILDER;
     }
   }
 
@@ -141,9 +150,17 @@ public class JoinBuildSink extends DataSink {
                                        joinNode_.getFragment().getNumInstances();
   }
 
+  public boolean isShared() { return joinNode_.canShareBuild(); }
+
   @Override
   protected String getLabel() {
     return "JOIN BUILD";
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    // The processing cost to export rows.
+    processingCost_ = joinNode_.computeJoinProcessingCost().second;
   }
 
   @Override
@@ -154,5 +171,13 @@ public class JoinBuildSink extends DataSink {
   @Override
   public void collectExprs(List<Expr> exprs) {
     exprs.addAll(buildExprs_);
+  }
+
+  @Override
+  public void computeRowConsumptionAndProductionToCost() {
+    super.computeRowConsumptionAndProductionToCost();
+    if (isShared()) {
+      fragment_.setFixedInstanceCount(getNumInstances());
+    }
   }
 }

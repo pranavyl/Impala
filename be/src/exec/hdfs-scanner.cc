@@ -20,9 +20,11 @@
 #include "codegen/codegen-anyval.h"
 #include "exec/base-sequence-scanner.h"
 #include "exec/exec-node.inline.h"
+#include "exec/file-metadata-utils.h"
 #include "exec/hdfs-scan-node.h"
 #include "exec/hdfs-scan-node-mt.h"
 #include "exec/read-write-util.h"
+#include "exec/scanner-context.inline.h"
 #include "exec/text-converter.h"
 #include "exec/text-converter.inline.h"
 #include "exprs/scalar-expr-evaluator.h"
@@ -46,11 +48,11 @@ DEFINE_double(min_filter_reject_ratio, 0.1, "(Advanced) If the percentage of "
 
 const char* FieldLocation::LLVM_CLASS_NAME = "struct.impala::FieldLocation";
 const char* HdfsScanner::LLVM_CLASS_NAME = "class.impala::HdfsScanner";
-const int64_t HdfsScanner::FOOTER_SIZE;
 
 HdfsScanner::HdfsScanner(HdfsScanNodeBase* scan_node, RuntimeState* state)
     : scan_node_(scan_node),
       state_(state),
+      file_metadata_utils_(scan_node),
       expr_perm_pool_(new MemPool(scan_node->expr_mem_tracker())),
       template_tuple_pool_(new MemPool(scan_node->mem_tracker())),
       tuple_byte_size_(scan_node->tuple_desc()->byte_size()),
@@ -66,6 +68,7 @@ HdfsScanner::HdfsScanner(HdfsScanNodeBase* scan_node, RuntimeState* state)
 HdfsScanner::HdfsScanner()
     : scan_node_(nullptr),
       state_(nullptr),
+      file_metadata_utils_(nullptr),
       tuple_byte_size_(0) {
   DCHECK(TestInfo::is_test());
 }
@@ -73,8 +76,26 @@ HdfsScanner::HdfsScanner()
 HdfsScanner::~HdfsScanner() {
 }
 
+Status HdfsScanner::ValidateSlotDescriptors() const {
+  if (file_format() != THdfsFileFormat::PARQUET &&
+      file_format() != THdfsFileFormat::ORC) {
+    // Virtual column FILE__POSITION is only supported for PARQUET files.
+    for (SlotDescriptor* sd : scan_node_->virtual_column_slots()) {
+      if (sd->virtual_column_type() == TVirtualColumnType::FILE_POSITION) {
+        return Status(Substitute(
+            "Virtual column FILE__POSITION is not supported for $0 files.",
+            _THdfsFileFormat_VALUES_TO_NAMES.find(file_format())->second));
+      }
+    }
+  }
+  return Status::OK();
+}
+
 Status HdfsScanner::Open(ScannerContext* context) {
   context_ = context;
+  RETURN_IF_ERROR(ValidateSlotDescriptors());
+  file_metadata_utils_.SetFile(state_, scan_node_->GetFileDesc(
+      context->partition_descriptor()->id(), context->GetStream()->filename()));
   stream_ = context->GetStream();
 
   // Clone the scan node's conjuncts map. The cloned evaluators must be closed by the
@@ -109,14 +130,10 @@ Status HdfsScanner::Open(ScannerContext* context) {
     }
   }
 
-  // Initialize the template_tuple_, it is copied from the template tuple map in the
-  // HdfsScanNodeBase.
-  Tuple* template_tuple =
-      scan_node_->GetTemplateTupleForPartitionId(context_->partition_descriptor()->id());
-  if (template_tuple != nullptr) {
-    template_tuple_ =
-        template_tuple->DeepCopy(*scan_node_->tuple_desc(), template_tuple_pool_.get());
-  }
+  std::map<const SlotId, const SlotDescriptor*> slot_descs_written;
+  template_tuple_ = file_metadata_utils_.CreateTemplateTuple(
+      context_->partition_descriptor()->id(), template_tuple_pool_.get(),
+      &slot_descs_written);
   template_tuple_map_[scan_node_->tuple_desc()] = template_tuple_;
 
   decompress_timer_ = ADD_TIMER(scan_node_->runtime_profile(), "DecompressionTime");
@@ -271,9 +288,9 @@ bool HdfsScanner::WriteCompleteTuple(MemPool* pool, FieldLocation* fields,
       need_escape = true;
     }
 
-    SlotDescriptor* desc = scan_node_->materialized_slots()[i];
-    bool error = !text_converter_->WriteSlot(desc, tuple,
-        fields[i].start, len, false, need_escape, pool);
+    const SlotDescriptor* slot_desc = scan_node_->materialized_slots()[i];
+    bool error = !text_converter_->WriteSlot(slot_desc, tuple, fields[i].start, len,
+        false, need_escape, pool);
     error_fields[i] = error;
     *error_in_row |= error;
   }
@@ -356,8 +373,8 @@ Status HdfsScanner::CodegenWriteCompleteTuple(const HdfsScanPlanNode* node,
     // for other things, we call the interpreted code for this slot from the codegen'd
     // code instead of failing codegen. See IMPALA-9747.
     if (TextConverter::SupportsCodegenWriteSlot(slot_desc->type())) {
-      RETURN_IF_ERROR(TextConverter::CodegenWriteSlot(codegen, tuple_desc, slot_desc, &fn,
-          node->hdfs_table_->null_column_value().data(),
+      RETURN_IF_ERROR(TextConverter::CodegenWriteSlot(codegen, tuple_desc, slot_desc,
+          &fn, node->hdfs_table_->null_column_value().data(),
           node->hdfs_table_->null_column_value().size(), true,
           state->query_options().strict_mode));
       if (i >= LlvmCodeGen::CODEGEN_INLINE_EXPRS_THRESHOLD) codegen->SetNoInline(fn);
@@ -601,10 +618,20 @@ Status HdfsScanner::CodegenInitTuple(
   DCHECK(*init_tuple_fn != nullptr);
 
   // Replace all of the constants in InitTuple() to specialize the code.
-  bool materialized_partition_keys_exist = !node->partition_key_slots_.empty();
-  int replaced = codegen->ReplaceCallSitesWithBoolConst(
-      *init_tuple_fn, materialized_partition_keys_exist, "has_template_tuple");
-  DCHECK_REPLACE_COUNT(replaced, 1);
+  bool has_template_tuple = !node->partition_key_slots_.empty();
+  if (!has_template_tuple) {
+    has_template_tuple = node->HasVirtualColumnInTemplateTuple();
+  }
+  int replaced = 0;
+  // If has_template_tuple is true, then we can certainly replace the callsites.
+  // If has_template_tuple is false, then we should only replace the callsites for
+  // non-Iceberg tables, as for Iceberg tables we might still create a template
+  // tuple based on the partitioning in the data files.
+  if (has_template_tuple || !node->hdfs_table_->IsIcebergTable()) {
+    replaced = codegen->ReplaceCallSitesWithBoolConst(
+      *init_tuple_fn, has_template_tuple, "has_template_tuple");
+    DCHECK_REPLACE_COUNT(replaced, 1);
+  }
 
   const TupleDescriptor* tuple_desc = node->tuple_desc_;
   replaced = codegen->ReplaceCallSitesWithValue(*init_tuple_fn,
@@ -759,6 +786,150 @@ Status HdfsScanner::UpdateDecompressor(const string& codec) {
   return Status::OK();
 }
 
+Status HdfsScanner::DecompressFileToBuffer(uint8_t** buffer, int64_t* bytes_read) {
+  // For other compressed file: attempt to read and decompress the entire file, point
+  // to the decompressed buffer, and then continue normal processing.
+  DCHECK(decompression_type_ != THdfsCompression::SNAPPY);
+  const HdfsFileDesc* desc = scan_node_->GetFileDesc(
+      context_->partition_descriptor()->id(), stream_->filename());
+  int64_t file_size = desc->file_length;
+  DCHECK_GT(file_size, 0);
+
+  Status status;
+  if (!stream_->GetBytes(file_size, buffer, bytes_read, &status)) {
+    DCHECK(!status.ok());
+    return status;
+  }
+
+  // If didn't read anything, return.
+  if (*bytes_read == 0) return Status::OK();
+
+  // Need to read the entire file.
+  if (file_size > *bytes_read) {
+    return Status(Substitute("Expected to read a compressed text file of size $0 bytes. "
+        "But only read $1 bytes. This may indicate data file corruption. (file: $3).",
+        file_size, *bytes_read, stream_->filename()));
+  }
+
+  // Decompress and adjust the buffer and bytes_read accordingly.
+  int64_t decompressed_len = 0;
+  uint8_t* decompressed_buffer = nullptr;
+  SCOPED_TIMER(decompress_timer_);
+  // TODO: Once the writers are in, add tests with very large compressed files (4GB)
+  // that could overflow.
+  RETURN_IF_ERROR(decompressor_->ProcessBlock(false, *bytes_read, *buffer,
+      &decompressed_len, &decompressed_buffer));
+
+  // Inform 'stream_' that the buffer with the compressed text can be released.
+  context_->ReleaseCompletedResources(true);
+
+  VLOG_FILE << "Decompressed " << *bytes_read << " to " << decompressed_len;
+  *buffer = decompressed_buffer;
+  *bytes_read = decompressed_len;
+  return Status::OK();
+}
+
+Status HdfsScanner::DecompressStreamToBuffer(uint8_t** buffer, int64_t* bytes_read,
+    MemPool* pool, bool* eosr) {
+  // We're about to create a new decompression buffer (if we can't reuse). Attach the
+  // memory from previous decompression rounds to 'pool'.
+  if (!decompressor_->reuse_output_buffer()) {
+    if (pool != nullptr) {
+      pool->AcquireData(data_buffer_pool_.get(), false);
+    } else {
+      data_buffer_pool_->FreeAll();
+    }
+  }
+
+  uint8_t* decompressed_buffer = nullptr;
+  int64_t decompressed_len = 0;
+  // Set bytes_to_read = -1 because we don't know how much data decompressor need.
+  // Just read the first available buffer within the scan range.
+  Status status = DecompressStream(-1, &decompressed_buffer, &decompressed_len,
+      eosr);
+  if (status.code() == TErrorCode::COMPRESSED_FILE_DECOMPRESSOR_NO_PROGRESS) {
+    // It's possible (but very unlikely) that ProcessBlockStreaming() wasn't able to
+    // make progress if the compressed buffer returned by GetBytes() is too small.
+    // (Note that this did not even occur in simple experiments where the input buffer
+    // is always 1 byte, but we need to handle this case to be defensive.) In this
+    // case, try again with a reasonably large fixed size buffer. If we still did not
+    // make progress, then return an error.
+    LOG(INFO) << status.GetDetail();
+    // Number of bytes to read when the previous attempt to streaming decompress did not
+    // make progress.
+    constexpr int64_t COMPRESSED_DATA_FIXED_READ_SIZE = 1 * 1024 * 1024;
+    status = DecompressStream(COMPRESSED_DATA_FIXED_READ_SIZE, &decompressed_buffer,
+        &decompressed_len, eosr);
+  }
+  RETURN_IF_ERROR(status);
+  *buffer = decompressed_buffer;
+  *bytes_read = decompressed_len;
+
+  if (*eosr) {
+    DCHECK(stream_->eosr());
+    context_->ReleaseCompletedResources(true);
+  }
+
+  return Status::OK();
+}
+
+Status HdfsScanner::DecompressStream(int64_t bytes_to_read,
+    uint8_t** decompressed_buffer, int64_t* decompressed_len, bool *eosr) {
+  // Some decompressors, such as Bzip2 API (version 0.9 and later) and Gzip can
+  // decompress buffers that are read from stream_, so we don't need to read the
+  // whole file in once. A compressed buffer is passed to ProcessBlockStreaming
+  // but it may not consume all of the input.
+  uint8_t* compressed_buffer_ptr = nullptr;
+  int64_t compressed_buffer_size = 0;
+  // We don't know how many bytes ProcessBlockStreaming() will consume so we set
+  // peek=true and then later advance the stream using SkipBytes().
+  if (bytes_to_read == -1) {
+    RETURN_IF_ERROR(stream_->GetBuffer(true, &compressed_buffer_ptr,
+        &compressed_buffer_size));
+  } else {
+    DCHECK_GT(bytes_to_read, 0);
+    Status status;
+    if (!stream_->GetBytes(bytes_to_read, &compressed_buffer_ptr, &compressed_buffer_size,
+        &status, true)) {
+      DCHECK(!status.ok());
+      return status;
+    }
+  }
+  int64_t compressed_buffer_bytes_read = 0;
+  bool stream_end = false;
+  {
+    SCOPED_TIMER(decompress_timer_);
+    Status status = decompressor_->ProcessBlockStreaming(compressed_buffer_size,
+        compressed_buffer_ptr, &compressed_buffer_bytes_read, decompressed_len,
+        decompressed_buffer, &stream_end);
+    if (!status.ok()) {
+      status.AddDetail(Substitute("$0file=$1, offset=$2", status.GetDetail(),
+          stream_->filename(), stream_->file_offset()));
+      return status;
+    }
+    DCHECK_GE(compressed_buffer_size, compressed_buffer_bytes_read);
+  }
+  // Skip the bytes in stream_ that were decompressed.
+  Status status;
+  if (!stream_->SkipBytes(compressed_buffer_bytes_read, &status)) {
+    DCHECK(!status.ok());
+    return status;
+  }
+
+  if (stream_->eosr()) {
+    if (stream_end) {
+      *eosr = true;
+    } else {
+      return Status(TErrorCode::COMPRESSED_FILE_TRUNCATED, stream_->filename());
+    }
+  } else if (*decompressed_len == 0) {
+    return Status(TErrorCode::COMPRESSED_FILE_DECOMPRESSOR_NO_PROGRESS,
+        stream_->filename());
+  }
+
+  return Status::OK();
+}
+
 bool HdfsScanner::ReportTupleParseError(FieldLocation* fields, uint8_t* errors) {
   for (int i = 0; i < scan_node_->materialized_slots().size(); ++i) {
     if (errors[i]) {
@@ -824,17 +995,21 @@ void HdfsScanner::CheckFiltersEffectiveness() {
 }
 
 Status HdfsScanner::IssueFooterRanges(HdfsScanNodeBase* scan_node,
-    const THdfsFileFormat::type& file_type, const vector<HdfsFileDesc*>& files) {
+    const THdfsFileFormat::type& file_type, const vector<HdfsFileDesc*>& files,
+    int64_t footer_size_estimate) {
   DCHECK(!files.empty());
+  DCHECK_LE(footer_size_estimate, READ_SIZE_MIN_VALUE);
   vector<ScanRange*> footer_ranges;
   for (int i = 0; i < files.size(); ++i) {
     // Compute the offset of the file footer.
-    int64_t footer_size = min(FOOTER_SIZE, files[i]->file_length);
+    int64_t footer_size = min(footer_size_estimate, files[i]->file_length);
     int64_t footer_start = files[i]->file_length - footer_size;
     DCHECK_GE(footer_start, 0);
 
     // Try to find the split with the footer.
     ScanRange* footer_split = FindFooterSplit(files[i]);
+    bool footer_scanner =
+        scan_node->IsZeroSlotTableScan() || scan_node->optimize_count_star();
 
     for (int j = 0; j < files[i]->splits.size(); ++j) {
       ScanRange* split = files[i]->splits[j];
@@ -845,7 +1020,7 @@ Status HdfsScanner::IssueFooterRanges(HdfsScanNodeBase* scan_node,
       // groups. We only want a single node to process the file footer in this case,
       // which is the node with the footer split.  If it's not a count(*), we create a
       // footer range for the split always.
-      if (!scan_node->IsZeroSlotTableScan() || footer_split == split) {
+      if (!footer_scanner || footer_split == split) {
         ScanRangeMetadata* split_metadata =
             static_cast<ScanRangeMetadata*>(split->meta_data());
         // Each split is processed by first issuing a scan range for the file footer, which
@@ -854,10 +1029,9 @@ Status HdfsScanner::IssueFooterRanges(HdfsScanNodeBase* scan_node,
         // metadata associated with the footer range.
         ScanRange* footer_range;
         if (footer_split != nullptr) {
-          footer_range = scan_node->AllocateScanRange(files[i]->fs,
-              files[i]->filename.c_str(), footer_size, footer_start,
-              split_metadata->partition_id, footer_split->disk_id(),
-              footer_split->expected_local(), files[i]->mtime,
+          footer_range = scan_node->AllocateScanRange(files[i]->GetFileInfo(),
+              footer_size, footer_start, split_metadata->partition_id,
+              footer_split->disk_id(), footer_split->expected_local(),
               BufferOpts(footer_split->cache_options()), split);
         } else {
           // If we did not find the last split, we know it is going to be a remote read.
@@ -865,9 +1039,9 @@ Status HdfsScanner::IssueFooterRanges(HdfsScanNodeBase* scan_node,
           int cache_options = !scan_node->IsDataCacheDisabled() ?
               BufferOpts::USE_DATA_CACHE : BufferOpts::NO_CACHING;
           footer_range =
-              scan_node->AllocateScanRange(files[i]->fs, files[i]->filename.c_str(),
-                   footer_size, footer_start, split_metadata->partition_id, -1,
-                   expected_local, files[i]->mtime, BufferOpts(cache_options), split);
+              scan_node->AllocateScanRange(files[i]->GetFileInfo(),
+                  footer_size, footer_start, split_metadata->partition_id, -1,
+                  expected_local, BufferOpts(cache_options), split);
         }
         footer_ranges.push_back(footer_range);
       } else {

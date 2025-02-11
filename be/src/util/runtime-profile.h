@@ -99,7 +99,8 @@ class RuntimeProfileBase {
 
   class Counter {
    public:
-    Counter(TUnit::type unit, int64_t value = 0) : value_(value), unit_(unit) {}
+    Counter(TUnit::type unit, int64_t value = 0)
+      : value_(value), unit_(unit), is_system_(false) {}
     virtual ~Counter(){}
 
     virtual void Add(int64_t delta) {
@@ -144,11 +145,15 @@ class RuntimeProfileBase {
 
     TUnit::type unit() const { return unit_; }
 
+    void SetIsSystem() { is_system_ = true; }
+    bool GetIsSystem() const { return  is_system_; }
+
    protected:
     friend class RuntimeProfile;
 
     AtomicInt64 value_;
     TUnit::type unit_;
+    bool is_system_;
   };
 
   class AveragedCounter;
@@ -160,7 +165,7 @@ class RuntimeProfileBase {
 
   /// Gets the counter object with 'name'.  Returns NULL if there is no counter with
   /// that name.
-  Counter* GetCounter(const std::string& name);
+  Counter* GetCounter(const std::string& name) const;
 
   /// Adds all counters with 'name' that are registered either in this or
   /// in any of the child profiles to 'counters'.
@@ -178,7 +183,7 @@ class RuntimeProfileBase {
   void PrettyPrint(
       Verbosity verbosity, std::ostream* s, const std::string& prefix = "") const;
 
-  void GetChildren(std::vector<RuntimeProfileBase*>* children);
+  void GetChildren(std::vector<RuntimeProfileBase*>* children) const;
 
   /// Gets all profiles in tree, including this one.
   void GetAllChildren(std::vector<RuntimeProfileBase*>* children);
@@ -313,7 +318,8 @@ class RuntimeProfileBase {
   AtomicInt64 total_time_ns_{0};
 
   RuntimeProfileBase(ObjectPool* pool, const std::string& name,
-      Counter* total_time_counter, Counter* inactive_timer);
+      Counter* total_time_counter, Counter* inactive_timer,
+      bool add_default_counters = true);
 
   ///  Inserts 'child' before the iterator 'insert_pos' in 'children_'.
   /// 'children_lock_' must be held by the caller.
@@ -432,9 +438,21 @@ class RuntimeProfile : public RuntimeProfileBase {
   class SamplingTimeSeriesCounter;
   class ChunkedTimeSeriesCounter;
 
+  /// String constants for instruction count names.
+  static const string FRAGMENT_INSTANCE_LIFECYCLE_TIMINGS;
+  static const string BUFFER_POOL;
+  static const string DEQUEUE;
+  static const string ENQUEUE;
+  static const string HASH_TABLE;
+  static const string PREFIX_FILTER;
+  static const string PREFIX_GROUPING_AGGREGATOR;
+
   /// Create a runtime profile object with 'name'. The profile, counters and any other
   /// structures owned by the profile are allocated from 'pool'.
-  static RuntimeProfile* Create(ObjectPool* pool, const std::string& name);
+  /// If add_default_counters is false, TotalTime and InactiveTotalTime will be
+  /// hidden in the newly created RuntimeProfile node.
+  static RuntimeProfile* Create(
+      ObjectPool* pool, const std::string& name, bool add_default_counters = true);
 
   ~RuntimeProfile();
 
@@ -460,8 +478,10 @@ class RuntimeProfile : public RuntimeProfileBase {
   /// Creates a new child profile with the given 'name'. A child profile with that name
   /// must not already exist. If 'prepend' is true, prepended before other child profiles,
   /// otherwise appended after other child profiles.
-  RuntimeProfile* CreateChild(
-      const std::string& name, bool indent = true, bool prepend = false);
+  /// If 'add_default_counters' is false, TotalTime and InactiveTotalTime will be
+  /// hidden in any newly created RuntimeProfile node.
+  RuntimeProfile* CreateChild(const std::string& name, bool indent = true,
+      bool prepend = false, bool add_default_counters = false);
 
   /// Sorts all children according to descending total time. Does not
   /// invalidate pointers to profiles.
@@ -479,7 +499,10 @@ class RuntimeProfile : public RuntimeProfileBase {
   /// are updated. Counters that do not already exist are created.
   /// Info strings matched up by key and are updated or added, depending on whether
   /// the key has already been registered.
-  void Update(const TRuntimeProfileTree& thrift_profile);
+  /// If add_default_counters is false, TotalTime and InactiveTotalTime will be
+  /// hidden in any newly created RuntimeProfile node.
+  void Update(
+      const TRuntimeProfileTree& thrift_profile, bool add_default_counters = true);
 
   /// Add a counter with 'name'/'unit'.  Returns a counter object that the caller can
   /// update.  The counter is owned by the RuntimeProfile object.
@@ -640,11 +663,11 @@ class RuntimeProfile : public RuntimeProfileBase {
   /// calling PeriodicCounterUpdater::StopTimeSeriesCounter() if the input stops changing.
   /// Note: these counters don't get merged (to make average profiles)
   TimeSeriesCounter* AddSamplingTimeSeriesCounter(const std::string& name,
-      TUnit::type unit, SampleFunction sample_fn);
+      TUnit::type unit, SampleFunction sample_fn, bool is_system = false);
 
   /// Same as above except the samples are collected from 'src_counter'.
   TimeSeriesCounter* AddSamplingTimeSeriesCounter(const std::string& name, Counter*
-      src_counter);
+      src_counter, bool is_system = false);
 
   /// Adds a chunked time series counter to the profile. This begins sampling immediately.
   /// This counter will collect new samples periodically by calling 'sample_fn()'. Samples
@@ -709,6 +732,9 @@ class RuntimeProfile : public RuntimeProfileBase {
   /// Get a copy of exec_summary to t_exec_summary
   void GetExecSummary(TExecSummary* t_exec_summary) const;
 
+  /// Print all the event timers as timeline into output.
+  void GetTimeline(std::string* output) const;
+
  protected:
   virtual int GetNumInputProfiles() const override { return 1; }
 
@@ -728,12 +754,15 @@ class RuntimeProfile : public RuntimeProfileBase {
   void PrettyPrintInfoStrings(
       std::ostream* s, const std::string& prefix, Verbosity verbosity) const override;
 
+  void PrettyPrintTimeline(std::ostream* s, const string& prefix) const;
+
   /// Print any additional counters from this subclass.
   void PrettyPrintSubclassCounters(
       std::ostream* s, const std::string& prefix, Verbosity verbosity) const override;
 
  private:
   friend class AggregatedRuntimeProfile;
+  friend class AdmissionControllerTest;
 
   /// A set of bucket counters registered in this runtime profile.
   std::set<std::vector<Counter*>*> bucketing_counters_;
@@ -781,11 +810,15 @@ class RuntimeProfile : public RuntimeProfileBase {
   mutable SpinLock t_exec_summary_lock_;
 
   /// Constructor used by Create().
-  RuntimeProfile(ObjectPool* pool, const std::string& name);
+  RuntimeProfile(
+      ObjectPool* pool, const std::string& name, bool add_default_counters = true);
 
   /// Update a subtree of profiles from nodes, rooted at *idx.
   /// On return, *idx points to the node immediately following this subtree.
-  void Update(const std::vector<TRuntimeProfileNode>& nodes, int* idx);
+  /// If add_default_counters is false, TotalTime and InactiveTotalTime will be
+  /// hidden in any newly created RuntimeProfile node.
+  void Update(
+      const std::vector<TRuntimeProfileNode>& nodes, int* idx, bool add_default_counters);
 
   /// Send exec_summary to thrift
   void ExecSummaryToThrift(TRuntimeProfileTree* tree) const;
@@ -818,7 +851,7 @@ class AggregatedRuntimeProfile : public RuntimeProfileBase {
   /// will have UpdateAggregated*() called on it. The descendants of the root are
   /// created and updated by that call.
   static AggregatedRuntimeProfile* Create(ObjectPool* pool, const std::string& name,
-      int num_input_profiles, bool is_root = true);
+      int num_input_profiles, bool is_root = true, bool add_default_counters = true);
 
   /// Updates the AveragedCounter counters in this profile with the counters from the
   /// 'src' profile, which is the input instance that was assigned index 'idx'. If a
@@ -828,7 +861,8 @@ class AggregatedRuntimeProfile : public RuntimeProfileBase {
   ///
   /// Note that 'src' must be all instances of RuntimeProfile - no
   /// AggregatedRuntimeProfiles can be part of the input.
-  void UpdateAggregatedFromInstance(RuntimeProfile* src, int idx);
+  void UpdateAggregatedFromInstance(
+      RuntimeProfile* src, int idx, bool add_default_counters = true);
 
   /// Updates the AveragedCounter counters in this profile with the counters from the
   /// 'src' profile, which must be a serialized AggregatedProfile. The instances in
@@ -836,7 +870,8 @@ class AggregatedRuntimeProfile : public RuntimeProfileBase {
   /// this profile. If a counter is present in 'src' but missing in this profile, a
   /// new AveragedCounter is created with the same name. Obtains locks on the counter
   /// maps and child counter maps in this profile.
-  void UpdateAggregatedFromInstances(const TRuntimeProfileTree& src, int start_idx);
+  void UpdateAggregatedFromInstances(
+      const TRuntimeProfileTree& src, int start_idx, bool add_default_counters = true);
 
  protected:
   virtual int GetNumInputProfiles() const override { return num_input_profiles_; }
@@ -911,8 +946,8 @@ class AggregatedRuntimeProfile : public RuntimeProfileBase {
   /// Time series counters. Protected by 'counter_map_lock_'.
   std::map<std::string, TAggTimeSeriesCounter> time_series_counter_map_;
 
-  AggregatedRuntimeProfile(
-      ObjectPool* pool, const std::string& name, int num_input_profiles, bool is_root);
+  AggregatedRuntimeProfile(ObjectPool* pool, const std::string& name,
+      int num_input_profiles, bool is_root, bool add_default_counters = true);
 
   /// Group the values in 'info_string_values' by value, with a vector of indices where
   /// that value appears. 'info_string_values' must be a value from 'info_strings_'.
@@ -920,7 +955,8 @@ class AggregatedRuntimeProfile : public RuntimeProfileBase {
       const std::vector<std::string>& info_string_values) const;
 
   /// Helper for UpdateAggregatedFromInstance() that are invoked recursively on 'src'.
-  void UpdateAggregatedFromInstanceRecursive(RuntimeProfile* src, int idx);
+  void UpdateAggregatedFromInstanceRecursive(
+      RuntimeProfile* src, int idx, bool add_default_counter = true);
 
   /// Helpers for UpdateAggregatedFromInstanceRecursive() that update particular parts
   /// of this profile node from 'src'.
@@ -930,8 +966,8 @@ class AggregatedRuntimeProfile : public RuntimeProfileBase {
   void UpdateEventSequencesFromInstance(RuntimeProfile* src, int idx);
 
   /// Helper for UpdateAggregatedFromInstances() that are invoked recursively on 'src'.
-  void UpdateAggregatedFromInstancesRecursive(
-      const TRuntimeProfileTree& src, int* node_idx, int start_idx);
+  void UpdateAggregatedFromInstancesRecursive(const TRuntimeProfileTree& src,
+      int* node_idx, int start_idx, bool add_default_counter = true);
 
   /// Helpers for UpdateAggregatedFromInstancesRecursive() that update particular parts
   /// of this profile node from 'src'. 'src' must have an aggregated profile set.

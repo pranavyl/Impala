@@ -78,7 +78,7 @@ class TSaslTransport : public TVirtualTransport<TSaslTransport> {
   /**
    * Whether this transport is open.
    */
-  virtual bool isOpen();
+  virtual bool isOpen() const;
 
   /**
    * Tests whether there is more data to read or if the remote side is
@@ -143,6 +143,13 @@ class TSaslTransport : public TVirtualTransport<TSaslTransport> {
    * @throws TTransportException if an error occurs
    */
   std::string getUsername();
+
+  /**
+   * Returns the IANA-registered mechanism name from underlying sasl connection.
+   *
+   * @throws TTransportException if an error occurs
+   */
+  std::string getMechanismName();
 
  protected:
   /// Underlying transport

@@ -25,7 +25,11 @@ import org.apache.avro.SchemaParseException;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.serde2.avro.AvroSerdeUtils;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.mr.Catalogs;
+import org.apache.iceberg.mr.InputFormatConfig;
 import org.apache.impala.authorization.AuthorizationConfig;
+import org.apache.impala.catalog.DataSourceTable;
+import org.apache.impala.catalog.FeDataSourceTable;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeHBaseTable;
 import org.apache.impala.catalog.FeIcebergTable;
@@ -74,6 +78,12 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
   public Map<String, String> getTblProperties() { return tblProperties_; }
 
   @Override
+  public String getOperation() {
+    return (targetProperty_ == TTablePropertyType.TBL_PROPERTY)
+        ? "SET TBLPROPERTIES" : "SET SERDEPROPERTIES";
+  }
+
+  @Override
   public TAlterTableParams toThrift() {
    TAlterTableParams params = super.toThrift();
    params.setAlter_type(TAlterTableType.SET_TBL_PROPERTIES);
@@ -104,6 +114,8 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
       analyzeKuduTable(analyzer);
     } else if (getTargetTable() instanceof FeIcebergTable) {
       analyzeIcebergTable(analyzer);
+    } else if (getTargetTable() instanceof FeDataSourceTable) {
+      analyzeDataSourceTable(analyzer);
     }
 
     // Check avro schema when it is set in avro.schema.url or avro.schema.literal to
@@ -155,6 +167,8 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
     icebergPropertyCheck(IcebergTable.ICEBERG_CATALOG);
     icebergPropertyCheck(IcebergTable.ICEBERG_CATALOG_LOCATION);
     icebergPropertyCheck(IcebergTable.ICEBERG_TABLE_IDENTIFIER);
+    icebergPropertyCheck(Catalogs.NAME);
+    icebergPropertyCheck(InputFormatConfig.TABLE_IDENTIFIER);
     icebergPropertyCheck(IcebergTable.METADATA_LOCATION);
     if (tblProperties_.containsKey(IcebergTable.ICEBERG_FILE_FORMAT)) {
       icebergTableFormatCheck(tblProperties_.get(IcebergTable.ICEBERG_FILE_FORMAT));
@@ -179,28 +193,6 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
     if (IcebergUtil.getIcebergFileFormat(fileformat) == null) {
       throw new AnalysisException("Invalid fileformat for Iceberg table: " + fileformat);
     }
-    try {
-      FeIcebergTable iceTable = (FeIcebergTable)getTargetTable();
-      List<DataFile> dataFiles = IcebergUtil.getIcebergDataFiles(iceTable,
-          new ArrayList<>(), /*timeTravelSpec=*/null);
-      if (dataFiles.isEmpty()) return;
-      DataFile firstFile = dataFiles.get(0);
-      String errorMsg = "Attempt to set Iceberg data file format to %s, but found data " +
-          "file %s with file format %s.";
-      if (!firstFile.format().name().equalsIgnoreCase(fileformat)) {
-        throw new AnalysisException(String.format(errorMsg, fileformat, firstFile.path(),
-        firstFile.format().name()));
-      }
-      //TODO(IMPALA-10610): Iceberg tables with mixed file formats are not readable.
-      for (DataFile df : dataFiles) {
-        if (df.format() != firstFile.format()) {
-          throw new AnalysisException(String.format(errorMsg, fileformat, df.path(),
-              df.format().name()));
-        }
-      }
-    } catch (TableLoadingException e) {
-      throw new AnalysisException(e);
-    }
   }
 
   private void icebergParquetCompressionCodecCheck() throws AnalysisException {
@@ -223,6 +215,28 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
     if (IcebergUtil.parseParquetPageSize(getTblProperties(), property, descr,
         errMsg) == null) {
       throw new AnalysisException(errMsg.toString());
+    }
+  }
+
+  private void analyzeDataSourceTable(Analyzer analyzer) throws AnalysisException {
+    if (partitionSet_ != null) {
+      throw new AnalysisException("Partition is not supported for DataSource table.");
+    } else if (targetProperty_ == TTablePropertyType.SERDE_PROPERTY) {
+      throw new AnalysisException("ALTER TABLE SET SERDEPROPERTIES is not supported " +
+          "for DataSource table.");
+    }
+    // Cannot change internal properties of DataSource.
+    dataSourcePropertyCheck(DataSourceTable.TBL_PROP_DATA_SRC_NAME);
+    dataSourcePropertyCheck(DataSourceTable.TBL_PROP_INIT_STRING);
+    dataSourcePropertyCheck(DataSourceTable.TBL_PROP_LOCATION);
+    dataSourcePropertyCheck(DataSourceTable.TBL_PROP_CLASS);
+    dataSourcePropertyCheck(DataSourceTable.TBL_PROP_API_VER);
+  }
+
+  private void dataSourcePropertyCheck(String property) throws AnalysisException {
+    if (tblProperties_.containsKey(property)) {
+      throw new AnalysisException(String.format("Changing the '%s' table property is " +
+          "not supported for DataSource table.", property));
     }
   }
 
@@ -297,10 +311,14 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
     boolean containsSortingColumnProperties = tblProperties
         .containsKey(AlterTableSortByStmt.TBL_PROP_SORT_COLUMNS);
 
-    if ((containsOrderingProperties || containsSortingColumnProperties) &&
-        table instanceof FeKuduTable) {
-      throw new AnalysisException("'sort.*' table properties are not "
-          + "supported for Kudu tables.");
+    if (containsOrderingProperties || containsSortingColumnProperties) {
+      if (table instanceof FeKuduTable) {
+        throw new AnalysisException("'sort.*' table properties are not "
+            + "supported for Kudu tables.");
+      } else if (table instanceof FeDataSourceTable) {
+        throw new AnalysisException("'sort.*' table properties are not "
+            + "supported for DataSource tables.");
+      }
     }
 
     TSortingOrder sortingOrder = TSortingOrder.LEXICAL;

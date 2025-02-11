@@ -21,6 +21,7 @@
 #include <string>
 
 #include "common/logging.h"
+#include "common/thread-debug-info.h"
 #include "rpc/jni-thrift-util.h"
 #include "util/backend-gflag-util.h"
 
@@ -45,6 +46,8 @@ DEFINE_int32(max_nonhdfs_partitions_parallel_load, 20,
 DEFINE_int32(initial_hms_cnxn_timeout_s, 120,
     "Number of seconds catalogd will wait to establish an initial connection to the HMS "
     "before exiting.");
+DEFINE_bool(enable_reading_puffin_stats, false, "Impala will only read Iceberg Puffin "
+    "stats files if this flag is set to true.");
 
 Catalog::Catalog() {
   JniMethodDescriptor methods[] = {
@@ -68,22 +71,32 @@ Catalog::Catalog() {
     {"prioritizeLoad", "([B)V", &prioritize_load_id_},
     {"getPartitionStats", "([B)[B", &get_partition_stats_id_},
     {"updateTableUsage", "([B)V", &update_table_usage_id_},
+    {"regenerateServiceId", "()V", &regenerate_service_id_},
+    {"refreshDataSources", "()V", &refresh_data_sources_},
+    {"getNullPartitionName", "()[B", &get_null_partition_name_id_},
+    {"getLatestCompactions", "([B)[B", &get_latest_compactions_id_},
+    {"getAllHadoopConfigs", "()[B", &get_hadoop_configs_id_},
+    {"setEventProcessorStatus", "([B)[B", &set_event_processor_status_id_},
   };
 
   JNIEnv* jni_env = JniUtil::GetJNIEnv();
+  // Used to release local references promptly
+  JniLocalFrame jni_frame;
+  ABORT_IF_ERROR(jni_frame.push(jni_env));
+
   // Create an instance of the java class JniCatalog
-  catalog_class_ = jni_env->FindClass("org/apache/impala/service/JniCatalog");
+  jclass catalog_class = jni_env->FindClass("org/apache/impala/service/JniCatalog");
   ABORT_IF_EXC(jni_env);
 
   uint32_t num_methods = sizeof(methods) / sizeof(methods[0]);
   for (int i = 0; i < num_methods; ++i) {
-    ABORT_IF_ERROR(JniUtil::LoadJniMethod(jni_env, catalog_class_, &(methods[i])));
+    ABORT_IF_ERROR(JniUtil::LoadJniMethod(jni_env, catalog_class, &(methods[i])));
   }
 
   jbyteArray cfg_bytes;
   ABORT_IF_ERROR(GetThriftBackendGFlagsForJNI(jni_env, &cfg_bytes));
 
-  jobject catalog = jni_env->NewObject(catalog_class_, catalog_ctor_, cfg_bytes);
+  jobject catalog = jni_env->NewObject(catalog_class, catalog_ctor_, cfg_bytes);
   CLEAN_EXIT_IF_EXC(jni_env);
   ABORT_IF_ERROR(JniUtil::LocalToGlobalRef(jni_env, catalog, &catalog_));
 }
@@ -120,16 +133,25 @@ Status Catalog::GetCatalogDelta(CatalogServer* caller, int64_t from_version,
 }
 
 Status Catalog::ExecDdl(const TDdlExecRequest& req, TDdlExecResponse* resp) {
+  if (req.__isset.header && req.header.__isset.query_id) {
+    GetThreadDebugInfo()->SetQueryId(req.header.query_id);
+  }
   return JniUtil::CallJniMethod(catalog_, exec_ddl_id_, req, resp);
 }
 
 Status Catalog::ResetMetadata(const TResetMetadataRequest& req,
     TResetMetadataResponse* resp) {
+  if (req.__isset.header && req.header.__isset.query_id) {
+    GetThreadDebugInfo()->SetQueryId(req.header.query_id);
+  }
   return JniUtil::CallJniMethod(catalog_, reset_metadata_id_, req, resp);
 }
 
 Status Catalog::UpdateCatalog(const TUpdateCatalogRequest& req,
     TUpdateCatalogResponse* resp) {
+  if (req.__isset.header && req.header.__isset.query_id) {
+    GetThreadDebugInfo()->SetQueryId(req.header.query_id);
+  }
   return JniUtil::CallJniMethod(catalog_, update_metastore_id_, req, resp);
 }
 
@@ -180,6 +202,9 @@ Status Catalog::GetFunctions(const TGetFunctionsRequest& request,
 }
 
 Status Catalog::PrioritizeLoad(const TPrioritizeLoadRequest& req) {
+  if (req.__isset.header && req.header.__isset.query_id) {
+    GetThreadDebugInfo()->SetQueryId(req.header.query_id);
+  }
   return JniUtil::CallJniMethod(catalog_, prioritize_load_id_, req);
 }
 
@@ -190,4 +215,32 @@ Status Catalog::GetPartitionStats(
 
 Status Catalog::UpdateTableUsage(const TUpdateTableUsageRequest& req) {
   return JniUtil::CallJniMethod(catalog_, update_table_usage_id_, req);
+}
+
+Status Catalog::GetAllHadoopConfigs(TGetAllHadoopConfigsResponse* result) {
+  return JniUtil::CallJniMethod(catalog_, get_hadoop_configs_id_, result);
+}
+
+void Catalog::RegenerateServiceId() {
+  JNIEnv* jni_env = JniUtil::GetJNIEnv();
+  jni_env->CallVoidMethod(catalog_, regenerate_service_id_);
+  ABORT_IF_EXC(jni_env);
+}
+
+Status Catalog::RefreshDataSources() {
+  return JniUtil::CallJniMethod(catalog_, refresh_data_sources_);
+}
+
+Status Catalog::GetNullPartitionName(TGetNullPartitionNameResponse* resp) {
+  return JniUtil::CallJniMethod(catalog_, get_null_partition_name_id_, resp);
+}
+
+Status Catalog::GetLatestCompactions(
+    const TGetLatestCompactionsRequest& req, TGetLatestCompactionsResponse* resp) {
+  return JniUtil::CallJniMethod(catalog_, get_latest_compactions_id_, req, resp);
+}
+
+Status Catalog::SetEventProcessorStatus(
+    const TSetEventProcessorStatusRequest& req, TSetEventProcessorStatusResponse* resp) {
+  return JniUtil::CallJniMethod(catalog_, set_event_processor_status_id_, req, resp);
 }

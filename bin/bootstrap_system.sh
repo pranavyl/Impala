@@ -70,17 +70,22 @@ set -x
 
 # Determine whether we're running on redhat or ubuntu
 REDHAT=
-REDHAT6=
 REDHAT7=
 REDHAT8=
+REDHAT9=
 UBUNTU=
 UBUNTU16=
 UBUNTU18=
 UBUNTU20=
+UBUNTU22=
 IN_DOCKER=
 if [[ -f /etc/redhat-release ]]; then
   REDHAT=true
   echo "Identified redhat system."
+  if grep 'release 9\.' /etc/redhat-release; then
+    REDHAT9=true
+    echo "Identified redhat9 system."
+  fi
   if grep 'release 8\.' /etc/redhat-release; then
     REDHAT8=true
     echo "Identified redhat8 system."
@@ -88,10 +93,6 @@ if [[ -f /etc/redhat-release ]]; then
   if grep 'release 7\.' /etc/redhat-release; then
     REDHAT7=true
     echo "Identified redhat7 system."
-  fi
-  if grep 'release 6\.' /etc/redhat-release; then
-    REDHAT6=true
-    echo "Identified redhat6 system."
   fi
   # TODO: restrict redhat versions
 else
@@ -114,8 +115,12 @@ else
     then
       UBUNTU20=true
       echo "Identified Ubuntu 20.04 system."
+    elif [[ $DISTRIB_RELEASE = 22.04 ]]
+    then
+      UBUNTU22=true
+      echo "Identified Ubuntu 22.04 system."
     else
-      echo "This script supports Ubuntu versions 16.04, 18.04 or 20.04" >&2
+      echo "This script supports Ubuntu versions 16.04, 18.04, 20.04, or 22.04" >&2
       exit 1
     fi
   else
@@ -155,6 +160,12 @@ function ubuntu20 {
   fi
 }
 
+function ubuntu22 {
+  if [[ "$UBUNTU22" == true ]]; then
+    "$@"
+  fi
+}
+
 # Helper function to execute following command only on RedHat
 function redhat {
   if [[ "$REDHAT" == true ]]; then
@@ -162,12 +173,6 @@ function redhat {
   fi
 }
 
-# Helper function to execute following command only on RedHat6
-function redhat6 {
-  if [[ "$REDHAT6" == true ]]; then
-    "$@"
-  fi
-}
 # Helper function to execute following command only on RedHat7
 function redhat7 {
   if [[ "$REDHAT7" == true ]]; then
@@ -177,6 +182,12 @@ function redhat7 {
 # Helper function to execute following command only on RedHat8
 function redhat8 {
   if [[ "$REDHAT8" == true ]]; then
+    "$@"
+  fi
+}
+# Helper function to execute following command only on RedHat8
+function redhat9 {
+  if [[ "$REDHAT9" == true ]]; then
     "$@"
   fi
 }
@@ -192,6 +203,9 @@ function notindocker {
     "$@"
   fi
 }
+
+# X permission on home directory is needed for some uses of postgresql (IMPALA-13693)
+chmod o+X ~
 
 # Note that yum has its own retries; see yum.conf(5).
 REAL_APT_GET=$(ubuntu which apt-get)
@@ -214,69 +228,72 @@ if [[ "$UBUNTU" == true ]]; then
     sleep 1
   done
 fi
+
+# Set UBUNTU_JAVA_VERSION, UBUNTU_PACKAGE_ARCH, REDHAT_JAVA_VERSION
+source "$IMPALA_HOME/bin/impala-config-java.sh"
+
 ubuntu apt-get update
-ubuntu apt-get --yes install ccache curl gawk g++ gcc libffi-dev \
+ubuntu apt-get --yes install ccache curl file gawk g++ gcc apt-utils git libffi-dev \
         libkrb5-dev krb5-admin-server krb5-kdc krb5-user libsasl2-dev \
         libsasl2-modules libsasl2-modules-gssapi-mit libssl-dev make ninja-build \
-        python-dev python-setuptools postgresql ssh wget vim-common psmisc \
-        lsof openjdk-8-jdk openjdk-8-source openjdk-8-dbg apt-utils git ant
-# Required by Kudu in the minicluster
-ubuntu20 apt-get --yes install libtinfo5
-ARCH_NAME=$(uname -p)
-if [[ $ARCH_NAME == 'aarch64' ]]; then
-  ubuntu apt-get --yes install unzip pkg-config flex maven python3-pip build-essential \
-          texinfo bison autoconf automake libtool libz-dev libncurses-dev
-fi
+        python3-dev python3-setuptools python3-venv postgresql \
+        ssh wget vim-common psmisc lsof net-tools language-pack-en libxml2-dev \
+        libxslt-dev openjdk-${UBUNTU_JAVA_VERSION}-jdk \
+        openjdk-${UBUNTU_JAVA_VERSION}-source openjdk-${UBUNTU_JAVA_VERSION}-dbg
 
-if [[ "$UBUNTU" == true ]]; then
-  # Don't use openjdk-8-jdk 8u181-b13-1ubuntu0.16.04.1 which is known to break the
-  # surefire tests. If we detect that version, we downgrade to the last known good one.
-  # See https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=911925 for details.
-  JDK_BAD_VERSION="8u181-b13-1ubuntu0.16.04.1"
-  if dpkg -l openjdk-8-jdk | grep -q $JDK_BAD_VERSION; then
-    JDK_TARGET_VERSION="8u181-b13-0ubuntu0.16.04.1"
-    DEB_DIR=$(mktemp -d)
-    pushd $DEB_DIR
-    wget --no-verbose \
-        "https://launchpadlibrarian.net/380913637/openjdk-8-jdk_8u181-b13-0ubuntu0.16.04.1_amd64.deb" \
-        "https://launchpadlibrarian.net/380913636/openjdk-8-jdk-headless_8u181-b13-0ubuntu0.16.04.1_amd64.deb" \
-        "https://launchpadlibrarian.net/380913641/openjdk-8-jre_8u181-b13-0ubuntu0.16.04.1_amd64.deb" \
-        "https://launchpadlibrarian.net/380913638/openjdk-8-jre-headless_8u181-b13-0ubuntu0.16.04.1_amd64.deb" \
-        "https://launchpadlibrarian.net/380913642/openjdk-8-source_8u181-b13-0ubuntu0.16.04.1_all.deb" \
-        "https://launchpadlibrarian.net/380913633/openjdk-8-dbg_8u181-b13-0ubuntu0.16.04.1_amd64.deb"
-    sudo dpkg -i *.deb
-    popd
-    rm -rf $DEB_DIR
+# Regular python packages don't exist on Ubuntu 22. Everything is Python 3.
+ubuntu16 apt-get --yes install python python-dev python-setuptools
+ubuntu18 apt-get --yes install python python-dev python-setuptools
+ubuntu20 apt-get --yes install python python-dev python-setuptools
+
+# Ubuntu 20's Python 2.7.18-1~20.04.5 version has a bug in its tarfile support.
+# If we detect the affected tarfile.py, download a patched version and overwrite it.
+if [[ $UBUNTU20 == true ]]; then
+  if [[ -f /usr/lib/python2.7/tarfile.py ]]; then
+    TARFILE_PY_HASH=$(sha1sum /usr/lib/python2.7/tarfile.py | cut -d' ' -f1)
+    if [[ "${TARFILE_PY_HASH}" == "6e1a6d9ea2a535cbb17fe266ed9ac76eb5e27b89" ]]; then
+      TMP_DIR=$(mktemp -d)
+      pushd $TMP_DIR
+      wget -nv https://launchpadlibrarian.net/759546541/tarfile.py
+      sudo cp tarfile.py /usr/lib/python2.7/tarfile.py
+      popd
+      rm -rf $TMP_DIR
+    fi
   fi
 fi
 
-# Ubuntu 18.04 and 20.04 install OpenJDK 11 and configure it as the default Java version.
-# Impala is currently tested with OpenJDK 8, so configure that version as the default.
+# Required by Kudu in the minicluster
+ubuntu20 apt-get --yes install libtinfo5
+ubuntu22 apt-get --yes install libtinfo5
+ARCH_NAME=$(uname -p)
 if [[ $ARCH_NAME == 'aarch64' ]]; then
-  ubuntu20 sudo update-java-alternatives -s java-1.8.0-openjdk-arm64
-  ubuntu18 sudo update-java-alternatives -s java-1.8.0-openjdk-arm64
-else
-  ubuntu18 sudo update-java-alternatives -s java-1.8.0-openjdk-amd64
-  ubuntu20 sudo update-java-alternatives -s java-1.8.0-openjdk-amd64
+  ubuntu apt-get --yes install unzip pkg-config flex maven python3-pip build-essential \
+          texinfo bison autoconf automake libtool libz-dev libncurses-dev \
+          libncurses5-dev libreadline-dev
 fi
 
-redhat sudo yum install -y curl gawk gcc gcc-c++ git krb5-devel krb5-server \
+# Configure the default Java version to be the version we selected.
+ubuntu sudo update-java-alternatives -s \
+    java-1.${UBUNTU_JAVA_VERSION}.0-openjdk-${UBUNTU_PACKAGE_ARCH}
+
+redhat sudo yum install -y file gawk gcc gcc-c++ git krb5-devel krb5-server \
         krb5-workstation libevent-devel libffi-devel make openssl-devel cyrus-sasl \
         cyrus-sasl-gssapi cyrus-sasl-devel cyrus-sasl-plain \
-        postgresql postgresql-server \
-        wget vim-common nscd cmake fuse-devel zlib-devel \
-        psmisc lsof openssh-server redhat-lsb java-1.8.0-openjdk-devel \
-        java-1.8.0-openjdk-src
+        postgresql postgresql-server rpm-build \
+        wget vim-common nscd cmake zlib-devel \
+        procps psmisc lsof openssh-server python3-devel python3-setuptools \
+        net-tools langpacks-en glibc-langpack-en libxml2-devel libxslt-devel \
+        java-${REDHAT_JAVA_VERSION}-openjdk-src java-${REDHAT_JAVA_VERSION}-openjdk-devel
 
-# Enable the Powertools repo for snappy-devel on RedHat 8
-redhat8 sudo yum install -y dnf-plugins-core
-# Package repo IDs changed from mixed case to all-lowercase between Centos 8.2
-# and 8.3, so use globbing to cover both conventions
-redhat8 sudo yum install -y --enablerepo="[Pp]ower[Tt]ools*" snappy-devel
+# fuse-devel doesn't exist for Redhat 9
+redhat7 sudo yum install -y fuse-devel curl
+redhat8 sudo yum install -y fuse-devel curl
+# Redhat9 can have curl-minimal preinstalled, which can conflict with curl.
+# Adding --allowerasing allows curl to replace curl-minimal.
+redhat9 sudo yum install -y --allowerasing curl
 
 # RedHat / CentOS 8 exposes only specific versions of Python.
 # Set up unversioned default Python 2.x for older CentOS versions
-redhat6 sudo yum install -y python-devel python-setuptools python-argparse
 redhat7 sudo yum install -y python-devel python-setuptools python-argparse
 
 # Install Python 2.x explicitly for CentOS 8
@@ -303,6 +320,38 @@ function setup_python2() {
 redhat8 setup_python2
 redhat8 pip install --user argparse
 
+# Point Python to Python 3 for Redhat 9 and Ubuntu 22
+function setup_python3() {
+  # If python is already set, then use it. Otherwise, try to point python to python3.
+  if ! command -v python > /dev/null; then
+    if command -v python3 ; then
+      # Newer OSes (e.g. Redhat 9 and equivalents) make it harder to get Python 2, and we
+      # need to start using Python 3 by default.
+      # For these new OSes (Ubuntu 22, Redhat 9), there is no alternative entry for
+      # python, so we need to create one from scratch.
+      if command -v alternatives > /dev/null; then
+        if sudo alternatives --list | grep python > /dev/null ; then
+          sudo alternatives --set python /usr/bin/python3
+        else
+          # The alternative doesn't exist, create it
+          sudo alternatives --install /usr/bin/python python /usr/bin/python3 20
+        fi
+      elif command -v update-alternatives > /dev/null; then
+        # This is what Ubuntu 20/22+ does. There is no official python alternative,
+        # so we need to create one.
+        sudo update-alternatives --install /usr/bin/python python /usr/bin/python3 20
+      else
+        echo "ERROR: trying to set python to point to python3"
+        echo "ERROR: alternatives/update-alternatives don't exist, so giving up..."
+        exit 1
+      fi
+    fi
+  fi
+}
+
+redhat9 setup_python3
+ubuntu22 setup_python3
+
 # CentOS repos don't contain ccache, so install from EPEL
 redhat sudo yum install -y epel-release
 redhat sudo yum install -y ccache
@@ -310,40 +359,32 @@ redhat sudo yum install -y ccache
 # Clean up yum caches
 redhat sudo yum clean all
 
-# Download ant for centos
-redhat sudo wget -nv \
-  https://archive.apache.org/dist/ant/binaries/apache-ant-1.9.14-bin.tar.gz
-redhat sudo sha512sum -c - <<< '487dbd1d7f678a92924ba884a57e910ccb4fe565c554278795a8fdfc80c4e88d81ebc2ccecb5a8f353f0b2076572bb921499a2cadb064e0f44fc406a3c31da20  apache-ant-1.9.14-bin.tar.gz'
-redhat sudo tar -C /usr/local -xzf apache-ant-1.9.14-bin.tar.gz
-redhat sudo ln -sf /usr/local/apache-ant-1.9.14/bin/ant /usr/local/bin
-
-# Download maven for all OSes, since the OS-packaged version can be
-# pretty old.
-if [ ! -d /usr/local/apache-maven-3.5.4 ]; then
+# Download Maven since the packaged version is pretty old.
+MVN_VERSION="3.9.8"
+if [ ! -d "/usr/local/apache-maven-${MVN_VERSION}" ]; then
   sudo wget -nv \
-    https://archive.apache.org/dist/maven/maven-3/3.5.4/binaries/apache-maven-3.5.4-bin.tar.gz
-  sudo sha512sum -c - <<< '2a803f578f341e164f6753e410413d16ab60fabe31dc491d1fe35c984a5cce696bc71f57757d4538fe7738be04065a216f3ebad4ef7e0ce1bb4c51bc36d6be86  apache-maven-3.5.4-bin.tar.gz'
-  sudo tar -C /usr/local -x --no-same-owner -zf apache-maven-3.5.4-bin.tar.gz
-  sudo ln -sf /usr/local/apache-maven-3.5.4/bin/mvn /usr/local/bin
+    "https://archive.apache.org/dist/maven/maven-3/${MVN_VERSION}/binaries/apache-maven-${MVN_VERSION}-bin.tar.gz"
+  sha512sum -c - <<< "7d171def9b85846bf757a2cec94b7529371068a0670df14682447224e57983528e97a6d1b850327e4ca02b139abaab7fcb93c4315119e6f0ffb3f0cbc0d0b9a2 apache-maven-${MVN_VERSION}-bin.tar.gz"
+  sudo tar -C /usr/local -xzf "apache-maven-${MVN_VERSION}-bin.tar.gz"
+  # Ensure that Impala's preferred version is installed locally,
+  # even if a previous version exists there.
+  sudo ln -s -f "/usr/local/apache-maven-${MVN_VERSION}/bin/mvn" "/usr/local/bin"
 
   # reset permissions on redhat8
   # TODO: figure out why this is necessary for redhat8
-  MAVEN_DIRECTORY="/usr/local/apache-maven-3.5.4"
+  MAVEN_DIRECTORY="/usr/local/apache-maven-${MVN_VERSION}"
   redhat8 indocker sudo chmod 0755 ${MAVEN_DIRECTORY}
   redhat8 indocker sudo chmod 0755 ${MAVEN_DIRECTORY}/{bin,boot}
+  redhat9 indocker sudo chmod 0755 ${MAVEN_DIRECTORY}
+  redhat9 indocker sudo chmod 0755 ${MAVEN_DIRECTORY}/{bin,boot}
 fi
 
 if ! { service --status-all | grep -E '^ \[ \+ \]  ssh$'; }
 then
   ubuntu sudo service ssh start
-  # TODO: CentOS/RH 7 uses systemd, and this doesn't work.
-  redhat6 sudo service sshd start
-  redhat7 notindocker sudo service sshd start
-  redhat8 notindocker sudo service sshd start
-  redhat7 indocker sudo /usr/bin/ssh-keygen -A
-  redhat7 indocker sudo /usr/sbin/sshd
-  redhat8 indocker sudo /usr/bin/ssh-keygen -A
-  redhat8 indocker sudo /usr/sbin/sshd
+  redhat notindocker sudo service sshd start
+  redhat indocker sudo /usr/bin/ssh-keygen -A
+  redhat indocker sudo /usr/sbin/sshd
   # The CentOS 8.1 image includes /var/run/nologin by mistake; this file prevents
   # SSH logins. See https://github.com/CentOS/sig-cloud-instance-images/issues/60
   redhat8 indocker sudo rm -f /var/run/nologin
@@ -355,14 +396,9 @@ fi
 
 echo ">>> Configuring system"
 
-redhat6 sudo service postgresql initdb
-redhat6 sudo service postgresql stop
-redhat7 notindocker sudo service postgresql initdb
-redhat7 notindocker sudo service postgresql stop
-redhat7 indocker sudo -u postgres PGDATA=/var/lib/pgsql/data pg_ctl init
-redhat8 notindocker sudo service postgresql initdb
-redhat8 notindocker sudo service postgresql stop
-redhat8 indocker sudo -u postgres PGDATA=/var/lib/pgsql/data pg_ctl init
+redhat notindocker sudo service postgresql initdb
+redhat notindocker sudo service postgresql stop
+redhat indocker sudo -u postgres PGDATA=/var/lib/pgsql/data pg_ctl init
 ubuntu sudo service postgresql stop
 
 # These configurations expose connectiong to PostgreSQL via md5-hashed
@@ -370,20 +406,26 @@ ubuntu sudo service postgresql stop
 # widely.
 ubuntu sudo sed -ri 's/local +all +all +peer/local all all trust/g' \
   /etc/postgresql/*/main/pg_hba.conf
+# Accept remote connections from the hosts in the same subnet.
+ubuntu sudo sed -ri "s/#listen_addresses = 'localhost'/listen_addresses = '0.0.0.0'/g" \
+  /etc/postgresql/*/main/postgresql.conf
+ubuntu sudo sed -ri 's/host +all +all +127.0.0.1\/32/host all all samenet/g' \
+  /etc/postgresql/*/main/pg_hba.conf
 redhat sudo sed -ri 's/local +all +all +(ident|peer)/local all all trust/g' \
   /var/lib/pgsql/data/pg_hba.conf
 # Accept md5 passwords from localhost
 redhat sudo sed -i -e 's,\(host.*\)ident,\1md5,' /var/lib/pgsql/data/pg_hba.conf
+# Accept remote connections from the hosts in the same subnet.
+redhat sudo sed -ri "s/#listen_addresses = 'localhost'/listen_addresses = '0.0.0.0'/g" \
+  /var/lib/pgsql/data/postgresql.conf
+redhat sudo sed -ri 's/host +all +all +127.0.0.1\/32/host all all samenet/g' \
+  /var/lib/pgsql/data/pg_hba.conf
 
 ubuntu sudo service postgresql start
-redhat6 sudo service postgresql start
-redhat7 notindocker sudo service postgresql start
-redhat8 notindocker sudo service postgresql start
+redhat notindocker sudo service postgresql start
 # Important to redirect pg_ctl to a logfile, lest it keep the stdout
 # file descriptor open, preventing the shell from exiting.
-redhat7 indocker sudo -u postgres PGDATA=/var/lib/pgsql/data bash -c \
-  "pg_ctl start -w --timeout=120 >> /var/lib/pgsql/pg.log 2>&1"
-redhat8 indocker sudo -u postgres PGDATA=/var/lib/pgsql/data bash -c \
+redhat indocker sudo -u postgres PGDATA=/var/lib/pgsql/data bash -c \
   "pg_ctl start -w --timeout=120 >> /var/lib/pgsql/pg.log 2>&1"
 
 # Set up postgres for HMS
@@ -432,7 +474,8 @@ ssh localhost whoami
 #  Traceback (most recent call last):
 #    ...
 #  ...ConnectionError: ('Connection aborted.', error(111, 'Connection refused'))
-echo -e "\n127.0.0.1 $(hostname -s) $(hostname)" | sudo tee -a /etc/hosts
+# Prefer the FQDN first for rpc-mgr-kerberized-test as newer krb5 requires FQDN.
+echo -e "\n127.0.0.1 $(hostname) $(hostname -s)" | sudo tee -a /etc/hosts
 #
 # In Docker, one can change /etc/hosts as above but not with sed -i. The error message is
 # "sed: cannot rename /etc/sedc3gPj8: Device or resource busy". The following lines are
@@ -449,13 +492,19 @@ sudo chown $(whoami) /var/lib/hadoop-hdfs/
 # TODO: restrict this to only the users it is needed for
 echo -e "\n* - nofile 1048576" | sudo tee -a /etc/security/limits.conf
 
+# Increase memlock for HDFS caching. On RedHat systems this defaults to 64 (KB). Ubuntu
+# uses systemd, which sets its own default. With Ubuntu 18.04 that default is 16 KB,
+# 20.04+ defaults to 64 MB. Set all to 64 MB for the current user; Impala test systems
+# require 10s of GBs of memory, so this setting should not be a problem.
+USER=${USER-$(id -un)}
+echo -e "${USER} - memlock 65536" | sudo tee /etc/security/limits.d/10-memlock.conf
+
 # Default on CentOS limits a user to 1024 or 4096 processes (threads) , which isn't
 # enough for minicluster with all of its friends.
-redhat6 sudo sed -i 's,\*\s*soft\s*nproc\s*[0-9]*$,* soft nproc unlimited,' \
-  /etc/security/limits.d/*-nproc.conf
 redhat7 sudo sed -i 's,\*\s*soft\s*nproc\s*[0-9]*$,* soft nproc unlimited,' \
   /etc/security/limits.d/*-nproc.conf
 redhat8 echo -e "* soft nproc unlimited" | sudo tee -a /etc/security/limits.conf
+redhat9 echo -e "* soft nproc unlimited" | sudo tee -a /etc/security/limits.conf
 
 echo ">>> Checking out Impala"
 
@@ -469,43 +518,12 @@ SET_IMPALA_HOME="export IMPALA_HOME=$(pwd)"
 echo -e "\n$SET_IMPALA_HOME" >> ~/.bashrc
 eval "$SET_IMPALA_HOME"
 
-# Ubuntu and RH install JDK's in slightly different paths.
-if [[ $UBUNTU == true ]]; then
-  # Assert that there's only one glob match.
-  [ 1 == $(compgen -G "/usr/lib/jvm/java-8-openjdk-*" | wc -l) ]
-  SET_JAVA_HOME="export JAVA_HOME=$(compgen -G '/usr/lib/jvm/java-8-openjdk-*')"
-else
-  # Assert that there's only one glob match.
-  [ 1 == $(compgen -G "/usr/lib/jvm/java-1.8.0-openjdk-*" | wc -l) ]
-  SET_JAVA_HOME="export JAVA_HOME=$(compgen -G '/usr/lib/jvm/java-1.8.0-openjdk-*')"
-fi
-
-echo -e "\n$SET_JAVA_HOME" >> "${IMPALA_HOME}/bin/impala-config-local.sh"
-eval "$SET_JAVA_HOME"
-# Assert that we have a java available
-test -f $JAVA_HOME/bin/java
-
-if [[ $ARCH_NAME == 'aarch64' ]]; then
-  echo -e "\nexport SKIP_TOOLCHAIN_BOOTSTRAP=true" >> \
-    "${IMPALA_HOME}/bin/impala-config-local.sh"
-  SET_TOOLCHAIN_HOME="export NATIVE_TOOLCHAIN_HOME=${IMPALA_HOME}/../native-toolchain"
-  echo -e "\n$SET_TOOLCHAIN_HOME" >> ~/.bashrc
-  echo -e "\n$SET_TOOLCHAIN_HOME" >> "${IMPALA_HOME}/bin/impala-config-local.sh"
-  eval "$SET_TOOLCHAIN_HOME"
-  if ! [[ -d "$NATIVE_TOOLCHAIN_HOME" ]]; then
-    time -p git clone https://github.com/cloudera/native-toolchain/ \
-      "$NATIVE_TOOLCHAIN_HOME"
-  fi
-  cd "$NATIVE_TOOLCHAIN_HOME"
-  git pull
-  echo "Begin build tool chain, may need several hours, please be patient...."
-  sudo chmod 755 ~/.cache
-  ./buildall.sh
-  cd -
-  mkdir -p ${IMPALA_HOME}/toolchain
-fi
-
 # Try to prepopulate the m2 directory to save time
-if ! bin/jenkins/populate_m2_directory.py ; then
-  echo "Failed to prepopulate the m2 directory. Continuing..."
+if [[ "${PREPOPULATE_M2_REPOSITORY:-true}" == true ]] ; then
+  echo ">>> Populating m2 directory..."
+  if ! bin/jenkins/populate_m2_directory.py ; then
+    echo "Failed to prepopulate the m2 directory. Continuing..."
+  fi
+else
+  echo ">>> Skip populating m2 directory"
 fi

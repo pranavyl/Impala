@@ -20,6 +20,8 @@
 '''This script creates a nested version of TPC-H. Non-nested TPC-H must already be
    loaded.
 '''
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import logging
 import os
 
@@ -90,7 +92,8 @@ def load():
     # explicitly creating an external table so that files are in the external warehouse
     # directory. Use external.table.purge=true so that it is equivalent to a Hive 2
     # managed table.
-    if HIVE_MAJOR_VERSION >= 3:
+    # For Apache Hive, HIVE-20085 (Hive 4) Allow CTAS.
+    if HIVE_MAJOR_VERSION >= 3 and os.environ["USE_APACHE_HIVE"] != "true":
       external = "EXTERNAL"
       tblproperties += ",'external.table.purge'='TRUE'"
     sql_params = {
@@ -103,7 +106,7 @@ def load():
         "external": external}
 
     # Split table creation into multiple queries or "chunks" so less memory is needed.
-    for chunk_idx in xrange(chunks):
+    for chunk_idx in range(chunks):
       sql_params["chunk_idx"] = chunk_idx
 
       # Create the nested data in text format. The \00#'s are nested field terminators,
@@ -142,7 +145,7 @@ def load():
       else:
         impala.execute("INSERT INTO TABLE tmp_orders_string " + tmp_orders_sql)
 
-    for chunk_idx in xrange(chunks):
+    for chunk_idx in range(chunks):
       sql_params["chunk_idx"] = chunk_idx
       tmp_customer_sql = r"""
           SELECT STRAIGHT_JOIN

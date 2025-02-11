@@ -21,12 +21,14 @@ import com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.hive.metastore.api.PrincipalType;
 import org.apache.impala.authorization.AuthorizationDelta;
 import org.apache.impala.authorization.AuthorizationManager;
+import org.apache.impala.authorization.Privilege;
 import org.apache.impala.authorization.User;
 import org.apache.impala.authorization.ranger.RangerBufferAuditHandler.AutoFlush;
 import org.apache.impala.catalog.AuthzCacheInvalidation;
 import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
+import org.apache.impala.common.Pair;
 import org.apache.impala.common.UnsupportedFeatureException;
 import org.apache.impala.thrift.TCatalogServiceRequestHeader;
 import org.apache.impala.thrift.TCreateDropRoleParams;
@@ -48,7 +50,9 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -225,7 +229,8 @@ public class RangerCatalogdAuthorizationManager implements AuthorizationManager 
         new User(header.getRequesting_user()).getShortName(), /*isGrant*/ true,
         /*user*/ null, Collections.emptyList(),
         Collections.singletonList(params.getPrincipal_name()),
-        plugin_.get().getClusterName(), header.getClient_ip(), params.getPrivileges());
+        plugin_.get().getClusterName(), header.getClient_ip(), params.getPrivileges(),
+        params.getOwner_name());
 
     grantPrivilege(requests, header.getRedacted_sql_stmt(), header.getClient_ip());
     // Update the authorization refresh marker so that the Impalads can refresh their
@@ -240,7 +245,8 @@ public class RangerCatalogdAuthorizationManager implements AuthorizationManager 
         new User(header.getRequesting_user()).getShortName(), /*isGrant*/ false,
         /*user*/ null, Collections.emptyList(),
         Collections.singletonList(params.getPrincipal_name()),
-        plugin_.get().getClusterName(), header.getClient_ip(), params.getPrivileges());
+        plugin_.get().getClusterName(), header.getClient_ip(), params.getPrivileges(),
+        params.getOwner_name());
 
     revokePrivilege(requests, header.getRedacted_sql_stmt(), header.getClient_ip());
     // Update the authorization refresh marker so that the Impalads can refresh their
@@ -254,7 +260,8 @@ public class RangerCatalogdAuthorizationManager implements AuthorizationManager 
     List<GrantRevokeRequest> requests = createGrantRevokeRequests(
         new User(header.getRequesting_user()).getShortName(), /*isGrant*/ true,
         params.getPrincipal_name(), Collections.emptyList(), Collections.emptyList(),
-        plugin_.get().getClusterName(), header.getClient_ip(), params.getPrivileges());
+        plugin_.get().getClusterName(), header.getClient_ip(), params.getPrivileges(),
+        params.getOwner_name());
 
     grantPrivilege(requests, header.getRedacted_sql_stmt(), header.getClient_ip());
     refreshAuthorization(response);
@@ -266,7 +273,8 @@ public class RangerCatalogdAuthorizationManager implements AuthorizationManager 
     List<GrantRevokeRequest> requests = createGrantRevokeRequests(
         new User(header.getRequesting_user()).getShortName(), /*isGrant*/ false,
         params.getPrincipal_name(), Collections.emptyList(), Collections.emptyList(),
-        plugin_.get().getClusterName(), header.getClient_ip(), params.getPrivileges());
+        plugin_.get().getClusterName(), header.getClient_ip(), params.getPrivileges(),
+        params.getOwner_name());
 
     revokePrivilege(requests, header.getRedacted_sql_stmt(), header.getClient_ip());
     refreshAuthorization(response);
@@ -279,7 +287,7 @@ public class RangerCatalogdAuthorizationManager implements AuthorizationManager 
         new User(header.getRequesting_user()).getShortName(), /*isGrant*/ true,
         /*user*/ null, Collections.singletonList(params.getPrincipal_name()),
         Collections.emptyList(), plugin_.get().getClusterName(), header.getClient_ip(),
-        params.getPrivileges());
+        params.getPrivileges(), params.getOwner_name());
 
     grantPrivilege(requests, header.getRedacted_sql_stmt(), header.getClient_ip());
     refreshAuthorization(response);
@@ -292,7 +300,7 @@ public class RangerCatalogdAuthorizationManager implements AuthorizationManager 
         new User(header.getRequesting_user()).getShortName(), /*isGrant*/ false,
         /*user*/ null, Collections.singletonList(params.getPrincipal_name()),
         Collections.emptyList(), plugin_.get().getClusterName(), header.getClient_ip(),
-        params.getPrivileges());
+        params.getPrivileges(), params.getOwner_name());
 
     revokePrivilege(requests, header.getRedacted_sql_stmt(), header.getClient_ip());
     // Update the authorization refresh marker so that the Impalads can refresh their
@@ -303,6 +311,7 @@ public class RangerCatalogdAuthorizationManager implements AuthorizationManager 
   @VisibleForTesting
   public void grantPrivilege(List<GrantRevokeRequest> requests, String sqlStmt,
       String clientIp) throws ImpalaException {
+    long startTime = System.currentTimeMillis();
     try {
       for (GrantRevokeRequest request : requests) {
         try (AutoFlush auditHandler = RangerBufferAuditHandler.autoFlush(sqlStmt,
@@ -314,12 +323,16 @@ public class RangerCatalogdAuthorizationManager implements AuthorizationManager 
       LOG.error("Error granting a privilege in Ranger: ", e);
       throw new InternalException("Error granting a privilege in Ranger. " +
           "Ranger error message: " + e.getMessage());
+    } finally {
+      LOG.debug("Handling granting privilege(s) took {} ms",
+          (System.currentTimeMillis() - startTime));
     }
   }
 
   @VisibleForTesting
   public void revokePrivilege(List<GrantRevokeRequest> requests, String sqlStmt,
       String clientIp) throws ImpalaException {
+    long startTime = System.currentTimeMillis();
     try {
       for (GrantRevokeRequest request : requests) {
         try (AutoFlush auditHandler = RangerBufferAuditHandler.autoFlush(sqlStmt,
@@ -331,6 +344,9 @@ public class RangerCatalogdAuthorizationManager implements AuthorizationManager 
       LOG.error("Error revoking a privilege in Ranger: ", e);
       throw new InternalException("Error revoking a privilege in Ranger. " +
           "Ranger error message: " + e.getMessage());
+    } finally {
+      LOG.debug("Handling revoking privilege(s) took {} ms",
+          (System.currentTimeMillis() - startTime));
     }
   }
 
@@ -375,18 +391,21 @@ public class RangerCatalogdAuthorizationManager implements AuthorizationManager 
 
   public static List<GrantRevokeRequest> createGrantRevokeRequests(String grantor,
       boolean isGrant, String user, List<String> groups, List<String> roles,
-      String clusterName, String clientIp, List<TPrivilege> privileges) {
+      String clusterName, String clientIp, List<TPrivilege> privileges,
+      String resourceOwner) {
     List<GrantRevokeRequest> requests = new ArrayList<>();
 
     for (TPrivilege p: privileges) {
       Function<Map<String, String>, GrantRevokeRequest> createRequest = (resource) ->
           createGrantRevokeRequest(grantor, user, groups, roles, clusterName,
-              p.has_grant_opt, isGrant, p.privilege_level, resource, clientIp);
+              p.has_grant_opt, isGrant, p.privilege_level, resource, resourceOwner,
+              clientIp);
 
-      // Ranger Impala service definition defines 3 resources:
+      // Ranger Impala service definition defines 4 resources:
       // [DB -> Table -> Column]
       // [DB -> Function]
       // [URI]
+      // [Storage Type -> Storage URI]
       // What it means is if we grant a particular privilege on a resource that
       // is common to other resources, we need to grant that privilege to those
       // resources.
@@ -394,25 +413,30 @@ public class RangerCatalogdAuthorizationManager implements AuthorizationManager 
         requests.add(createRequest.apply(RangerUtil.createColumnResource(p)));
       } else if (p.getUri() != null) {
         requests.add(createRequest.apply(RangerUtil.createUriResource(p)));
+      } else if (p.getFn_name() != null) {
+        requests.add(createRequest.apply(RangerUtil.createFunctionResource(p)));
       } else if (p.getDb_name() != null) {
         // DB is used by column and function resources.
         requests.add(createRequest.apply(RangerUtil.createColumnResource(p)));
         requests.add(createRequest.apply(RangerUtil.createFunctionResource(p)));
+      } else if (p.getStorage_url() != null || p.getStorage_type() != null) {
+        requests.add(createRequest.apply(RangerUtil.createStorageHandlerUriResource(p)));
       } else {
-        // Server is used by column, function, and URI resources.
+        // Server is used by column, function, URI, and storage handler URI resources.
         requests.add(createRequest.apply(RangerUtil.createColumnResource(p)));
         requests.add(createRequest.apply(RangerUtil.createFunctionResource(p)));
         requests.add(createRequest.apply(RangerUtil.createUriResource(p)));
+        requests.add(createRequest.apply(RangerUtil.createStorageHandlerUriResource(p)));
       }
     }
 
-    return requests;
+    return consolidateGrantRevokeRequests(requests);
   }
 
   private static GrantRevokeRequest createGrantRevokeRequest(String grantor, String user,
       List<String> groups, List<String> roles, String clusterName, boolean withGrantOpt,
       boolean isGrant, TPrivilegeLevel level, Map<String, String> resource,
-      String clientIp) {
+      String resourceOwner, String clientIp) {
     GrantRevokeRequest request = new GrantRevokeRequest();
     request.setGrantor(grantor);
     // In a Kerberized environment, we also need to call setGrantorGroups() to provide
@@ -427,18 +451,90 @@ public class RangerCatalogdAuthorizationManager implements AuthorizationManager 
     request.setReplaceExistingPermissions(Boolean.FALSE);
     request.setClusterName(clusterName);
     request.setResource(resource);
+    if (resourceOwner != null) request.setOwnerUser(resourceOwner);
     request.setClientIPAddress(clientIp);
 
     // For revoke grant option, omit the privilege
     if (!(!isGrant && withGrantOpt)) {
-      if (level == TPrivilegeLevel.INSERT) {
-        request.getAccessTypes().add(RangerAuthorizationChecker.UPDATE_ACCESS_TYPE);
+      if (resource.containsKey(RangerImpalaResourceBuilder.STORAGE_TYPE)) {
+        // We consider TPrivilegeLevel.ALL and TPrivilegeLevel.OWNER because for a
+        // statement that grants or revokes the ALL or OWNER privileges on SERVER,
+        // 'resource' could also correspond to a storage handler URI.
+        // For such a statement, we add the RWSTORAGE privilege on the wildcard storage
+        // handler URI. On the other hand, we won't ask Ranger to add a policy associated
+        // with the RWSTORAGE privilege on the wildcard storage handler URI in a
+        // query that grants or revokes a privilege other than ALL or OWNER. For
+        // instance, we won't ask Ranger to add a policy granting the RWSTORAGE privilege
+        // on the wildcard storage handler URI for "GRANT SELECT ON SERVER TO USER
+        // non_owner".
+        // Recall that no new Ranger policy will be added if we do not add a Privilege
+        // to 'accessTypes' of 'request'.
+        if (level == TPrivilegeLevel.ALL || level == TPrivilegeLevel.OWNER ||
+            level == TPrivilegeLevel.RWSTORAGE) {
+          request.getAccessTypes().add(Privilege.RWSTORAGE.name().toLowerCase());
+        }
       } else {
-        request.getAccessTypes().add(level.name().toLowerCase());
+        if (level == TPrivilegeLevel.INSERT) {
+          request.getAccessTypes().add(RangerAuthorizationChecker.UPDATE_ACCESS_TYPE);
+        } else if (level != TPrivilegeLevel.RWSTORAGE) {
+          // When 'resource' does not correspond to a storage handler URI, we add the
+          // specified 'level' as is to 'accessTypes' of 'request' only if 'level' is not
+          // TPrivilegeLevel.RWSTORAGE since TPrivilegeLevel.RWSTORAGE is not
+          // well-defined with respect to other types of resources, e.g., table. This
+          // way we won't add a policy that grants or revokes the privilege of RWSTORAGE
+          // on a 'resource' that is incompatible.
+          request.getAccessTypes().add(level.name().toLowerCase());
+        }
       }
     }
 
     return request;
+  }
+
+  /**
+   * This method combines GrantRevokeRequest's for specified columns in the same table
+   * into one GrantRevokeRequest to reduce the number of Ranger policies created on the
+   * Ranger server. This method implicitly assumes that for those GrantRevokeRequest's
+   * with specified columns on the given List, the fields other than database, table, and
+   * column names are the same.
+   */
+  private static List<GrantRevokeRequest> consolidateGrantRevokeRequests(
+      List<GrantRevokeRequest> requests) {
+    List<GrantRevokeRequest> combinedRequests = new LinkedList<>();
+    Map<Pair<String, String>, GrantRevokeRequest> consolidatedColumnRequests =
+        new HashMap<>();
+    List<GrantRevokeRequest> unconsolidatedRequests = new LinkedList<>();
+
+    for (GrantRevokeRequest request : requests) {
+      Map<String, String> resource = request.getResource();
+      String column = resource.get(RangerImpalaResourceBuilder.COLUMN);
+      if (column != null &&
+          !column.equals(RangerImpalaResourceBuilder.WILDCARD_ASTERISK)) {
+        // If 'column' is the name of a specified column, the database name and the table
+        // name must have been specified too.
+        String database = resource.get(RangerImpalaResourceBuilder.DATABASE);
+        String table = resource.get(RangerImpalaResourceBuilder.TABLE);
+        Pair<String, String> key = new Pair<>(database, table);
+        if (!consolidatedColumnRequests.containsKey(key)) {
+          consolidatedColumnRequests.put(key, request);
+        } else {
+          // Combine 'column' into the GrantRevokeRequest for other specified columns in
+          // the same table.
+          Map<String, String> consolidatedResource =
+              consolidatedColumnRequests.get(key).getResource();
+          String consolidatedColumns = consolidatedResource
+              .get(RangerImpalaResourceBuilder.COLUMN);
+          consolidatedResource.put(RangerImpalaResourceBuilder.COLUMN,
+              consolidatedColumns + RangerImpalaResourceBuilder.COLUMN_SEP + column);
+        }
+      } else {
+        unconsolidatedRequests.add(request);
+      }
+    }
+
+    combinedRequests.addAll(consolidatedColumnRequests.values());
+    combinedRequests.addAll(unconsolidatedRequests);
+    return combinedRequests;
   }
 
   /**

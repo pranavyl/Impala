@@ -33,6 +33,7 @@ import org.apache.impala.authorization.AuthorizationChecker;
 import org.apache.impala.authorization.AuthorizationPolicy;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TAuthzCacheInvalidation;
 import org.apache.impala.thrift.TCatalogObject;
@@ -48,14 +49,17 @@ import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.thrift.TUpdateCatalogCacheRequest;
 import org.apache.impala.thrift.TUpdateCatalogCacheResponse;
 import org.apache.impala.util.PatternMatcher;
+import org.apache.impala.util.TByteBuffer;
 import org.apache.impala.util.TUniqueIdUtil;
+import org.apache.thrift.TConfiguration;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.transport.TByteBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
+
+import javax.annotation.Nullable;
 
 /**
  * Thread safe Catalog for an Impalad.  The Impalad catalog can be updated either via
@@ -165,15 +169,17 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
   /**
    * Update the catalog service Id. Trigger a full update if the service ID changes.
    */
-  private void setCatalogServiceId(TUniqueId catalog_service_id) throws CatalogException {
+  private void setCatalogServiceId(TUniqueId catalogServiceId) throws CatalogException {
     // Check for changes in the catalog service ID.
-    if (!catalogServiceId_.equals(catalog_service_id)) {
+    if (!catalogServiceId_.equals(catalogServiceId)) {
       boolean firstRun = catalogServiceId_.equals(INITIAL_CATALOG_SERVICE_ID);
-      catalogServiceId_ = catalog_service_id;
+      TUniqueId oldCatalogServiceId = catalogServiceId_;
+      catalogServiceId_ = catalogServiceId;
       if (!firstRun) {
         // Throw an exception which will trigger a full topic update request.
-        throw new CatalogException("Detected catalog service ID change. Aborting " +
-            "updateCatalog()");
+        throw new CatalogException("Detected catalog service ID changes from " +
+            TUniqueIdUtil.PrintId(oldCatalogServiceId) + " to " +
+            TUniqueIdUtil.PrintId(catalogServiceId) + ". Aborting updateCatalog()");
       }
     }
   }
@@ -208,11 +214,14 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
     Map<TableName, PartitionMetaSummary> partUpdates = new HashMap<>();
     long newCatalogVersion = lastSyncedCatalogVersion_.get();
     Pair<Boolean, ByteBuffer> update;
+    int maxMessageSize = BackendConfig.INSTANCE.getThriftRpcMaxMessageSize();
+    final TConfiguration config = new TConfiguration(maxMessageSize,
+        TConfiguration.DEFAULT_MAX_FRAME_SIZE, TConfiguration.DEFAULT_RECURSION_DEPTH);
     while ((update = FeSupport.NativeGetNextCatalogObjectUpdate(req.native_iterator_ptr))
         != null) {
       boolean isDelete = update.first;
       TCatalogObject obj = new TCatalogObject();
-      obj.read(new TBinaryProtocol(new TByteBuffer(update.second)));
+      obj.read(new TBinaryProtocol(new TByteBuffer(config, update.second)));
       String key = Catalog.toCatalogObjectKey(obj);
       int len = update.second.capacity();
       if (len > 100 * 1024 * 1024 /* 100MB */) {
@@ -273,8 +282,9 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
 
 
   @Override // FeCatalog
-  public void prioritizeLoad(Set<TableName> tableNames) throws InternalException {
-    FeSupport.PrioritizeLoad(tableNames);
+  public void prioritizeLoad(Set<TableName> tableNames, @Nullable TUniqueId queryId)
+      throws InternalException {
+    FeSupport.PrioritizeLoad(tableNames, queryId);
   }
 
   @Override // FeCatalog
@@ -291,6 +301,16 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
       } catch (InterruptedException e) {
         // Ignore
       }
+    }
+  }
+
+  /**
+   * Called by FeCatalogManager when new ImpalaCatalog is created and this one is
+   * no longer used. Wakes up all threads that wait for catalogUpdateEventNotifier_.
+   */
+  public void release() {
+    synchronized (catalogUpdateEventNotifier_) {
+      catalogUpdateEventNotifier_.notifyAll();
     }
   }
 
@@ -323,7 +343,7 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
         TableName tblName = new TableName(table.getDb_name(), table.getTbl_name());
         addTable(table,
             newPartitions.getOrDefault(tblName, Collections.emptyList()),
-            catalogObject.getCatalog_version());
+            catalogObject.getCatalog_version(), catalogObject.getLast_modified_time_ms());
         break;
       case FUNCTION:
         // Remove the function first, in case there is an existing function with the same
@@ -454,7 +474,7 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
   }
 
   private void addTable(TTable thriftTable, List<THdfsPartition> newPartitions,
-      long catalogVersion) throws TableLoadingException {
+      long catalogVersion, long lastLoadedTime) throws TableLoadingException {
     Db db = getDb(thriftTable.db_name);
     if (db == null) {
       if (LOG.isTraceEnabled()) {
@@ -466,8 +486,9 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
 
     Preconditions.checkNotNull(newPartitions);
     Table existingTable = db.getTable(thriftTable.tbl_name);
-    Table newTable = Table.fromThrift(db, thriftTable);
+    Table newTable = Table.fromThrift(db, thriftTable, true);
     newTable.setCatalogVersion(catalogVersion);
+    newTable.setLastLoadedTimeMs(lastLoadedTime);
     if (existingTable != null && existingTable.getCatalogVersion() >= catalogVersion) {
       if (LOG.isTraceEnabled()) {
         LOG.trace("Ignore stale update on table {}: currentVersion={}, updateVersion={}",
@@ -494,20 +515,29 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
         for (PrunablePartition part : ((HdfsTable) existingTable).getPartitions()) {
           numExistingParts++;
           if (tHdfsTable.partitions.containsKey(part.getId())) {
-            Preconditions.checkState(
-                newHdfsTable.addPartitionNoThrow((HdfsPartition) part));
+            // Create a new partition instance under the new table object and copy all
+            // the fields of the existing partition.
+            HdfsPartition newPart = new HdfsPartition.Builder(newHdfsTable, part.getId())
+                .copyFromPartition((HdfsPartition) part)
+                .build();
+            Preconditions.checkState(newHdfsTable.addPartitionNoThrow(newPart));
           } else {
             numDeletedParts++;
           }
         }
       }
       // Apply incremental updates.
+      List<String> stalePartitionNames = new ArrayList<>();
       for (THdfsPartition tPart : newPartitions) {
         // TODO: remove this after IMPALA-9937. It's only illegal in statestore updates,
         //  which indicates a leak of partitions in the catalog topic - a stale partition
         //  should already have a corresponding deletion so won't get here.
-        Preconditions.checkState(tHdfsTable.partitions.containsKey(tPart.id),
-            "Received stale partition in a statestore update: " + tPart);
+        if (!tHdfsTable.partitions.containsKey(tPart.id)) {
+          stalePartitionNames.add(tPart.partition_name);
+          LOG.warn("Stale partition: {}.{}:{} id={}", tPart.db_name, tPart.tbl_name,
+              tPart.partition_name, tPart.id);
+          continue;
+        }
         // The existing table could have a newer version than the last sent table version
         // in catalogd, so some partition instances may already exist here. This happens
         // when we have executed DDL/DMLs on this table on this coordinator since the last
@@ -526,6 +556,13 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
         LOG.trace("Added partition (id:{}, name:{}) to table {}",
             tPart.id, tPart.partition_name, newHdfsTable.getFullName());
         numNewParts++;
+      }
+      if (!stalePartitionNames.isEmpty()) {
+        LOG.warn("Received {} stale partitions of table {}.{} in the statestore update:" +
+                " {}. There are possible leaks in the catalog topic values. To resolve " +
+                "the leak, add them back and then drop them again.",
+            stalePartitionNames.size(), thriftTable.db_name, thriftTable.tbl_name,
+            String.join(",", stalePartitionNames));
       }
       // Validate that all partitions are set.
       ((HdfsTable) newTable).validatePartitions(tHdfsTable.partitions.keySet());

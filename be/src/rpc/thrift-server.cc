@@ -32,12 +32,13 @@
 
 #include <sstream>
 #include "gen-cpp/Types_types.h"
-#include "kudu/security/openssl_util.h"
+#include "kudu/util/openssl_util.h"
 #include "rpc/TAcceptQueueServer.h"
 #include "rpc/auth-provider.h"
 #include "rpc/authentication.h"
 #include "rpc/thrift-server.h"
 #include "rpc/thrift-thread.h"
+#include "rpc/thrift-util.h"
 #include "transport/THttpServer.h"
 #include "util/condition-variable.h"
 #include "util/debug-util.h"
@@ -268,7 +269,8 @@ void ThriftServer::ThriftServerEventProcessor::deleteContext(void* context,
 ThriftServer::ThriftServer(const string& name,
     const std::shared_ptr<TProcessor>& processor, int port, AuthProvider* auth_provider,
     MetricGroup* metrics, int max_concurrent_connections, int64_t queue_timeout_ms,
-    int64_t idle_poll_period_ms, TransportType transport_type)
+    int64_t idle_poll_period_ms, TransportType transport_type,
+    bool is_external_facing)
   : started_(false),
     port_(port),
     ssl_enabled_(false),
@@ -282,7 +284,8 @@ ThriftServer::ThriftServer(const string& name,
     connection_handler_(NULL),
     metrics_(NULL),
     auth_provider_(auth_provider),
-    transport_type_(transport_type) {
+    transport_type_(transport_type),
+    is_external_facing_(is_external_facing) {
   if (auth_provider_ == NULL) {
     auth_provider_ = AuthManager::GetInstance()->GetInternalAuthProvider();
   }
@@ -304,52 +307,10 @@ namespace {
 
 /// Factory subclass to override getPassword() which provides a password string to Thrift
 /// to decrypt the private key file.
-class ImpalaSslSocketFactory : public TSSLSocketFactory {
+class ImpalaPasswordedTlsSocketFactory : public ImpalaTlsSocketFactory {
  public:
-  ImpalaSslSocketFactory(SSLProtocol version, const string& password)
-    : TSSLSocketFactory(version), password_(password) {}
-
-  void ciphers(const string& enable) override {
-    if (ctx_.get() == nullptr) {
-      throw new TSSLException("ImpalaSslSocketFactory was not properly initialized.");
-    }
-    LOG(INFO) << "Enabling the following ciphers for the ImpalaSslSocketFactory: "
-              << enable;
-    SCOPED_OPENSSL_NO_PENDING_ERRORS;
-    TSSLSocketFactory::ciphers(enable);
-
-    // The following was taken from be/src/kudu/security/tls_context.cc, bugs fixed here
-    // may also need to be fixed there.
-    // Enable ECDH curves. For OpenSSL 1.1.0 and up, this is done automatically.
-#ifndef OPENSSL_NO_ECDH
-#if OPENSSL_VERSION_NUMBER < 0x10002000L
-    // OpenSSL 1.0.1 and below only support setting a single ECDH curve at once.
-    // We choose prime256v1 because it's the first curve listed in the "modern
-    // compatibility" section of the Mozilla Server Side TLS recommendations,
-    // accessed Feb. 2017.
-    c_unique_ptr<EC_KEY> ecdh{
-        EC_KEY_new_by_curve_name(NID_X9_62_prime256v1), &EC_KEY_free};
-    if (ecdh == nullptr) {
-      throw TSSLException(
-          "failed to create prime256v1 curve: " + kudu::security::GetOpenSSLErrors());
-    }
-
-    int rc = SSL_CTX_set_tmp_ecdh(ctx_->get(), ecdh.get());
-    if (rc <= 0) {
-      throw new TSSLException(
-          "failed to set ECDH curve: " + kudu::security::GetOpenSSLErrors());
-    }
-#elif OPENSSL_VERSION_NUMBER < 0x10100000L
-    // OpenSSL 1.0.2 provides the set_ecdh_auto API which internally figures out
-    // the best curve to use.
-    int rc = SSL_CTX_set_ecdh_auto(ctx_->get(), 1);
-    if (rc <= 0) {
-      throw TSSLException(
-          "failed to configure ECDH support: " + kudu::security::GetOpenSSLErrors());
-    }
-#endif
-#endif
-  }
+  ImpalaPasswordedTlsSocketFactory(SSLProtocol version, const string& password)
+    : ImpalaTlsSocketFactory(version), password_(password) {}
 
  protected:
   virtual void getPassword(string& output, int size) override {
@@ -372,27 +333,36 @@ Status ThriftServer::CreateSocket(std::shared_ptr<TServerSocket>* socket) {
     try {
       // This 'factory' is only called once, since CreateSocket() is only called from
       // Start(). The c'tor may throw if there is an error initializing the SSL context.
-      std::shared_ptr<TSSLSocketFactory> socket_factory(
-          new ImpalaSslSocketFactory(version_, key_password_));
+      std::shared_ptr<ImpalaTlsSocketFactory> socket_factory(
+          new ImpalaPasswordedTlsSocketFactory(version_, key_password_));
       socket_factory->overrideDefaultPasswordCallback();
 
-      if (!cipher_list_.empty()) socket_factory->ciphers(cipher_list_);
+      socket_factory->configureCiphers(cipher_list_, tls_ciphersuites_,
+          disable_tls12_);
       socket_factory->loadCertificate(certificate_path_.c_str());
       socket_factory->loadPrivateKey(private_key_path_.c_str());
-      socket->reset(new TSSLServerSocket(port_, socket_factory));
+      ImpalaKeepAliveServerSocket<TSSLServerSocket>* server_socket =
+          new ImpalaKeepAliveServerSocket<TSSLServerSocket>(port_, socket_factory);
+      server_socket->setKeepAliveOptions(keepalive_probe_period_s_,
+          keepalive_retry_period_s_, keepalive_retry_count_);
+      socket->reset(server_socket);
     } catch (const TException& e) {
       return Status(TErrorCode::SSL_SOCKET_CREATION_FAILED, e.what());
     }
-    return Status::OK();
   } else {
-    socket->reset(new TServerSocket(port_));
-    return Status::OK();
+    ImpalaKeepAliveServerSocket<TServerSocket>* server_socket =
+        new ImpalaKeepAliveServerSocket<TServerSocket>(port_);
+    server_socket->setKeepAliveOptions(keepalive_probe_period_s_,
+        keepalive_retry_period_s_, keepalive_retry_count_);
+    socket->reset(server_socket);
   }
+  return Status::OK();
 }
 
 Status ThriftServer::EnableSsl(SSLProtocol version, const string& certificate,
     const string& private_key, const string& pem_password_cmd,
-    const std::string& ciphers) {
+    const std::string& cipher_list, const std::string& tls_ciphersuites,
+    bool disable_tls12) {
   DCHECK(!started_);
   if (certificate.empty()) return Status(TErrorCode::SSL_CERTIFICATE_PATH_BLANK);
   if (private_key.empty()) return Status(TErrorCode::SSL_PRIVATE_KEY_PATH_BLANK);
@@ -409,7 +379,9 @@ Status ThriftServer::EnableSsl(SSLProtocol version, const string& certificate,
   ssl_enabled_ = true;
   certificate_path_ = certificate;
   private_key_path_ = private_key;
-  cipher_list_ = ciphers;
+  cipher_list_ = cipher_list;
+  tls_ciphersuites_ = tls_ciphersuites;
+  disable_tls12_ = disable_tls12;
   version_ = version;
 
   if (!pem_password_cmd.empty()) {
@@ -422,6 +394,13 @@ Status ThriftServer::EnableSsl(SSLProtocol version, const string& certificate,
   }
 
   return Status::OK();
+}
+
+void ThriftServer::SetKeepAliveOptions(int32_t probe_period_s, int32_t retry_period_s,
+    int32_t retry_count) {
+  keepalive_probe_period_s_ = probe_period_s;
+  keepalive_retry_period_s_ = retry_period_s;
+  keepalive_retry_count_ = retry_count;
 }
 
 Status ThriftServer::Start() {
@@ -440,7 +419,7 @@ Status ThriftServer::Start() {
 
   server_.reset(new TAcceptQueueServer(processor_, server_socket, transport_factory,
       protocol_factory, thread_factory, name_, max_concurrent_connections_,
-      queue_timeout_ms_, idle_poll_period_ms_));
+      queue_timeout_ms_, idle_poll_period_ms_, is_external_facing_));
   if (metrics_ != NULL) {
     (static_cast<TAcceptQueueServer*>(server_.get()))
         ->InitMetrics(metrics_, metrics_name_);
@@ -470,5 +449,12 @@ void ThriftServer::StopForTesting() {
   DCHECK(server_);
   server_->stop();
   if (started_) Join();
+}
+
+void ThriftServer::GetConnectionContextList(ConnectionContextList* connection_contexts) {
+  lock_guard<mutex> l(connection_contexts_lock_);
+  for (const ConnectionContextSet::value_type& pair : connection_contexts_) {
+    connection_contexts->push_back(pair.second);
+  }
 }
 }

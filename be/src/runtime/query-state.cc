@@ -19,9 +19,10 @@
 
 #include <mutex>
 
+#include "codegen/llvm-codegen-cache.h"
 #include "codegen/llvm-codegen.h"
 #include "common/thread-debug-info.h"
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "exprs/expr.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/rpc/rpc_controller.h"
@@ -110,7 +111,7 @@ QueryState::QueryState(
     refcnt_(0),
     is_cancelled_(0),
     query_spilled_(0),
-    host_profile_(RuntimeProfile::Create(obj_pool(), "<track resource usage>")) {
+    host_profile_(RuntimeProfile::Create(obj_pool(), "<track resource usage>", false)) {
   if (query_ctx_.request_pool.empty()) {
     // fix up pool name for tests
     DCHECK(!request_pool.empty());
@@ -118,12 +119,6 @@ QueryState::QueryState(
   }
   TQueryOptions& query_options =
       const_cast<TQueryOptions&>(query_ctx_.client_request.query_options);
-  // max_errors does not indicate how many errors in total have been recorded, but rather
-  // how many are distinct. It is defined as the sum of the number of generic errors and
-  // the number of distinct other errors.
-  if (query_options.max_errors <= 0) {
-    query_options.max_errors = 100;
-  }
   if (query_options.batch_size <= 0) {
     query_options.__set_batch_size(DEFAULT_BATCH_SIZE);
   }
@@ -181,7 +176,7 @@ Status QueryState::Init(const ExecQueryFInstancesRequestPB* exec_rpc_params,
 
   ExecEnv* exec_env = ExecEnv::GetInstance();
 
-  RuntimeProfile* jvm_host_profile = RuntimeProfile::Create(&obj_pool_, "JVM");
+  RuntimeProfile* jvm_host_profile = RuntimeProfile::Create(&obj_pool_, "JVM", false);
   host_profile_->AddChild(jvm_host_profile);
 
   int64_t gc_count = JvmMemoryCounterMetric::GC_COUNT->GetValue();
@@ -223,35 +218,35 @@ Status QueryState::Init(const ExecQueryFInstancesRequestPB* exec_rpc_params,
   // Initialize resource tracking counters.
   if (query_ctx().trace_resource_usage) {
     SystemStateInfo* system_state_info = exec_env->system_state_info();
-    host_profile_->AddChunkedTimeSeriesCounter(
+    host_profile_->AddSamplingTimeSeriesCounter(
         "HostCpuUserPercentage", TUnit::BASIS_POINTS, [system_state_info] () {
-        return system_state_info->GetCpuUsageRatios().user;
+        return system_state_info->GetCpuUsageRatios().user.Load();
         });
-    host_profile_->AddChunkedTimeSeriesCounter(
+    host_profile_->AddSamplingTimeSeriesCounter(
         "HostCpuSysPercentage", TUnit::BASIS_POINTS, [system_state_info] () {
-        return system_state_info->GetCpuUsageRatios().system;
+        return system_state_info->GetCpuUsageRatios().system.Load();
         });
-    host_profile_->AddChunkedTimeSeriesCounter(
+    host_profile_->AddSamplingTimeSeriesCounter(
         "HostCpuIoWaitPercentage", TUnit::BASIS_POINTS, [system_state_info] () {
-        return system_state_info->GetCpuUsageRatios().iowait;
+        return system_state_info->GetCpuUsageRatios().iowait.Load();
         });
     // Add network usage
-    host_profile_->AddChunkedTimeSeriesCounter(
+    host_profile_->AddSamplingTimeSeriesCounter(
         "HostNetworkRx", TUnit::BYTES_PER_SECOND, [system_state_info] () {
-        return system_state_info->GetNetworkUsage().rx_rate;
+        return system_state_info->GetNetworkUsage().rx_rate.Load();
         });
-    host_profile_->AddChunkedTimeSeriesCounter(
+    host_profile_->AddSamplingTimeSeriesCounter(
         "HostNetworkTx", TUnit::BYTES_PER_SECOND, [system_state_info] () {
-        return system_state_info->GetNetworkUsage().tx_rate;
+        return system_state_info->GetNetworkUsage().tx_rate.Load();
         });
     // Add disk stats
-    host_profile_->AddChunkedTimeSeriesCounter(
+    host_profile_->AddSamplingTimeSeriesCounter(
         "HostDiskReadThroughput", TUnit::BYTES_PER_SECOND, [system_state_info] () {
-        return system_state_info->GetDiskStats().read_rate;
+        return system_state_info->GetDiskStats().read_rate.Load();
         });
-    host_profile_->AddChunkedTimeSeriesCounter(
+    host_profile_->AddSamplingTimeSeriesCounter(
         "HostDiskWriteThroughput", TUnit::BYTES_PER_SECOND, [system_state_info] () {
-        return system_state_info->GetDiskStats().write_rate;
+        return system_state_info->GetDiskStats().write_rate.Load();
         });
   }
 
@@ -269,8 +264,20 @@ Status QueryState::Init(const ExecQueryFInstancesRequestPB* exec_rpc_params,
   RETURN_IF_ERROR(InitBufferPoolState());
 
   // Initialize the RPC proxy once and report any error.
-  RETURN_IF_ERROR(ControlService::GetProxy(
-      query_ctx().coord_ip_address, query_ctx().coord_hostname, &proxy_));
+  NetworkAddressPB coord_addr = FromTNetworkAddress(query_ctx().coord_ip_address);
+  RETURN_IF_ERROR(
+      ControlService::GetProxy(coord_addr, query_ctx().coord_hostname, &proxy_));
+
+  // Making a copy of the "filepath to hosts" mapping into std library types.
+  for (const auto& nodes : exec_rpc_params->by_node_filepath_to_hosts()) {
+    for (const auto& files : nodes.second.filepath_to_hosts()) {
+      FileSchedulingInfo file_schedule_info(files.first, files.second.is_relative());
+      for (const auto& host : files.second.hosts()) {
+        file_schedule_info.hosts.push_back(host);
+      }
+      node_to_file_schedulings_[nodes.first].push_back(file_schedule_info);
+    }
+  }
 
   // don't copy query_ctx, it's large and we already did that in the c'tor
   exec_rpc_params_.set_coord_state_idx(exec_rpc_params->coord_state_idx());
@@ -372,6 +379,7 @@ bool VerifyFiltersProduced(const vector<TPlanFragmentInstanceCtx>& instance_ctxs
 }
 
 Status QueryState::InitFilterBank() {
+  const NetworkAddressPB& this_krpc_address = ExecEnv::GetInstance()->krpc_address();
   int64_t runtime_filters_reservation_bytes = 0;
   int fragment_ctx_idx = -1;
   const vector<TPlanFragment>& fragments = fragment_info_.fragments;
@@ -421,9 +429,32 @@ Status QueryState::InitFilterBank() {
     for (const TRuntimeFilterSource& produced_filter : instance_ctx.filters_produced) {
       auto it = filters.find(produced_filter.filter_id);
       DCHECK(it != filters.end());
-      ++it->second.num_producers;
+      FilterRegistration& reg = it->second;
+      ++reg.num_producers;
+
+      if (produced_filter.__isset.aggregator_desc) {
+        TRuntimeFilterAggDesc agg_desc = produced_filter.aggregator_desc;
+        if (reg.need_subaggregation) {
+          // This filter registration is already set before.
+          // Do sanity check to make sure it match with the rest of TRuntimeFilterSource.
+          DCHECK_EQ(reg.num_reporting_hosts, agg_desc.num_reporting_hosts);
+          DCHECK_EQ(reg.krpc_hostname_to_report, agg_desc.krpc_hostname);
+          DCHECK_EQ(reg.krpc_backend_to_report, agg_desc.krpc_address);
+        } else {
+          // This filter bank is a backend aggregator for 'filter'.
+          reg.need_subaggregation = true;
+          reg.num_reporting_hosts = agg_desc.num_reporting_hosts;
+          reg.krpc_hostname_to_report = agg_desc.krpc_hostname;
+          reg.krpc_backend_to_report = agg_desc.krpc_address;
+          if (KrpcAddressEqual(
+                  this_krpc_address, FromTNetworkAddress(agg_desc.krpc_address))) {
+            reg.is_intermediate_aggregator = true;
+          }
+        }
+      }
     }
   }
+
   filter_bank_.reset(
       new RuntimeFilterBank(this, filters, runtime_filters_reservation_bytes));
   return filter_bank_->ClaimBufferReservation();
@@ -673,8 +704,8 @@ bool QueryState::ReportExecStatus() {
   // without the profile so that the coordinator can still get the status and won't
   // conclude that the backend has hung and cancel the query.
   if (profile_buf != nullptr) {
-    unique_ptr<kudu::faststring> sidecar_buf = make_unique<kudu::faststring>();
-    sidecar_buf->assign_copy(profile_buf, profile_len);
+    kudu::faststring sidecar_buf;
+    sidecar_buf.assign_copy(profile_buf, profile_len);
     unique_ptr<RpcSidecar> sidecar = RpcSidecar::FromFaststring(move(sidecar_buf));
 
     int sidecar_idx;
@@ -805,6 +836,16 @@ bool QueryState::WaitForFinishOrTimeout(int32_t timeout_ms) {
   return !timed_out;
 }
 
+bool QueryState::codegen_cache_enabled() const {
+  return !query_options().disable_codegen_cache && !disable_codegen_cache_
+      && ExecEnv::GetInstance()->codegen_cache_enabled();
+}
+
+bool QueryState::is_initialized() {
+  std::lock_guard<std::mutex> l(init_lock_);
+  return is_initialized_;
+}
+
 bool QueryState::StartFInstances() {
   VLOG(2) << "StartFInstances(): query_id=" << PrintId(query_id())
           << " #instances=" << fragment_info_.fragment_instance_ctxs.size();
@@ -822,6 +863,23 @@ bool QueryState::StartFInstances() {
   if (UNLIKELY(!start_finstances_status.ok())) goto error;
   VLOG(2) << "descriptor table for query=" << PrintId(query_id())
           << "\n" << desc_tbl_->DebugString();
+  // IMPALA-13378: Verify that tuple ids in all PlanNode exist in the descriptor table.
+  for (TPlanFragment f : fragment_info_.fragments) {
+    for (TPlanNode node : f.plan.nodes) {
+      for (TTupleId tuple_id : node.row_tuples) {
+        if (UNLIKELY(desc_tbl_->GetTupleDescriptor(tuple_id) == nullptr)) {
+          string msg = Substitute(
+              "Tuple id $0 of PlanNode $1 not found in descriptor table",
+              tuple_id, node.node_id);
+          // It'd be helpful to also print 'fragment_info_' but it might lead to crash
+          // if it's corrupt.
+          LOG(ERROR) << msg << ": " << desc_tbl_->DebugString();
+          start_finstances_status = Status(msg);
+          goto error;
+        }
+      }
+    }
+  }
 
   start_finstances_status = FragmentState::CreateFragmentStateMap(
       fragment_info_, exec_rpc_params_, this, fragment_state_map_);
@@ -990,6 +1048,12 @@ void QueryState::Cancel() {
 void QueryState::PublishFilter(const PublishFilterParamsPB& params, RpcContext* context) {
   if (!WaitForPrepare().ok()) return;
   filter_bank_->PublishGlobalFilter(params, context);
+}
+
+void QueryState::UpdateFilterFromRemote(
+    const UpdateFilterParamsPB& params, RpcContext* context) {
+  if (!WaitForPrepare().ok()) return;
+  filter_bank_->UpdateFilterFromRemote(params, context);
 }
 
 Status QueryState::StartSpilling(RuntimeState* runtime_state, MemTracker* mem_tracker) {

@@ -52,6 +52,12 @@ public class TimeTravelSpec extends StmtNode {
   // Iceberg uses millis, Kudu uses micros for time travel, so using micros here.
   private long asOfMicros_ = -1;
 
+  // A time string represents the asOfMicros_ for the query option TIMEZONE
+  private String timeString_;
+
+  // Flag to show that analysis has been done
+  private boolean analyzed_;
+
   public Kind getKind() { return kind_; }
 
   public long getAsOfVersion() { return asOfVersion_; }
@@ -71,6 +77,7 @@ public class TimeTravelSpec extends StmtNode {
     asOfExpr_ = other.asOfExpr_.clone();
     asOfVersion_ = other.asOfVersion_;
     asOfMicros_ = other.asOfMicros_;
+    timeString_ = other.timeString_;
   }
 
   @Override
@@ -78,15 +85,30 @@ public class TimeTravelSpec extends StmtNode {
 
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
+    if (analyzed_) return;
     switch (kind_) {
       case TIME_AS_OF: analyzeTimeBased(analyzer); break;
       case VERSION_AS_OF: analyzeVersionBased(analyzer); break;
     }
+    analyzed_ = true;
   }
 
   private void analyzeTimeBased(Analyzer analyzer) throws AnalysisException {
     Preconditions.checkNotNull(asOfExpr_);
-    asOfExpr_.analyze(analyzer);
+    try {
+      asOfExpr_.analyze(analyzer);
+    } catch (AnalysisException e) {
+      if (e.getMessage().contains("Could not resolve column/field reference")) {
+        // If the AS_OF expr is not a simple constant it will need table information
+        // that is not yet available as the analysis of the table is not yet
+        // complete. If this happens we know it is not a constant expr, so construct
+        // a better error message.
+        throw new AnalysisException(
+            "FOR SYSTEM_TIME AS OF <expression> must be a constant expression: "
+            + toSql());
+      }
+      throw e;
+    }
     if (!asOfExpr_.isConstant()) {
       throw new AnalysisException(
           "FOR SYSTEM_TIME AS OF <expression> must be a constant expression: " + toSql());
@@ -102,6 +124,14 @@ public class TimeTravelSpec extends StmtNode {
     try {
       asOfMicros_ = ExprUtil.localTimestampToUnixTimeMicros(analyzer, asOfExpr_);
       LOG.debug("FOR SYSTEM_TIME AS OF micros: " + String.valueOf(asOfMicros_));
+    } catch (InternalException ie) {
+      throw new AnalysisException(
+          "Invalid TIMESTAMP expression: " + ie.getMessage(), ie);
+    }
+    try {
+      timeString_ = ExprUtil.localTimestampToString(analyzer, asOfExpr_);
+      LOG.debug("FOR SYSTEM_TIME AS OF time: {}, {}", timeString_,
+          analyzer.getQueryCtx().getLocal_time_zone());
     } catch (InternalException ie) {
       throw new AnalysisException(
           "Invalid TIMESTAMP expression: " + ie.getMessage(), ie);
@@ -145,5 +175,10 @@ public class TimeTravelSpec extends StmtNode {
   @Override
   public final String toSql() {
     return toSql(DEFAULT);
+  }
+
+  public String toTimeString() {
+    Preconditions.checkState(Kind.TIME_AS_OF.equals(kind_));
+    return timeString_;
   }
 }

@@ -55,7 +55,7 @@ class SimpleLoggerTest : public ::testing::Test {
 
   // Create a SimpleLogger with standard log prefix, max entries per file, and
   // max files.
-  unique_ptr<SimpleLogger> CreateSimpleLogger(path directory) {
+  unique_ptr<SimpleLogger> CreateSimpleLogger(const path& directory) {
     return std::make_unique<SimpleLogger>(directory.string(), LOG_FILE_PREFIX,
         MAX_ENTRIES_PER_FILE, MAX_LOG_FILES);
   }
@@ -72,7 +72,7 @@ TEST_F(SimpleLoggerTest, CreateDirectories) {
   logger.reset();
 
   // Test that it also works if the directory already exists
-  logger = CreateSimpleLogger(tmp_dir().string());
+  logger = CreateSimpleLogger(tmp_dir());
   EXPECT_OK(logger->Init());
 }
 
@@ -249,7 +249,7 @@ TEST_F(SimpleLoggerTest, Blast) {
       &log_files);
   ASSERT_OK(status);
   // Debugging logging to help diagnosis for any problems.
-  for (string log_file : log_files) {
+  for (const string& log_file : log_files) {
     LOG(INFO) << "Log files after blast: " << log_file;
   }
   EXPECT_EQ(log_files.size(), MAX_LOG_FILES);
@@ -264,7 +264,7 @@ TEST_F(SimpleLoggerTest, Blast) {
   // Regex to match the expect line. The parentheses are a grouping that lets us extract
   // the number separately.
   std::regex entry_regex = std::regex("entry_([0-9]+)");
-  for (string log_file : log_files) {
+  for (const string& log_file : log_files) {
     ifstream file(log_file);
     string line;
     while (getline(file, line)) {

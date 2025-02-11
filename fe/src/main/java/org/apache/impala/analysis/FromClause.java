@@ -25,6 +25,7 @@ import java.util.List;
 
 import org.apache.impala.analysis.TableRef.ZippingUnnestType;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.iceberg.IcebergMetadataTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.util.AcidUtils;
 
@@ -89,6 +90,7 @@ public class FromClause extends StmtNode implements Iterable<TableRef> {
       tblRef.analyze(analyzer);
       leftTblRef = tblRef;
       if (tblRef instanceof CollectionTableRef) {
+        checkIcebergCollectionSupport((CollectionTableRef)tblRef);
         checkTopLevelComplexAcidScan(analyzer, (CollectionTableRef)tblRef);
         if (firstZippingUnnestRef != null && tblRef.isZippingUnnest() &&
             firstZippingUnnestRef.getResolvedPath().getRootTable() !=
@@ -105,6 +107,7 @@ public class FromClause extends StmtNode implements Iterable<TableRef> {
           }
           if (firstZippingUnnestRef == null) firstZippingUnnestRef = tblRef;
           analyzer.addZippingUnnestTupleId((CollectionTableRef)tblRef);
+          analyzer.increaseZippingUnnestCount();
         }
       }
     }
@@ -145,12 +148,27 @@ public class FromClause extends StmtNode implements Iterable<TableRef> {
 
   private void checkTopLevelComplexAcidScan(Analyzer analyzer,
       CollectionTableRef collRef) {
+    if (collRef.getCollectionExpr() != null) return;
+    // Don't do any checks of the collection that came from a view as getTable() would
+    // return null in that case.
+    if (collRef.getTable() == null) return;
     if (!AcidUtils.isFullAcidTable(
         collRef.getTable().getMetaStoreTable().getParameters())) {
       return;
     }
-    if (collRef.getCollectionExpr() == null) {
-      analyzer.setHasTopLevelAcidCollectionTableRef();
+    analyzer.setHasTopLevelAcidCollectionTableRef();
+  }
+
+  private void checkIcebergCollectionSupport(CollectionTableRef tblRef)
+      throws AnalysisException {
+    Preconditions.checkNotNull(tblRef);
+    Preconditions.checkNotNull(tblRef.getDesc());
+    Preconditions.checkNotNull(tblRef.getDesc().getPath());
+    Preconditions.checkNotNull(tblRef.getDesc().getPath().getRootTable());
+    // IMPALA-12853: Collection types in FROM clause for Iceberg Metadata Tables
+    if (tblRef.getDesc().getPath().getRootTable() instanceof IcebergMetadataTable) {
+      throw new AnalysisException("Querying collection types (ARRAY/MAP) in FROM " +
+          "clause is not supported for Iceberg Metadata tables.");
     }
   }
 
@@ -173,7 +191,11 @@ public class FromClause extends StmtNode implements Iterable<TableRef> {
         // contrary to the intended semantics of reset(). We could address this issue by
         // changing the WITH-clause analysis to register local views that have
         // fully-qualified table refs, and then remove the full qualification here.
-        newTblRef.rawPath_ = origTblRef.getResolvedPath().getFullyQualifiedRawPath();
+        Path oldPath = origTblRef.getResolvedPath();
+        if (oldPath.getRootDesc() == null
+            || !oldPath.getRootDesc().getType().isCollectionStructType()) {
+          newTblRef.rawPath_ = oldPath.getFullyQualifiedRawPath();
+        }
         set(i, newTblRef);
       }
       // recurse for views

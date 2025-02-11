@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 import threading
 
@@ -139,9 +141,9 @@ class TestConcurrentDdls(CustomClusterTestSuite):
     # Run DDLs with invalidate metadata in parallel
     NUM_ITERS = 16
     worker = [None] * (NUM_ITERS + 1)
-    for i in xrange(1, NUM_ITERS + 1):
+    for i in range(1, NUM_ITERS + 1):
       worker[i] = pool.apply_async(run_ddls, (i,))
-    for i in xrange(1, NUM_ITERS + 1):
+    for i in range(1, NUM_ITERS + 1):
       try:
         worker[i].get(timeout=100)
       except TimeoutError:
@@ -184,7 +186,7 @@ class TestConcurrentDdls(CustomClusterTestSuite):
 
     NUM_ITERS = 20
     pool = ThreadPool(processes=2)
-    for i in xrange(NUM_ITERS):
+    for i in range(NUM_ITERS):
       # Run two INVALIDATE METADATA commands in parallel
       r1 = pool.apply_async(run_invalidate_metadata)
       r2 = pool.apply_async(run_invalidate_metadata)
@@ -195,3 +197,26 @@ class TestConcurrentDdls(CustomClusterTestSuite):
         dump_server_stacktraces()
         assert False, "INVALIDATE METADATA timeout in 60s!"
     pool.terminate()
+
+  @CustomClusterTestSuite.with_args(
+    catalogd_args="--enable_incremental_metadata_updates=true")
+  def test_concurrent_invalidate_metadata_with_refresh(self, unique_database):
+    # Create a wide table with some partitions
+    tbl = unique_database + ".wide_tbl"
+    create_stmt = "create table {} (".format(tbl)
+    for i in range(600):
+      create_stmt += "col{} int, ".format(i)
+    create_stmt += "col600 int) partitioned by (p int) stored as textfile"
+    self.execute_query(create_stmt)
+    for i in range(10):
+      self.execute_query("alter table {} add partition (p={})".format(tbl, i))
+
+    refresh_stmt = "refresh " + tbl
+    refresh_handle = self.client.execute_async(refresh_stmt)
+    for i in range(10):
+      self.execute_query("invalidate metadata " + tbl)
+      # Always keep a concurrent REFRESH statement running
+      refresh_state = self.client.get_state(refresh_handle)
+      if refresh_state == self.client.QUERY_STATES['FINISHED']\
+          or refresh_state == self.client.QUERY_STATES['EXCEPTION']:
+        refresh_handle = self.client.execute_async(refresh_stmt)

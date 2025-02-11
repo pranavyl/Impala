@@ -18,6 +18,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <boost/random/random_device.hpp>
@@ -34,10 +35,16 @@
 #include "gen-cpp/ImpalaHiveServer2Service.h"
 #include "gen-cpp/ImpalaService.h"
 #include "gen-cpp/control_service.pb.h"
+#include "gen-cpp/Query_types.h"
+#include "gen-cpp/TCLIService_types.h"
 #include "kudu/util/random.h"
+#include "kudu/util/version_util.h"
 #include "rpc/thrift-server.h"
 #include "runtime/types.h"
+#include "service/internal-server.h"
 #include "service/query-options.h"
+#include "service/query-state-record.h"
+#include "service/workload-management-worker.h"
 #include "statestore/statestore-subscriber.h"
 #include "util/condition-variable.h"
 #include "util/container-util.h"
@@ -45,6 +52,7 @@
 #include "util/sharded-query-map-util.h"
 #include "util/simple-logger.h"
 #include "util/thread-pool.h"
+#include "util/ticker.h"
 #include "util/time.h"
 
 namespace kudu {
@@ -75,6 +83,7 @@ class TGetExecSummaryReq;
 class ClientRequestState;
 class QueryDriver;
 struct QueryHandle;
+class QueryScanner;
 class SimpleLogger;
 class UpdateFilterParamsPB;
 class UpdateFilterResultPB;
@@ -176,12 +185,14 @@ class TQueryExecRequest;
 /// locks are acquired, lower-numbered locks must be acquired before higher-numbered
 /// locks:
 /// 1. session_state_map_lock_
-/// 2. SessionState::lock
-/// 3. query_expiration_lock_
-/// 4. ClientRequestState::fetch_rows_lock
-/// 5. ClientRequestState::lock
-/// 6. ClientRequestState::expiration_data_lock_
-/// 7. Coordinator::exec_summary_lock
+/// 2. query_expiration_lock_
+/// 3. SessionState::lock
+/// 4. idle_query_statuses_lock_
+/// 5. ClientRequestState::fetch_rows_lock
+/// 6. ClientRequestState::lock
+/// 7. ClientRequestState::expiration_data_lock_
+/// 8. Coordinator::exec_summary_lock
+/// 9. ClientRequestState::exec_state_lock_
 ///
 /// The following locks are not held in conjunction with other locks:
 /// * query_log_lock_
@@ -190,6 +201,7 @@ class TQueryExecRequest;
 /// * uuid_lock_
 /// * catalog_version_lock_
 /// * connection_to_sessions_map_lock_
+/// * per_user_session_count_lock_
 ///
 /// TODO: The same doesn't apply to the execution state of an individual plan
 /// fragment: the originating coordinator might die, but we can get notified of
@@ -197,6 +209,7 @@ class TQueryExecRequest;
 class ImpalaServer : public ImpalaServiceIf,
                      public ImpalaHiveServer2ServiceIf,
                      public ThriftServer::ConnectionHandlerIf,
+                     public InternalServer,
                      public std::enable_shared_from_this<ImpalaServer>,
                      public CacheLineAligned {
  public:
@@ -380,9 +393,9 @@ class ImpalaServer : public ImpalaServiceIf,
 
   /// Static helper for PrepareQueryContext() that is used from expr-benchmark.
   static void PrepareQueryContext(const std::string& hostname,
-      const TNetworkAddress& krpc_addr, TQueryCtx* query_ctx);
+      const NetworkAddressPB& krpc_addr, TQueryCtx* query_ctx);
 
-  /// SessionHandlerIf methods
+  /// ThriftServer::ConnectionHandlerIf methods
 
   /// Called when a Beeswax or HS2 connection starts. For Beeswax, registers a new
   /// SessionState associated with the new connection. For HS2, this is a no-op (HS2
@@ -397,6 +410,32 @@ class ImpalaServer : public ImpalaServiceIf,
   /// idle if all the sessions associated with it have expired due to idle timeout.
   /// Called when a client has been inactive for --idle_client_poll_period_s seconds.
   virtual bool IsIdleConnection(const ThriftServer::ConnectionContext& session_context);
+
+  /// InternalServer methods, see internal-server.h for details
+  virtual Status OpenSession(const std::string& user_name, TUniqueId& new_session_id,
+      const QueryOptionMap& query_opts = {});
+  virtual bool CloseSession(const impala::TUniqueId& session_id);
+  virtual Status ExecuteIgnoreResults(const std::string& user_name,
+      const std::string& sql, const QueryOptionMap& query_opts = {},
+      const bool persist_in_db = true, TUniqueId* query_id = nullptr);
+  virtual Status ExecuteAndFetchAllHS2(const std::string& user_name,
+      const std::string& sql,
+      std::vector<apache::hive::service::cli::thrift::TRow>& results,
+      const QueryOptionMap& query_opts = {}, const bool persist_in_db = true,
+      results_columns* columns = nullptr, TUniqueId* query_id = nullptr);
+  virtual Status SubmitAndWait(const std::string& user_name, const std::string& sql,
+      TUniqueId& new_session_id, TUniqueId& new_query_id,
+      const QueryOptionMap& query_opts = {}, const bool persist_in_db = true);
+  virtual Status WaitForResults(TUniqueId& query_id);
+  virtual Status SubmitQuery(const std::string& sql, const impala::TUniqueId& session_id,
+      TUniqueId& new_query_id, const bool persist_in_db = true);
+  virtual Status FetchAllRowsHS2(const TUniqueId& query_id,
+      std::vector<apache::hive::service::cli::thrift::TRow>& results,
+      results_columns* columns = nullptr);
+  virtual void CloseQuery(const TUniqueId& query_id);
+  virtual void GetConnectionContextList(
+      ThriftServer::ConnectionContextList* connection_contexts);
+  /// end of InternalServer methods
 
   void CatalogUpdateCallback(const StatestoreSubscriber::TopicDeltaMap& topic_deltas,
       std::vector<TTopicDelta>* topic_updates);
@@ -417,27 +456,32 @@ class ImpalaServer : public ImpalaServiceIf,
   /// been updated from a statestore heartbeat that includes this catalog
   /// update's version.
   ///
-  /// If wait_for_all_subscribers is true, this function also
-  /// waits for all other catalog topic subscribers to process this update by checking the
-  /// current min_subscriber_topic_version included in each state store heartbeat.
+  /// If 'wait_for_all_subscribers' is true, this function also waits for all other
+  /// catalog topic subscribers to process this update by checking the current
+  /// min_subscriber_topic_version included in each state store heartbeat.
+  ///
+  /// 'query_options' is used for running debug actions.
   Status ProcessCatalogUpdateResult(const TCatalogUpdateResult& catalog_update_result,
-      bool wait_for_all_subscribers) WARN_UNUSED_RESULT;
+      bool wait_for_all_subscribers, const TQueryOptions& query_options,
+      RuntimeProfile::EventSequence* timeline)
+      WARN_UNUSED_RESULT;
 
   /// Wait until the catalog update with version 'catalog_update_version' is
   /// received and applied in the local catalog cache or until the catalog
   /// service id has changed.
   void WaitForCatalogUpdate(const int64_t catalog_update_version,
-      const TUniqueId& catalog_service_id);
+      const TUniqueId& catalog_service_id, RuntimeProfile::EventSequence* timeline);
 
   /// Wait until the minimum catalog object version in the local cache is
   /// greater than 'min_catalog_update_version' or until the catalog
   /// service id has changed.
   void WaitForMinCatalogUpdate(const int64_t min_catalog_update_version,
-      const TUniqueId& catalog_service_id);
+      const TUniqueId& catalog_service_id, RuntimeProfile::EventSequence* timeline);
 
   /// Wait until the last applied catalog update has been broadcast to
   /// all coordinators or until the catalog service id has changed.
-  void WaitForCatalogUpdateTopicPropagation(const TUniqueId& catalog_service_id);
+  void WaitForCatalogUpdateTopicPropagation(const TUniqueId& catalog_service_id,
+      RuntimeProfile::EventSequence* timeline);
 
   /// Returns true if lineage logging is enabled, false otherwise.
   ///
@@ -468,6 +512,11 @@ class ImpalaServer : public ImpalaServiceIf,
   /// the server has started successfully.
   int GetHS2Port();
 
+  /// Return the number of live queries managed by this server. Acquires
+  /// completed_queries_lock_ to check for completed queries that have not been written.
+  /// (implemented in workload-management-worker.cc)
+  size_t NumLiveQueries();
+
   /// Returns a current snapshot of the local backend descriptor.
   std::shared_ptr<const BackendDescriptorPB> GetLocalBackendDescriptor();
 
@@ -482,6 +531,10 @@ class ImpalaServer : public ImpalaServiceIf,
   /// failed ones (that is, ids not in the active set).
   void CancelQueriesOnFailedBackends(
       const std::unordered_set<BackendIdPB>& current_membership);
+
+  /// Returns true if all services required for the server have been started and the
+  /// registration with statestore is completed.
+  bool AreServicesReady() const;
 
   /// Start the shutdown process. Return an error if it could not be started. Otherwise,
   /// if it was successfully started by this or a previous call, return OK along with
@@ -513,6 +566,10 @@ class ImpalaServer : public ImpalaServiceIf,
 
   /// Returns true if 'user' was configured as an authorized proxy user.
   bool IsAuthorizedProxyUser(const std::string& user) WARN_UNUSED_RESULT;
+
+  /// Gets connection contexts for all types of thrift servers.
+  void GetAllConnectionContexts(
+      ThriftServer::ConnectionContextList* connection_contexts);
 
   // Mapping between query option names and levels
   QueryOptionLevels query_option_levels_;
@@ -557,11 +614,19 @@ class ImpalaServer : public ImpalaServiceIf,
     /// Connected user for this session, i.e. the user which originated this session.
     std::string connected_user;
 
+    /// Short username for connected user. Only applies when connected_user is a kerberos
+    /// principal. Only applicable for hs2 sessions.
+    std::string connected_user_short;
+
     /// The user to delegate to. Empty for no delegation.
     std::string do_as_user;
 
     /// Client network address.
     TNetworkAddress network_address;
+
+    /// If using hs2-http protocol, this is the origin of the session
+    /// as recorded in the X-Forwarded-For http message header.
+    std::string http_origin;
 
     /// Protects all fields below. See "Locking" in the class comment for lock
     /// acquisition order.
@@ -599,6 +664,15 @@ class ImpalaServer : public ImpalaServiceIf,
     /// are either queued or have started executing. Used primarily to identify queries
     /// that need to be closed if the session closes or expires.
     boost::unordered_set<TUniqueId> inflight_queries;
+
+    /// Queries are added to inflight_queries via SetQueryInflight. Execution is async
+    /// and can start before SetQueryInflight is called. If a query is retried before
+    /// SetQueryInflight is called, the original may be cleaned up before it is added to
+    /// inflight_queries. In that case we add it to prestopped_queries instead.
+    std::set<TUniqueId> prestopped_queries;
+
+    /// Unregistered queries we need to clear from idle_query_statuses_ on closure.
+    std::vector<TUniqueId> idled_queries;
 
     /// Total number of queries run as part of this session.
     int64_t total_queries;
@@ -642,6 +716,18 @@ class ImpalaServer : public ImpalaServiceIf,
     TQueryOptions QueryOptions();
   };
 
+  /// Helper function that decrements the value associated with the given key, and
+  /// returns the new value. If the value becomes zero, then the entry is removed from
+  /// the map
+  static int64_t DecrementCount(
+      std::map<std::string, int64_t>& loads, const std::string& key);
+
+  /// Try cancelling and unregistering the query with the given query_id as the
+  /// requesting_user. 'is_admin' is true if requesting_user is an admin.
+  /// This method is used in executing a KILL QUERY statement.
+  Status KillQuery(
+      const TUniqueId& query_id, const std::string& requesting_user, bool is_admin);
+
  private:
   struct ExpirationEvent;
   class SecretArg;
@@ -651,9 +737,14 @@ class ImpalaServer : public ImpalaServiceIf,
   friend struct SessionState;
   friend class ImpalaServerTest;
   friend class QueryDriver;
+  friend class QueryScanner;
 
+  static const string BEESWAX_SERVER_NAME;
+  static const string HS2_SERVER_NAME;
+  static const string HS2_HTTP_SERVER_NAME;
+  static const string INTERNAL_SERVER_NAME;
   // Used to identify external frontend RPC calls
-  const string EXTERNAL_FRONTEND_SERVER_NAME = "external-frontend";
+  static const string EXTERNAL_FRONTEND_SERVER_NAME;
 
   boost::scoped_ptr<ImpalaHttpHandler> http_handler_;
 
@@ -664,6 +755,9 @@ class ImpalaServer : public ImpalaServiceIf,
   static const char* SQLSTATE_OPTIONAL_FEATURE_NOT_IMPLEMENTED;
   /// String format of retry information returned in GetLog() RPCs.
   static const char* GET_LOG_QUERY_RETRY_INFO_FORMAT;
+  /// String format of errors related to a query. It contains a placeholder for
+  /// the query id.
+  static const char* QUERY_ERROR_FORMAT;
 
   /// Used in situations where the client provides a session ID and a query ID and the
   /// caller needs to validate that the query can be accessed from the session. The two
@@ -690,14 +784,14 @@ class ImpalaServer : public ImpalaServiceIf,
   /// have been checked out.
   /// external_exec_request is a statement that was prepared by an external frontend using
   /// Impala PlanNodes or null if the external frontend isn't being used.
-  Status Execute(TQueryCtx* query_ctx, std::shared_ptr<SessionState> session_state,
-      QueryHandle* query_handle,
-      const TExecRequest* external_exec_request) WARN_UNUSED_RESULT;
+  Status Execute(TQueryCtx* query_ctx, const std::shared_ptr<SessionState>& session_state,
+      QueryHandle* query_handle, const TExecRequest* external_exec_request,
+      const bool include_in_query_log = true) WARN_UNUSED_RESULT;
 
   /// Implements Execute() logic, but doesn't unregister query on error.
   Status ExecuteInternal(const TQueryCtx& query_ctx,
       const TExecRequest* external_exec_request,
-      std::shared_ptr<SessionState> session_state, bool* registered_query,
+      const std::shared_ptr<SessionState>& session_state, bool* registered_query,
       QueryHandle* query_handle);
 
   /// Common execution logic factored out from Execute to be shared with
@@ -711,19 +805,24 @@ class ImpalaServer : public ImpalaServiceIf,
   /// Registers the query with query_driver_map_ using the globally unique query_id. The
   /// caller must have checked out the session state.
   Status RegisterQuery(const TUniqueId& query_id,
-      std::shared_ptr<SessionState> session_state,
+      const std::shared_ptr<SessionState>& session_state,
       QueryHandle* query_handle) WARN_UNUSED_RESULT;
 
   /// Adds the query to the set of in-flight queries for the session. The query remains
-  /// in-flight until the query is unregistered.  Until a query is in-flight, an attempt
-  /// to cancel or close the query by the user will return an error status.  If the
-  /// session is closed before a query is in-flight, then the query cancellation is
-  /// deferred until after the issuing path has completed initializing the query.  Once
+  /// in-flight until the query is unregistered. Until a query is in-flight, an attempt
+  /// to cancel or close the query by the user will return an error status. A query that
+  /// retries may close the original query state before SetQueryInflight is called; in
+  /// that case it adds the query to prestopped_queries, which will bypass unnecessary
+  /// setup when SetQueryInflight is later called on it.
+  ///
+  /// If the session is closed before a query is in-flight, then the query cancellation
+  /// is deferred until after the issuing path has completed initializing the query. Once
   /// a query is in-flight, it can be cancelled/closed asynchronously by the user
   /// (e.g. via an RPC) and the session close path can close (cancel and unregister) it.
-  /// The query must have already been registered using RegisterQuery().  The caller
+  ///
+  /// The query must have already been registered using RegisterQuery(). The caller
   /// must have checked out the session state.
-  Status SetQueryInflight(std::shared_ptr<SessionState> session_state,
+  Status SetQueryInflight(const std::shared_ptr<SessionState>& session_state,
       const QueryHandle& query_handle) WARN_UNUSED_RESULT;
 
   /// Starts the process of unregistering the query. The query is cancelled on the
@@ -886,119 +985,18 @@ class ImpalaServer : public ImpalaServiceIf,
   /// Initializes the backend descriptor in 'be_desc' with the local backend information.
   void BuildLocalBackendDescriptorInternal(BackendDescriptorPB* be_desc);
 
-  /// Snapshot of a query's state, archived in the query log. Not mutated after
-  /// construction.
-  struct QueryStateRecord {
-    /// Compressed representation of profile returned by RuntimeProfile::Compress().
-    /// Must be initialised to a valid value if this is a completed query.
-    /// Empty if this was initialised from a running query.
-    const std::vector<uint8_t> compressed_profile;
+  /// Converts a type to a string. The only complex types supported are array and map,
+  /// which are returned as strings (see IMPALA-11041).
+  std::string ColumnTypeToBeeswaxTypeString(const TColumnType& type);
 
-    /// Query id
-    TUniqueId id;
-
-    /// Queries are run and authorized on behalf of the effective_user.
-    /// If there is no delegated user, this will be the connected user. Otherwise, it
-    /// will be set to the delegated user.
-    std::string effective_user;
-
-    /// If true, effective_user has access to the runtime profile and execution
-    /// summary.
-    bool user_has_profile_access;
-
-    /// default db for this query
-    std::string default_db;
-
-    /// SQL statement text
-    std::string stmt;
-
-    /// Text representation of plan
-    std::string plan;
-
-    /// DDL, DML etc.
-    TStmtType::type stmt_type;
-
-    /// True if the query required a coordinator fragment
-    bool has_coord;
-
-    /// The number of fragments that have completed
-    int64_t num_complete_fragments;
-
-    /// The total number of fragments
-    int64_t total_fragments;
-
-    /// The number of rows fetched by the client
-    int64_t num_rows_fetched;
-
-    /// The state of the query as of this snapshot. The possible values for the
-    /// query_state = union(beeswax::QueryState, ClientRequestState::RetryState). This is
-    /// necessary so that the query_state can accurately reflect if a query has been
-    /// retried or not. This string is not displayed in the runtime profiles, it is only
-    /// displayed on the /queries endpoint of the Web UI when listing out the state of
-    /// each query. This is necessary so that users can clearly see if a query has been
-    /// retried or not.
-    std::string query_state;
-
-    /// The beeswax::QueryState of the query as of this snapshot.
-    beeswax::QueryState::type beeswax_query_state;
-
-    /// Start and end time of the query, in Unix microseconds.
-    /// A query whose end_time_us is 0 indicates that it is an in-flight query.
-    /// These two variables are initialized with the corresponding values from
-    /// ClientRequestState.
-    int64_t start_time_us, end_time_us;
-
-    /// Summary of execution for this query.
-    TExecSummary exec_summary;
-
-    Status query_status;
-
-    /// Timeline of important query events
-    TEventSequence event_sequence;
-
-    /// Save the query plan fragments so that the plan tree can be rendered on the debug
-    /// webpages.
-    vector<TPlanFragment> fragments;
-
-    // If true, this query has no more rows to return
-    bool all_rows_returned;
-
-    // The most recent time this query was actively being processed, in Unix milliseconds.
-    int64_t last_active_time_ms;
-
-    /// Resource pool to which the request was submitted for admission, or an empty
-    /// string if this request doesn't go through admission control.
-    std::string resource_pool;
-
-    /// True if this query was retried, false otherwise.
-    bool was_retried = false;
-
-    /// If this query was retried, the query id of the retried query.
-    std::unique_ptr<const TUniqueId> retried_query_id;
-
-    /// Initialise from 'exec_state' of a completed query. 'compressed_profile' must be
-    /// a runtime profile decompressed with RuntimeProfile::Compress().
-    QueryStateRecord(
-        const ClientRequestState& exec_state, std::vector<uint8_t>&& compressed_profile);
-
-    /// Initialize from 'exec_state' of a running query
-    QueryStateRecord(const ClientRequestState& exec_state);
-
-    /// Default constructor used only when participating in collections
-    QueryStateRecord() { }
-
-   private:
-    // Common initialization for constructors.
-    void Init(const ClientRequestState& exec_state);
-  };
-
-  struct QueryStateRecordLessThan {
-    /// Comparator that sorts by start time.
-    bool operator() (const QueryStateRecord& lhs, const QueryStateRecord& rhs) const;
-  };
+  /// Places a completed query into the in-memory queue of completed queries.
+  /// (implemented in workload-management-worker.cc)
+  void EnqueueCompletedQuery(
+      const QueryHandle& query_handle, std::shared_ptr<QueryStateRecord> qs_rec);
 
   /// Returns the active QueryHandle for this query id. The QueryHandle contains the
   /// active ClientRequestState. Returns an error Status if the query id cannot be found.
+  /// If caller is an RPC thread, RPC context will be registered for time tracking
   /// See QueryDriver for a description of active ClientRequestStates.
   Status GetActiveQueryHandle(
       const TUniqueId& query_id, QueryHandle* query_handle);
@@ -1037,11 +1035,14 @@ class ImpalaServer : public ImpalaServiceIf,
       const beeswax::QueryHandle& beeswax_handle, TUniqueId* query_id);
 
   /// Helper function to raise BeeswaxException
+  ///
+  /// To include query id in the error message, it is required that the query id of the
+  /// thread debug info is set in at least the caller's scope.
   [[noreturn]] void RaiseBeeswaxException(const std::string& msg, const char* sql_state);
 
   /// Executes the fetch logic. Doesn't clean up the exec state if an error occurs.
-  Status FetchInternal(TUniqueId query_id, bool start_over,
-      int32_t fetch_size, beeswax::Results* query_results) WARN_UNUSED_RESULT;
+  Status FetchInternal(const TUniqueId& query_id, bool start_over, int32_t fetch_size,
+      beeswax::Results* query_results) WARN_UNUSED_RESULT;
 
   /// Populate dml_result and clean up exec state. If the query
   /// status is an error, dml_result is not populated and the status is returned.
@@ -1069,8 +1070,8 @@ class ImpalaServer : public ImpalaServiceIf,
   /// 'num_results'. If fetch_first is true, then the query's state should be reset to
   /// fetch from the beginning of the result set. Doesn't clean up exec state if an
   /// error occurs.
-  Status FetchInternal(TUniqueId query_id, SessionState* session, int32_t fetch_size,
-      bool fetch_first,
+  Status FetchInternal(const TUniqueId& query_id, SessionState* session,
+      int32_t fetch_size, bool fetch_first,
       apache::hive::service::cli::thrift::TFetchResultsResp* fetch_results,
       int32_t* num_results) WARN_UNUSED_RESULT;
 
@@ -1082,7 +1083,8 @@ class ImpalaServer : public ImpalaServiceIf,
   /// dynamically scroll through the results, but also allow users to download a file
   /// containing all the results for a query.
   Status SetupResultsCacheing(const QueryHandle& query_handle,
-      std::shared_ptr<SessionState> session, int64_t cache_num_rows) WARN_UNUSED_RESULT;
+      const std::shared_ptr<SessionState>& session,
+      int64_t cache_num_rows) WARN_UNUSED_RESULT;
 
   /// Helper functions to translate between HiveServer2 and Impala structs
 
@@ -1160,14 +1162,33 @@ class ImpalaServer : public ImpalaServiceIf,
   /// current query ids to the admissiond.
   [[noreturn]] void AdmissionHeartbeatThread();
 
+  /// Blocks until running workload management threads are shut down.
+  /// (implemented in workload-management-worker.cc)
+  void ShutdownWorkloadManagement();
+
+  /// Periodically writes out completed queries (if configured)
+  /// (implemented in workload-management-worker.cc)
+  void WorkloadManagementWorker(const kudu::Version& target_schema_version);
+
+  /// Checks if the workload management state is `SHUTTING_DOWN`. If so, changes the
+  /// workload management state to `SHUTDOWN`,  and returns true. Otherwise, takes no
+  /// action and returns false.
+  bool IsWorkloadManagementShuttingDown();
+
+  /// Returns a list of completed queries that have not yet been written to storage.
+  /// Acquires completed_queries_lock_ to make a copy of completed_queries_ state.
+  /// (implemented in workload-management-worker.cc)
+  std::vector<std::shared_ptr<QueryStateExpanded>> GetCompletedQueries();
+
   /// Called from ExpireQueries() to check query resource limits for 'crs'. If the query
   /// exceeded a resource limit, returns a non-OK status with information about what
   /// limit was exceeded. Returns OK if the query will continue running and expiration
   /// check should be rescheduled for a later time.
   Status CheckResourceLimits(ClientRequestState* crs);
 
-  /// Expire 'crs' and cancel it with status 'status'.
-  void ExpireQuery(ClientRequestState* crs, const Status& status);
+  /// Expire 'crs' and cancel it with status 'status'. Optionally unregisters the query.
+  void ExpireQuery(ClientRequestState* crs, const Status& status,
+      bool unregister = false);
 
   typedef boost::unordered_map<std::string, boost::unordered_set<std::string>>
       AuthorizedProxyMap;
@@ -1187,30 +1208,45 @@ class ImpalaServer : public ImpalaServiceIf,
   /// Random number generator for use in this class, thread safe.
   static ThreadSafeRandom rng_;
 
-  /// Guards query_log_ and query_log_index_
+  /// Guards query_log_, query_log_index_, and query_log_est_sizes_.
   std::mutex query_log_lock_;
 
   /// FIFO list of query records, which are written after the query finishes executing.
   /// Queries may briefly have entries in 'query_log_' and 'query_driver_map_'
-  /// while the query is being unregistered.
-  typedef std::list<std::unique_ptr<QueryStateRecord>> QueryLog;
+  /// while the query is being unregistered. To ensure that the records provided by
+  /// GetQueryRecord function are always valid, this list uses shared_ptr to hold
+  /// QueryStateRecord, preventing its lifecycle from ending prematurely due to removal
+  /// from the list.
+  typedef std::list<std::shared_ptr<QueryStateRecord>> QueryLog;
   QueryLog query_log_;
 
   /// Index that allows lookup via TUniqueId into the query log. The QueryStateRecord
-  /// value is owned by 'query_log_' so the entry in this index must be removed when
+  /// pointer is owned by 'query_log_' so the entry in this index must be removed when
   /// it is removed from 'query_log_'.
-  typedef boost::unordered_map<TUniqueId, QueryStateRecord*> QueryLogIndex;
+  typedef boost::unordered_map<TUniqueId, std::shared_ptr<QueryStateRecord>*>
+      QueryLogIndex;
   QueryLogIndex query_log_index_;
 
-  /// Sets the given QueryLogIndex for the given query_id. Returns an error Status if the
-  /// given query_id cannot be found in the QueryLogIndex.
+  /// Estimated individual size of records in query_log_ in bytes.
+  std::list<int64_t> query_log_est_sizes_;
+
+  /// Sets the given query_record (and retried_query_record too if given) for the given
+  /// query_id. Returns an error Status if the given query_id cannot be found in the
+  /// QueryLogIndex.
   Status GetQueryRecord(
-      const TUniqueId& query_id, QueryLogIndex::const_iterator* query_record);
+      const TUniqueId& query_id, std::shared_ptr<QueryStateRecord>* query_record,
+      std::shared_ptr<QueryStateRecord>* retried_query_record = nullptr);
 
   /// Decompresses the profile in the given QueryStateRecord into the specified format.
   /// The decompressed profile is added to the given RuntimeProfileOutput.
   Status DecompressToProfile(TRuntimeProfileFormat::type format,
-      QueryLogIndex::const_iterator query_record, RuntimeProfileOutput* profile);
+      const QueryStateRecord& query_record, RuntimeProfileOutput* profile);
+
+  void WaitForNewCatalogServiceId(
+      const TUniqueId& cur_service_id, std::unique_lock<std::mutex>* ver_lock);
+
+  /// Random `impala::TUniqueID` generator. Use wherever a new `TUniqueId` is needed.
+  TUniqueId RandomUniqueID();
 
   /// Logger for writing encoded query profiles, one per line with the following format:
   /// <ms-since-epoch> <query-id> <thrift query profile URL encoded and gzipped>
@@ -1355,30 +1391,7 @@ class ImpalaServer : public ImpalaServiceIf,
     /// 'secret' must be provided and is validated against the stored secret for the
     /// session. Must only be called once per ScopedSessionState.
     Status WithSession(const TUniqueId& session_id, const SecretArg& secret,
-        std::shared_ptr<SessionState>* session = NULL) WARN_UNUSED_RESULT {
-      DCHECK(session_.get() == NULL);
-      RETURN_IF_ERROR(impala_->GetSessionState(
-            session_id, secret, &session_, /* mark_active= */ true));
-      if (session != NULL) (*session) = session_;
-
-      // We won't have a connection context in the case of ChildQuery, which calls into
-      // hiveserver2 functions directly without going through the Thrift stack.
-      if (ThriftServer::HasThreadConnectionContext()) {
-        // Check that the session user matches the user authenticated on the connection.
-        const ThriftServer::Username& connection_username =
-            ThriftServer::GetThreadConnectionContext()->username;
-        if (!connection_username.empty()
-            && session_->connected_user != connection_username) {
-          return Status::Expected(TErrorCode::UNAUTHORIZED_SESSION_USER,
-              connection_username, session_->connected_user);
-        }
-
-        // Try adding the session id to the connection's set of sessions in case this is
-        // the first time this session has been used on this connection.
-        impala_->AddSessionToConnection(session_id, session_.get());
-      }
-      return Status::OK();
-    }
+        std::shared_ptr<SessionState>* session = NULL) WARN_UNUSED_RESULT;
 
     /// Same as WithSession(), except:
     /// * It should only be called from beeswax with a 'connection_id' obtained from
@@ -1421,9 +1434,31 @@ class ImpalaServer : public ImpalaServiceIf,
   typedef boost::unordered_map<TUniqueId, std::shared_ptr<SessionState>> SessionStateMap;
   SessionStateMap session_state_map_;
 
+  /// Protects idle_query_statuses_;
+  std::mutex idle_query_statuses_lock_;
+
+  /// A map of queries that were stopped due to idle timeout and the status they had when
+  /// unregistered. Used to return a more useful error when looking up unregistered IDs.
+  std::map<TUniqueId, Status> idle_query_statuses_;
+
   /// Protects connection_to_sessions_map_. See "Locking" in the class comment for lock
   /// acquisition order.
   std::mutex connection_to_sessions_map_lock_;
+
+  /// A map from user to a count of sessions created by the user.
+  typedef std::map<std::string, int64_t> SessionCounts;
+  SessionCounts per_user_session_count_map_;
+
+  /// Protects per_user_session_count_map_. See "Locking" in the class comment for lock
+  /// acquisition order.
+  std::mutex per_user_session_count_lock_;
+
+  /// Increment the count of HS2 sessions used by the user.
+  /// If max_hs2_sessions_per_user is greater than zero, and the count of HS2 sessions
+  /// used by the user would be above that value, then an error status is returned.
+  Status IncrementAndCheckSessionCount(const string& user_name);
+  /// Decrement the count of HS2 sessions used by the user.
+  void DecrementSessionCount(const string& user_name);
 
   /// Map from a connection ID to the associated list of sessions so that all can be
   /// closed when the connection ends. HS2 allows for multiplexing several sessions across
@@ -1431,6 +1466,15 @@ class ImpalaServer : public ImpalaServiceIf,
   /// is not removed from this map to avoid the cost of looking it up.
   typedef boost::unordered_map<TUniqueId, std::set<TUniqueId>> ConnectionToSessionMap;
   ConnectionToSessionMap connection_to_sessions_map_;
+
+  /// Map storing connections opened by the methods from the InternalServer interface.
+  /// Key is the session id, value is a shared pointer holding the connection's
+  /// ConnectionContext. Use the `internal_server_connections_lock_` mutex whenever
+  /// accessing this map
+  typedef std::map<TUniqueId, std::shared_ptr<ThriftServer::ConnectionContext>>
+      SessionToConnectionContext;
+  SessionToConnectionContext internal_server_connections_;
+  std::mutex internal_server_connections_lock_;
 
   /// Returns session state for given session_id.
   /// If not found or validation of 'secret' against the stored secret in the
@@ -1443,7 +1487,7 @@ class ImpalaServer : public ImpalaServiceIf,
 
   /// Decrement the session's reference counter and mark last_accessed_ms so that state
   /// expiration can proceed.
-  inline void MarkSessionInactive(std::shared_ptr<SessionState> session) {
+  inline void MarkSessionInactive(const std::shared_ptr<SessionState>& session) {
     std::lock_guard<std::mutex> l(session->lock);
     DCHECK_GT(session->ref_count, 0);
     --session->ref_count;
@@ -1451,7 +1495,7 @@ class ImpalaServer : public ImpalaServiceIf,
   }
 
   /// Increment the session's reference counter.
-  inline void MarkSessionActive(std::shared_ptr<SessionState> session) {
+  inline void MarkSessionActive(const std::shared_ptr<SessionState>& session) {
     std::lock_guard<std::mutex> l(session->lock);
     ++session->ref_count;
   }
@@ -1465,8 +1509,9 @@ class ImpalaServer : public ImpalaServiceIf,
 
   /// Entries in the 'query_locations' map.
   struct QueryLocationInfo {
-    QueryLocationInfo(NetworkAddressPB address, TUniqueId query_id) : address(address) {
-      query_ids.insert(query_id);
+    QueryLocationInfo(NetworkAddressPB address, TUniqueId query_id)
+      : address(std::move(address)) {
+      query_ids.insert(std::move(query_id));
     }
 
     /// Used for logging and error messages so that users don't have to translate between
@@ -1508,6 +1553,7 @@ class ImpalaServer : public ImpalaServiceIf,
       catalog_topic_version(0L),
       catalog_object_version_lower_bound(0L) {
     }
+
     /// Update the metrics to store the current version of catalog, current topic and
     /// current service id used by impalad.
     void  UpdateCatalogVersionMetrics();
@@ -1564,7 +1610,7 @@ class ImpalaServer : public ImpalaServiceIf,
 
   /// Comparator that breaks ties when two queries have identical expiration deadlines.
   struct ExpirationEventComparator {
-    bool operator()(const ExpirationEvent& t1, const ExpirationEvent& t2) {
+    bool operator()(const ExpirationEvent& t1, const ExpirationEvent& t2) const {
       if (t1.deadline < t2.deadline) return true;
       if (t2.deadline < t1.deadline) return false;
       if (t1.query_id < t2.query_id) return true;
@@ -1630,5 +1676,16 @@ class ImpalaServer : public ImpalaServiceIf,
   /// Stores the last version number for the admission heartbeat that was sent.
   /// Incremented every time a new admission heartbeat is sent.
   int64_t admission_heartbeat_version_ = 0;
+
+  /// Workload Management Related Declarations.
+  /// Tracks the state of workload management processing. Access to workload_mgmt_state_
+  /// must only happen while holding the workload_mgmt_state_mu_ lock.
+  std::mutex workload_mgmt_state_mu_;
+  workloadmgmt::WorkloadManagementState workload_mgmt_state_ =
+      workloadmgmt::WorkloadManagementState::NOT_STARTED;
+
+  /// Thread that runs Workload Management.
+  std::unique_ptr<Thread> workload_management_thread_;
+
 };
 }

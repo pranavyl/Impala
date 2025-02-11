@@ -60,7 +60,6 @@ using namespace strings;
 using boost::shared_mutex;
 using boost::filesystem::path;
 using boost::uuids::random_generator;
-using std::to_string;
 
 // Control the number of disks on the machine.  If 0, this comes from the system
 // settings.
@@ -75,6 +74,19 @@ DEFINE_string(data_cache, "", "The configuration string for IO data cache. "
     "a capacity quota per directory. For example /data/0,/data/1:1TB means the cache "
     "may use up to 2TB, with 1TB max in /data/0 and /data/1 respectively. Please note "
     "that each Impala daemon on a host must have a unique caching directory.");
+DEFINE_int32(data_cache_num_async_write_threads, 0,
+    "(Experimental) Number of data cache async write threads. Write threads will write "
+    "the cache asynchronously after IO thread read data, so IO thread will return more "
+    "quickly. The extra memory for temporary buffers is limited by "
+    "--data_cache_async_write_buffer_limit. If this's 0, then write will be "
+    "synchronous.");
+
+DEFINE_bool(data_cache_keep_across_restarts, false,
+    "(Experimental) If this is true, the data cache metadata is dumped to the same "
+    "directory as the cached files on disk when the process gracefully shutdowns. The "
+    "metadata will be reloaded the next time the process starts, so that the previous "
+    "cached data can be reused as if the process had never shutdown. If loading fails, "
+    "it will proceed with regular initialization.");
 
 // Rotational disks should have 1 thread per disk to minimize seeks.  Non-rotational
 // don't have this penalty and benefit from multiple concurrent IO requests.
@@ -145,6 +157,9 @@ DEFINE_int32(num_ozone_io_threads, 16, "Number of Ozone I/O threads");
 // The maximum number of SFS I/O threads.
 DEFINE_int32(num_sfs_io_threads, 16, "Number of SFS I/O threads");
 
+// The maximum number of OBS I/O threads.
+DEFINE_int32(num_obs_io_threads, 16, "Number of OBS I/O threads");
+
 // The number of cached file handles defines how much memory can be used per backend for
 // caching frequently used file handles. Measurements indicate that a single file handle
 // uses about 6kB of memory. 20k file handles will thus reserve ~120MB of memory.
@@ -191,6 +206,9 @@ DEFINE_bool(cache_s3_file_handles, true, "Enable the file handle cache for "
 DEFINE_bool(cache_abfs_file_handles, true, "Enable the file handle cache for "
     "ABFS files.");
 
+DEFINE_bool(cache_ozone_file_handles, true, "Enable the file handle cache for Ozone "
+    "files.");
+
 DECLARE_int64(min_buffer_size);
 
 static const char* DEVICE_NAME_METRIC_KEY_TEMPLATE =
@@ -219,14 +237,13 @@ string DiskIoMgr::DebugString() {
 }
 
 WriteRange::WriteRange(
-    const string& file, int64_t file_offset, int disk_id, WriteDoneCallback callback)
-  : RequestRange(RequestType::WRITE), callback_(callback) {
-  SetRange(file, file_offset, disk_id);
+    string file, int64_t file_offset, int disk_id, WriteDoneCallback callback)
+  : RequestRange(RequestType::WRITE), callback_(move(callback)) {
+  SetRange(move(file), file_offset, disk_id);
 }
 
-void WriteRange::SetRange(
-    const std::string& file, int64_t file_offset, int disk_id) {
-  file_ = file;
+void WriteRange::SetRange(std::string file, int64_t file_offset, int disk_id) {
+  file_ = move(file);
   offset_ = file_offset;
   disk_id_ = disk_id;
 }
@@ -261,6 +278,7 @@ Status WriteRange::DoWrite() {
     ret_status = file_writer->Open();
     if (!ret_status.ok()) return DoWriteEnd(queue, ret_status);
     ret_status = file_writer->Write(this, &written_bytes);
+    disk_file_->UpdateReadBufferMetaDataIfNeeded(written_bytes - len_);
     int64_t actual_file_size = disk_file_->actual_file_size();
     // actual_file_size is only set once, otherwise it is 0 by default. If it is still
     // not set, it is impossible to be full.
@@ -294,28 +312,23 @@ Status WriteRange::DoWriteEnd(DiskQueue* queue, const Status& ret_status) {
 
 RemoteOperRange::RemoteOperRange(DiskFile* src_file, DiskFile* dst_file,
     int64_t block_size, int disk_id, RequestType::type type, DiskIoMgr* io_mgr,
-    RemoteOperDoneCallback callback)
-  : RequestRange(type, disk_id),
-    callback_(callback),
+    RemoteOperDoneCallback callback, int64_t file_offset)
+  : RequestRange(type, disk_id, file_offset),
+    callback_(move(callback)),
     io_mgr_(io_mgr),
     disk_file_src_(src_file),
     disk_file_dst_(dst_file),
     block_size_(block_size) {}
 
-Status RemoteOperRange::DoOper(uint8_t* buffer, int64_t buffer_size) {
-  DCHECK(request_type() == RequestType::FILE_UPLOAD);
-  return DoUpload(buffer, buffer_size);
-}
-
 Status RemoteOperRange::DoUpload(uint8_t* buffer, int64_t buffer_size) {
   DCHECK(disk_file_src_ != nullptr);
   DCHECK(disk_file_dst_ != nullptr);
   hdfsFS hdfs_conn = disk_file_dst_->hdfs_conn_;
-  int64_t file_size = disk_file_src_->actual_file_size_.Load();
+  int64_t file_size = disk_file_src_->actual_file_size();
   DCHECK(hdfs_conn != nullptr);
   DCHECK(file_size != 0);
-  const char* remote_file_path = disk_file_dst_->path().c_str();
-  const char* local_file_path = disk_file_src_->path().c_str();
+  const string& remote_file_path = disk_file_dst_->path();
+  const string& local_file_path = disk_file_src_->path();
   DiskQueue* queue = io_mgr_->disk_queues_[disk_id_];
   Status status = Status::OK();
   int64_t ret, offset = 0;
@@ -335,9 +348,9 @@ Status RemoteOperRange::DoUpload(uint8_t* buffer, int64_t buffer_size) {
   }
 
   RETURN_IF_ERROR(io_mgr_->local_file_system_->OpenForRead(
-      local_file_path, O_RDONLY, S_IRUSR | S_IWUSR, &local_file));
+      local_file_path.c_str(), O_RDONLY, S_IRUSR | S_IWUSR, &local_file));
   hdfsFile remote_hdfs_file =
-      hdfsOpenFile(hdfs_conn, remote_file_path, O_WRONLY, 0, 0, buffer_size);
+      hdfsOpenFile(hdfs_conn, remote_file_path.c_str(), O_WRONLY, 0, 0, buffer_size);
 
   if (remote_hdfs_file == nullptr) {
     status = Status(TErrorCode::DISK_IO_ERROR, GetBackendString(),
@@ -348,9 +361,12 @@ Status RemoteOperRange::DoUpload(uint8_t* buffer, int64_t buffer_size) {
   /// Read the blocks from the local buffer file and write the blocks
   /// to the remote file.
   while (file_size != offset) {
+    // If to_delete flag is set, we will quit the upload process, close the local file
+    // but leave the deletion work to the thread which sets the to_delete flag.
+    if (disk_file_src_->is_to_delete()) goto end;
     int bytes = min(file_size - offset, buffer_size);
-    status =
-        io_mgr_->local_file_system_->Fread(local_file, buffer, bytes, local_file_path);
+    status = io_mgr_->local_file_system_->Fread(
+        local_file, buffer, bytes, local_file_path.c_str());
     if (!status.ok()) goto end;
     {
       ScopedHistogramTimer write_timer(queue->write_latency());
@@ -375,18 +391,95 @@ end:
     ScopedHistogramTimer write_timer(queue->write_latency());
     if (hdfsCloseFile(hdfs_conn, remote_hdfs_file) != 0) {
       // Try to close the local file if error happens.
-      RETURN_IF_ERROR(io_mgr_->local_file_system_->Fclose(local_file, local_file_path));
+      RETURN_IF_ERROR(
+          io_mgr_->local_file_system_->Fclose(local_file, local_file_path.c_str()));
       return Status(TErrorCode::DISK_IO_ERROR, GetBackendString(),
           Substitute(
               "Failed to close HDFS file: $0", remote_file_path, GetHdfsErrorMsg("")));
     }
   }
-  RETURN_IF_ERROR(io_mgr_->local_file_system_->Fclose(local_file, local_file_path));
+  RETURN_IF_ERROR(
+      io_mgr_->local_file_system_->Fclose(local_file, local_file_path.c_str()));
   if (status.ok()) {
     disk_file_dst_->SetStatus(io::DiskFileStatus::PERSISTED);
     disk_file_dst_->SetActualFileSize(file_size);
+    VLOG(2) << "File upload succeeded. File name: " << remote_file_path;
   } else {
     LOG(WARNING) << "File upload failed, msg:" << status.msg().msg();
+  }
+  return status;
+}
+
+Status RemoteOperRange::DoFetch() {
+  hdfsFS hdfs_conn = disk_file_src_->hdfs_conn_;
+  DCHECK(hdfs_conn != nullptr);
+  // Fetch the data from the source file (remote) to the destination file (local).
+  DCHECK(disk_file_dst_ != nullptr);
+  DCHECK(disk_file_src_ != nullptr);
+  int64_t buffer_idx = disk_file_dst_->GetReadBufferIndex(offset_);
+  int64_t local_file_size = disk_file_dst_->GetReadBuffActualSize(buffer_idx);
+  const string& remote_file_path = disk_file_src_->path();
+  DiskQueue* queue = io_mgr_->disk_queues_[disk_id_];
+  Status status = Status::OK();
+
+  // Get the shared lock to prevent the physical files from deletion during the fetching.
+  // The sequence is to get the local file lock, then remote file lock, or it might meet
+  // deadlocks.
+  shared_lock<shared_mutex> dstl(disk_file_dst_->physical_file_lock_);
+  shared_lock<shared_mutex> srcl(disk_file_src_->physical_file_lock_);
+
+  // Check if the remote file is deleted.
+  auto src_status = disk_file_src_->GetFileStatus();
+  if (src_status != io::DiskFileStatus::PERSISTED) {
+    DCHECK(src_status == io::DiskFileStatus::DELETED);
+    return Status(Substitute("File has been deleted, path: '$0'", remote_file_path));
+  }
+
+  unique_lock<SpinLock> read_buffer_lock(
+      *(disk_file_dst_->GetBufferBlockLock(buffer_idx)));
+  MemBlock* read_buffer_bloc = disk_file_dst_->GetBufferBlock(buffer_idx);
+  if (disk_file_dst_->IsReadBufferBlockStatus(
+          read_buffer_bloc, MemBlockStatus::DISABLED, dstl, &read_buffer_lock)) {
+    // If the read block is disabled, the status doesn't allow any writes to
+    // the block, probably the query ends or is cancelled.
+    return Status(Substitute(
+        "Mem block '$0' has been deleted, path: '$1'", buffer_idx, remote_file_path));
+  }
+  RETURN_IF_ERROR(disk_file_dst_->AllocReadBufferBlockLocked(
+      read_buffer_bloc, local_file_size, dstl, read_buffer_lock));
+  DCHECK(read_buffer_bloc->data() != nullptr);
+  hdfsFile remote_hdfs_file =
+      hdfsOpenFile(hdfs_conn, remote_file_path.c_str(), O_RDONLY, 0, 0, block_size_);
+  if (remote_hdfs_file == nullptr) {
+    status = Status(TErrorCode::DISK_IO_ERROR, GetBackendString(),
+        Substitute("Could not open file: $0: $1", remote_file_path, GetStrErrMsg()));
+  } else {
+    int ret = [&]() {
+      ScopedHistogramTimer read_timer(queue->read_latency());
+      return hdfsPreadFully(hdfs_conn, remote_hdfs_file, offset_,
+          read_buffer_bloc->data(), local_file_size);
+    }();
+    if (ret != -1) {
+      queue->read_size()->Update(local_file_size);
+      disk_file_dst_->SetReadBufferBlockStatus(
+          read_buffer_bloc, MemBlockStatus::WRITTEN, dstl, &read_buffer_lock);
+    } else {
+      // The caller may need to handle the error, and deal with the read buffer block.
+      status = Status(TErrorCode::DISK_IO_ERROR, GetBackendString(),
+          GetHdfsErrorMsg("Error reading from HDFS file: ", remote_file_path));
+    }
+  }
+
+  // Try to close the remote file.
+  if (remote_hdfs_file != nullptr && hdfsCloseFile(hdfs_conn, remote_hdfs_file) != 0) {
+    // If there was an error during reading, keep the old status.
+    string close_err_msg = Substitute(
+        "Failed to close HDFS file: $0", remote_file_path, GetHdfsErrorMsg(""));
+    if (status.ok()) {
+      return Status(TErrorCode::DISK_IO_ERROR, GetBackendString(), close_err_msg);
+    } else {
+      LOG(WARNING) << close_err_msg;
+    }
   }
   return status;
 }
@@ -498,14 +591,19 @@ Status DiskIoMgr::Init() {
     } else if (i == RemoteSFSDiskId()) {
       num_threads_per_disk = FLAGS_num_sfs_io_threads;
       device_name = "SFS remote";
+    } else if (i == RemoteOBSDiskId()) {
+      num_threads_per_disk = FLAGS_num_obs_io_threads;
+      device_name = "OBS remote";
     } else if (DiskInfo::is_rotational(i)) {
       num_threads_per_disk = num_io_threads_per_rotational_disk_;
       // During tests, i may not point to an existing disk.
-      device_name = i < DiskInfo::num_disks() ? DiskInfo::device_name(i) : to_string(i);
+      device_name =
+          i < DiskInfo::num_disks() ? DiskInfo::device_name(i) : std::to_string(i);
     } else {
       num_threads_per_disk = num_io_threads_per_solid_state_disk_;
       // During tests, i may not point to an existing disk.
-      device_name = i < DiskInfo::num_disks() ? DiskInfo::device_name(i) : to_string(i);
+      device_name =
+          i < DiskInfo::num_disks() ? DiskInfo::device_name(i) : std::to_string(i);
     }
     const string& i_string = Substitute("$0", i);
 
@@ -597,7 +695,8 @@ Status DiskIoMgr::Init() {
   DCHECK_EQ(ret, 0);
 
   if (!FLAGS_data_cache.empty()) {
-    remote_data_cache_.reset(new DataCache(FLAGS_data_cache));
+    remote_data_cache_.reset(
+        new DataCache(FLAGS_data_cache, FLAGS_data_cache_num_async_write_threads));
     RETURN_IF_ERROR(remote_data_cache_->Init());
   }
   return Status::OK();
@@ -637,6 +736,13 @@ Status DiskIoMgr::AllocateBuffersForRange(
     BufferPool::ClientHandle* bp_client, ScanRange* range, int64_t max_bytes) {
   return range->AllocateBuffersForRange(bp_client, max_bytes,
       min_buffer_size_, max_buffer_size_);
+}
+
+Status DiskIoMgr::DumpDataCache() {
+  if (FLAGS_data_cache_keep_across_restarts && remote_data_cache_) {
+    return remote_data_cache_->Dump();
+  }
+  return Status::Expected("No cache dump is required.");
 }
 
 vector<int64_t> DiskIoMgr::ChooseBufferSizes(int64_t scan_range_len, int64_t max_bytes) {
@@ -686,7 +792,7 @@ int64_t DiskIoMgr::ComputeIdealBufferReservation(int64_t scan_range_len) {
 // Work is available if there is a RequestContext with
 //  - A ScanRange with a buffer available, or
 //  - A WriteRange in unstarted_write_ranges_ or
-//  - A RemoteOperRange in unstarted_remote_upload_ranges_
+//  - A RemoteOperRange in unstarted_remote_file_op_ranges_.
 RequestRange* DiskQueue::GetNextRequestRange(RequestContext** request_context) {
   // This loops returns either with work to do or when the disk IoMgr shuts down.
   while (true) {
@@ -762,10 +868,16 @@ void DiskQueue::DiskThreadLoop(DiskIoMgr* io_mgr) {
                                 "block size: '$0'",
                   size)));
         } else {
-          Status oper_status = oper_range->DoOper(buffer, size);
+          Status oper_status = oper_range->DoUpload(buffer, size);
           worker_context->OperDone(oper_range, oper_status);
           free(buffer);
         }
+        break;
+      }
+      case RequestType::FILE_FETCH: {
+        RemoteOperRange* oper_range = static_cast<RemoteOperRange*>(range);
+        Status oper_status = oper_range->DoFetch();
+        worker_context->OperDone(oper_range, oper_status);
         break;
       }
       default:
@@ -832,6 +944,7 @@ int DiskIoMgr::AssignQueue(
     if (IsCosPath(file, check_default_fs)) return RemoteCosDiskId();
     if (IsOzonePath(file, check_default_fs)) return RemoteOzoneDiskId();
     if (IsSFSPath(file, check_default_fs)) return RemoteSFSDiskId();
+    if (IsOBSPath(file, check_default_fs)) return RemoteOBSDiskId();
   }
   // Assign to a local disk queue.
   DCHECK(!IsS3APath(file, check_default_fs)); // S3 is always remote.
@@ -840,8 +953,8 @@ int DiskIoMgr::AssignQueue(
   DCHECK(!IsOSSPath(file, check_default_fs)); // OSS/JindoFS is always remote.
   DCHECK(!IsGcsPath(file, check_default_fs)); // GCS is always remote.
   DCHECK(!IsCosPath(file, check_default_fs)); // COS is always remote.
-  DCHECK(!IsOzonePath(file, check_default_fs)); // Ozone is always remote.
   DCHECK(!IsSFSPath(file, check_default_fs)); // SFS is always remote.
+  DCHECK(!IsOBSPath(file, check_default_fs)); // OBS is always remote.
   if (disk_id == -1) {
     // disk id is unknown, assign it an arbitrary one.
     disk_id = next_disk_id_.Add(1);
@@ -873,14 +986,12 @@ void DiskIoMgr::ReleaseExclusiveHdfsFileHandle(unique_ptr<ExclusiveHdfsFileHandl
   fid.reset();
 }
 
-Status DiskIoMgr::GetCachedHdfsFileHandle(const hdfsFS& fs,
-    std::string* fname, int64_t mtime, RequestContext *reader,
-    CachedHdfsFileHandle** handle_out) {
+Status DiskIoMgr::GetCachedHdfsFileHandle(const hdfsFS& fs, std::string* fname,
+    int64_t mtime, RequestContext* reader, FileHandleCache::Accessor* accessor) {
   bool cache_hit;
   SCOPED_TIMER(reader->open_file_timer_);
-  RETURN_IF_ERROR(file_handle_cache_.GetFileHandle(fs, fname, mtime, false, handle_out,
-      &cache_hit));
-  ImpaladMetrics::IO_MGR_NUM_FILE_HANDLES_OUTSTANDING->Increment(1L);
+  RETURN_IF_ERROR(
+      file_handle_cache_.GetFileHandle(fs, fname, mtime, false, accessor, &cache_hit));
   if (cache_hit) {
     ImpaladMetrics::IO_MGR_CACHED_FILE_HANDLES_HIT_RATIO->Update(1L);
     ImpaladMetrics::IO_MGR_CACHED_FILE_HANDLES_HIT_COUNT->Increment(1L);
@@ -893,24 +1004,17 @@ Status DiskIoMgr::GetCachedHdfsFileHandle(const hdfsFS& fs,
   return Status::OK();
 }
 
-void DiskIoMgr::ReleaseCachedHdfsFileHandle(std::string* fname,
-    CachedHdfsFileHandle* fid) {
-  file_handle_cache_.ReleaseFileHandle(fname, fid, false);
-  ImpaladMetrics::IO_MGR_NUM_FILE_HANDLES_OUTSTANDING->Increment(-1L);
-}
-
 Status DiskIoMgr::ReopenCachedHdfsFileHandle(const hdfsFS& fs, std::string* fname,
-    int64_t mtime, RequestContext* reader, CachedHdfsFileHandle** fid) {
+    int64_t mtime, RequestContext* reader, FileHandleCache::Accessor* accessor) {
   bool cache_hit;
   SCOPED_TIMER(reader->open_file_timer_);
   ImpaladMetrics::IO_MGR_CACHED_FILE_HANDLES_REOPENED->Increment(1L);
-  file_handle_cache_.ReleaseFileHandle(fname, *fid, true);
-  // The old handle has been destroyed, so *fid must be overwritten before returning.
-  *fid = nullptr;
-  Status status = file_handle_cache_.GetFileHandle(fs, fname, mtime, true, fid,
-      &cache_hit);
+
+  accessor->Destroy();
+
+  Status status =
+      file_handle_cache_.GetFileHandle(fs, fname, mtime, true, accessor, &cache_hit);
   if (!status.ok()) {
-    ImpaladMetrics::IO_MGR_NUM_FILE_HANDLES_OUTSTANDING->Increment(-1L);
     return status;
   }
   DCHECK(!cache_hit);

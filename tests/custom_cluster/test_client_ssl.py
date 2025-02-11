@@ -16,10 +16,12 @@
 # under the License.
 #
 
+from __future__ import absolute_import, division, print_function
 import json
 import logging
 import os
 import pytest
+import re
 import requests
 import signal
 import ssl
@@ -32,9 +34,9 @@ from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 from tests.common.impala_service import ImpaladService
 from tests.common.test_dimensions import create_client_protocol_dimension
 from tests.shell.util import run_impala_shell_cmd, run_impala_shell_cmd_no_expect, \
-    ImpalaShell
+    ImpalaShell, create_impala_shell_executable_dimension
 
-REQUIRED_MIN_OPENSSL_VERSION = 0x10001000L
+REQUIRED_MIN_OPENSSL_VERSION = 0x10001000
 # Python supports TLSv1.2 from 2.7.9 officially but on Red Hat/CentOS Python2.7.5
 # with newer python-libs (eg python-libs-2.7.5-77) supports TLSv1.2 already
 if IS_REDHAT_DERIVATIVE:
@@ -128,7 +130,7 @@ class TestClientSsl(CustomClusterTestSuite):
     p.send_cmd("profile")
     result = p.get_result()
 
-    print result.stderr
+    print(result.stderr)
     assert "Query Status: Cancelled" in result.stdout
     assert impalad.wait_for_num_in_flight_queries(0)
 
@@ -140,7 +142,15 @@ class TestClientSsl(CustomClusterTestSuite):
 
   @classmethod
   def add_test_dimensions(cls):
+    super(TestClientSsl, cls).add_test_dimensions()
+    # Limit the test dimensions to avoid long run times. This runs hs2 and hs2-http
+    # with only the dev shells (python2 and python3) for a total of up to 4
+    # dimensions.
     cls.ImpalaTestMatrix.add_dimension(create_client_protocol_dimension())
+    cls.ImpalaTestMatrix.add_dimension(
+        create_impala_shell_executable_dimension(dev_only=True))
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('protocol') != 'beeswax')
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(impalad_args=WEBSERVER_SSL_ARGS,
@@ -235,18 +245,26 @@ class TestClientSsl(CustomClusterTestSuite):
     run_impala_shell_cmd(vector, args, expect_success=False)
 
   def _validate_positive_cases(self, vector, ca_cert=""):
+    python3_10_version_re = re.compile(r"using Python 3\.1[0-9]")
     shell_options = ["--ssl", "-q", "select 1 + 2"]
-    result = run_impala_shell_cmd(vector, shell_options, wait_until_connected=False)
+    result = run_impala_shell_cmd(vector, shell_options)
     for msg in [self.SSL_ENABLED, self.CONNECTED, self.FETCHED]:
       assert msg in result.stderr
-    assert self.DEPRECATION_WARNING not in result.stderr
+    # Python >3.10 has deprecated ssl.PROTOCOL_TLS and impala-shell currently emits a
+    # DeprecationWarning for that version. As a temporary workaround, this skips the
+    # assert about deprecation for Python 3.10 or above. This can be removed when
+    # IMPALA-12219 is fixed.
+    # Note: This is the version that impala-shell uses, not the version pytests uses.
+    if not python3_10_version_re.search(result.stderr):
+      assert self.DEPRECATION_WARNING not in result.stderr
 
     if ca_cert != "":
       shell_options = shell_options + ["--ca_cert=%s" % ca_cert]
-      result = run_impala_shell_cmd(vector, shell_options, wait_until_connected=False)
+      result = run_impala_shell_cmd(vector, shell_options)
       for msg in [self.SSL_ENABLED, self.CONNECTED, self.FETCHED]:
         assert msg in result.stderr
-      assert self.DEPRECATION_WARNING not in result.stderr
+      if not python3_10_version_re.search(result.stderr):
+        assert self.DEPRECATION_WARNING not in result.stderr
 
   def _verify_ssl_webserver(self):
     for port in ["25000", "25010", "25020"]:
@@ -276,7 +294,6 @@ class TestClientSslUnsupported(CustomClusterTestSuite):
                                     catalogd_args=SSL_ARGS)
   @pytest.mark.skipif(SKIP_SSL_MSG is not None, reason=SKIP_SSL_MSG)
   def test_shell_warning(self, vector):
-    result = run_impala_shell_cmd_no_expect(
-      vector, ["--ssl", "-q", "select 1 + 2"], wait_until_connected=False)
+    result = run_impala_shell_cmd_no_expect(vector, ["--ssl", "-q", "select 1 + 2"])
     assert "Warning: TLSv1.2 is not supported for Python < 2.7.9" in result.stderr, \
       result.stderr

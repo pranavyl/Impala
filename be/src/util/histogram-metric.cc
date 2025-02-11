@@ -64,9 +64,9 @@ void HistogramMetric::ToJson(rapidjson::Document* document, rapidjson::Value* va
     container.AddMember("count", histogram_->TotalCount(), document->GetAllocator());
   }
   rapidjson::Value type_value(
-      PrintThriftEnum(TMetricKind::HISTOGRAM).c_str(), document->GetAllocator());
+      PrintValue(TMetricKind::HISTOGRAM).c_str(), document->GetAllocator());
   container.AddMember("kind", type_value, document->GetAllocator());
-  rapidjson::Value units(PrintThriftEnum(unit()).c_str(), document->GetAllocator());
+  rapidjson::Value units(PrintValue(unit()).c_str(), document->GetAllocator());
   container.AddMember("units", units, document->GetAllocator());
 
   *value = container;
@@ -151,6 +151,7 @@ string HistogramMetric::HistogramToHumanReadable(T* histogram, TUnit::type unit)
   DCHECK(histogram != nullptr);
   stringstream out;
   out << "Count: " << histogram->TotalCount() << ", "
+      << "sum: " << PrettyPrinter::Print(histogram->TotalSum(), unit) << ", "
       << "min / max: " << PrettyPrinter::Print(histogram->MinValue(), unit) << " / "
       << PrettyPrinter::Print(histogram->MaxValue(), unit) << ", "
       << "25th %-ile: " << PrettyPrinter::Print(histogram->ValueAtPercentile(25), unit)

@@ -51,11 +51,25 @@ struct TDebugOptions {
   4: optional string action_param
 }
 
+// Descriptor about impalad address designated as runtime filter aggregator.
+struct TRuntimeFilterAggDesc {
+  // Hostname of aggregator backend.
+  1: required string krpc_hostname
+  // Ip:port of aggregator backend.
+  2: required Types.TNetworkAddress krpc_address
+  // Number of impalad that report filter update to this aggregator backend,
+  // including the aggregator backend itself.
+  3: required i32 num_reporting_hosts
+}
 
 // Descriptor that indicates that a runtime filter is produced by a plan node.
 struct TRuntimeFilterSource {
   1: required Types.TPlanNodeId src_node_id
   2: required i32 filter_id
+
+  // The following field is only set if a filter source need to send filter update
+  // to a designated backend aggregator intead of the coordinator.
+  3: optional TRuntimeFilterAggDesc aggregator_desc
 }
 
 // The Thrift portion of the execution parameters of a single fragment instance. Every
@@ -195,6 +209,29 @@ struct TPoolConfig {
   // maximum, the mt_dop setting is reduced to the maximum. If the max_mt_dop is
   // negative, no limit is enforced.
   9: required i64 max_mt_dop = -1;
+
+  // Maximum CPU cores per node for processing a query.
+  // Typically it should be set with the value less than or equal to the number of cores
+  // of the executor nodes.
+  // 0 indicates no limit. Default value is set as 0.
+  10: required i64 max_query_cpu_core_per_node_limit = 0;
+
+  // Maximum CPU cores on coordinator for processing a query.
+  // Typically it should be set with the value less than or equal to the number of cores
+  // of the coordinators.
+  // 0 indicates no limit. Default value is set as 0.
+  11: required i64 max_query_cpu_core_coordinator_limit = 0;
+
+  // Map from user name to a per user limit on the number of queries.
+  // A user name of "*" can be used as a wildcard to limit the number of concurrent
+  // queries that can be queued by any user.
+  // If a user name is present this overrides any wildcard limit.
+  12: required map<string, i32> user_query_limits
+
+  // A map is from group name to a per user limit on the number of queries.
+  // If a rule for the user is not present in user_query_limits, then these rules
+  // are evaluated, if the user is a member of a group.
+  13: required map<string, i32> group_query_limits
 }
 
 struct TParseDateStringResult {

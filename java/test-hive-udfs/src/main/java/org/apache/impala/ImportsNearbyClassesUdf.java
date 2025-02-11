@@ -27,6 +27,11 @@ import org.apache.hadoop.io.Text;
  * the class loader.
  */
 public class ImportsNearbyClassesUdf extends UDF {
+  public ImportsNearbyClassesUdf() {
+    // Ensure that new classes can be loaded in constructor.
+    UtilForUdfConstructor.getHello();
+  }
+
   public Text evaluate(Text para) throws ParseException {
     return new Text(UtilForUdf.getHello());
   }

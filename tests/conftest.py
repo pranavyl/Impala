@@ -17,6 +17,8 @@
 
 # py.test configuration module
 #
+from __future__ import absolute_import, division, print_function
+from builtins import map, range, zip
 from impala.dbapi import connect as impala_connect
 from kudu import connect as kudu_connect
 from random import choice, sample
@@ -31,7 +33,7 @@ import sys
 import tests.common
 from impala_py_lib.helpers import find_all_files, is_core_dump
 from tests.common.environ import build_flavor_timeout
-from common.test_result_verifier import QueryTestResult
+from tests.common.test_result_verifier import QueryTestResult
 from tests.common.patterns import is_valid_impala_identifier
 from tests.comparison.db_connection import ImpalaConnection
 from tests.util.filesystem_utils import FILESYSTEM, ISILON_WEBHDFS_PORT, WAREHOUSE
@@ -52,6 +54,7 @@ DEFAULT_KUDU_MASTER_HOSTS = os.getenv('KUDU_MASTER_HOSTS', '127.0.0.1')
 DEFAULT_KUDU_MASTER_PORT = os.getenv('KUDU_MASTER_PORT', '7051')
 DEFAULT_METASTORE_SERVER = 'localhost:9083'
 DEFAULT_NAMENODE_ADDR = None
+DEFAULT_TEST_PROTOCOL = os.getenv('DEFAULT_TEST_PROTOCOL', 'beeswax')
 if FILESYSTEM == 'isilon':
   DEFAULT_NAMENODE_ADDR = "{node}:{port}".format(node=os.getenv("ISILON_NAMENODE"),
                                                  port=ISILON_WEBHDFS_PORT)
@@ -59,6 +62,7 @@ if FILESYSTEM == 'isilon':
 # Timeout each individual test case after 2 hours, or 4 hours for slow builds
 PYTEST_TIMEOUT_S = \
     build_flavor_timeout(2 * 60 * 60, slow_build_timeout=4 * 60 * 60)
+
 
 def pytest_configure(config):
   """ Hook startup of pytest. Sets up log format and per-test timeout. """
@@ -173,6 +177,20 @@ def pytest_addoption(parser):
                    "version used to execute the tests. "
                    "(See $IMPALA_HOME/bin/set-pythonpath.sh.)")
 
+  parser.addoption("--calcite_report_mode", action="store_true", default=False,
+                   help="Mode designed to provide coverage for the Calcite planner. "
+                   "Produces a JSON file for each run_test_case() invocation and "
+                   "continues past errors. These JSON files can be processed to produce "
+                   "a report to detect improvements and protect against regressions.")
+
+  parser.addoption("--calcite_report_output_dir", default=None,
+                   help="Location to store the output JSON files for "
+                   "calcite_report_mode. Defaults to ${IMPALA_LOGS_DIR}/calcite_report.")
+
+  parser.addoption("--default_test_protocol", default=DEFAULT_TEST_PROTOCOL,
+                   choices=("beeswax", "hs2", "hs2-http"),
+                   help="Impala protocol to run test if test does not specify any.")
+
 
 def pytest_assertrepr_compare(op, left, right):
   """
@@ -184,7 +202,7 @@ def pytest_assertrepr_compare(op, left, right):
   if isinstance(left, QueryTestResult) and isinstance(right, QueryTestResult) and \
      op == "==":
     result = ['Comparing QueryTestResults (expected vs actual):']
-    for l, r in map(None, left.rows, right.rows):
+    for l, r in zip(left.rows, right.rows):
       result.append("%s == %s" % (l, r) if l == r else "%s != %s" % (l, r))
     if len(left.rows) != len(right.rows):
       result.append('Number of rows returned (expected vs actual): '
@@ -228,9 +246,9 @@ def pytest_generate_tests(metafunc):
 
     if len(vectors) == 0:
       LOG.warning("No test vectors generated for test '%s'. Check constraints and "
-          "input vectors" % metafunc.function.func_name)
+          "input vectors" % metafunc.function.__name__)
 
-    vector_names = map(str, vectors)
+    vector_names = list(map(str, vectors))
     # In the case this is a test result update or sanity run, select a single test vector
     # to run. This is okay for update_results because results are expected to be the same
     # for all test vectors.
@@ -279,7 +297,7 @@ def testid_checksum(request):
   #  "'abort_on_error': 1, 'exec_single_node_rows_threshold': 0, 'batch_size': 0, "
   #  "'num_nodes': 0} | query_type: SELECT | cancel_delay: 3 | action: WAIT | "
   #  "query: select l_returnflag from lineitem]")
-  return '{0:x}'.format(crc32(request.node.nodeid) & 0xffffffff)
+  return '{0:x}'.format(crc32(request.node.nodeid.encode('utf-8')) & 0xffffffff)
 
 
 @pytest.fixture
@@ -664,7 +682,7 @@ def pytest_collection_modifyitems(items, config, session):
     return
 
   num_items = len(items)
-  this_shard, num_shards = map(int, config.option.shard_tests.split("/"))
+  this_shard, num_shards = list(map(int, config.option.shard_tests.split("/")))
   assert 0 <= this_shard <= num_shards
   if this_shard == num_shards:
     this_shard = 0
@@ -692,3 +710,6 @@ def pytest_runtest_logstart(nodeid, location):
   # than being elided.
   tests.common.current_node = \
       nodeid.replace(",", ";").replace(" ", "").replace("=", "-")[0:255]
+
+  # Store the unaltered nodeid as well
+  tests.common.nodeid = nodeid

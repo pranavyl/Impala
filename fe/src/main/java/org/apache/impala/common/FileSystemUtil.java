@@ -21,6 +21,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
@@ -32,10 +33,18 @@ import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.fs.adl.AdlFileSystem;
 import org.apache.hadoop.fs.azurebfs.AzureBlobFileSystem;
 import org.apache.hadoop.fs.azurebfs.SecureAzureBlobFileSystem;
+import org.apache.hadoop.fs.ozone.BasicRootedOzoneClientAdapterImpl;
+import org.apache.hadoop.fs.ozone.BasicRootedOzoneFileSystem;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.client.HdfsAdmin;
 import org.apache.hadoop.hdfs.protocol.EncryptionZone;
+import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
+import org.apache.hadoop.ozone.client.ObjectStore;
+import org.apache.hadoop.ozone.client.OzoneBucket;
+import org.apache.hadoop.ozone.client.OzoneVolume;
 import org.apache.impala.catalog.HdfsCompression;
+import org.apache.impala.common.Pair;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.util.DebugUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,11 +53,16 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.Stack;
+import java.util.StringTokenizer;
 import java.util.UUID;
+
+import static org.apache.hadoop.ozone.OzoneConsts.OZONE_URI_DELIMITER;
 
 /**
  * Common utility functions for operating on FileSystem objects.
@@ -69,7 +83,11 @@ public class FileSystemUtil {
   public static final String SCHEME_ALLUXIO = "alluxio";
   public static final String SCHEME_GCS = "gs";
   public static final String SCHEME_COS = "cosn";
+  public static final String SCHEME_OSS = "oss";
   public static final String SCHEME_SFS = "sfs";
+  public static final String SCHEME_OBS = "obs";
+
+  public static final String NO_ERASURE_CODE_LABEL = "NONE";
 
   /**
    * Set containing all FileSystem scheme that known to supports storage UUIDs in
@@ -98,6 +116,8 @@ public class FileSystemUtil {
           .add(SCHEME_OFS)
           .add(SCHEME_GCS)
           .add(SCHEME_COS)
+          .add(SCHEME_OSS)
+          .add(SCHEME_OBS)
           .build();
 
   /**
@@ -110,8 +130,11 @@ public class FileSystemUtil {
           .add(SCHEME_ADL)
           .add(SCHEME_HDFS)
           .add(SCHEME_S3A)
+          .add(SCHEME_OFS)
           .add(SCHEME_GCS)
           .add(SCHEME_COS)
+          .add(SCHEME_OSS)
+          .add(SCHEME_OBS)
           .build();
 
   /**
@@ -128,6 +151,8 @@ public class FileSystemUtil {
           .add(SCHEME_OFS)
           .add(SCHEME_GCS)
           .add(SCHEME_COS)
+          .add(SCHEME_OSS)
+          .add(SCHEME_OBS)
           .build();
 
   /**
@@ -184,6 +209,70 @@ public class FileSystemUtil {
   }
 
   /**
+   * Returns a string representation of the Ozone replication type for a given path.
+   */
+  private static String getOzoneReplication(ObjectStore os, Path p) throws IOException {
+    String path = Path.getPathWithoutSchemeAndAuthority(p).toString();
+    StringTokenizer tokens = new StringTokenizer(path, OZONE_URI_DELIMITER);
+
+    if (!tokens.hasMoreTokens()) return null;
+
+    OzoneVolume volume = os.getVolume(tokens.nextToken());
+    if (!tokens.hasMoreTokens()) return null;
+    OzoneBucket bucket = volume.getBucket(tokens.nextToken());
+    if (!tokens.hasMoreTokens()) {
+      return bucket.getReplicationConfig().getReplication();
+    }
+
+    // Get all remaining text except the leading slash
+    String keyName = tokens.nextToken("").substring(1);
+    return bucket.getKey(keyName).getReplicationConfig().getReplication();
+  }
+
+  /**
+   * Returns the erasure coding policy for the path, or NONE if not set.
+   */
+  public static String getErasureCodingPolicy(Path p) {
+    if (isDistributedFileSystem(p)) {
+      try {
+        DistributedFileSystem dfs = (DistributedFileSystem) p.getFileSystem(CONF);
+        ErasureCodingPolicy policy = dfs.getErasureCodingPolicy(p);
+        if (policy != null) {
+          return policy.getName();
+        }
+      } catch (IOException e) {
+        LOG.warn("Unable to retrieve erasure coding policy for {}", p, e);
+      }
+    } else if (isOzoneFileSystem(p)) {
+      try {
+        FileSystem fs = p.getFileSystem(CONF);
+        if (!fs.getFileStatus(p).isErasureCoded()) {
+          // Ozone will return the replication factor (ONE, THREE, etc) for Ratis
+          // replication. We avoid returning that for consistency.
+          return NO_ERASURE_CODE_LABEL;
+        }
+
+        if (fs instanceof BasicRootedOzoneFileSystem) {
+          BasicRootedOzoneFileSystem ofs = (BasicRootedOzoneFileSystem) fs;
+          Preconditions.checkState(
+              ofs.getAdapter() instanceof BasicRootedOzoneClientAdapterImpl);
+          BasicRootedOzoneClientAdapterImpl adapter =
+              (BasicRootedOzoneClientAdapterImpl) ofs.getAdapter();
+          String replication = getOzoneReplication(adapter.getObjectStore(), p);
+          if (replication != null) {
+            return replication;
+          }
+        } else {
+          LOG.debug("Retrieving erasure code policy not supported for {}", p);
+        }
+      } catch (IOException e) {
+        LOG.warn("Unable to retrieve erasure coding policy for {}", p, e);
+      }
+    }
+    return NO_ERASURE_CODE_LABEL;
+  }
+
+  /**
    * Relocates all visible (non-hidden) files from a source directory to a destination
    * directory. Files are moved (renamed) to the new location unless the source and
    * destination directories are in different encryption zones, in which case the files
@@ -194,6 +283,15 @@ public class FileSystemUtil {
    */
   public static int relocateAllVisibleFiles(Path sourceDir, Path destDir)
       throws IOException {
+    return relocateAllVisibleFiles(sourceDir, destDir, null);
+  }
+
+  /**
+   * This method does the same as #relocateAllVisibleFiles(Path, Path) but it also adds
+   * loaded files into #loadedFiles.
+   */
+  public static int relocateAllVisibleFiles(Path sourceDir, Path destDir,
+        List<Path> loadedFiles) throws IOException {
     FileSystem destFs = destDir.getFileSystem(CONF);
     FileSystem sourceFs = sourceDir.getFileSystem(CONF);
     Preconditions.checkState(destFs.isDirectory(destDir));
@@ -222,9 +320,41 @@ public class FileSystemUtil {
             appendToBaseFileName(destFile.getName(), uuid.toString()));
       }
       FileSystemUtil.relocateFile(fStatus.getPath(), destFile, false);
+      if (loadedFiles != null) {
+        loadedFiles.add(destFile);
+      }
       ++numFilesMoved;
     }
     return numFilesMoved;
+  }
+
+  // Returns the first two elements (volume, bucket) of the unqualified path.
+  public static Pair<String, String> volumeBucketPair(Path p) {
+    String path = Path.getPathWithoutSchemeAndAuthority(p).toString();
+    StringTokenizer tokens = new StringTokenizer(path, OZONE_URI_DELIMITER);
+    String volume = "", bucket = "";
+    if (tokens.hasMoreTokens()) {
+      volume = tokens.nextToken();
+      if (tokens.hasMoreTokens()) {
+        bucket = tokens.nextToken();
+      }
+    }
+    return Pair.create(volume, bucket);
+  }
+
+  /*
+   * Returns true if the source and path are in the same bucket. Ozone's ofs encodes
+   * volume/bucket into the path. All other filesystems make it part of the authority
+   * portion of the URI.
+   */
+  public static boolean isSameBucket(Path source, Path dest) throws IOException {
+    if (!isPathOnFileSystem(source, dest.getFileSystem(CONF))) return false;
+
+    // Return true for anything besides OFS.
+    if (!hasScheme(source, SCHEME_OFS)) return true;
+
+    // Compare (volume, bucket) for source and dest.
+    return volumeBucketPair(source).equals(volumeBucketPair(dest));
   }
 
   /**
@@ -237,11 +367,11 @@ public class FileSystemUtil {
    * destination location. Instead, a UUID will be appended to the base file name,
    * preserving the existing file extension. If renameIfAlreadyExists is false, an
    * IOException will be thrown if there is a file name conflict.
+   * Returns the Path that points to the destination file.
    */
-  public static void relocateFile(Path sourceFile, Path dest,
+  public static Path relocateFile(Path sourceFile, Path dest,
       boolean renameIfAlreadyExists) throws IOException {
     FileSystem destFs = dest.getFileSystem(CONF);
-    FileSystem sourceFs = sourceFile.getFileSystem(CONF);
 
     Path destFile =
         destFs.isDirectory(dest) ? new Path(dest, sourceFile.getName()) : dest;
@@ -252,7 +382,7 @@ public class FileSystemUtil {
       destFile = new Path(destDir,
           appendToBaseFileName(destFile.getName(), UUID.randomUUID().toString()));
     }
-    boolean sameFileSystem = isPathOnFileSystem(sourceFile, destFs);
+    boolean sameBucket = isSameBucket(sourceFile, dest);
     boolean destIsDfs = isDistributedFileSystem(destFs);
 
     // If the source and the destination are on different file systems, or in different
@@ -262,41 +392,35 @@ public class FileSystemUtil {
         arePathsInSameHdfsEncryptionZone(destFs, sourceFile, destFile);
     // We can do a rename if the src and dst are in the same encryption zone in the same
     // distributed filesystem.
-    boolean doRename = destIsDfs && sameFileSystem && sameEncryptionZone;
+    boolean doRename = destIsDfs && sameBucket && sameEncryptionZone;
     // Alternatively, we can do a rename if the src and dst are on the same
-    // non-distributed filesystem.
-    if (!doRename) doRename = !destIsDfs && sameFileSystem;
+    // non-distributed filesystem in the same bucket (if it has that concept).
+    if (!doRename) doRename = !destIsDfs && sameBucket;
     if (doRename) {
-      if (LOG.isTraceEnabled()) {
-        LOG.trace(String.format(
-            "Moving '%s' to '%s'", sourceFile.toString(), destFile.toString()));
-      }
+      LOG.trace("Moving '{}' to '{}'", sourceFile, destFile);
       // Move (rename) the file.
       if (!destFs.rename(sourceFile, destFile)) {
         throw new IOException(String.format(
             "Failed to move '%s' to '%s'", sourceFile, destFile));
       }
-      return;
+      return destFile;
     }
-    if (destIsDfs && sameFileSystem) {
-      Preconditions.checkState(!doRename);
-      // We must copy rather than move if the source and dest are in different
-      // encryption zones. A move would return an error from the NN because a move is a
+    Preconditions.checkState(!doRename);
+    if (destIsDfs && sameBucket) {
+      Preconditions.checkState(!sameEncryptionZone);
+      // We must copy rather than move if the source and dest are in different encryption
+      // zones or buckets. A move would return an error from the NN because a move is a
       // metadata-only operation and the files would not be encrypted/decrypted properly
       // on the DNs.
-      if (LOG.isTraceEnabled()) {
-        LOG.trace(String.format(
-            "Copying source '%s' to '%s' because HDFS encryption zones are different.",
-            sourceFile, destFile));
-      }
+      LOG.trace(
+          "Copying source '{}' to '{}' because HDFS encryption zones are different.",
+          sourceFile, destFile);
     } else {
-      Preconditions.checkState(!sameFileSystem);
-      if (LOG.isTraceEnabled()) {
-        LOG.trace(String.format("Copying '%s' to '%s' between filesystems.",
-            sourceFile, destFile));
-      }
+      LOG.trace("Copying '{}' to '{}' between filesystems.", sourceFile, destFile);
     }
+    FileSystem sourceFs = sourceFile.getFileSystem(CONF);
     FileUtil.copy(sourceFs, sourceFile, destFs, destFile, true, true, CONF);
+    return destFile;
   }
 
   /**
@@ -307,6 +431,22 @@ public class FileSystemUtil {
     InputStream fileStream = fs.open(file);
     try {
       return IOUtils.toString(fileStream);
+    } finally {
+      IOUtils.closeQuietly(fileStream);
+    }
+  }
+
+  /**
+   * Reads the first 4 bytes of the file and returns it as a string. It is used to
+   * identify the file format.
+   */
+  public static String readMagicString(Path file) throws IOException {
+    FileSystem fs = file.getFileSystem(CONF);
+    InputStream fileStream = fs.open(file);
+    byte[] buffer = new byte[4];
+    try {
+      IOUtils.read(fileStream, buffer, 0, 4);
+      return  new String(buffer);
     } finally {
       IOUtils.closeQuietly(fileStream);
     }
@@ -405,7 +545,7 @@ public class FileSystemUtil {
   /**
    * Returns true iff the path is on a S3AFileSystem.
    */
-  public static boolean isS3AFileSystem(Path path) throws IOException {
+  public static boolean isS3AFileSystem(Path path) {
     return hasScheme(path, SCHEME_S3A);
   }
 
@@ -424,6 +564,20 @@ public class FileSystemUtil {
   }
 
   /**
+   * Returns true iff the filesystem is an OssFileSystem.
+   */
+  public static boolean isOSSFileSystem(FileSystem fs) {
+    return hasScheme(fs, SCHEME_OSS);
+  }
+
+  /**
+   * Returns true iff the filesystem is a OBSFileSystem.
+   */
+  public static boolean isOBSFileSystem(FileSystem fs) {
+    return hasScheme(fs, SCHEME_OBS);
+  }
+
+  /**
    * Returns true iff the filesystem is AdlFileSystem.
    */
   public static boolean isADLFileSystem(FileSystem fs) {
@@ -433,7 +587,7 @@ public class FileSystemUtil {
   /**
    * Returns true iff the path is on AdlFileSystem.
    */
-  public static boolean isADLFileSystem(Path path) throws IOException {
+  public static boolean isADLFileSystem(Path path) {
     return hasScheme(path, SCHEME_ADL);
   }
 
@@ -452,7 +606,7 @@ public class FileSystemUtil {
    * Returns true iff the path is on AzureBlobFileSystem or
    * SecureAzureBlobFileSystem.
    */
-  public static boolean isABFSFileSystem(Path path) throws IOException {
+  public static boolean isABFSFileSystem(Path path) {
     return hasScheme(path, SCHEME_ABFS) || hasScheme(path, SCHEME_ABFSS);
   }
 
@@ -466,7 +620,7 @@ public class FileSystemUtil {
   /**
    * Return true iff path is on a local filesystem.
    */
-  public static boolean isLocalFileSystem(Path path) throws IOException {
+  public static boolean isLocalFileSystem(Path path) {
     return hasScheme(path, SCHEME_FILE);
   }
 
@@ -480,7 +634,7 @@ public class FileSystemUtil {
   /**
    * Return true iff path is on a DFS filesystem.
    */
-  public static boolean isDistributedFileSystem(Path path) throws IOException {
+  public static boolean isDistributedFileSystem(Path path) {
     return hasScheme(path, SCHEME_HDFS);
   }
 
@@ -494,7 +648,7 @@ public class FileSystemUtil {
   /**
    * Returns true iff the path is on OzoneFileSystem.
    */
-  public static boolean isOzoneFileSystem(Path path) throws IOException {
+  public static boolean isOzoneFileSystem(Path path) {
     return hasScheme(path, SCHEME_O3FS) || hasScheme(path, SCHEME_OFS);
   }
 
@@ -533,7 +687,9 @@ public class FileSystemUtil {
     ALLUXIO,
     GCS,
     COS,
-    SFS;
+    OSS,
+    SFS,
+    OBS;
 
     private static final Map<String, FsType> SCHEME_TO_FS_MAPPING =
         ImmutableMap.<String, FsType>builder()
@@ -548,6 +704,8 @@ public class FileSystemUtil {
             .put(SCHEME_ALLUXIO, ALLUXIO)
             .put(SCHEME_GCS, GCS)
             .put(SCHEME_COS, COS)
+            .put(SCHEME_OSS, OSS)
+            .put(SCHEME_OBS, OBS)
             .build();
 
     /**
@@ -629,6 +787,34 @@ public class FileSystemUtil {
   }
 
   /**
+   * Copies the source file with the given URI to tmp directory on the local filesystem.
+   * Returns local file path.
+   * Throws IOException on failure.
+   */
+  public static String copyFileFromUriToLocal(String srcUri)
+      throws IOException {
+    Preconditions.checkNotNull(srcUri);
+    String localLibPath = BackendConfig.INSTANCE.getBackendCfg().local_library_path;
+    String fileExt = FilenameUtils.getExtension(srcUri);
+    String localPath;
+    if (localLibPath != null && !localLibPath.isEmpty()) {
+      localPath = localLibPath + "/" + UUID.randomUUID().toString() + "." + fileExt;
+    } else {
+      localPath = "/tmp/" + UUID.randomUUID().toString() + "." + fileExt;
+    }
+    try {
+      Path remoteFilePath = new Path(srcUri);
+      Path localFilePath = new Path("file://" + localPath);
+      FileSystemUtil.copyToLocal(remoteFilePath, localFilePath);
+    } catch (Exception e) {
+      String errorMsg = "Failed to copy " + srcUri + " to local path: " + localPath;
+      LOG.error(errorMsg, e);
+      throw new IOException(String.format("%s, %s", errorMsg, e.getMessage()));
+    }
+    return localPath;
+  }
+
+  /**
    * Delete the file at 'path' if it exists.
    */
   public static void deleteIfExists(Path path) {
@@ -645,11 +831,7 @@ public class FileSystemUtil {
    * Returns true if the given path is a location which supports caching (e.g. HDFS).
    */
   public static boolean isPathCacheable(Path path) {
-    try {
-      return isDistributedFileSystem(path);
-    } catch (IOException e) {
-      return false;
-    }
+    return isDistributedFileSystem(path);
   }
 
   /**
@@ -724,7 +906,7 @@ public class FileSystemUtil {
           return listFiles(fs, p, true, debugAction);
         }
         DebugUtils.executeDebugAction(debugAction, DebugUtils.REFRESH_HDFS_LISTING_DELAY);
-        return new FilterIterator(p, new RecursingIterator<>(fs, p,
+        return new FilterIterator(p, new RecursingIterator<>(fs, p, debugAction,
             FileSystemUtil::listStatusIterator));
       }
       DebugUtils.executeDebugAction(debugAction, DebugUtils.REFRESH_HDFS_LISTING_DELAY);
@@ -747,9 +929,11 @@ public class FileSystemUtil {
       // survive from transient sub-directories.
       if (hasRecursiveListFiles(fs)) {
         baseIterator = fs.listFiles(p, recursive);
-      } else {
-        baseIterator = new RecursingIterator<>(fs, p,
+      } else if (recursive) {
+        baseIterator = new RecursingIterator<>(fs, p, debugAction,
             FileSystemUtil::listLocatedStatusIterator);
+      } else {
+        baseIterator = listLocatedStatusIterator(fs, p);
       }
       return new FilterIterator(p, baseIterator);
     } catch (FileNotFoundException e) {
@@ -812,11 +996,26 @@ public class FileSystemUtil {
    */
   public static String relativizePath(Path path, Path startPath) {
     URI relUri = startPath.toUri().relativize(path.toUri());
-    if (relUri.isAbsolute() || relUri.getPath().startsWith("/")) {
+    if (!isRelative(relUri)) {
       throw new RuntimeException("FileSystem returned an unexpected path " +
           path + " for a file within " + startPath);
     }
     return relUri.getPath();
+  }
+
+  /**
+   * Return the path of 'path' relative to the startPath. This may
+   * differ from simply the file name in the case of recursive listings.
+   * Instead of throwing an exception, it returns null when cannot relativize 'path'.
+   */
+  public static String relativizePathNoThrow(Path path, Path startPath) {
+    URI relUri = startPath.toUri().relativize(path.toUri());
+    if (isRelative(relUri)) return relUri.getPath();
+    return null;
+  }
+
+  private static boolean isRelative(URI uri) {
+    return !(uri.isAbsolute() || uri.getPath().startsWith(Path.SEPARATOR));
   }
 
   /**
@@ -843,13 +1042,35 @@ public class FileSystemUtil {
     return false;
   }
 
-  /**
-   * Prefix string used by hive to write certain temporary or "non-data" files in the
-   * table location
-   */
-  public static final String HIVE_TEMP_FILE_PREFIX = "_tmp.";
-
   public static final String DOT = ".";
+  public static final String HIVE_TEMP_FILE_PREFIX = "_tmp.";
+  public static final String SPARK_TEMP_FILE_PREFIX = "_spark_metadata";
+
+  /**
+   * Prefix string used by tools like hive/spark/flink to write certain temporary or
+   * "non-data" files in the table location
+   */
+  private static final List<String> TMP_DIR_PREFIX_LIST = new ArrayList<>();
+  static {
+    // Use hard-coded prefix-list if BackendConfig is uninitialized. Note that
+    // getIgnoredDirPrefixList() could return null if BackendConfig is created with
+    // initialize=false in external FE (IMPALA-10515).
+    if (BackendConfig.INSTANCE == null
+        || BackendConfig.INSTANCE.getIgnoredDirPrefixList() == null) {
+      TMP_DIR_PREFIX_LIST.add(DOT);
+      TMP_DIR_PREFIX_LIST.add(HIVE_TEMP_FILE_PREFIX);
+      TMP_DIR_PREFIX_LIST.add(SPARK_TEMP_FILE_PREFIX);
+      LOG.warn("BackendConfig.INSTANCE uninitialized. Use hard-coded prefix-list.");
+    } else {
+      String s = BackendConfig.INSTANCE.getIgnoredDirPrefixList();
+      for (String prefix : s.split(",")) {
+        if (!prefix.isEmpty()) {
+          TMP_DIR_PREFIX_LIST.add(prefix);
+        }
+      }
+    }
+    LOG.info("Prefix list of ignored dirs: " + TMP_DIR_PREFIX_LIST);
+  }
 
   /**
    * Util method used to filter out hidden and temporary staging directories
@@ -859,7 +1080,12 @@ public class FileSystemUtil {
   @VisibleForTesting
   static boolean isIgnoredDir(Path path) {
     String filename = path.getName();
-    return filename.startsWith(DOT) || filename.startsWith(HIVE_TEMP_FILE_PREFIX);
+    for (String prefix : TMP_DIR_PREFIX_LIST) {
+      if (filename.startsWith(prefix)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -926,17 +1152,22 @@ public class FileSystemUtil {
     private final BiFunctionWithException<FileSystem, Path, RemoteIterator<T>>
         newIterFunc_;
     private final FileSystem fs_;
+    private final String debugAction_;
     private final Stack<RemoteIterator<T>> iters_ = new Stack<>();
     private RemoteIterator<T> curIter_;
     private T curFile_;
 
-    private RecursingIterator(FileSystem fs, Path startPath,
+    private RecursingIterator(FileSystem fs, Path startPath, String debugAction,
         BiFunctionWithException<FileSystem, Path, RemoteIterator<T>> newIterFunc)
         throws IOException {
       this.fs_ = Preconditions.checkNotNull(fs);
+      this.debugAction_ = debugAction;
       this.newIterFunc_ = Preconditions.checkNotNull(newIterFunc);
       Preconditions.checkNotNull(startPath);
       curIter_ = newIterFunc.apply(fs, startPath);
+      LOG.trace("listed start path: {}", startPath);
+      DebugUtils.executeDebugAction(debugAction,
+          DebugUtils.REFRESH_PAUSE_AFTER_HDFS_REMOTE_ITERATOR_CREATION);
     }
 
     @Override
@@ -978,6 +1209,13 @@ public class FileSystemUtil {
      * @throws IOException if any IO error occurs
      */
     private void handleFileStat(T fileStatus) throws IOException {
+      LOG.trace("handleFileStat: {}", fileStatus.getPath());
+      if (isIgnoredDir(fileStatus.getPath())) {
+        LOG.debug("Ignoring {} since it is either a hidden directory or a temporary "
+            + "staging directory", fileStatus.getPath());
+        curFile_ = null;
+        return;
+      }
       if (fileStatus.isFile()) {
         curFile_ = fileStatus;
         return;
@@ -987,6 +1225,9 @@ public class FileSystemUtil {
       iters_.push(curIter_);
       curIter_ = subIter;
       curFile_ = fileStatus;
+      LOG.trace("listed sub dir: {}", fileStatus.getPath());
+      DebugUtils.executeDebugAction(debugAction_,
+          DebugUtils.REFRESH_PAUSE_AFTER_HDFS_REMOTE_ITERATOR_CREATION);
     }
 
     @Override

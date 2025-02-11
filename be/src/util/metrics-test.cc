@@ -408,7 +408,8 @@ TEST_F(MetricsTest, HistogramMetrics) {
   EXPECT_EQ(histo_val["min"].GetInt(), 0);
   EXPECT_EQ(histo_val["max"].GetInt(), MAX_VALUE + 1);
 
-  EXPECT_EQ(metric->ToHumanReadable(), "Count: 10002, min / max: 0 / 10s001ms, "
+  EXPECT_EQ(metric->ToHumanReadable(),
+      "Count: 10002, sum: 13h53m, min / max: 0 / 10s001ms, "
       "25th %-ile: 2s500ms, 50th %-ile: 5s000ms, 75th %-ile: 7s500ms, "
       "90th %-ile: 9s000ms, 95th %-ile: 9s496ms, 99.9th %-ile: 9s984ms");
 }
@@ -500,12 +501,12 @@ TEST_F(MetricsTest, PrometheusMetricNames) {
   EXPECT_EQ("impala_server_metric",
       MetricGroup::ImpalaToPrometheusName("impala-server-metric"));
 
-  // Test that . and - get transformed to _.
-  EXPECT_EQ("impala_metric_name_with_punctuation_",
-      MetricGroup::ImpalaToPrometheusName("metric-name.with-punctuation_"));
+  // Test that ".", "'" and "-" get transformed to _.
+  EXPECT_EQ("impala_metric__name__with_punctuation_",
+      MetricGroup::ImpalaToPrometheusName("metric-'name'.with-punctuation_"));
 
   // Other special characters are unmodified
-  EXPECT_EQ("impala_!@#$%*", MetricGroup::ImpalaToPrometheusName("!@#$%*"));
+  EXPECT_EQ("impala_!@#$%*:", MetricGroup::ImpalaToPrometheusName("!@#$%*:"));
 }
 
 void AssertPrometheus(const std::stringstream& val, const string& name,

@@ -35,11 +35,14 @@ void TColumnValueToHS2TColumn(const TColumnValue& col_val, const TColumnType& ty
 
 /// Evaluate 'expr_eval' over the row [start_idx, start_idx + num_rows) from 'batch' into
 /// 'column' with 'type' starting at output_row_idx. The caller is responsible for
-/// calling RuntimeState::GetQueryStatus() to check for expression evaluation errors.
+/// calling RuntimeState::GetQueryStatus() to check for expression evaluation errors. If
+/// 'stringify_map_keys' is true, converts map keys to strings; see IMPALA-11778.
+/// 'expected_result_count' is used for reserving space in the result vectors.
 /// For V6->
 void ExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, const TColumnType& type,
     RowBatch* batch, int start_idx, int num_rows, uint32_t output_row_idx,
-    apache::hive::service::cli::thrift::TColumn* column);
+     int expected_result_count, bool stringify_map_keys,
+     apache::hive::service::cli::thrift::TColumn* column);
 
 /// For V1->V5
 void TColumnValueToHS2TColumnValue(const TColumnValue& col_val, const TColumnType& type,
@@ -68,4 +71,7 @@ std::string PrintTColumnValue(const impala::TColumnValue& colval);
 
 /// Return true if one field in value is set. Return false otherwise.
 bool isOneFieldSet(const impala::TColumnValue& value);
+
+apache::hive::service::cli::thrift::TTypeEntry ColumnToHs2Type(
+    const TColumnType& columnType);
 }

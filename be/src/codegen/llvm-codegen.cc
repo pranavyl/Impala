@@ -16,21 +16,18 @@
 // under the License.
 
 #include "codegen/llvm-codegen.h"
+#include "codegen/llvm-codegen-cache.h"
 
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <unordered_set>
-
-#include <mutex>
 #include <boost/algorithm/string.hpp>
 #include <boost/assert/source_location.hpp>
 #include <gutil/strings/substitute.h>
 
-#include <llvm/ADT/Triple.h>
-#include <llvm/Analysis/InstructionSimplify.h>
-#include <llvm/Analysis/Passes.h>
-#include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/ExecutionEngine/MCJIT.h>
 #include <llvm/IR/Constants.h>
@@ -40,18 +37,17 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/InstIterator.h>
-#include <llvm/IR/LegacyPassManager.h>
-#include <llvm/IR/NoFolder.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Linker/Linker.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Support/CommandLine.h>
 #include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/Host.h>
-#include <llvm/Support/TargetRegistry.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
-#include <llvm/Transforms/IPO.h>
-#include <llvm/Transforms/IPO/PassManagerBuilder.h>
+#include <llvm/Transforms/IPO/GlobalDCE.h>
+#include <llvm/Transforms/IPO/Internalize.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Cloning.h>
@@ -65,18 +61,19 @@
 #include "codegen/mcjit-mem-mgr.h"
 #include "common/logging.h"
 #include "exprs/anyval-util.h"
+#include "gutil/sysinfo.h"
 #include "impala-ir/impala-ir-names.h"
 #include "runtime/collection-value.h"
 #include "runtime/descriptors.h"
+#include "runtime/exec-env.h"
+#include "runtime/fragment-state.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/lib-cache.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
-#include "runtime/fragment-state.h"
 #include "runtime/runtime-state.h"
 #include "runtime/string-value.h"
 #include "runtime/timestamp-value.h"
-#include "gutil/sysinfo.h"
 #include "util/cpu-info.h"
 #include "util/debug-util.h"
 #include "util/hdfs-util.h"
@@ -85,6 +82,7 @@
 #include "util/symbols-util.h"
 #include "util/test-info.h"
 #include "util/thread.h"
+#include "util/thrift-debug-util.h"
 
 #include "common/names.h"
 
@@ -127,10 +125,11 @@ DEFINE_string_hidden(llvm_cpu_attr_whitelist, "adx,aes,avx,avx2,bmi,bmi2,cmov,cx
     "routinely tested. This flag is provided to enable additional LLVM CPU attribute "
     "flags for testing.");
 #endif
+DEFINE_string_hidden(llvm_ir_opt, "Os",
+    "The IR optimization level for pre-generated code; supports O1, O2, and Os.");
 DECLARE_bool(enable_legacy_avx_support);
 
 namespace impala {
-
 const string LlvmCodeGen::ASYNC_CODEGEN_THREAD_COUNTERS_PREFIX = "CodegenCompileThread";
 bool LlvmCodeGen::llvm_initialized_ = false;
 string LlvmCodeGen::cpu_name_;
@@ -152,8 +151,11 @@ const map<int64_t, std::string> LlvmCodeGen::cpu_flag_mappings_{
   LOG(FATAL) << "LLVM hit fatal error: " << reason.c_str();
 }
 
-Status LlvmCodeGen::InitializeLlvm(bool load_backend) {
+Status LlvmCodeGen::InitializeLlvm(const char* procname, bool load_backend) {
   DCHECK(!llvm_initialized_);
+  // Treat all functions as having the inline hint
+  std::array<const char*, 2> argv = { { procname, "-inline-threshold=325" } };
+  CHECK(llvm::cl::ParseCommandLineOptions(argv.size(), argv.data()));
   llvm::remove_fatal_error_handler();
   llvm::install_fatal_error_handler(LlvmCodegenHandleError);
   // These functions can *only* be called once per process and are used to set up
@@ -226,8 +228,12 @@ LlvmCodeGen::LlvmCodeGen(FragmentState* state, ObjectPool* pool,
   context_->setDiagnosticHandler(&DiagnosticHandler::DiagnosticHandlerFn, this);
   load_module_timer_ = ADD_TIMER(profile_, "LoadTime");
   prepare_module_timer_ = ADD_TIMER(profile_, "PrepareTime");
+  codegen_cache_lookup_timer_ = ADD_TIMER(profile_, "CodegenCacheLookupTime");
+  codegen_cache_save_timer_ = ADD_TIMER(profile_, "CodegenCacheSaveTime");
+  module_bitcode_gen_timer_ = ADD_TIMER(profile_, "ModuleBitcodeGenTime");
   module_bitcode_size_ = ADD_COUNTER(profile_, "ModuleBitcodeSize", TUnit::BYTES);
   ir_generation_timer_ = ADD_TIMER(profile_, "IrGenerationTime");
+  function_prune_timer_ = ADD_TIMER(profile_, "FunctionPruneTime");
   optimization_timer_ = ADD_TIMER(profile_, "OptimizationTime");
   compile_timer_ = ADD_TIMER(profile_, "CompileTime");
   main_thread_timer_ = ADD_TIMER(profile_, "MainThreadCodegenTime");
@@ -235,6 +241,9 @@ LlvmCodeGen::LlvmCodeGen(FragmentState* state, ObjectPool* pool,
       ASYNC_CODEGEN_THREAD_COUNTERS_PREFIX);
   num_functions_ = ADD_COUNTER(profile_, "NumFunctions", TUnit::UNIT);
   num_instructions_ = ADD_COUNTER(profile_, "NumInstructions", TUnit::UNIT);
+  num_opt_functions_ = ADD_COUNTER(profile_, "NumOptimizedFunctions", TUnit::UNIT);
+  num_opt_instructions_ = ADD_COUNTER(profile_, "NumOptimizedInstructions", TUnit::UNIT);
+  num_cached_functions_ = ADD_COUNTER(profile_, "NumCachedFunctions", TUnit::UNIT);
   llvm_thread_counters_ = ADD_THREAD_COUNTERS(profile_, "Codegen");
 }
 
@@ -264,8 +273,19 @@ Status LlvmCodeGen::CreateFromMemory(FragmentState* state, ObjectPool* pool,
   SCOPED_THREAD_COUNTER_MEASUREMENT((*codegen)->llvm_thread_counters());
 
   llvm::StringRef module_ir;
-  string module_name;
-
+  string module_name = "Impala IR";
+  if (FLAGS_llvm_ir_opt == "O1") {
+    module_ir = llvm::StringRef(
+        reinterpret_cast<const char*>(impala_llvm_o1_ir), impala_llvm_o1_ir_len);
+  } else if (FLAGS_llvm_ir_opt == "O2") {
+    module_ir = llvm::StringRef(
+        reinterpret_cast<const char*>(impala_llvm_o2_ir), impala_llvm_o2_ir_len);
+  } else if (FLAGS_llvm_ir_opt == "Os") {
+    module_ir = llvm::StringRef(
+        reinterpret_cast<const char*>(impala_llvm_os_ir), impala_llvm_os_ir_len);
+  } else {
+    CHECK(false) << "llvm_ir_opt flag invalid; try O1, O2, or Os.";
+  }
 #if __x86_64__
   // By default, Impala now requires AVX2 support, but the enable_legacy_avx_support
   // flag can allow running on AVX machines. The minimum requirement must have already
@@ -273,8 +293,6 @@ Status LlvmCodeGen::CreateFromMemory(FragmentState* state, ObjectPool* pool,
   // LLVM IR to use.
   if (IsCPUFeatureEnabled(CpuInfo::AVX2)) {
     // Use the default IR that supports AVX2
-    module_ir = llvm::StringRef(
-        reinterpret_cast<const char*>(impala_llvm_ir), impala_llvm_ir_len);
     module_name = "Impala IR with AVX2 support";
   } else if (FLAGS_enable_legacy_avx_support && IsCPUFeatureEnabled(CpuInfo::AVX)) {
     // If there is no AVX but legacy mode is enabled, use legacy IR with AVX support
@@ -286,11 +304,6 @@ Status LlvmCodeGen::CreateFromMemory(FragmentState* state, ObjectPool* pool,
     // This should have been enforced earlier.
     CHECK(false) << "CPU is missing AVX/AVX2 support";
   }
-#else
-  // Non-x86_64 always use the default IR
-  module_ir = llvm::StringRef(
-      reinterpret_cast<const char*>(impala_llvm_ir), impala_llvm_ir_len);
-  module_name = "Impala IR";
 #endif
 
   unique_ptr<llvm::MemoryBuffer> module_ir_buf(
@@ -329,7 +342,7 @@ Status LlvmCodeGen::LoadModuleFromFile(
 }
 
 Status LlvmCodeGen::LoadModuleFromMemory(unique_ptr<llvm::MemoryBuffer> module_ir_buf,
-    string module_name, unique_ptr<llvm::Module>* module) {
+    const string& module_name, unique_ptr<llvm::Module>* module) {
   DCHECK(!module_name.empty());
   COUNTER_ADD(module_bitcode_size_, module_ir_buf->getMemBufferRef().getBufferSize());
   llvm::Expected<unique_ptr<llvm::Module>> tmp_module =
@@ -357,7 +370,7 @@ Status LlvmCodeGen::LinkModuleFromLocalFs(const string& file) {
   RETURN_IF_ERROR(LoadModuleFromFile(file, &new_module));
 
   // The module data layout must match the one selected by the execution engine.
-  new_module->setDataLayout(execution_engine_->getDataLayout());
+  new_module->setDataLayout(execution_engine()->getDataLayout());
 
   // Parse all functions' names from the new module and find those which also exist in
   // the main module. They are declarations in the new module or duplicated definitions
@@ -443,7 +456,7 @@ Status LlvmCodeGen::CreateImpalaCodegen(FragmentState* state,
 }
 
 Status LlvmCodeGen::Init(unique_ptr<llvm::Module> module) {
-  DCHECK(module != NULL);
+  DCHECK(module != nullptr);
 
   llvm::CodeGenOpt::Level opt_level = llvm::CodeGenOpt::Aggressive;
 #ifndef NDEBUG
@@ -463,9 +476,9 @@ Status LlvmCodeGen::Init(unique_ptr<llvm::Module> module) {
   builder.setMAttrs(cpu_attrs_);
   builder.setErrorStr(&error_string_);
 
-  execution_engine_.reset(builder.create());
-  if (execution_engine_ == NULL) {
-    module_ = NULL; // module_ was owned by builder.
+  execution_engine_ = unique_ptr<llvm::ExecutionEngine>(builder.create());
+  if (execution_engine_ == nullptr) {
+    module_ = nullptr; // module_ was owned by builder.
     stringstream ss;
     ss << "Could not create ExecutionEngine: " << error_string_;
     return Status(ss.str());
@@ -479,23 +492,28 @@ Status LlvmCodeGen::Init(unique_ptr<llvm::Module> module) {
   true_value_ = llvm::ConstantInt::get(context(), llvm::APInt(1, true, true));
   false_value_ = llvm::ConstantInt::get(context(), llvm::APInt(1, false, true));
 
-  SetupJITListeners();
+  symbol_emitter_ = SetupSymbolEmitter(execution_engine_.get());
+  engine_cache_ = make_shared<CodeGenObjectCache>();
 
   RETURN_IF_ERROR(LoadIntrinsics());
 
   return Status::OK();
 }
 
-void LlvmCodeGen::SetupJITListeners() {
+unique_ptr<CodegenSymbolEmitter> LlvmCodeGen::SetupSymbolEmitter(
+    llvm::ExecutionEngine* execution_engine) {
   bool need_symbol_emitter = !FLAGS_asm_module_dir.empty() || FLAGS_perf_map;
-  if (!need_symbol_emitter) return;
-  symbol_emitter_.reset(new CodegenSymbolEmitter(id_));
-  execution_engine_->RegisterJITEventListener(symbol_emitter_.get());
-  symbol_emitter_->set_emit_perf_map(FLAGS_perf_map);
+  if (!need_symbol_emitter) return nullptr;
+  unique_ptr<CodegenSymbolEmitter> symbol_emitter =
+      make_unique<CodegenSymbolEmitter>(id_);
+  execution_engine->RegisterJITEventListener(symbol_emitter.get());
+  symbol_emitter->set_emit_perf_map(FLAGS_perf_map);
 
   if (!FLAGS_asm_module_dir.empty()) {
-    symbol_emitter_->set_asm_path(Substitute("$0/$1.asm", FLAGS_asm_module_dir, id_));
+    symbol_emitter->set_asm_path(Substitute("$0/$1.asm", FLAGS_asm_module_dir, id_));
   }
+
+  return symbol_emitter;
 }
 
 LlvmCodeGen::~LlvmCodeGen() {
@@ -510,8 +528,8 @@ void LlvmCodeGen::Close() {
     memory_manager_ = nullptr;
   }
   if (mem_tracker_ != nullptr) mem_tracker_->Close();
-
-  // Execution engine executes callback on event listener, so tear down engine first.
+  engine_cache_.reset();
+  engine_cache_cached_.reset();
   execution_engine_.reset();
   symbol_emitter_.reset();
   module_ = nullptr;
@@ -676,6 +694,15 @@ void LlvmCodeGen::CreateIfElseBlocks(llvm::Function* fn, const string& if_name,
   *else_block = llvm::BasicBlock::Create(context(), else_name, fn, insert_before);
 }
 
+llvm::PHINode* LlvmCodeGen::CreateBinaryPhiNode(LlvmBuilder* builder, llvm::Value* value1,
+    llvm::Value* value2, llvm::BasicBlock* incoming_block1,
+    llvm::BasicBlock* incoming_block2, const string& name) {
+  llvm::PHINode* res = builder->CreatePHI(value1->getType(), 2, name);
+  res->addIncoming(value1, incoming_block1);
+  res->addIncoming(value2, incoming_block2);
+  return res;
+}
+
 Status LlvmCodeGen::MaterializeFunction(llvm::Function* fn) {
   DCHECK(!is_compiled_);
   if (fn->isIntrinsic() || !fn->isMaterializable()) return Status::OK();
@@ -810,6 +837,7 @@ LlvmCodeGen::FnPrototype::FnPrototype(
 llvm::Function* LlvmCodeGen::FnPrototype::GeneratePrototype(
     LlvmBuilder* builder, llvm::Value** params) {
   vector<llvm::Type*> arguments;
+  arguments.reserve(args_.size());
   for (int i = 0; i < args_.size(); ++i) {
     arguments.push_back(args_[i].type);
   }
@@ -913,7 +941,19 @@ Status LlvmCodeGen::LoadFunction(const TFunction& fn, const string& symbol,
 #endif
     // Associate the dynamically loaded function pointer with the Function* we defined.
     // This tells LLVM where the compiled function definition is located in memory.
-    execution_engine_->addGlobalMapping(*llvm_fn, fn_ptr);
+    execution_engine()->addGlobalMapping(*llvm_fn, fn_ptr);
+    // Disable the codegen cache because codegen cache uses the llvm module bitcode as
+    // the key while the bitcode doesn't contain the global function mapping of the
+    // execution engine. If the mapping is changed during running, like udf recreation,
+    // the function mapping in the cache could point to an old address and lead to a
+    // crash while calling the udf,  so block the codegen cache for native udfs.
+    // Builtin functions should not have the issue, because they should not change
+    // during runtime.
+    if (fn.binary_type == TFunctionBinaryType::NATIVE) {
+      // Should be before compilation.
+      DCHECK(!is_compiled_);
+      codegen_cache_enabled_ = false;
+    }
   } else if (fn.binary_type == TFunctionBinaryType::BUILTIN) {
     // In this path, we're running a builtin with the UDF interface. The IR is
     // in the llvm module. Builtin functions may use Expr::GetConstant(). Clone the
@@ -1112,7 +1152,102 @@ Status LlvmCodeGen::FinalizeLazyMaterialization() {
   return MaterializeModule();
 }
 
-Status LlvmCodeGen::FinalizeModule() {
+bool LlvmCodeGen::LookupCache(CodeGenCacheKey& cache_key) {
+  DCHECK(!cache_key.empty());
+  CodeGenCacheEntry entry;
+  CodeGenCache* cache = ExecEnv::GetInstance()->codegen_cache();
+  DCHECK(cache != nullptr);
+  Status lookup_status = cache->Lookup(cache_key,
+      state_->query_options().codegen_cache_mode, &entry, &engine_cache_cached_);
+  bool entry_exists = lookup_status.ok() && !entry.Empty();
+  LOG(INFO) << DebugCacheEntryString(cache_key, true /*is_lookup*/,
+      CodeGenCacheModeAnalyzer::is_debug(state_->query_options().codegen_cache_mode),
+      entry_exists);
+  if (entry_exists) {
+    // Fallback to normal procedure if function names hashcode is not expected.
+    // The names hashcode should be the same unless there is a collision on the
+    // key, we expect this case is very rare.
+    if (function_names_hashcode_ != entry.function_names_hashcode) {
+      LOG(WARNING)
+          << "The codegen cache entry contains a different function names hashcode: "
+          << " function names hashcode expected: " << function_names_hashcode_
+          << " actual: " << entry.function_names_hashcode
+          << " key hash_code=" << cache_key.hash_code();
+      cache->IncHitOrMissCount(/*hit*/ false);
+      return false;
+    }
+
+    if (entry.opt_level < state_->query_options().codegen_opt_level) {
+      // Requested optimization level is higher than cached entry, so treat as a miss.
+      VLOG(2) << "Overwriting codegen cache entry at " << entry.opt_level
+          << " with optimization level " << state_->query_options().codegen_opt_level;
+      cache->IncHitOrMissCount(/*hit*/ false);
+      return false;
+    }
+
+    // Because we cache all the compiled codegened functions, the cached number of
+    // functions should be the same as the total optimized function number.
+    COUNTER_SET(num_cached_functions_, entry.num_opt_functions);
+    COUNTER_SET(num_functions_, entry.num_functions);
+    COUNTER_SET(num_instructions_, entry.num_instructions);
+    COUNTER_SET(num_opt_functions_, entry.num_opt_functions);
+    COUNTER_SET(num_opt_instructions_, entry.num_opt_instructions);
+  }
+  cache->IncHitOrMissCount(/*hit*/ entry_exists);
+  return entry_exists;
+}
+
+string LlvmCodeGen::GetAllFunctionNames() {
+  stringstream result;
+  // The way to concat would be like "function1,function2".
+  // The function names are sorted in 'fns_to_jit_compile_'.
+  constexpr char separator = ',';
+  for (auto& entry : fns_to_jit_compile_) {
+    const llvm::StringRef& fn_name = entry.first;
+    result << fn_name.data() << separator;
+  }
+  return result.str();
+}
+
+void LlvmCodeGen::GenerateFunctionNamesHashCode() {
+  string function_names = GetAllFunctionNames();
+  // Use the same hash seed as the codegen cache key.
+  function_names_hashcode_ = HashUtil::MurmurHash2_64(function_names.c_str(),
+      function_names.length(), CodeGenCacheKeyConstructor::CODEGEN_CACHE_HASH_SEED_CONST);
+}
+
+Status LlvmCodeGen::StoreCache(CodeGenCacheKey& cache_key) {
+  DCHECK(!cache_key.empty());
+  Status store_status = ExecEnv::GetInstance()->codegen_cache()->Store(
+      cache_key, this, state_->query_options().codegen_cache_mode,
+      state_->query_options().codegen_opt_level);
+  LOG(INFO) << DebugCacheEntryString(cache_key, false /*is_lookup*/,
+      CodeGenCacheModeAnalyzer::is_debug(state_->query_options().codegen_cache_mode),
+      store_status.ok());
+  return store_status;
+}
+
+void LlvmCodeGen::PruneModule() {
+  SCOPED_TIMER(function_prune_timer_);
+  // Before running any other optimization passes, run the internalize pass, giving it
+  // the names of all functions registered by AddFunctionToJit(), followed by the
+  // global dead code elimination pass. This causes all functions not registered to be
+  // JIT'd to be marked as internal, and any internal functions that are not used are
+  // deleted by DCE pass. This greatly decreases compile time by removing unused code.
+  llvm::ModuleAnalysisManager module_analysis_manager;
+  llvm::PassBuilder pass_builder(execution_engine()->getTargetMachine());
+  pass_builder.registerModuleAnalyses(module_analysis_manager);
+
+  llvm::ModulePassManager module_pass_manager;
+  module_pass_manager.addPass(
+      llvm::InternalizePass([this](const llvm::GlobalValue& gv) {
+        return fns_to_jit_compile_.count(gv.getName()) > 0;
+      }));
+  module_pass_manager.addPass(llvm::GlobalDCEPass());
+  module_pass_manager.run(*module_, module_analysis_manager);
+}
+
+Status LlvmCodeGen::FinalizeModule(string* module_id) {
   DCHECK(!is_compiled_);
   is_compiled_ = true;
 
@@ -1124,6 +1259,7 @@ Status LlvmCodeGen::FinalizeModule() {
     } else {
       f << GetIR(true);
       f.close();
+      LOG(INFO) << "Saved unoptimized IR to " << path;
     }
   }
 
@@ -1157,8 +1293,47 @@ Status LlvmCodeGen::FinalizeModule() {
   }
 
   RETURN_IF_ERROR(FinalizeLazyMaterialization());
-  if (optimizations_enabled_ && !FLAGS_disable_optimization_passes) {
-    RETURN_IF_ERROR(OptimizeModule());
+  PruneModule();
+
+  bool codegen_cache_enabled = state_->codegen_cache_enabled() && codegen_cache_enabled_;
+  CodeGenCacheKey cache_key;
+  bool cache_hit = false;
+  if (codegen_cache_enabled) {
+    string bitcode;
+    SCOPED_TIMER(codegen_cache_lookup_timer_);
+    {
+      SCOPED_TIMER(module_bitcode_gen_timer_);
+      llvm::raw_string_ostream bitcode_stream(bitcode);
+      llvm::WriteBitcodeToFile(module_, bitcode_stream);
+      bitcode_stream.flush();
+    }
+    CodeGenCacheKeyConstructor::construct(bitcode, &cache_key);
+    // Generate the function names hashcode no matter the look up result, will be used
+    // in the cache store process if look up failed.
+    GenerateFunctionNamesHashCode();
+    DCHECK(!cache_key.empty());
+    // Set the module id for the use of ObjectCache.
+    module_->setModuleIdentifier(cache_key.hash_code().str());
+    cache_hit = LookupCache(cache_key);
+  }
+
+  if (!cache_hit) {
+    // Update counters before final optimization, but after removing unused functions.
+    // This gives us a rough measure of how much work the optimization and compilation
+    // must do. If found in cache, counters will be restored from the cache entry.
+    InstructionCounter counter;
+    counter.visit(*module_);
+    COUNTER_SET(num_functions_, counter.GetCount(InstructionCounter::TOTAL_FUNCTIONS));
+    COUNTER_SET(num_instructions_, counter.GetCount(InstructionCounter::TOTAL_INSTS));
+
+    if (optimizations_enabled_ && !FLAGS_disable_optimization_passes) {
+      RETURN_IF_ERROR(OptimizeModule());
+      counter.ResetCount();
+      counter.visit(*module_);
+    }
+    COUNTER_SET(
+        num_opt_functions_, counter.GetCount(InstructionCounter::TOTAL_FUNCTIONS));
+    COUNTER_SET(num_opt_instructions_, counter.GetCount(InstructionCounter::TOTAL_INSTS));
   }
 
   if (FLAGS_opt_module_dir.size() != 0) {
@@ -1169,19 +1344,33 @@ Status LlvmCodeGen::FinalizeModule() {
     } else {
       f << GetIR(true);
       f.close();
+      LOG(INFO) << "Saved optimized IR to " << path;
     }
   }
 
+  if (codegen_cache_enabled) {
+    if (cache_hit) {
+      DCHECK(engine_cache_cached_ != nullptr);
+      execution_engine()->setObjectCache(engine_cache_cached_.get());
+    } else {
+      execution_engine()->setObjectCache(engine_cache_.get());
+    }
+  }
   {
     SCOPED_TIMER(compile_timer_);
     // Finalize module, which compiles all functions.
-    execution_engine_->finalizeObject();
+    execution_engine()->finalizeObject();
+  }
+  SetFunctionPointers();
+  Status store_cache_status;
+  if (codegen_cache_enabled && !cache_hit) {
+    SCOPED_TIMER(codegen_cache_save_timer_);
+    store_cache_status = StoreCache(cache_key);
   }
 
-  SetFunctionPointers();
-  DestroyModule();
-
-  // Track the memory consumed by the compiled code.
+  // Track the memory consumed by the runtime compiled code.
+  // If codegen cache is enabled, the part stored to the cache will be taken care by
+  // codegen cache to track the memory consumption.
   int64_t bytes_allocated = memory_manager_->bytes_allocated();
   if (!mem_tracker_->TryConsume(bytes_allocated)) {
     const string& msg = Substitute(
@@ -1189,6 +1378,10 @@ Status LlvmCodeGen::FinalizeModule() {
     return mem_tracker_->MemLimitExceeded(NULL, msg, bytes_allocated);
   }
   memory_manager_->set_bytes_tracked(bytes_allocated);
+
+  // Get the module id before module destruction.
+  if (module_id != nullptr) *module_id = module_->getModuleIdentifier();
+  DestroyModule();
   return Status::OK();
 }
 
@@ -1222,83 +1415,62 @@ Status LlvmCodeGen::FinalizeModuleAsync(RuntimeProfile::EventSequence* event_seq
 Status LlvmCodeGen::OptimizeModule() {
   SCOPED_TIMER(optimization_timer_);
 
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+
   // This pass manager will construct optimizations passes that are "typical" for
   // c/c++ programs.  We're relying on llvm to pick the best passes for us.
   // TODO: we can likely muck with this to get better compile speeds or write
   // our own passes.  Our subexpression elimination optimization can be rolled into
   // a pass.
-  llvm::PassManagerBuilder pass_builder;
-  // 2 maps to -O2
-  // TODO: should we switch to 3? (3 may not produce different IR than 2 while taking
-  // longer, but we should check)
-  pass_builder.OptLevel = 2;
-  // Don't optimize for code size (this corresponds to -O2/-O3)
-  pass_builder.SizeLevel = 0;
-  // Use a threshold equivalent to adding InlineHint on all functions.
-  // This results in slightly better performance than the default threshold (225).
-  pass_builder.Inliner = llvm::createFunctionInliningPass(325);
+  llvm::PassBuilder pass_builder(execution_engine()->getTargetMachine());
+  pass_builder.registerModuleAnalyses(MAM);
+  pass_builder.registerCGSCCAnalyses(CGAM);
+  pass_builder.registerFunctionAnalyses(FAM);
+  pass_builder.registerLoopAnalyses(LAM);
+  pass_builder.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-  // The TargetIRAnalysis pass is required to provide information about the target
-  // machine to optimisation passes, e.g. the cost model.
-  llvm::TargetIRAnalysis target_analysis =
-      execution_engine_->getTargetMachine()->getTargetIRAnalysis();
-
-  // Before running any other optimization passes, run the internalize pass, giving it
-  // the names of all functions registered by AddFunctionToJit(), followed by the
-  // global dead code elimination pass. This causes all functions not registered to be
-  // JIT'd to be marked as internal, and any internal functions that are not used are
-  // deleted by DCE pass. This greatly decreases compile time by removing unused code.
-  unordered_set<string> exported_fn_names;
-  for (auto& entry : fns_to_jit_compile_) {
-    exported_fn_names.insert(entry.first->getName().str());
+  TCodeGenOptLevel::type opt_level = state_->query_options().codegen_opt_level;
+  llvm::PassBuilder::OptimizationLevel opt;
+  // GCC's -Werror=switch errors if a case is not covered.
+  switch (opt_level) {
+    case TCodeGenOptLevel::O0:
+      // Default optimization pipeline requires O1 or greater, so for O0 we skip.
+      return Status::OK();
+    case TCodeGenOptLevel::O1:
+      opt = llvm::PassBuilder::OptimizationLevel::O1;
+      break;
+    case TCodeGenOptLevel::Os:
+      opt = llvm::PassBuilder::OptimizationLevel::Os;
+      break;
+    case TCodeGenOptLevel::O2:
+      opt = llvm::PassBuilder::OptimizationLevel::O2;
+      break;
+    case TCodeGenOptLevel::O3:
+      opt = llvm::PassBuilder::OptimizationLevel::O3;
+      break;
   }
-  unique_ptr<llvm::legacy::PassManager> module_pass_manager(
-      new llvm::legacy::PassManager());
-  module_pass_manager->add(llvm::createTargetTransformInfoWrapperPass(target_analysis));
-  module_pass_manager->add(
-      llvm::createInternalizePass([&exported_fn_names](const llvm::GlobalValue& gv) {
-        return exported_fn_names.find(gv.getName().str()) != exported_fn_names.end();
-      }));
-  module_pass_manager->add(llvm::createGlobalDCEPass());
-  module_pass_manager->run(*module_);
-
-  // Update counters before final optimization, but after removing unused functions. This
-  // gives us a rough measure of how much work the optimization and compilation must do.
-  InstructionCounter counter;
-  counter.visit(*module_);
-  COUNTER_SET(num_functions_, counter.GetCount(InstructionCounter::TOTAL_FUNCTIONS));
-  COUNTER_SET(num_instructions_, counter.GetCount(InstructionCounter::TOTAL_INSTS));
+  llvm::ModulePassManager pass_manager = pass_builder.buildPerModuleDefaultPipeline(opt);
 
   int64_t estimated_memory = ESTIMATED_OPTIMIZER_BYTES_PER_INST
-      * counter.GetCount(InstructionCounter::TOTAL_INSTS);
+      * num_instructions_->value();
   if (!mem_tracker_->TryConsume(estimated_memory)) {
     const string& msg = Substitute(
         "Codegen failed to reserve '$0' bytes for optimization", estimated_memory);
     return mem_tracker_->MemLimitExceeded(NULL, msg, estimated_memory);
   }
 
-  // Create and run function pass manager
-  unique_ptr<llvm::legacy::FunctionPassManager> fn_pass_manager(
-      new llvm::legacy::FunctionPassManager(module_));
-  fn_pass_manager->add(llvm::createTargetTransformInfoWrapperPass(target_analysis));
-  pass_builder.populateFunctionPassManager(*fn_pass_manager);
-  fn_pass_manager->doInitialization();
-  for (llvm::Module::iterator it = module_->begin(), end = module_->end(); it != end;
-       ++it) {
-    if (!it->isDeclaration()) fn_pass_manager->run(*it);
-  }
-  fn_pass_manager->doFinalization();
-
   // Create and run module pass manager
-  module_pass_manager.reset(new llvm::legacy::PassManager());
-  module_pass_manager->add(llvm::createTargetTransformInfoWrapperPass(target_analysis));
-  pass_builder.populateModulePassManager(*module_pass_manager);
-  module_pass_manager->run(*module_);
+  pass_manager.run(*module_, MAM);
   if (FLAGS_print_llvm_ir_instruction_count) {
-    for (int i = 0; i < fns_to_jit_compile_.size(); ++i) {
+    for (auto& entry : fns_to_jit_compile_) {
       InstructionCounter counter;
-      counter.visit(*fns_to_jit_compile_[i].first);
-      VLOG(1) << fns_to_jit_compile_[i].first->getName().str();
+      llvm::Function* llvm_function = entry.second.first;
+      const llvm::StringRef& llvm_function_name = entry.first;
+      counter.visit(*llvm_function);
+      VLOG(1) << llvm_function_name.data();
       VLOG(1) << counter.PrintCounters();
     }
   }
@@ -1307,15 +1479,48 @@ Status LlvmCodeGen::OptimizeModule() {
   return Status::OK();
 }
 
-void LlvmCodeGen::SetFunctionPointers() {
+bool LlvmCodeGen::SetFunctionPointers(CodeGenCache* cache,
+    const CodeGenCacheKey* cache_key) {
   // Get pointers to all codegen'd functions.
-  for (const std::pair<llvm::Function*, CodegenFnPtrBase*>& fn_pair
-      : fns_to_jit_compile_) {
-    llvm::Function* function = fn_pair.first;
-    void* jitted_function = execution_engine_->getPointerToFunction(function);
-    DCHECK(jitted_function != nullptr) << "Failed to jit " << function->getName().data();
-    fn_pair.second->store(jitted_function);
+  for (auto& entry : fns_to_jit_compile_) {
+    const llvm::StringRef& function_name = entry.first;
+
+    LlvmFunctionWithFnPtrTargets& fn_with_targets = entry.second;
+    llvm::Function* function = fn_with_targets.first;
+    std::vector<CodegenFnPtrBase*>& jitted_fn_ptrs = fn_with_targets.second;
+
+    void* jitted_function = nullptr;
+    if (cache != nullptr) {
+      DCHECK(cache_key != nullptr);
+      // engine_cache_cached_ is used to keep the life of the object cache
+      // in case the object cache is evicted in the global cache.
+      DCHECK(engine_cache_cached_ != nullptr);
+      // Using the function getFunctionAddress() with a non-existent function name would
+      // hit an assertion during the test, could be a bug in llvm 5, need to review after
+      // upgrade llvm. But because we already checked the names hashcode for key collision
+      // cases, we expect all the functions should be in the cached execution engine.
+      jitted_function =
+          reinterpret_cast<void*>(execution_engine()->getFunctionAddress(function_name));
+      if (jitted_function == nullptr) {
+        LOG(WARNING) << "Failed to get a jitted function from cache: "
+                     << function_name.data()
+                     << " key hash_code=" << cache_key->hash_code();
+        cache->IncHitOrMissCount(/*hit*/ false);
+        return false;
+      }
+    } else {
+      DCHECK(cache_key == nullptr);
+      jitted_function = execution_engine()->getPointerToFunction(function);
+      DCHECK(jitted_function != nullptr) << "Failed to jit " << function_name.data();
+    }
+
+    DCHECK(jitted_function != nullptr);
+    for (CodegenFnPtrBase* jitted_fn_ptr : jitted_fn_ptrs) {
+      jitted_fn_ptr->store(jitted_function);
+    }
   }
+
+  return true;
 }
 
 void LlvmCodeGen::DestroyModule() {
@@ -1327,13 +1532,14 @@ void LlvmCodeGen::DestroyModule() {
   llvm_intrinsics_.clear();
   hash_fns_.clear();
   fns_to_jit_compile_.clear();
-  execution_engine_->removeModule(module_);
+  execution_engine()->removeModule(module_);
   module_ = NULL;
 }
 
 void LlvmCodeGen::AddFunctionToJit(llvm::Function* fn, CodegenFnPtrBase* fn_ptr) {
   DCHECK(finalized_functions_.find(fn) != finalized_functions_.end())
       << "Attempted to add a non-finalized function to Jit: " << fn->getName().str();
+  DCHECK(!is_compiled_);
   llvm::Type* decimal_val_type = GetNamedType(CodegenAnyVal::LLVM_DECIMALVAL_NAME);
   if (fn->getReturnType() == decimal_val_type) {
     // Per the x86 calling convention ABI, DecimalVals should be returned via an extra
@@ -1370,8 +1576,16 @@ void LlvmCodeGen::AddFunctionToJit(llvm::Function* fn, CodegenFnPtrBase* fn_ptr)
 }
 
 void LlvmCodeGen::AddFunctionToJitInternal(llvm::Function* fn, CodegenFnPtrBase* fn_ptr) {
-  DCHECK(!is_compiled_);
-  fns_to_jit_compile_.push_back(make_pair(fn, fn_ptr));
+  DCHECK(fn != nullptr);
+  DCHECK(fn_ptr != nullptr);
+  const llvm::StringRef& fn_name = fn->getName();
+
+  auto it = fns_to_jit_compile_.find(fn_name);
+  if (it == fns_to_jit_compile_.end()) {
+    fns_to_jit_compile_[fn_name] = make_pair(fn, vector<CodegenFnPtrBase*>{fn_ptr});
+  } else {
+    it->second.second.push_back(fn_ptr);
+  }
 }
 
 void LlvmCodeGen::CodegenDebugTrace(
@@ -1619,7 +1833,7 @@ void LlvmCodeGen::ClearHashFns() {
 //   ret i32 %12
 // }
 llvm::Function* LlvmCodeGen::GetHashFunction(int num_bytes) {
-  if (base::IsAarch64() || IsCPUFeatureEnabled(CpuInfo::SSE4_2)) {
+  if (IS_AARCH64 || IsCPUFeatureEnabled(CpuInfo::SSE4_2)) {
     if (num_bytes == -1) {
       // -1 indicates variable length, just return the generic loop based
       // hash fn.
@@ -1833,6 +2047,36 @@ string LlvmCodeGen::DiagnosticHandler::GetErrorString() {
     return return_msg;
   }
   return "";
+}
+
+string LlvmCodeGen::DebugCacheEntryString(CodeGenCacheKey& key, bool is_lookup,
+    bool debug_mode, bool success) const {
+  stringstream out;
+  if (is_lookup) {
+    out << "Look up codegen cache ";
+  } else {
+    out << "Store to codegen cache ";
+  }
+  if (success) {
+    out << "succeeded. ";
+  } else {
+    if (is_lookup) {
+      out << "missed. ";
+    } else {
+      out << "failed. ";
+    }
+  }
+  out << "CodeGen Cache Key hash_code=" << key.hash_code();
+  if (UNLIKELY(debug_mode)) {
+    out << "\nFragment Plan: " << apache::thrift::ThriftDebugString(state_->fragment())
+        << "\n";
+    out << "CodeGen Functions: \n";
+    for (auto& entry : fns_to_jit_compile_) {
+      const llvm::StringRef& fn_name = entry.first;
+      out << "  " << fn_name.data() << "\n";
+    }
+  }
+  return out.str();
 }
 }
 

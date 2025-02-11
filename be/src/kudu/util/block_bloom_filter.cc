@@ -18,14 +18,15 @@
 #include "kudu/util/block_bloom_filter.h"
 
 #ifdef __aarch64__
-  #include "sse2neon.h"
-#else
-  #include <emmintrin.h>
-  #include <mm_malloc.h>
+#include <arm_neon.h>
+#else //__aarch64__
+#include <emmintrin.h>
+#include <mm_malloc.h>
 #endif
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -175,6 +176,55 @@ void BlockBloomFilter::Close() {
   }
 }
 
+#ifdef __aarch64__
+// A static helper function for the arm64 methods. Turns a 32-bit hash into a 256-bit
+// Bucket with 1 single 1-bit set in each 32-bit lane.
+static inline ATTRIBUTE_ALWAYS_INLINE uint32x4x2_t MakeMask(const uint32_t hash) {
+  const uint32x4_t ones = vdupq_n_u32(1);
+  constexpr uint32_t c[8] = {BLOOM_HASH_CONSTANTS};
+  const uint32x4x2_t rehash = vld1q_u32_x2(c);
+  // Load hash, repeated 4 times.
+  uint32x4_t hash_data = vdupq_n_u32(hash);
+
+  // Multiply-shift hashing ala Dietzfelbinger et al.: multiply 'hash' by eight different
+  // odd constants, then keep the 5 most significant bits from each product.
+  int32x4x2_t t;
+  t.val[0] = vreinterpretq_s32_u32(vshrq_n_u32(vmulq_u32(rehash.val[0], hash_data), 27));
+  t.val[1] = vreinterpretq_s32_u32(vshrq_n_u32(vmulq_u32(rehash.val[1], hash_data), 27));
+
+  // Use these 5 bits to shift a single bit to a location in each 32-bit lane
+  uint32x4x2_t res;
+  res.val[0] = vshlq_u32(ones, t.val[0]);
+  res.val[1] = vshlq_u32(ones, t.val[1]);
+  return res;
+}
+
+ATTRIBUTE_NO_SANITIZE_INTEGER
+void BlockBloomFilter::BucketInsert(const uint32_t bucket_idx, const uint32_t hash) noexcept {
+  const uint32x4x2_t mask = MakeMask(hash);
+  uint32x4x2_t* addr = &(reinterpret_cast<uint32x4x2_t*>(directory_)[bucket_idx]);
+  uint32_t* bucket = reinterpret_cast<uint32_t*>(addr);
+  uint32x4x2_t data = vld1q_u32_x2(bucket);
+  data.val[0] = vorrq_u32(data.val[0], mask.val[0]);
+  data.val[1] = vorrq_u32(data.val[1], mask.val[1]);
+  vst1q_u32_x2(bucket, data);
+}
+
+ATTRIBUTE_NO_SANITIZE_INTEGER
+bool BlockBloomFilter::BucketFind(
+    const uint32_t bucket_idx, const uint32_t hash) const noexcept {
+  const uint32x4x2_t mask = MakeMask(hash);
+  uint32x4x2_t* addr = &(reinterpret_cast<uint32x4x2_t*>(directory_)[bucket_idx]);
+  uint32_t* bucket = reinterpret_cast<uint32_t*>(addr);
+  uint32x4x2_t data = vld1q_u32_x2(bucket);
+  // We should return true if 'bucket' has a one wherever 'mask' does.
+  uint32x4_t t0 = vtstq_u32(data.val[0], mask.val[0]);
+  uint32x4_t t1 = vtstq_u32(data.val[1], mask.val[1]);
+  int64x2_t t = vreinterpretq_s64_u32(vandq_u32(t0, t1));
+  int64_t a = vgetq_lane_s64(t, 0) & vgetq_lane_s64(t, 1);
+  return a == -1;
+}
+#elif defined(__x86_64__)
 ATTRIBUTE_NO_SANITIZE_INTEGER
 void BlockBloomFilter::BucketInsert(const uint32_t bucket_idx, const uint32_t hash) noexcept {
   // new_bucket will be all zeros except for eight 1-bits, one in each 32-bit word. It is
@@ -206,33 +256,93 @@ bool BlockBloomFilter::BucketFind(
   }
   return true;
 }
+#endif
 
-// The following three methods are derived from
-//
-// fpp = (1 - exp(-kBucketWords * ndv/space))^kBucketWords
-//
-// where space is in bits.
+// This implements the false positive probability in Putze et al.'s "Cache-, hash-and
+// space-efficient bloom filters", equation 3.
+double BlockBloomFilter::FalsePositiveProb(const size_t ndv, const int log_space_bytes) {
+  static constexpr double kWordBits = 1 << kLogBucketWordBits;
+  const double bytes = static_cast<double>(1L << log_space_bytes);
+  if (ndv == 0) return 0.0;
+  if (bytes <= 0) return 1.0;
+  // This short-cuts a slowly-converging sum for very dense filters
+  if (ndv / (bytes * CHAR_BIT) > 2) return 1.0;
+
+  double result = 0;
+  // lam is the usual parameter to the Poisson's PMF. Following the notation in the paper,
+  // lam is B/c, where B is the number of bits in a bucket and c is the number of bits per
+  // distinct value
+  const double lam = kBucketWords * kWordBits / ((bytes * CHAR_BIT) / ndv);
+  // Some of the calculations are done in log-space to increase numerical stability
+  const double loglam = log(lam);
+
+  // 750 iterations are sufficient to cause the sum to converge in all of the tests. In
+  // other words, setting the iterations higher than 750 will give the same result as
+  // leaving it at 750.
+  static constexpr uint64_t kBloomFppIters = 750;
+  for (uint64_t j = 0; j < kBloomFppIters; ++j) {
+    // We start with the highest value of i, since the values we're adding to result are
+    // mostly smaller at high i, and this increases accuracy to sum from the smallest
+    // values up.
+    const double i = static_cast<double>(kBloomFppIters - 1 - j);
+    // The PMF of the Poisson distribution is lam^i * exp(-lam) / i!. In logspace, using
+    // lgamma for the log of the factorial function:
+    double logp = i * loglam - lam - lgamma(i + 1);
+    // The f_inner part of the equation in the paper is the probability of a single
+    // collision in the bucket. Since there are kBucketWords non-overlapping lanes in each
+    // bucket, the log of this probability is:
+    const double logfinner = kBucketWords * log(1.0 - pow(1.0 - 1.0 / kWordBits, i));
+    // Here we are forced out of log-space calculations
+    result += exp(logp + logfinner);
+  }
+  return (result > 1.0) ? 1.0 : result;
+}
+
 size_t BlockBloomFilter::MaxNdv(const int log_space_bytes, const double fpp) {
   DCHECK(log_space_bytes > 0 && log_space_bytes < 61);
   DCHECK(0 < fpp && fpp < 1);
-  static const double ik = 1.0 / kBucketWords;
-  return -1 * ik * static_cast<double>(1ULL << (log_space_bytes + 3)) * log(1 - pow(fpp, ik));
+  // Starting with an exponential search, we find bounds for how many distinct values a
+  // filter of size (1 << log_space_bytes) can hold before it exceeds a false positive
+  // probability of fpp.
+  size_t too_many = 1;
+  while (FalsePositiveProb(too_many, log_space_bytes) <= fpp) {
+    too_many *= 2;
+  }
+  // From here forward, we have the invariant that FalsePositiveProb(too_many,
+  // log_space_bytes) > fpp
+  size_t too_few = too_many / 2;
+  // Invariant for too_few: FalsePositiveProb(too_few, log_space_bytes) <= fpp
+
+  constexpr size_t kProximity = 1;
+  // Simple binary search. If this is too slow, the required proximity of too_few and
+  // too_many can be raised from 1 to something higher.
+  while (too_many - too_few > kProximity) {
+    const size_t mid = (too_many + too_few) / 2;
+    const double mid_fpp = FalsePositiveProb(mid, log_space_bytes);
+    if (mid_fpp <= fpp) {
+      too_few = mid;
+    } else {
+      too_many = mid;
+    }
+  }
+  DCHECK_LE(FalsePositiveProb(too_few, log_space_bytes), fpp);
+  DCHECK_GT(FalsePositiveProb(too_few + kProximity, log_space_bytes), fpp);
+  return too_few;
 }
 
 int BlockBloomFilter::MinLogSpace(const size_t ndv, const double fpp) {
-  static const double k = kBucketWords;
-  if (0 == ndv) return 0;
-  // m is the number of bits we would need to get the fpp specified
-  const double m = -k * ndv / log(1 - pow(fpp, 1.0 / k));
-
-  // Handle case where ndv == 1 => ceil(log2(m/8)) < 0.
-  return std::max(0, static_cast<int>(ceil(log2(m / 8))));
-}
-
-double BlockBloomFilter::FalsePositiveProb(const size_t ndv, const int log_space_bytes) {
-  return pow(1 - exp((-1.0 * static_cast<double>(kBucketWords) * static_cast<double>(ndv))
-                     / static_cast<double>(1ULL << (log_space_bytes + 3))),
-             kBucketWords);
+  int low = 0;
+  int high = 64;
+  while (high > low + 1) {
+    int mid = (high + low) / 2;
+    const double candidate = FalsePositiveProb(ndv, mid);
+    if (candidate <= fpp) {
+      high = mid;
+    } else {
+      low = mid;
+    }
+  }
+  return high;
 }
 
 void BlockBloomFilter::InsertNoAvx2(const uint32_t hash) noexcept {
@@ -307,6 +417,28 @@ Status BlockBloomFilter::OrEqualArray(size_t n, const uint8_t* __restrict__ in,
   return Status::OK();
 }
 
+#ifdef __aarch64__
+void BlockBloomFilter::OrEqualArrayNoAVX2(size_t n, const uint8_t* __restrict__ in,
+                                          uint8_t* __restrict__ out) {
+  // The trivial loop out[i] |= in[i] should auto-vectorize with gcc at -O3, but it is not
+  // written in a way that is very friendly to auto-vectorization. Instead, we manually
+  // vectorize, increasing the speed by up to 56x.
+  const uint8_t* simd_in = in;
+  const uint8_t* const simd_in_end = in + n;
+  uint8_t* simd_out = out;
+  // in.directory has a size (in bytes) that is a multiple of 32. Since sizeof(uint8x16_t)
+  // == 16, we can do two vorq's in each iteration without checking array bounds.
+  while (simd_in != simd_in_end) {
+    uint8x16x2_t a = vld1q_u8_x2(simd_in);
+    uint8x16x2_t b = vld1q_u8_x2(simd_out);
+    b.val[0] = vorrq_u8(b.val[0], a.val[0]);
+    b.val[1] = vorrq_u8(b.val[1], a.val[1]);
+    vst1q_u8_x2(simd_out, b);
+    simd_out += 32;
+    simd_in += 32;
+  }
+}
+#elif defined(__x86_64__)
 void BlockBloomFilter::OrEqualArrayNoAVX2(size_t n, const uint8_t* __restrict__ in,
                                           uint8_t* __restrict__ out) {
   // The trivial loop out[i] |= in[i] should auto-vectorize with gcc at -O3, but it is not
@@ -325,6 +457,7 @@ void BlockBloomFilter::OrEqualArrayNoAVX2(size_t n, const uint8_t* __restrict__ 
     }
   }
 }
+#endif
 
 Status BlockBloomFilter::Or(const BlockBloomFilter& other) {
   // AlwaysTrueFilter is a special case implemented with a nullptr.

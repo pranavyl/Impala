@@ -18,6 +18,7 @@
 package org.apache.impala.analysis;
 
 import java.util.List;
+import java.util.Objects;
 
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.Function.CompareMode;
@@ -28,6 +29,7 @@ import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 
 import com.google.common.base.MoreObjects;
+import com.google.common.base.MoreObjects.ToStringHelper;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -54,6 +56,11 @@ public class CompoundPredicate extends Predicate {
   }
   private final Operator op_;
 
+  // Selectivity estimate from BetweenToCompoundRule.computeBetweenSelectivity().
+  // Only set if this CompoundPredicate is a rewrite from BetweenPredicate.
+  // Otherwise, set to -1.
+  private final double betweenSelectivity_;
+
   public static void initBuiltins(Db db) {
     // AND and OR are implemented as custom exprs, so they do not have a function symbol.
     db.addBuiltin(ScalarFunction.createBuiltinOperator(
@@ -67,7 +74,13 @@ public class CompoundPredicate extends Predicate {
         Lists.<Type>newArrayList(Type.BOOLEAN), Type.BOOLEAN));
   }
 
-  public CompoundPredicate(Operator op, Expr e1, Expr e2) {
+  public static CompoundPredicate createFromBetweenPredicate(Operator op,
+      BinaryPredicate lower, BinaryPredicate upper, double betweenSelectivity) {
+    Preconditions.checkArgument(betweenSelectivity >= 0.0);
+    return new CompoundPredicate(op, lower, upper, betweenSelectivity);
+  }
+
+  private CompoundPredicate(Operator op, Expr e1, Expr e2, double betweenSelectivity) {
     super();
     this.op_ = op;
     Preconditions.checkNotNull(e1);
@@ -84,7 +97,10 @@ public class CompoundPredicate extends Predicate {
         setHasAlwaysTrueHint(true);
       }
     }
+    betweenSelectivity_ = betweenSelectivity;
   }
+
+  public CompoundPredicate(Operator op, Expr e1, Expr e2) { this(op, e1, e2, -1); }
 
   /**
    * Copy c'tor used in clone().
@@ -92,21 +108,28 @@ public class CompoundPredicate extends Predicate {
   protected CompoundPredicate(CompoundPredicate other) {
     super(other);
     op_ = other.op_;
+    betweenSelectivity_ = other.betweenSelectivity_;
   }
 
   public Operator getOp() { return op_; }
 
   @Override
-  public boolean localEquals(Expr that) {
+  protected boolean localEquals(Expr that) {
     return super.localEquals(that) && ((CompoundPredicate) that).op_ == op_;
   }
 
   @Override
+  protected int localHash() {
+    return Objects.hash(super.localHash(), op_);
+  }
+
+  @Override
   public String debugString() {
-    return MoreObjects.toStringHelper(this)
+    ToStringHelper helper = MoreObjects.toStringHelper(this)
         .add("op", op_)
-        .addValue(super.debugString())
-        .toString();
+        .addValue(super.debugString());
+    if (betweenSelectivity_ != -1) helper.add("betweenSelectivity", betweenSelectivity_);
+    return helper.toString();
   }
 
   @Override
@@ -141,14 +164,33 @@ public class CompoundPredicate extends Predicate {
         CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
     Preconditions.checkState(fn_ != null);
     Preconditions.checkState(fn_.getReturnType().isBoolean());
-    castForFunctionCall(false, analyzer.isDecimalV2());
+    castForFunctionCall(false, analyzer.getRegularCompatibilityLevel());
 
+    computeSelectivity(analyzer);
+  }
+
+  protected void computeSelectivity(Analyzer analyzer) {
+    if (hasValidSelectivityHint()) {
+      // TODO: Support selectivity hint for 'AND' compound predicates.
+      if (this.getOp() == Operator.AND) {
+        // 'AND' compound predicates will be replaced by children in Expr#getConjuncts,
+        // so selectivity hint will be missing, we add a warning here.
+        analyzer.addWarning("Selectivity hints are ignored for 'AND' compound "
+            + "predicates, either in the SQL query or internally generated.");
+      } else {
+        return;
+      }
+    }
     computeSelectivity();
   }
 
+  @Deprecated
   protected void computeSelectivity() {
-    if (!getChild(0).hasSelectivity() ||
-        (children_.size() == 2 && !getChild(1).hasSelectivity())) {
+    if (betweenSelectivity_ != -1) {
+      selectivity_ = betweenSelectivity_;
+      return;
+    } else if (!getChild(0).hasSelectivity()
+        || (children_.size() == 2 && !getChild(1).hasSelectivity())) {
       // Give up if one of our children has an unknown selectivity.
       selectivity_ = -1;
       return;
@@ -222,4 +264,6 @@ public class CompoundPredicate extends Predicate {
     if (rhs == null) return lhs;
     return new CompoundPredicate(Operator.AND, rhs, lhs);
   }
+
+  public boolean derivedFromBetween() { return betweenSelectivity_ != -1; }
 }

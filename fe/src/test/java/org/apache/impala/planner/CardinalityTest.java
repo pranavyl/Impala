@@ -18,17 +18,24 @@
 package org.apache.impala.planner;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.service.Frontend.PlanCtx;
 import org.apache.impala.testutil.TestUtils;
+import org.apache.impala.thrift.QueryConstants;
 import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.util.MathUtil;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.google.common.collect.ImmutableSet;
@@ -40,6 +47,16 @@ import com.google.common.collect.ImmutableSet;
 public class CardinalityTest extends PlannerTestBase {
 
   private static double CARDINALITY_TOLERANCE = 0.05;
+
+  @BeforeClass
+  public static void setUpClass() throws Exception {
+    RuntimeEnv.INSTANCE.setTestEnv(true);
+  }
+
+  @AfterClass
+  public static void cleanUpClass() {
+    RuntimeEnv.INSTANCE.reset();
+  }
 
   /**
    * Test the happy path: table with stats, no all-null cols.
@@ -101,6 +118,10 @@ public class CardinalityTest extends PlannerTestBase {
         "SELECT COUNT(*) FROM functional.alltypes GROUP BY id", 7300);
     verifyCardinality(
         "SELECT COUNT(*) FROM functional.alltypes GROUP BY bool_col", 2);
+
+    // Regression test for IMPALA-11301.
+    verifyCardinality(
+        "SELECT * FROM tpcds_parquet.date_dim WHERE d_current_day != 'a'", 36525);
   }
 
   /**
@@ -182,8 +203,10 @@ public class CardinalityTest extends PlannerTestBase {
     // NDV(id) = 26 * ndv(null_str) = 1 ; 26 * 1 = 26
     verifyCardinality(baseStmt + "nullrows.id, null_str", 26);
     // NDV(id) = 26 * ndv(group_str) = 156
-    // Planner does not know that id determines group_str
-    verifyCardinality(baseStmt + "nullrows.id, group_str", 156);
+    // However, id and group_str belong to the same nullrows table that has only 26 rows.
+    verifyCardinality(baseStmt + "nullrows.id, group_str", 26);
+    // NDV(nullrows.id) * NDV(alltypes.month) = 26 * 12 = 312
+    verifyCardinality(baseStmt + "nullrows.id, alltypes.month", 312);
   }
 
   /**
@@ -198,7 +221,7 @@ public class CardinalityTest extends PlannerTestBase {
     verifyCardinality(
         "SELECT COUNT(*)" + joinClause + "GROUP BY t1.id", 7300);
     verifyCardinality(
-        "SELECT COUNT(*)" + joinClause + "GROUP BY t1.id, t1.int_col", 7300 * 10);
+        "SELECT COUNT(*)" + joinClause + "GROUP BY t1.id, t1.int_col", 7300);
   }
 
   @Test
@@ -366,11 +389,11 @@ public class CardinalityTest extends PlannerTestBase {
     // The estimated number of rows caps the output cardinality.
     verifyApproxCardinality(
         "select distinct id, int_col from functional_parquet.alltypes",
-        12760, true, ImmutableSet.of(),
+        12400, true, ImmutableSet.of(),
         pathToFirstAggregationNode, AggregationNode.class);
     verifyApproxCardinality(
         "select distinct id, int_col from functional_parquet.alltypes",
-        12760, true, ImmutableSet.of(),
+        12400, true, ImmutableSet.of(),
         pathToSecondAggregationNode, AggregationNode.class);
     // No column stats available and row estimation disabled - no estimate is possible.
     verifyCardinality(
@@ -396,6 +419,12 @@ public class CardinalityTest extends PlannerTestBase {
     verifyApproxCardinality("SELECT SUM(int_col) OVER() int_col "
         + "FROM functional_parquet.alltypestiny", 742, true,
         ImmutableSet.of(), path, AnalyticEvalNode.class);
+
+    // Regression test for IMPALA-11301. row_number() is (incorrectly) assumed to have
+    // NDV=1, which was leading to selectivity=0.0 in rn != 5. Will break if someone
+    // implements correct ndv estimates for analytic functions.
+    verifyCardinality("SELECT * FROM (SELECT *, row_number() OVER(order by id) "
+        + "as rn FROM functional.alltypestiny) v where rn != 5", 4);
   }
 
   @Test
@@ -877,12 +906,14 @@ public class CardinalityTest extends PlannerTestBase {
     // Ndv of int_col is 10;
     // MIN_HASH_TBL_MEM is 10M
     verifyApproxMemoryEstimate("SELECT COUNT(int_col) FROM functional.alltypes "
-        + "GROUP BY int_col", AggregationNode.MIN_HASH_TBL_MEM, true, false,
-        ImmutableSet.of(), pathToFirstAggregationNode, AggregationNode.class);
+            + "GROUP BY int_col",
+        QueryConstants.MIN_HASH_TBL_MEM, true, false, ImmutableSet.of(),
+        pathToFirstAggregationNode, AggregationNode.class);
     // create a single node plan.
     verifyApproxMemoryEstimate("SELECT COUNT(int_col) FROM functional.alltypes "
-        + "GROUP BY int_col", AggregationNode.MIN_HASH_TBL_MEM, false, false,
-        ImmutableSet.of(), pathToAggregationNode, AggregationNode.class);
+            + "GROUP BY int_col",
+        QueryConstants.MIN_HASH_TBL_MEM, false, false, ImmutableSet.of(),
+        pathToAggregationNode, AggregationNode.class);
 
     // FUNCTIONAL.ALLTYPES.ID's Ndv is 7300 and avgRowSize is 4
     // FUNCTIONAL.ALLTYPESSMALL.TIMESTAMP_COL's Ndv is 100 and avgRowSize is 16
@@ -1003,6 +1034,54 @@ public class CardinalityTest extends PlannerTestBase {
         ImmutableSet.of(), pathToKuduScanNodeSg, KuduScanNode.class);
   }
 
+  @Test
+  public void testByteBasedNumWriters() {
+    int min_bytes = HdfsTableSink.MIN_WRITE_BYTES;
+
+    // Test unpartitioned insert cases.
+    assertEquals(1, HdfsTableSink.bytesBasedNumWriters(10, 50, false, 1, min_bytes, 1));
+    assertEquals(25, HdfsTableSink.bytesBasedNumWriters(10, 50, false, 1, min_bytes, 25));
+    assertEquals(10, HdfsTableSink.bytesBasedNumWriters(10, 10, false, 1, min_bytes, 25));
+
+    // Test partitioned insert cases with unknown totalNumPartitions.
+    assertEquals(1, HdfsTableSink.bytesBasedNumWriters(10, 50, true, -1, min_bytes, 1));
+    assertEquals(25, HdfsTableSink.bytesBasedNumWriters(10, 50, true, -1, min_bytes, 25));
+    assertEquals(10, HdfsTableSink.bytesBasedNumWriters(10, 10, true, -1, min_bytes, 25));
+
+    // Test partitioned insert cases with totalNumPartitions == 1.
+    assertEquals(10, HdfsTableSink.bytesBasedNumWriters(10, 50, true, 1, min_bytes, 1));
+    assertEquals(10, HdfsTableSink.bytesBasedNumWriters(10, 50, true, 1, min_bytes, 25));
+    assertEquals(10, HdfsTableSink.bytesBasedNumWriters(10, 10, true, 1, min_bytes, 25));
+
+    // Test partitioned insert cases with totalNumPartitions == maxNumWriters.
+    assertEquals(10, HdfsTableSink.bytesBasedNumWriters(10, 50, true, 50, min_bytes, 1));
+    assertEquals(25, HdfsTableSink.bytesBasedNumWriters(10, 50, true, 50, min_bytes, 25));
+    assertEquals(10, HdfsTableSink.bytesBasedNumWriters(10, 10, true, 10, min_bytes, 25));
+
+    // Test partitioned insert cases with totalNumPartitions > maxNumWriters.
+    assertEquals(10, HdfsTableSink.bytesBasedNumWriters(10, 50, true, 60, min_bytes, 1));
+    assertEquals(25, HdfsTableSink.bytesBasedNumWriters(10, 50, true, 60, min_bytes, 25));
+    assertEquals(10, HdfsTableSink.bytesBasedNumWriters(10, 10, true, 11, min_bytes, 25));
+
+    // Test partitioned insert cases with totalNumPartitions < maxNumWriters.
+    assertEquals(10, HdfsTableSink.bytesBasedNumWriters(10, 50, true, 40, min_bytes, 1));
+    assertEquals(25, HdfsTableSink.bytesBasedNumWriters(10, 50, true, 40, min_bytes, 25));
+    assertEquals(9, HdfsTableSink.bytesBasedNumWriters(10, 10, true, 9, min_bytes, 25));
+
+    // Test partitioned insert cases with totalNumPartitions < numInputNodes.
+    assertEquals(8, HdfsTableSink.bytesBasedNumWriters(10, 50, true, 8, min_bytes, 1));
+    assertEquals(8, HdfsTableSink.bytesBasedNumWriters(10, 50, true, 8, min_bytes, 25));
+    assertEquals(8, HdfsTableSink.bytesBasedNumWriters(10, 10, true, 8, min_bytes, 25));
+
+    // Test 0 cardinality.
+    assertEquals(1, HdfsTableSink.bytesBasedNumWriters(10, 50, false, 1, 0, 25));
+    assertEquals(1, HdfsTableSink.bytesBasedNumWriters(10, 50, true, 50, 0, 25));
+
+    // Test 0 avgRowSize (this is hypothetical and defensive).
+    assertEquals(1, HdfsTableSink.bytesBasedNumWriters(10, 50, false, 1, min_bytes, 0));
+    assertEquals(10, HdfsTableSink.bytesBasedNumWriters(10, 50, true, 50, min_bytes, 0));
+  }
+
   /**
    * Given a query and an expected cardinality, checks that the root
    * node of the single-fragment plan has the expected cardinality.
@@ -1104,6 +1183,9 @@ public class CardinalityTest extends PlannerTestBase {
     // the distributed plan).
     PlanNode currentNode = plan.get(plan.size() - 1).getPlanRoot();
     for (Integer currentChildIndex: path) {
+      assertTrue(currentNode.getDisplayLabel() + " does not have child index "
+              + currentChildIndex,
+          currentNode.hasChild(currentChildIndex));
       currentNode = currentNode.getChild(currentChildIndex);
     }
     assertEquals("PlanNode class not matched: ", cl.getName(),
@@ -1231,4 +1313,91 @@ public class CardinalityTest extends PlannerTestBase {
         expected * CARDINALITY_TOLERANCE);
   }
 
+  @Test
+  public void testSmallestValidCardinality() {
+    long[] validCard = {0, 1, Long.MAX_VALUE};
+    long unknown = -1;
+
+    // Case 1: both argument is valid.
+    for (long c1 : validCard) {
+      for (long c2 : validCard) {
+        assertEquals(c1 + " vs " + c2, Math.min(c1, c2),
+            PlanNode.smallestValidCardinality(c1, c2));
+      }
+    }
+    // Case 2: One argument is valid, the other is unknown.
+    for (long c : validCard) {
+      assertEquals(
+          c + " vs " + unknown, c, PlanNode.smallestValidCardinality(c, unknown));
+      assertEquals(
+          unknown + " vs " + c, c, PlanNode.smallestValidCardinality(unknown, c));
+    }
+    // Case 3: both argument is unknown.
+    assertEquals(unknown + " vs " + unknown, unknown,
+        PlanNode.smallestValidCardinality(unknown, unknown));
+  }
+
+  @Test
+  public void testEstimatePreaggCardinality() {
+    List<Long> positiveLong = Arrays.asList(1L, 2L, 5L, 10L, 100L, 1000L, Long.MAX_VALUE);
+    List<Long> validCard = new ArrayList<>(positiveLong);
+    validCard.add(-1L);
+    validCard.add(0L);
+
+    for (Long totalInstances : positiveLong) {
+      for (Long globalNdv : positiveLong) {
+        for (Long inputCard : validCard) {
+          String pattern = "totalInstances=%d, globalNdv=%d, inputCard=%d,"
+          + " isNonGroupingAggregation=%b, canCompteleEarly=%b, limit=%d, ouputCard=%d";
+
+          // Test regular preaggregation
+          long outputCard = AggregationNode.estimatePreaggCardinality(
+              totalInstances, globalNdv, inputCard, false, false, -1);
+          String message = String.format(pattern, totalInstances, globalNdv, inputCard,
+              false, false, -1, outputCard);
+          assertTrue(message + ", expect>=0", outputCard >= 0);
+          if (inputCard == 0) {
+            assertTrue(message + ", expect=0", outputCard == 0);
+          } else if (inputCard == -1 || totalInstances == 1) {
+            long leastInputVsNdv =
+                PlanNode.smallestValidCardinality(inputCard, globalNdv);
+            assertTrue(
+                message + ", expect=" + leastInputVsNdv, outputCard == leastInputVsNdv);
+          } else {
+            assertTrue(message + ", expect<=" + inputCard, outputCard <= inputCard);
+          }
+
+          // Test non-grouping preaggregation.
+          outputCard = AggregationNode.estimatePreaggCardinality(
+              totalInstances, globalNdv, inputCard, true, false, -1);
+          message = String.format(
+              pattern, totalInstances, globalNdv, inputCard, true, false, -1, outputCard);
+          assertTrue(message + ", expect>=0", outputCard >= 0);
+          long allDuplicate =
+              MathUtil.saturatingMultiplyCardinalities(globalNdv, totalInstances);
+          long leastInputVsAllDuplicate =
+              PlanNode.smallestValidCardinality(inputCard, allDuplicate);
+          if (allDuplicate < inputCard) {
+            assertTrue(message + ", expect=" + leastInputVsAllDuplicate,
+                outputCard == leastInputVsAllDuplicate);
+          }
+
+          // Test preaggregation with limit.
+          for (Long limit : validCard) {
+            if (limit < 0) continue;
+            outputCard = AggregationNode.estimatePreaggCardinality(
+                totalInstances, globalNdv, inputCard, false, true, limit);
+            message = String.format(pattern, totalInstances, globalNdv, inputCard, false,
+                true, limit, outputCard);
+            assertTrue(message + ", expect>=0", outputCard >= 0);
+            long allAtLimit =
+                MathUtil.saturatingMultiplyCardinalities(totalInstances, limit);
+            long leastOfAll =
+                PlanNode.smallestValidCardinality(allAtLimit, leastInputVsAllDuplicate);
+            assertTrue(message + ", expect=" + leastOfAll, outputCard == leastOfAll);
+          }
+        }
+      }
+    }
+  }
 }

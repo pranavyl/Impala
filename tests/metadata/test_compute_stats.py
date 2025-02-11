@@ -15,14 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
-from subprocess import check_call
+from hive_metastore.ttypes import (
+    ColumnStatistics, ColumnStatisticsDesc, ColumnStatisticsData,
+    ColumnStatisticsObj, StringColumnStatsData)
 
 from tests.common.environ import ImpalaTestClusterProperties
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon,
-                               SkipIfGCS, SkipIfCOS, SkipIfLocal, SkipIfCatalogV2)
+from tests.common.skip import SkipIfFS, SkipIfLocal, SkipIfCatalogV2
 from tests.common.test_dimensions import (
     create_exec_option_dimension,
     create_single_exec_option_dimension,
@@ -51,10 +54,12 @@ class TestComputeStats(ImpalaTestSuite):
         create_uncompressed_text_dimension(cls.get_workload()))
 
   @SkipIfLocal.hdfs_blocks
+  @SkipIfFS.incorrent_reported_ec
   def test_compute_stats(self, vector, unique_database):
     self.run_test_case('QueryTest/compute-stats', vector, unique_database)
 
   @SkipIfLocal.hdfs_blocks
+  @SkipIfFS.incorrent_reported_ec
   def test_compute_stats_avro(self, vector, unique_database, cluster_properties):
     if cluster_properties.is_catalog_v2_cluster():
       # IMPALA-7308: changed behaviour of various Avro edge cases significantly in the
@@ -65,16 +70,19 @@ class TestComputeStats(ImpalaTestSuite):
       self.run_test_case('QueryTest/compute-stats-avro', vector, unique_database)
 
   @SkipIfLocal.hdfs_blocks
+  @SkipIfFS.incorrent_reported_ec
   def test_compute_stats_decimal(self, vector, unique_database):
     # Test compute stats on decimal columns separately so we can vary between platforms
     # with and without write support for decimals (Hive < 0.11 and >= 0.11).
     self.run_test_case('QueryTest/compute-stats-decimal', vector, unique_database)
 
   @SkipIfLocal.hdfs_blocks
+  @SkipIfFS.incorrent_reported_ec
   def test_compute_stats_date(self, vector, unique_database):
     # Test compute stats on date columns separately.
     self.run_test_case('QueryTest/compute-stats-date', vector, unique_database)
 
+  @SkipIfFS.incorrent_reported_ec
   def test_compute_stats_incremental(self, vector, unique_database):
     self.run_test_case('QueryTest/compute-stats-incremental', vector, unique_database)
 
@@ -99,7 +107,7 @@ class TestComputeStats(ImpalaTestSuite):
     try:
       self.run_test_case('QueryTest/compute-stats-keywords', vector)
     finally:
-      self.cleanup_db("parquet")
+      self.cleanup_db("parquet", sync_ddl=0)
 
   def test_compute_stats_compression_codec(self, vector, unique_database):
     """IMPALA-8254: Tests that running compute stats with compression_codec set
@@ -113,13 +121,7 @@ class TestComputeStats(ImpalaTestSuite):
                                           {"compression_codec": c})
         self.execute_query_expect_success(self.client, "drop stats {0}".format(table))
 
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_compute_stats_impala_2201(self, vector, unique_database):
     """IMPALA-2201: Tests that the results of compute incremental stats are properly
     persisted when the data was loaded from Hive with hive.stats.autogather=true.
@@ -189,18 +191,12 @@ class TestComputeStats(ImpalaTestSuite):
 
     # Check that the template formulated above exists and row count of the table is
     # not zero, for all scans.
-    for i in xrange(len(explain_result.data)):
+    for i in range(len(explain_result.data)):
       if ("SCAN HDFS" in explain_result.data[i]):
          assert(hdfs_physical_properties_template in explain_result.data[i + 1])
          assert("cardinality=0" not in explain_result.data[i + 2])
 
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_corrupted_stats_in_partitioned_hive_tables(self, vector, unique_database):
     """IMPALA-9744: Tests that the partition stats corruption in Hive tables
     (row count=0, partition size>0, persisted when the data was loaded with
@@ -243,13 +239,7 @@ class TestComputeStats(ImpalaTestSuite):
     self.create_load_test_corrupt_stats(self, unique_database, create_load_stmts,
             table_name, 2, 2)
 
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_corrupted_stats_in_unpartitioned_hive_tables(self, vector, unique_database):
     """IMPALA-9744: Tests that the stats corruption in unpartitioned Hive
     tables (row count=0, partition size>0, persisted when the data was loaded
@@ -448,3 +438,44 @@ class TestParquetComputeColumnMinMax(ImpalaTestSuite):
 
   def test_compute_stats(self, vector, unique_database):
     self.run_test_case('QueryTest/compute-stats-column-minmax', vector, unique_database)
+
+
+class TestInvalidStatsFromHms(ImpalaTestSuite):
+  @classmethod
+  def get_workload(self):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestInvalidStatsFromHms, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
+    cls.ImpalaTestMatrix.add_constraint(
+        lambda v: v.get_value('table_format').file_format == 'text'
+        and v.get_value('table_format').compression_codec == 'none')
+
+  def test_invalid_col_stats(self, unique_database):
+    """Test that invalid column stats, i.e. values < -1, are normalized in Impala"""
+    tbl = unique_database + ".tbl"
+    self.execute_query("create table {} as select 1 as id, 'aaa' as name".format(tbl))
+    # Add invalid stats in HMS
+    hms_client, _ = ImpalaTestSuite.create_hive_client(9083)
+    cs = ColumnStatistics()
+    cs.engine = "impala"
+    isTblLevel = True
+    cs.statsDesc = ColumnStatisticsDesc(isTblLevel, unique_database, "tbl")
+    cs_data = ColumnStatisticsData()
+    maxColLen = -100
+    avgColLen = -200
+    numNulls = -300
+    numDVs = -400
+    cs_data.stringStats = StringColumnStatsData(maxColLen, avgColLen, numNulls, numDVs)
+    cs_obj = ColumnStatisticsObj("name", "string", cs_data)
+    cs.statsObj = [cs_obj]
+    assert hms_client.update_table_column_statistics(cs)
+    # REFRESH to reload the stats
+    self.execute_query("refresh " + tbl)
+    # Verify the invalid stats are normalized to -1
+    res = self.execute_query("show column stats " + tbl)
+    assert res.data == [
+      'id\tTINYINT\t-1\t-1\t1\t1\t-1\t-1',
+      'name\tSTRING\t-1\t-1\t-1\t-1\t-1\t-1']

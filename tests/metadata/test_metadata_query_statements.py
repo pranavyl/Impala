@@ -17,13 +17,12 @@
 
 # Impala tests for queries that query metadata and set session settings
 
+from __future__ import absolute_import, division, print_function
 import pytest
 import re
 
-from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import (SkipIfIsilon, SkipIfS3, SkipIfABFS, SkipIfADLS,
-                               SkipIfGCS, SkipIfCOS, SkipIfLocal, SkipIfCatalogV2)
+from tests.common.skip import SkipIfFS, SkipIfCatalogV2
 from tests.common.test_dimensions import ALL_NODES_ONLY
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_dimensions import create_uncompressed_text_dimension
@@ -67,6 +66,7 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
   def test_show(self, vector):
     self.run_test_case('QueryTest/show', vector)
 
+  @SkipIfFS.incorrent_reported_ec
   def test_show_stats(self, vector):
     self.run_test_case('QueryTest/show-stats', vector, "functional")
 
@@ -75,13 +75,7 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
 
   # Missing Coverage: Describe formatted compatibility between Impala and Hive when the
   # data doesn't reside in hdfs.
-  @SkipIfIsilon.hive
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_describe_formatted(self, vector, unique_database):
     # IMPALA-10176: test_describe_formatted is broken, so disable it for now
     pytest.skip()
@@ -152,7 +146,6 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
         compare=compare_describe_formatted)
 
   @pytest.mark.execute_serially # due to data src setup/teardown
-  @SkipIfCatalogV2.data_sources_unsupported()
   def test_show_data_sources(self, vector):
     try:
       self.__create_data_sources()
@@ -169,26 +162,23 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
     for name in self.TEST_DATA_SRC_NAMES:
       self.client.execute(self.CREATE_DATA_SRC_STMT % (name,))
 
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   @pytest.mark.execute_serially  # because of use of hardcoded database
   def test_describe_db(self, vector, cluster_properties):
     self.__test_describe_db_cleanup()
     try:
+      # Some versions of HMS will fail to create the database if the managed directory
+      # is already present. This is not a test for HMS, so this uses unique directory
+      # names to workaround the issue.
       self.client.execute("create database impala_test_desc_db1")
       self.client.execute("create database impala_test_desc_db2 "
                           "comment 'test comment'")
       self.client.execute("create database impala_test_desc_db3 "
-                          "location '" + get_fs_path("/testdb") + "'")
+                          "location '" + get_fs_path("/testdb3") + "'")
       self.client.execute("create database impala_test_desc_db4 comment 'test comment' "
-                          "location \"" + get_fs_path("/test2.db") + "\"")
+                          "location \"" + get_fs_path("/test4.db") + "\"")
       self.client.execute("create database impala_test_desc_db5 comment 'test comment' "
-                          "managedlocation \"" + get_fs_path("/test2.db") + "\"")
+                          "managedlocation \"" + get_fs_path("/test5.db") + "\"")
       self.run_stmt_in_hive("create database hive_test_desc_db comment 'test comment' "
                            "with dbproperties('pi' = '3.14', 'e' = '2.82')")
       self.run_stmt_in_hive("create database hive_test_desc_db2 comment 'test comment' "
@@ -206,10 +196,10 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
       self.__test_describe_db_cleanup()
 
   def __test_describe_db_cleanup(self):
-    self.cleanup_db('hive_test_desc_db')
-    self.cleanup_db('hive_test_desc_db2')
-    self.cleanup_db('impala_test_desc_db1')
-    self.cleanup_db('impala_test_desc_db2')
-    self.cleanup_db('impala_test_desc_db3')
-    self.cleanup_db('impala_test_desc_db4')
-    self.cleanup_db('impala_test_desc_db5')
+    self.cleanup_db('hive_test_desc_db', sync_ddl=0)
+    self.cleanup_db('hive_test_desc_db2', sync_ddl=0)
+    self.cleanup_db('impala_test_desc_db1', sync_ddl=0)
+    self.cleanup_db('impala_test_desc_db2', sync_ddl=0)
+    self.cleanup_db('impala_test_desc_db3', sync_ddl=0)
+    self.cleanup_db('impala_test_desc_db4', sync_ddl=0)
+    self.cleanup_db('impala_test_desc_db5', sync_ddl=0)

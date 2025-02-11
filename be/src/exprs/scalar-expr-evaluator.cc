@@ -22,6 +22,7 @@
 #include "common/object-pool.h"
 #include "common/status.h"
 #include "exprs/aggregate-functions.h"
+#include "exprs/ai-functions.h"
 #include "exprs/anyval-util.h"
 #include "exprs/bit-byte-functions.h"
 #include "exprs/case-expr.h"
@@ -316,17 +317,15 @@ void* ScalarExprEvaluator::GetValue(const ScalarExpr& expr, const TupleRow* row)
     case TYPE_VARCHAR: {
       impala_udf::StringVal v = expr.GetStringVal(this, row);
       if (v.is_null) return nullptr;
-      result_.string_val.ptr = reinterpret_cast<char*>(v.ptr);
-      result_.string_val.len = v.len;
+      result_.string_val.Assign(reinterpret_cast<char*>(v.ptr), v.len);
       return &result_.string_val;
     }
     case TYPE_CHAR:
     case TYPE_FIXED_UDA_INTERMEDIATE: {
       impala_udf::StringVal v = expr.GetStringVal(this, row);
       if (v.is_null) return nullptr;
-      result_.string_val.ptr = reinterpret_cast<char*>(v.ptr);
-      result_.string_val.len = v.len;
-      return result_.string_val.ptr;
+      result_.string_val.Assign(reinterpret_cast<char*>(v.ptr), v.len);
+      return result_.string_val.Ptr();
     }
     case TYPE_TIMESTAMP: {
       impala_udf::TimestampVal v = expr.GetTimestampVal(this, row);
@@ -451,6 +450,7 @@ DateVal ScalarExprEvaluator::GetDateVal(const TupleRow* row) {
 void ScalarExprEvaluator::InitBuiltinsDummy() {
   // Call one function from each of the classes to pull all the symbols
   // from that class in.
+  AiFunctions::is_api_endpoint_supported("");
   AggregateFunctions::InitNull(nullptr, nullptr);
   BitByteFunctions::CountSet(nullptr, TinyIntVal::null());
   CastFunctions::CastToBooleanVal(nullptr, TinyIntVal::null());

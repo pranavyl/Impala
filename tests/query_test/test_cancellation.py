@@ -18,11 +18,14 @@
 # Tests query cancellation using the ImpalaService.Cancel API
 #
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 import threading
 from time import sleep
 from RuntimeProfile.ttypes import TRuntimeProfileFormat
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
+from tests.common.test_dimensions import add_mandatory_exec_option
 from tests.common.test_vector import ImpalaTestDimension
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.util.cancel_util import cancel_query_and_validate_state
@@ -73,11 +76,16 @@ JOIN_BEFORE_CLOSE = [False, True]
 
 # Extra dimensions to test order by without limit
 SORT_QUERY = 'select * from lineitem order by l_orderkey'
-SORT_CANCEL_DELAY = range(6, 10)
+SORT_CANCEL_DELAY = list(range(6, 10))
 SORT_BUFFER_POOL_LIMIT = ['0', '300m'] # Test spilling and non-spilling sorts.
 
 # Test with and without multithreading
 MT_DOP_VALUES = [0, 4]
+
+# Use KILL QUERY statement or not.
+# False: Send the Thrift RPCs directly.
+# True: Execute a KILL QUERY statement.
+USE_KILL_QUERY_STATEMENT = [False, True]
 
 class TestCancellation(ImpalaTestSuite):
   @classmethod
@@ -105,17 +113,24 @@ class TestCancellation(ImpalaTestSuite):
         ImpalaTestDimension('cpu_limit_s', *CPU_LIMIT_S))
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('mt_dop', *MT_DOP_VALUES))
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('use_kill_query_statement', *USE_KILL_QUERY_STATEMENT))
 
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('query_type') != 'CTAS' or (\
-            v.get_value('table_format').file_format in ['text', 'parquet', 'kudu'] and\
-            v.get_value('table_format').compression_codec == 'none'))
+            v.get_value('table_format').file_format in ['text', 'parquet', 'kudu', 'json']
+            and v.get_value('table_format').compression_codec == 'none'))
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('exec_option')['batch_size'] == 0)
     # Ignore 'compute stats' queries for the CTAS query type.
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: not (v.get_value('query_type') == 'CTAS' and
             v.get_value('query').startswith('compute stats')))
+    # 'use_kill_query_statement' and 'join_before_close' cannot be both True, since
+    # the KILL QUERY statement will also close the query.
+    cls.ImpalaTestMatrix.add_constraint(
+        lambda v: not (v.get_value('use_kill_query_statement')
+            and v.get_value('join_before_close')))
 
     # Ignore CTAS on Kudu if there is no PRIMARY KEY specified.
     cls.ImpalaTestMatrix.add_constraint(
@@ -140,7 +155,7 @@ class TestCancellation(ImpalaTestSuite):
       self.cleanup_test_table(vector.get_value('table_format'))
       file_format = vector.get_value('table_format').file_format
       if file_format == 'kudu':
-        assert QUERIES.has_key(query) and QUERIES[query] is not None,\
+        assert query in QUERIES and QUERIES[query] is not None,\
             "PRIMARY KEY for query %s not specified" % query
         query = "create table ctas_cancel primary key (%s) "\
             "partition by hash partitions 3 stored as kudu as %s" %\
@@ -152,7 +167,7 @@ class TestCancellation(ImpalaTestSuite):
     wait_action = vector.get_value('wait_action')
     fail_rpc_action = vector.get_value('fail_rpc_action')
 
-    debug_action = "|".join(filter(None, [wait_action, fail_rpc_action]))
+    debug_action = "|".join([_f for _f in [wait_action, fail_rpc_action] if _f])
     vector.get_value('exec_option')['debug_action'] = debug_action
 
     vector.get_value('exec_option')['buffer_pool_limit'] =\
@@ -161,10 +176,11 @@ class TestCancellation(ImpalaTestSuite):
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
 
     # Execute the query multiple times, cancelling it each time.
-    for i in xrange(NUM_CANCELATION_ITERATIONS):
+    for i in range(NUM_CANCELATION_ITERATIONS):
       cancel_query_and_validate_state(self.client, query,
           vector.get_value('exec_option'), vector.get_value('table_format'),
-          vector.get_value('cancel_delay'), vector.get_value('join_before_close'))
+          vector.get_value('cancel_delay'), vector.get_value('join_before_close'),
+          use_kill_query_statement=vector.get_value('use_kill_query_statement'))
 
       if query_type == "CTAS":
         self.cleanup_test_table(vector.get_value('table_format'))
@@ -196,7 +212,7 @@ class TestCancellation(ImpalaTestSuite):
                for _ in range(5)), 'Query failed to cancel'
     # Get profile and check for formatting errors
     profile = client.get_runtime_profile(handle, TRuntimeProfileFormat.THRIFT)
-    for (k, v) in profile.nodes[1].info_strings.iteritems():
+    for (k, v) in profile.nodes[1].info_strings.items():
       # Ensure that whitespace gets removed from values.
       assert v == v.rstrip(), \
         "Profile value contains surrounding whitespace: %s %s" % (k, v)
@@ -245,6 +261,9 @@ class TestCancellationSerial(TestCancellation):
 
   @pytest.mark.execute_serially
   def test_cancel_insert(self, vector):
+    if vector.get_value('table_format').file_format == 'json':
+      # Insert into json format is not supported yet.
+      pytest.skip()
     self.execute_cancel_test(vector)
     metric_verifier = MetricVerifier(self.impalad_test_service)
     metric_verifier.verify_no_open_files(timeout=10)
@@ -270,3 +289,30 @@ class TestCancellationFullSort(TestCancellation):
 
   def test_cancel_sort(self, vector):
     self.execute_cancel_test(vector)
+
+
+class TestCancellationFinalizeDelayed(ImpalaTestSuite):
+  @classmethod
+  def get_workload(self):
+    return 'tpch'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestCancellationFinalizeDelayed, cls).add_test_dimensions()
+
+    # Test with a small delay in QueryDriver::Finalize from close() to check that queries
+    # that are finalized as a result of closing the session correctly return "Invalid or
+    # unknown query handle" to the close() RPC.
+    add_mandatory_exec_option(cls, 'debug_action', 'FINALIZE_INFLIGHT_QUERY:SLEEP@10')
+
+    # Debug action is independent of file format, so only testing for
+    # table_format=parquet/none in order to avoid a test dimension explosion.
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format == 'parquet'
+        and v.get_value('table_format').compression_codec == 'none')
+
+  def test_cancellation(self, vector):
+    query = "select l_returnflag from tpch_parquet.lineitem"
+    cancel_delay = 0
+    cancel_query_and_validate_state(self.client, query,
+        vector.get_value('exec_option'), vector.get_value('table_format'), cancel_delay)

@@ -52,6 +52,8 @@ DEFINE_string(principal, "", "Kerberos principal. If set, both client and backen
 DEFINE_string(be_principal, "", "Kerberos principal for backend network connections only,"
     "overriding --principal if set. Must not be set if --principal is not set.");
 DEFINE_string(keytab_file, "", "Absolute path to Kerberos keytab file");
+DEFINE_string(spnego_keytab_file, "", "Absolute path to Kerberos keytab file "
+    "for HTTP spnego. If it is empty, --keytab_file flag will be used.");
 DEFINE_string(krb5_ccname, "/tmp/krb5cc_impala_internal", "Absolute path to the file "
     "based credentials cache that we pass to the KRB5CCNAME environment variable.");
 DEFINE_string(krb5_conf, "", "Absolute path to Kerberos krb5.conf if in a non-standard "
@@ -169,6 +171,9 @@ DEFINE_int32(stress_catalog_startup_delay_ms, 0, "A stress option that injects e
     "catalogd opens ports or accepts connections. Delay <= 0 injects no delay.");
 DEFINE_int32(stress_disk_read_delay_ms, 0, "A stress option that injects extra delay"
     " in milliseconds when the I/O manager is reading from disk.");
+DEFINE_int32(stress_statestore_startup_delay_ms, 0, "A stress option that injects extra "
+    "delay in milliseconds during the startup of statestore. The delay is before the "
+    "statestored opens ports or accepts connections. Delay <= 0 injects no delay.");
 #endif
 
 DEFINE_string(debug_actions, "", "For testing only. Uses the same format as the debug "
@@ -227,6 +232,21 @@ DEFINE_bool(redirect_stdout_stderr, true,
 DEFINE_int32(max_log_files, 10, "Maximum number of log files to retain per severity "
     "level. The most recent log files are retained. If set to 0, all log files are "
     "retained.");
+DEFINE_bool(log_rotation_match_pid, false,
+    "If set to True, Impala log rotation will only consider log files that match with "
+    "PID of currently running service. Otherwise, log rotation will ignore the PID in "
+    "log file names and may remove older log files from previous PID run. "
+    "Set to True if log files from prior run must be retained or when running multiple "
+    "instances of same service with common log directory. Default to False.");
+
+static const string re2_mem_limit_help_msg =
+    "Maximum bytes of memory to be used by re2's regex engine "
+    "to hold the compiled form of the regexp. For more memory-consuming patterns, "
+    "this can be set to be a higher number."
+    + Substitute(MEM_UNITS_HELP_MSG, "memory limit for RE2 max_mem opt")
+    + "Default to 8MB. Using percentage is discouraged.";
+
+DEFINE_string(re2_mem_limit, "8MB", re2_mem_limit_help_msg.c_str());
 
 // The read size is the preferred size of the reads issued to HDFS or the local FS.
 // There is a trade off of latency and throughput, trying to keep disks busy but
@@ -290,7 +310,7 @@ DEFINE_string(blacklisted_dbs, "sys,information_schema",
     " create, or drop databases which are blacklisted.");
 DEFINE_string(blacklisted_tables, "",
     "Comma separated full names (in format: <db>.<table>) of blacklisted tables. "
-    "Configure which tables to be skipped for loading (in startup and reseting metadata "
+    "Configure which tables to be skipped for loading (in startup and resetting metadata "
     "of the table). Users can't access, create, or drop tables which are blacklisted");
 
 DEFINE_double_hidden(invalidate_tables_gc_old_gen_full_threshold, 0.6, "The threshold "
@@ -332,9 +352,9 @@ DEFINE_int32(num_check_authorization_threads, 1,
     "The number of threads used to check authorization for the user when executing show "
     "tables/databases. This configuration is applicable only when authorization is "
     "enabled. A value of 1 disables multi-threaded execution for checking authorization."
-    "However, a small value of larger than 1 may limit the parallism of FE requests when "
-    "checking authorization with a high concurrency. The value must be in the range of "
-    "1 to 128.");
+    "However, a small value of larger than 1 may limit the parallelism of FE requests "
+    "when checking authorization with a high concurrency. The value must be in the range "
+    "of 1 to 128.");
 
 DEFINE_bool_hidden(use_customized_user_groups_mapper_for_ranger, false,
     "If true, use the customized user-to-groups mapper when performing authorization via"
@@ -358,6 +378,82 @@ DEFINE_bool(enable_legacy_avx_support, false,
     "machines with AVX but no AVX2. This allows running Impala on older machines "
     "without AVX2 support. This is a legacy mode that will be removed in a "
     "future release.");
+
+DEFINE_bool(pull_table_types_and_comments, false,
+    "When set, catalogd will always load the table types and comments at startup and in "
+    "executing INVALIDATE METADATA commands. In other words, unloaded tables will not "
+    "just contain the table names, but also the table types and comments. This is a "
+    "catalogd-only flag. Required if users want GET_TABLES requests return correct table "
+    "types or comments.");
+
+DEFINE_bool(tolerate_statestore_startup_delay, true, "If set to true, the subscriber "
+    "is able to tolerate the delay of the statestore's availability. The subscriber's "
+    "process will not exit if it cannot register with the specified statestore on "
+    "startup. But instead it enters into Recovery mode, it will loop, sleep and retry "
+    "till it successfully registers with the statestore.");
+
+// Starting flags for CatalogD High Availability
+DEFINE_bool(enable_catalogd_ha, false, "Set to true to enable CatalogD HA");
+DEFINE_bool(force_catalogd_active, false, "Set to true to force this catalogd instance "
+    "to take active role. It's used to perform manual fail over for catalog service.");
+// Use subscriber-id which is built with network address as priority value of catalogd
+// instance when designating active catalogd. The lower subscriber_id (i.e. lower network
+// address) corresponds to a higher priority.
+// This is mainly used in unit-test for predictable results.
+DEFINE_bool(use_subscriber_id_as_catalogd_priority, false, "Subscriber-id is used as "
+    "priority value of catalogd instance if this is set as true. Otherwise, "
+    "registration_id which is generated as random number will be used as priority value "
+    "of catalogd instance.");
+// Waiting period in ms for HA preemption. It should be set with proper value based on the
+// time to take for bringing a catalogd instance in-line in the deployment environment.
+DEFINE_int64(catalogd_ha_preemption_wait_period_ms, 10000, "(Advanced) The time after "
+    "which statestore designates the first registered catalogd as active if statestore "
+    "does not receive registration request from the second catalogd.");
+DEFINE_int64(active_catalogd_designation_monitoring_interval_ms, 100, "(Advanced) "
+    "Interval (in ms) with which the statestore monitors if active catalogd is "
+    "designated.");
+DEFINE_int64(update_catalogd_rpc_resend_interval_ms, 100, "(Advanced) Interval (in ms) "
+    "with which the statestore resends the update catalogd RPC to a subscriber if the "
+    "statestore has failed to send the RPC to the subscriber.");
+
+DEFINE_int32(iceberg_reload_new_files_threshold, 100, "(Advanced) If during a table "
+    "refresh the number of new files are greater than this, catalogd will use a "
+    "recursive file listing to load file metadata. If number of new files are less or "
+    "equal to this, catalogd will load the file metadata one by one.");
+
+DEFINE_bool(iceberg_allow_datafiles_in_table_location_only, true, "If true, Impala "
+    "does not allow Iceberg data file locations outside of the table directory during "
+    "reads");
+
+DEFINE_bool(iceberg_always_allow_merge_on_read_operations, false, "Impala can only "
+    "write delete files with 'merge-on-read'. If this flag is true, Impala allows "
+    "executing DELETE, UPDATE and MERGE operations on Iceberg tables even if the table "
+    "property is 'copy-on-write'.");
+
+// Host and port of Statestore Service
+DEFINE_string(state_store_host, "localhost",
+    "hostname where StatestoreService is running");
+DEFINE_int32(state_store_port, 24000, "port where StatestoreService is running");
+
+// Starting flags for Statestore HA
+DEFINE_string(state_store_2_host, "localhost",
+    "hostname where second StatestoreService instance is running");
+DEFINE_int32(state_store_2_port, 24001,
+    "port where second StatestoreService instance is running");
+// Port for RPC communication between two statestore instances for Statestore HA
+DEFINE_int32(state_store_ha_port, 24020,
+    "port where StatestoreHaService is running");
+
+// TGeospatialLibrary's values are mapped here as constants
+static const string geo_lib_none = "NONE";
+static const string geo_lib_hive_esri = "HIVE_ESRI";
+
+static const string geo_lib_help_msg =
+    "Specifies which implementation of "
+    "geospatial functions should be included as builtins. Possible values: [\""
+    + geo_lib_none + "\", \"" + geo_lib_hive_esri + "\"]";
+
+DEFINE_string(geospatial_library, geo_lib_none, geo_lib_help_msg.c_str());
 
 // ++========================++
 // || Startup flag graveyard ||
@@ -396,6 +492,7 @@ REMOVED_FLAG(coordinator_rpc_threads);
 REMOVED_FLAG(disable_admission_control);
 REMOVED_FLAG(disable_mem_pools);
 REMOVED_FLAG(enable_accept_queue_server);
+REMOVED_FLAG(enable_orc_scanner);
 REMOVED_FLAG(enable_partitioned_aggregation);
 REMOVED_FLAG(enable_partitioned_hash_join);
 REMOVED_FLAG(enable_phj_probe_side_filtering);

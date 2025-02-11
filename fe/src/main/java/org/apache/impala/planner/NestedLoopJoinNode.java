@@ -31,6 +31,9 @@ import org.apache.impala.thrift.TNestedLoopJoinNode;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.util.ExprUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
@@ -49,11 +52,18 @@ import com.google.common.base.Preconditions;
  * right input.
  */
 public class NestedLoopJoinNode extends JoinNode {
+  private static final Logger LOG = LoggerFactory.getLogger(NestedLoopJoinNode.class);
+
+  // Coefficients for estimating NL join CPU processing cost.  Derived from benchmarking.
+  private static final double COST_COEFFICIENT_NLJ_TINY_RHS = 0.2049;
+  private static final double COST_COEFFICIENT_NLJ = 0.1559;
+
   public NestedLoopJoinNode(PlanNode outer, PlanNode inner, boolean isStraightJoin,
       DistributionMode distrMode, JoinOperator joinOp, List<Expr> otherJoinConjuncts) {
     super(outer, inner, isStraightJoin, distrMode, joinOp,
         Collections.<BinaryPredicate>emptyList(), otherJoinConjuncts,
         "NESTED LOOP JOIN");
+    Preconditions.checkState(joinOp_ != JoinOperator.ICEBERG_DELETE_JOIN);
   }
 
   @Override
@@ -78,6 +88,7 @@ public class NestedLoopJoinNode extends JoinNode {
   @Override
   public Pair<ResourceProfile, ResourceProfile> computeJoinResourceProfile(
       TQueryOptions queryOptions) {
+    // TODO: This seems a bug below that the total data is not divided by numInstances_.
     long perInstanceMemEstimate;
     if (getChild(1).getCardinality() == -1 || getChild(1).getAvgRowSize() == -1
         || numNodes_ == 0) {
@@ -90,6 +101,34 @@ public class NestedLoopJoinNode extends JoinNode {
     // Memory requirements for the probe side are minimal - batches are just streamed
     // through.
     return Pair.create(ResourceProfile.noReservation(0), buildProfile);
+  }
+
+  @Override
+  public Pair<ProcessingCost, ProcessingCost> computeJoinProcessingCost() {
+    // Benchmarked cost is generally a linear function of the product of the input
+    // and output cardinalities, but the coefficients are slightly different for
+    // very small RHS (< 5 rows per fragment instance) vs larger RHS so we compute
+    // different costs here based on that RHS threshold.
+    // We return the full cost in the first element of the Pair.
+    long probeCardinality = getProbeCardinalityForCosting();
+    long buildCardinality = Math.max(0, getChild(1).getCardinality());
+    long cardProduct = checkedMultiply(probeCardinality, buildCardinality);
+    long perInstanceBuildCardinality =
+        (long) Math.ceil(buildCardinality / fragment_.getNumInstancesForCosting());
+    double totalCost = 0.0F;
+    if (perInstanceBuildCardinality < 5) {
+      totalCost = cardProduct * COST_COEFFICIENT_NLJ_TINY_RHS;
+    } else {
+      totalCost = cardProduct * COST_COEFFICIENT_NLJ;
+    }
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Probe CPU cost estimate: " + totalCost
+          + ", Probe Card: " + probeCardinality + ", Build Card: " + buildCardinality
+          + ", Build Card Per Instance: " + perInstanceBuildCardinality);
+    }
+    ProcessingCost processingCost =
+        ProcessingCost.basicCost(getDisplayLabel(), totalCost);
+    return Pair.create(processingCost, ProcessingCost.zero());
   }
 
   @Override

@@ -114,13 +114,22 @@ class Sorter::Page {
 ///
 /// Runs are either "initial runs" constructed from the sorter's input by evaluating
 /// the expressions in 'sort_tuple_exprs_' or "intermediate runs" constructed
-/// by merging already-sorted runs. Initial runs are sorted in-place in memory. Once
-/// sorted, runs can be spilled to disk to free up memory. Sorted runs are merged by
+/// by merging already-sorted runs. Initial runs are sorted in-place in memory.
+/// Once sorted, runs can be spilled to disk to free up memory. Sorted runs are merged by
 /// SortedRunMerger, either to produce the final sorted output or to produce another
 /// sorted run.
+/// By default, the size of initial runs is determined by the available memory: the
+/// sorter tries to add batches to the run until some (memory) limit is reached.
+/// Some query options can also limit the size of an initial (or in-memory) run.
+/// SORT_RUN_BYTES_LIMIT triggers spilling after the size of data in the run exceeds the
+/// given threshold (usually expressed in MB or GB).
+/// MAX_SORT_RUN_SIZE allows constructing runs up to a certain size by limiting the
+/// number of pages in the initial runs. These smaller in-memory runs are also referred
+/// to as 'miniruns'. Miniruns are not spilled immediately, but sorted in-place first,
+/// and collected to be merged in memory before spilling the produced output run to disk.
 ///
 /// The expected calling sequence of functions is as follows:
-/// * Init() to initialize the run and allocate initial pages.
+/// * Init() or TryInit() to initialize the run and allocate initial pages.
 /// * Add*Batch() to add batches of tuples to the run.
 /// * FinalizeInput() to signal that no more batches will be added.
 /// * If the run is unsorted, it must be sorted. After that set_sorted() must be called.
@@ -141,13 +150,23 @@ class Sorter::Run {
   /// var-len data into var_len_copy_page_.
   Status Init();
 
+  /// Similar to Init(), except for the following differences:
+  /// It is only used to initialize miniruns (query option MAX_SORT_RUN_SIZE > 0 cases).
+  /// The first in-memory run is always initialized by calling Init(), because that must
+  /// succeed. The following ones are initialized by TryInit().
+  /// TryInit() allocates one fixed-len page and one var-len page if 'has_var_len_slots_'
+  /// is true. There is no need for var_len_copy_page here. Returns false if
+  /// initialization was successful, returns true, if reservation was not enough.
+  Status TryInit(bool* allocation_failed);
+
   /// Add the rows from 'batch' starting at 'start_index' to the current run. Returns
   /// the number of rows actually added in 'num_processed'. If the run is full (no more
   /// pages can be allocated), 'num_processed' may be less than the number of remaining
   /// rows in the batch. AddInputBatch() materializes the input rows using the
   /// expressions in sorter_->sort_tuple_expr_evals_, while AddIntermediateBatch() just
   /// copies rows.
-  Status AddInputBatch(RowBatch* batch, int start_index, int* num_processed);
+  Status AddInputBatch(
+      RowBatch* batch, int start_index, int* num_processed, bool* allocation_failed);
 
   Status AddIntermediateBatch(RowBatch* batch, int start_index, int* num_processed);
 
@@ -199,6 +218,9 @@ class Sorter::Run {
   bool is_finalized() const { return is_finalized_; }
   bool is_sorted() const { return is_sorted_; }
   void set_sorted() { is_sorted_ = true; }
+  int max_num_of_pages() const { return max_num_of_pages_; }
+  int fixed_len_size() { return fixed_len_pages_.size(); }
+  int run_size() { return fixed_len_pages_.size() + var_len_pages_.size(); }
   int64_t num_tuples() const { return num_tuples_; }
   /// Returns true if we have var-len pages in the run.
   bool HasVarLenPages() const {
@@ -215,17 +237,44 @@ class Sorter::Run {
   /// INITIAL_RUN and HAS_VAR_LEN_SLOTS are template arguments for performance and must
   /// match 'initial_run_' and 'has_var_len_slots_'.
   template <bool HAS_VAR_LEN_SLOTS, bool INITIAL_RUN>
-  Status AddBatchInternal(
-      RowBatch* batch, int start_index, int* num_processed);
+  Status AddBatchInternal(RowBatch* batch, int start_index, int* num_processed,
+        bool* allocation_failed);
 
   /// Finalize the list of pages: delete empty final pages and unpin the previous page
   /// if the run is unpinned.
   Status FinalizePages(vector<Page>* pages);
 
-  /// Collect the non-null var-len (e.g. STRING) slots from 'src' in 'var_len_values' and
-  /// return the total length of all var-len values in 'total_var_len'.
-  void CollectNonNullVarSlots(
-      Tuple* src, vector<StringValue*>* var_len_values, int* total_var_len);
+  void CheckTypesAreValidInSortingTuple();
+
+  /// Collects the non-null var-len slots (non-smallified strings and collections) from
+  /// 'src'. Smallified strings (see Small String Optimization, IMPALA-12373) are not
+  /// collected. Strings are returned in 'string_values' and collections are returned,
+  /// along with their byte size, in 'collection_values' (any existing elements of
+  /// 'string_values' and 'collection_values' are cleared). The total length of all
+  /// var-len values is returned in 'total_var_len'. Nested (non-top-level) var-len values
+  /// are collected recursively.
+  ///
+  /// Children are placed before their parents in the vectors (post-order traversal).
+  /// This order is chosen because of the way we serialise the values in CopyVarLenData()
+  /// and CopyVarLenDataConvertOffset(): we write the var-len part of 'StringValue's and
+  /// 'CollectionValue's to the buffer and update the pointers in-place. The order becomes
+  /// important if these '(String|Collection)Value's are themselves (var-len) children of
+  /// other 'CollectionValue's. If children are written before their parents, then when
+  /// the parents are written their pointers have already been updated so they can be
+  /// written as-is. If parents were written before their children, updating the pointers
+  /// in-place would not be enough, the already serialised pointers would have to be
+  /// updated in the byte buffer. Note that to ensure that this order is kept, the
+  /// 'StringValue's must be serialised before the 'CollectionValue's - strings can be
+  /// children of collections but not the other way around.
+  void CollectNonNullNonSmallVarSlots(Tuple* src, const TupleDescriptor& tuple_desc,
+      vector<StringValue*>* string_values,
+      std::vector<std::pair<CollectionValue*, int64_t>>* collection_values,
+      int* total_var_len);
+
+  void CollectNonNullNonSmallVarSlotsHelper(Tuple* src, const TupleDescriptor& tuple_desc,
+      vector<StringValue*>* string_values,
+      std::vector<std::pair<CollectionValue*, int64_t>>* collection_values,
+      int* total_var_len);
 
   enum AddPageMode { KEEP_PREV_PINNED, UNPIN_PREV };
 
@@ -251,21 +300,46 @@ class Sorter::Run {
   /// this function will pin the page at 'page_index' + 1 in 'pages'.
   Status PinNextReadPage(vector<Page>* pages, int page_index);
 
-  /// Copy the StringValues in 'var_values' to 'dest' in order and update the StringValue
-  /// ptrs in 'dest' to point to the copied data.
-  void CopyVarLenData(const vector<StringValue*>& var_values, uint8_t* dest);
+  /// Copy the var len data in 'string_values' and 'collection_values_and_sizes' to 'dest'
+  /// in order and update the pointers to point to the copied data.
+  void CopyVarLenData(const vector<StringValue*>& string_values,
+      const vector<std::pair<CollectionValue*, int64_t>>& collection_values_and_sizes,
+      uint8_t* dest);
 
-  /// Copy the StringValues in 'var_values' to 'dest' in order. Update the StringValue
-  /// ptrs in 'dest' to contain a packed offset for the copied data comprising
-  /// page_index and the offset relative to page_start.
-  void CopyVarLenDataConvertOffset(const vector<StringValue*>& var_values, int page_index,
-      const uint8_t* page_start, uint8_t* dest);
+  /// Copy the StringValues in 'var_values' and the CollectionValues referenced in
+  /// 'collection_values_and_sizes' to 'dest' in order. Update the StringValue ptrs in
+  /// 'dest' to contain a packed offset for the copied data comprising page_index and the
+  /// offset relative to page_start.
+  void CopyVarLenDataConvertOffset(const vector<StringValue*>& var_values,
+      const std::vector<std::pair<CollectionValue*, int64_t>>&
+          collection_values_and_sizes,
+      int page_index, const uint8_t* page_start, uint8_t* dest);
 
-  /// Convert encoded offsets to valid pointers in tuple with layout 'sort_tuple_desc_'.
+  /// Convert encoded offsets to valid pointers in 'tuple' with layout 'tuple_desc'.
   /// 'tuple' is modified in-place. Returns true if the pointers refer to the page at
-  /// 'var_len_pages_index_' and were successfully converted or false if the var len
-  /// data is in the next page, in which case 'tuple' is unmodified.
-  bool ConvertOffsetsToPtrs(Tuple* tuple);
+  /// 'var_len_pages_index_' and were successfully converted or false if the var len data
+  /// is in the next page, in which case 'tuple' is unmodified.
+  bool ConvertOffsetsToPtrs(Tuple* tuple, const TupleDescriptor& tuple_desc)
+      WARN_UNUSED_RESULT;
+
+  template <class ValueType>
+  WARN_UNUSED_RESULT
+  bool ConvertValueOffsetsToPtrs(Tuple* tuple, uint8_t* page_start,
+      const vector<SlotDescriptor*>& slots);
+
+  bool ConvertStringValueOffsetsToPtrs(Tuple* tuple, const TupleDescriptor& tuple_desc,
+      uint8_t* page_start) WARN_UNUSED_RESULT;
+  bool ConvertCollectionValueOffsetsToPtrs(Tuple* tuple,
+      const TupleDescriptor& tuple_desc, uint8_t* page_start) WARN_UNUSED_RESULT;
+
+  bool ConvertOffsetsForCollectionChildren(const CollectionValue& cv,
+      const SlotDescriptor& slot_desc) WARN_UNUSED_RESULT;
+
+  /// Only initial in-memory runs' size can be limited by the 'MAX_SORT_RUN_SIZE' query
+  /// option. Returns true if the initial in-memory run reached its maximum capacity in
+  /// pages (fixed-len + var-len pages).
+  template <bool INITIAL_RUN>
+  bool IR_ALWAYS_INLINE MaxSortRunSizeReached();
 
   int NumOpenPages(const vector<Page>& pages);
 
@@ -289,7 +363,7 @@ class Sorter::Run {
 
   const bool has_var_len_slots_;
 
-  /// True if this is an initial run. False implies this is an sorted intermediate run
+  /// True if this is an initial run. False implies this is a sorted intermediate run
   /// resulting from merging other runs.
   const bool initial_run_;
 
@@ -335,6 +409,12 @@ class Sorter::Run {
 
   /// Used to implement GetNextBatch() interface required for the merger.
   boost::scoped_ptr<RowBatch> buffered_batch_;
+
+  /// Max number of fixed-len + var-len pages in an in-memory minirun. It defines the
+  /// length of a minirun.
+  /// The default value is 0 which means that only 1 in-memory run will be created, and
+  /// its size will be determined by other limits eg. memory or sort_run_bytes_limit.
+  int max_num_of_pages_;
 
   /// Members used when a run is read in GetNext().
   /// The index into 'fixed_' and 'var_len_pages_' of the pages being read in GetNext().
@@ -444,7 +524,7 @@ class Sorter::TupleSorter {
   /// 'compare_fn' is the pointer to the code-gen version of the compare method with
   /// which to replace all non-code-gen versions.
   static Status Codegen(FragmentState* state, llvm::Function* compare_fn,
-      CodegenFnPtr<SortHelperFn>* codegend_fn);
+      int tuple_byte_size, CodegenFnPtr<SortHelperFn>* codegend_fn);
 
   /// Mangled name of SorterHelper().
   static const char* SORTER_HELPER_SYMBOL;
@@ -460,6 +540,9 @@ class Sorter::TupleSorter {
   /// Size of the tuples in memory.
   const int tuple_size_;
 
+  /// Getter for the size of the tuples in memory. Replaced by a constant during codegen
+  int IR_NO_INLINE get_tuple_size() const { return tuple_size_; }
+
   /// Tuple comparator with method Less() that returns true if lhs < rhs.
   const TupleRowComparator& comparator_;
 
@@ -474,7 +557,7 @@ class Sorter::TupleSorter {
   Run* run_;
 
   /// Temporarily allocated space to copy and swap tuples (Both are used in
-  /// Partition()). Owned by this TupleSorter instance.
+  /// Partition2way() and Partition3way()). Owned by this TupleSorter instance.
   uint8_t* temp_tuple_buffer_;
   uint8_t* swap_buffer_;
 
@@ -483,10 +566,17 @@ class Sorter::TupleSorter {
   /// high: Mersenne Twister should be more than adequate.
   std::mt19937_64 rng_;
 
+  void IR_ALWAYS_INLINE FreeExprResultPoolIfNeeded();
+
   /// Wrapper around comparator_.Less(). Also call expr_results_pool_.Clear()
   /// on every 'state_->batch_size()' invocations of comparator_.Less(). Returns true
   /// if 'lhs' is less than 'rhs'.
   bool IR_ALWAYS_INLINE Less(const TupleRow* lhs, const TupleRow* rhs);
+
+  /// Wrapper around comparator_.Compare(). Also call expr_results_pool_.Clear()
+  /// on every 'state_->batch_size()' invocations of comparator_.Compare(). Returns -
+  /// if 'lhs' is less than 'rhs', + if 'lhs' is greater than 'rhs' and 0 if equal
+  int IR_ALWAYS_INLINE Compare(const TupleRow* lhs, const TupleRow* rhs);
 
   /// Perform an insertion sort for rows in the range [begin, end) in a run.
   /// Only valid to call for ranges of size at least 1.
@@ -499,19 +589,36 @@ class Sorter::TupleSorter {
   /// groups and the index to the first element in the second group is returned in
   /// 'cut'. Return an error status if any error is encountered or if the query is
   /// cancelled.
-  Status IR_ALWAYS_INLINE Partition(TupleIterator begin, TupleIterator end,
+  Status IR_ALWAYS_INLINE Partition2way(TupleIterator begin, TupleIterator end,
       const Tuple* pivot, TupleIterator* cut);
 
-  /// Performs a quicksort of rows in the range [begin, end) followed by insertion sort
-  /// for smaller groups of elements. Return an error status for any errors or if the
-  /// query is cancelled.
+  /// Partitions the sequence of tuples in the range [begin, end) in a run into three
+  /// groups around the pivot tuple - i.e. tuples in first group are < the pivot,
+  /// tuples in the second group are = pivot, and tuples in the third group are > pivot.
+  /// Tuples are swapped in place to create the groups and the index to
+  /// the first element in the second group is returned in 'cut_left',
+  /// and the index to the first element in the third group is returned in 'cut_right'.
+  /// Returns an error status if any error is encountered or if the query is
+  /// cancelled.
+  Status IR_ALWAYS_INLINE Partition3way(TupleIterator begin, TupleIterator end,
+      const Tuple* pivot, TupleIterator* cut_left, TupleIterator* cut_right);
+
+  /// Performs a modified quicksort of rows in the range [begin, end):
+  /// If duplicates are found during pivot selection, Partition3way
+  /// is called in that iteration, otherwise partitioning goes 2-way.
+  /// This adaptive quicksort is followed by insertion sort for smaller groups
+  /// of elements.
+  /// Return an error status for any errors or if the query is cancelled.
   Status SortHelper(TupleIterator begin, TupleIterator end);
 
   /// Select a pivot to partition [begin, end).
-  Tuple* IR_ALWAYS_INLINE SelectPivot(TupleIterator begin, TupleIterator end);
+  Tuple* IR_ALWAYS_INLINE SelectPivot(TupleIterator begin, TupleIterator end,
+      bool* has_equals);
 
-  /// Return median of three tuples according to the sort comparator.
-  Tuple* IR_ALWAYS_INLINE MedianOfThree(Tuple* t1, Tuple* t2, Tuple* t3);
+  /// Return median of three tuples according to the sort comparator. Sets has_equals
+  /// flag true if duplicates found among the pivot candidates.
+  Tuple* IR_ALWAYS_INLINE MedianOfThree(Tuple* t1, Tuple* t2, Tuple* t3,
+      bool* has_equals);
 
   /// Swaps tuples pointed to by left and right using 'swap_tuple'.
   static void IR_ALWAYS_INLINE Swap(Tuple* RESTRICT left, Tuple* RESTRICT right,

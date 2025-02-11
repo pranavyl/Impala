@@ -39,6 +39,7 @@
 #include "runtime/tuple-row.h"
 #include "runtime/tuple.h"
 #include "util/runtime-profile-counters.h"
+#include "util/runtime-profile.h"
 #include "util/string-parser.h"
 
 #include "gen-cpp/PlanNodes_types.h"
@@ -103,10 +104,8 @@ Status GroupingAggregatorConfig::Init(
   for (int i = 0; i < grouping_exprs_.size(); ++i) {
     SlotDescriptor* desc = intermediate_tuple_desc_->slots()[i];
     DCHECK(desc->type().type == TYPE_NULL || desc->type() == grouping_exprs_[i]->type());
-    // Hack to avoid TYPE_NULL SlotRefs.
-    SlotRef* build_expr = state->obj_pool()->Add(desc->type().type != TYPE_NULL ?
-            new SlotRef(desc) :
-            new SlotRef(desc, ColumnType(TYPE_BOOLEAN)));
+    // Use SlotRef::TypeSafeCreate() to avoid TYPE_NULL SlotRefs.
+    SlotRef* build_expr = state->obj_pool()->Add(SlotRef::TypeSafeCreate(desc));
     build_exprs_.push_back(build_expr);
     // Not an entry point because all hash table callers support codegen.
     RETURN_IF_ERROR(
@@ -134,10 +133,9 @@ static const int STREAMING_HT_MIN_REDUCTION_SIZE =
     sizeof(STREAMING_HT_MIN_REDUCTION) / sizeof(STREAMING_HT_MIN_REDUCTION[0]);
 
 GroupingAggregator::GroupingAggregator(ExecNode* exec_node, ObjectPool* pool,
-    const GroupingAggregatorConfig& config, int64_t estimated_input_cardinality,
-    bool needUnsetLimit)
-  : Aggregator(
-        exec_node, pool, config, Substitute("GroupingAggregator $0", config.agg_idx_)),
+    const GroupingAggregatorConfig& config, int64_t estimated_input_cardinality)
+  : Aggregator(exec_node, pool, config,
+      Substitute("$0$1", RuntimeProfile::PREFIX_GROUPING_AGGREGATOR, config.agg_idx_)),
     hash_table_config_(*config.hash_table_config_),
     intermediate_row_desc_(config.intermediate_row_desc_),
     is_streaming_preagg_(config.is_streaming_preagg_),
@@ -153,9 +151,6 @@ GroupingAggregator::GroupingAggregator(ExecNode* exec_node, ObjectPool* pool,
     estimated_input_cardinality_(estimated_input_cardinality),
     partition_pool_(new ObjectPool()) {
   DCHECK_EQ(PARTITION_FANOUT, 1 << NUM_PARTITIONING_BITS);
-  if (needUnsetLimit) {
-    UnsetLimit();
-  }
 }
 
 Status GroupingAggregator::Prepare(RuntimeState* state) {
@@ -477,7 +472,6 @@ Status GroupingAggregator::AddBatch(RuntimeState* state, RowBatch* batch) {
 
 Status GroupingAggregator::AddBatchStreaming(
     RuntimeState* state, RowBatch* out_batch, RowBatch* child_batch, bool* eos) {
-  RETURN_IF_ERROR(QueryMaintenance(state));
   SCOPED_TIMER(streaming_timer_);
   RETURN_IF_ERROR(QueryMaintenance(state));
   num_input_rows_ += child_batch->num_rows();
@@ -511,6 +505,7 @@ Status GroupingAggregator::AddBatchStreaming(
   }
 
   TPrefetchMode::type prefetch_mode = state->query_options().prefetch_mode;
+  int64_t num_row_out_batch_old = out_batch->num_rows();
   GroupingAggregatorConfig::AddBatchStreamingImplFn fn
       = add_batch_streaming_impl_fn_.load();
   if (fn != nullptr) {
@@ -521,8 +516,8 @@ Status GroupingAggregator::AddBatchStreaming(
         child_batch, out_batch, ht_ctx_.get(), remaining_capacity));
   }
   *eos = (streaming_idx_ == 0);
-
-  num_rows_returned_ += out_batch->num_rows();
+  DCHECK_GE(out_batch->num_rows(), num_row_out_batch_old);
+  num_rows_returned_ += out_batch->num_rows() - num_row_out_batch_old;
   COUNTER_SET(num_passthrough_rows_, num_rows_returned_);
   return Status::OK();
 }
@@ -582,7 +577,7 @@ int GroupingAggregator::GroupingExprsVarlenSize() {
   for (int expr_idx : string_grouping_exprs_) {
     StringValue* sv = reinterpret_cast<StringValue*>(ht_ctx_->ExprValue(expr_idx));
     // Avoid branching by multiplying length by null bit.
-    varlen_size += sv->len * !ht_ctx_->ExprValueNull(expr_idx);
+    varlen_size += sv->Len() * !ht_ctx_->ExprValueNull(expr_idx);
   }
   return varlen_size;
 }
@@ -609,9 +604,10 @@ void GroupingAggregator::CopyGroupingValues(
     // ptr and len were already copied to the fixed-len part of string value
     StringValue* sv = reinterpret_cast<StringValue*>(
         intermediate_tuple->GetSlot(slot_desc->tuple_offset()));
-    memcpy(buffer, sv->ptr, sv->len);
-    sv->ptr = reinterpret_cast<char*>(buffer);
-    buffer += sv->len;
+    if (sv->IsSmall()) continue;
+    memcpy(buffer, sv->Ptr(), sv->Len());
+    sv->SetPtr(reinterpret_cast<char*>(buffer));
+    buffer += sv->Len();
   }
 }
 

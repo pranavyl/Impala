@@ -306,30 +306,6 @@ OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ---- DATASET
 tpcds
 ---- BASE_TABLE_NAME
-inventory
----- COLUMNS
-inv_date_sk                int
-inv_item_sk                bigint
-inv_warehouse_sk           int
-inv_quantity_on_hand       int
-primary key (inv_date_sk, inv_item_sk, inv_warehouse_sk) DISABLE NOVALIDATE RELY
-foreign key (inv_date_sk) references {db_name}{db_suffix}.date_dim (d_date_sk) DISABLE NOVALIDATE RELY
-foreign key (inv_item_sk) references {db_name}{db_suffix}.item (i_item_sk) DISABLE NOVALIDATE RELY
-foreign key (inv_warehouse_sk) references {db_name}{db_suffix}.warehouse (w_warehouse_sk) DISABLE NOVALIDATE RELY
----- ROW_FORMAT
-delimited fields terminated by '|'
----- TABLE_PROPERTIES
-text:serialization.null.format=
----- DEPENDENT_LOAD
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
-SELECT * FROM {db_name}.{table_name};
----- LOAD
-LOAD DATA LOCAL INPATH '{impala_home}/testdata/impala-data/{db_name}/inventory/'
-OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
-====
----- DATASET
-tpcds
----- BASE_TABLE_NAME
 call_center
 ---- COLUMNS
 cc_call_center_sk         int
@@ -400,7 +376,7 @@ c_birth_year              int
 c_birth_country           string
 c_login                   string
 c_email_address           string
-c_last_review_date        string
+c_last_review_date_sk     string
 primary key (c_customer_sk) DISABLE NOVALIDATE RELY
 foreign key (c_current_addr_sk) references {db_name}{db_suffix}.customer_address (ca_address_sk) DISABLE NOVALIDATE RELY
 foreign key (c_current_cdemo_sk) references {db_name}{db_suffix}.customer_demographics (cd_demo_sk) DISABLE NOVALIDATE RELY
@@ -531,6 +507,117 @@ SELECT * FROM {db_name}.{table_name};
 ---- LOAD
 LOAD DATA LOCAL INPATH
 '{impala_home}/testdata/impala-data/{db_name}/catalog_page/'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+====
+---- DATASET
+tpcds
+---- BASE_TABLE_NAME
+web_page
+---- COLUMNS
+wp_web_page_sk            int
+wp_web_page_id            string
+wp_rec_start_date         string
+wp_rec_end_date           string
+wp_creation_date_sk       int
+wp_access_date_sk         int
+wp_autogen_flag           string
+wp_customer_sk            int
+wp_url                    string
+wp_type                   string
+wp_char_count             int
+wp_link_count             int
+wp_image_count            int
+wp_max_ad_count           int
+primary key (wp_web_page_sk) DISABLE NOVALIDATE RELY
+foreign key (wp_creation_date_sk) references {db_name}{db_suffix}.date_dim (d_date_sk) DISABLE NOVALIDATE RELY
+foreign key (wp_access_date_sk) references {db_name}{db_suffix}.date_dim (d_date_sk) DISABLE NOVALIDATE RELY
+foreign key (wp_customer_sk) references {db_name}{db_suffix}.customer (c_customer_sk) DISABLE NOVALIDATE RELY
+---- ROW_FORMAT
+delimited fields terminated by '|'
+---- TABLE_PROPERTIES
+text:serialization.null.format=
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+SELECT * FROM {db_name}.{table_name};
+---- LOAD
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/impala-data/{db_name}/web_page/'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+====
+---- DATASET
+tpcds
+---- BASE_TABLE_NAME
+web_site
+---- COLUMNS
+web_site_sk           int
+web_site_id           string
+web_rec_start_date    string
+web_rec_end_date      string
+web_name              string
+web_open_date_sk      int
+web_close_date_sk     int
+web_class             string
+web_manager           string
+web_mkt_id            int
+web_mkt_class         string
+web_mkt_desc          string
+web_market_manager    string
+web_company_id        int
+web_company_name      string
+web_street_number     string
+web_street_name       string
+web_street_type       string
+web_suite_number      string
+web_city              string
+web_county            string
+web_state             string
+web_zip               string
+web_country           string
+web_gmt_offset        decimal(5,2)
+web_tax_percentage    decimal(5,2)
+primary key (web_site_sk) DISABLE NOVALIDATE RELY
+foreign key (web_open_date_sk) references {db_name}{db_suffix}.date_dim (d_date_sk) DISABLE NOVALIDATE RELY
+foreign key (web_close_date_sk) references {db_name}{db_suffix}.date_dim (d_date_sk) DISABLE NOVALIDATE RELY
+---- ROW_FORMAT
+delimited fields terminated by '|'
+---- TABLE_PROPERTIES
+text:serialization.null.format=
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+SELECT * FROM {db_name}.{table_name};
+---- LOAD
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/impala-data/{db_name}/web_site/'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+====
+---- DATASET
+tpcds
+---- BASE_TABLE_NAME
+inventory
+---- COLUMNS
+inv_date_sk                int
+inv_item_sk                bigint
+inv_warehouse_sk           int
+inv_quantity_on_hand       int
+primary key (inv_date_sk, inv_item_sk, inv_warehouse_sk) DISABLE NOVALIDATE RELY
+foreign key (inv_date_sk) references {db_name}{db_suffix}.date_dim (d_date_sk) DISABLE NOVALIDATE RELY
+foreign key (inv_item_sk) references {db_name}{db_suffix}.item (i_item_sk) DISABLE NOVALIDATE RELY
+foreign key (inv_warehouse_sk) references {db_name}{db_suffix}.warehouse (w_warehouse_sk) DISABLE NOVALIDATE RELY
+---- ROW_FORMAT
+delimited fields terminated by '|'
+---- TABLE_PROPERTIES
+text:serialization.null.format=
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+SELECT * FROM {db_name}.{table_name};
+---- LOAD
+set hive.exec.max.dynamic.partitions.pernode=10000;
+set hive.exec.max.dynamic.partitions=10000;
+set hive.exec.dynamic.partition.mode=nonstrict;
+set hive.exec.dynamic.partition=true;
+set hive.optimize.sort.dynamic.partition=true;
+set hive.optimize.sort.dynamic.partition.threshold=1;
+set hive.exec.reducers.max=32;
+
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/impala-data/{db_name}/inventory/'
 OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
@@ -747,8 +834,8 @@ delimited fields terminated by '|'
 ---- TABLE_PROPERTIES
 text:serialization.null.format=
 ---- DEPENDENT_LOAD
--- Split the load into multiple steps to reduce total memory usage for larger
--- scale factors. TODO: Dynamically scale this based on the scale factor?
+-- partitioned_insert: ss_sold_date_sk,2450800,2452700,450
+-- TODO: Dynamically scale this based on the scale factor?
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (ss_sold_date_sk)
 {hint} SELECT ss_sold_time_sk,
   ss_item_sk,
@@ -774,127 +861,12 @@ INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (ss_sold_date
   ss_net_profit,
   ss_sold_date_sk
 FROM {db_name}.{table_name}
-WHERE ss_sold_date_sk IS NULL;
-
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (ss_sold_date_sk)
-{hint} SELECT ss_sold_time_sk,
-  ss_item_sk,
-  ss_customer_sk,
-  ss_cdemo_sk,
-  ss_hdemo_sk,
-  ss_addr_sk,
-  ss_store_sk,
-  ss_promo_sk,
-  ss_ticket_number,
-  ss_quantity,
-  ss_wholesale_cost,
-  ss_list_price,
-  ss_sales_price,
-  ss_ext_discount_amt,
-  ss_ext_sales_price,
-  ss_ext_wholesale_cost,
-  ss_ext_list_price,
-  ss_ext_tax,
-  ss_coupon_amt,
-  ss_net_paid,
-  ss_net_paid_inc_tax,
-  ss_net_profit,
-  ss_sold_date_sk
-FROM {db_name}.{table_name}
-WHERE ss_sold_date_sk < 2451272;
-
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (ss_sold_date_sk)
-{hint} SELECT ss_sold_time_sk,
-  ss_item_sk,
-  ss_customer_sk,
-  ss_cdemo_sk,
-  ss_hdemo_sk,
-  ss_addr_sk,
-  ss_store_sk,
-  ss_promo_sk,
-  ss_ticket_number,
-  ss_quantity,
-  ss_wholesale_cost,
-  ss_list_price,
-  ss_sales_price,
-  ss_ext_discount_amt,
-  ss_ext_sales_price,
-  ss_ext_wholesale_cost,
-  ss_ext_list_price,
-  ss_ext_tax,
-  ss_coupon_amt,
-  ss_net_paid,
-  ss_net_paid_inc_tax,
-  ss_net_profit,
-  ss_sold_date_sk
-FROM {db_name}.{table_name}
-WHERE 2451272 <= ss_sold_date_sk and ss_sold_date_sk < 2451728;
-
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (ss_sold_date_sk)
-{hint} SELECT ss_sold_time_sk,
-  ss_item_sk,
-  ss_customer_sk,
-  ss_cdemo_sk,
-  ss_hdemo_sk,
-  ss_addr_sk,
-  ss_store_sk,
-  ss_promo_sk,
-  ss_ticket_number,
-  ss_quantity,
-  ss_wholesale_cost,
-  ss_list_price,
-  ss_sales_price,
-  ss_ext_discount_amt,
-  ss_ext_sales_price,
-  ss_ext_wholesale_cost,
-  ss_ext_list_price,
-  ss_ext_tax,
-  ss_coupon_amt,
-  ss_net_paid,
-  ss_net_paid_inc_tax,
-  ss_net_profit,
-  ss_sold_date_sk
-FROM {db_name}.{table_name}
-WHERE 2451728 <= ss_sold_date_sk and ss_sold_date_sk < 2452184;
-
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (ss_sold_date_sk)
-{hint} SELECT ss_sold_time_sk,
-  ss_item_sk,
-  ss_customer_sk,
-  ss_cdemo_sk,
-  ss_hdemo_sk,
-  ss_addr_sk,
-  ss_store_sk,
-  ss_promo_sk,
-  ss_ticket_number,
-  ss_quantity,
-  ss_wholesale_cost,
-  ss_list_price,
-  ss_sales_price,
-  ss_ext_discount_amt,
-  ss_ext_sales_price,
-  ss_ext_wholesale_cost,
-  ss_ext_list_price,
-  ss_ext_tax,
-  ss_coupon_amt,
-  ss_net_paid,
-  ss_net_paid_inc_tax,
-  ss_net_profit,
-  ss_sold_date_sk
-FROM {db_name}.{table_name}
-WHERE 2452184 <= ss_sold_date_sk;
+{part_predicate};
 ---- LOAD
-USE {db_name};
-
-set hive.exec.max.dynamic.partitions.pernode=10000;
-set hive.exec.max.dynamic.partitions=10000;
-set hive.exec.dynamic.partition.mode=nonstrict;
-set hive.exec.dynamic.partition=true;
-set hive.optimize.sort.dynamic.partition=true;
-set hive.optimize.sort.dynamic.partition.threshold=1;
-
-insert overwrite table {table_name} partition(ss_sold_date_sk)
-select ss_sold_time_sk,
+-- partitioned_insert: ss_sold_date_sk,2450800,2452700,450
+-- TODO: Dynamically scale this based on the scale factor?
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION (ss_sold_date_sk)
+SELECT ss_sold_time_sk,
   ss_item_sk,
   ss_customer_sk,
   ss_cdemo_sk,
@@ -917,121 +889,9 @@ select ss_sold_time_sk,
   ss_net_paid_inc_tax,
   ss_net_profit,
   ss_sold_date_sk
-from store_sales_unpartitioned
-WHERE ss_sold_date_sk IS NULL
-distribute by ss_sold_date_sk;
-
-insert overwrite table {table_name} partition(ss_sold_date_sk)
-select ss_sold_time_sk,
-  ss_item_sk,
-  ss_customer_sk,
-  ss_cdemo_sk,
-  ss_hdemo_sk,
-  ss_addr_sk,
-  ss_store_sk,
-  ss_promo_sk,
-  ss_ticket_number,
-  ss_quantity,
-  ss_wholesale_cost,
-  ss_list_price,
-  ss_sales_price,
-  ss_ext_discount_amt,
-  ss_ext_sales_price,
-  ss_ext_wholesale_cost,
-  ss_ext_list_price,
-  ss_ext_tax,
-  ss_coupon_amt,
-  ss_net_paid,
-  ss_net_paid_inc_tax,
-  ss_net_profit,
-  ss_sold_date_sk
-from store_sales_unpartitioned
-WHERE ss_sold_date_sk < 2451272
-distribute by ss_sold_date_sk;
-
-insert overwrite table {table_name} partition(ss_sold_date_sk)
-select ss_sold_time_sk,
-  ss_item_sk,
-  ss_customer_sk,
-  ss_cdemo_sk,
-  ss_hdemo_sk,
-  ss_addr_sk,
-  ss_store_sk,
-  ss_promo_sk,
-  ss_ticket_number,
-  ss_quantity,
-  ss_wholesale_cost,
-  ss_list_price,
-  ss_sales_price,
-  ss_ext_discount_amt,
-  ss_ext_sales_price,
-  ss_ext_wholesale_cost,
-  ss_ext_list_price,
-  ss_ext_tax,
-  ss_coupon_amt,
-  ss_net_paid,
-  ss_net_paid_inc_tax,
-  ss_net_profit,
-  ss_sold_date_sk
-from store_sales_unpartitioned
-WHERE 2451272 <= ss_sold_date_sk and ss_sold_date_sk < 2451728
-distribute by ss_sold_date_sk;
-
-insert overwrite table {table_name} partition(ss_sold_date_sk)
-select ss_sold_time_sk,
-  ss_item_sk,
-  ss_customer_sk,
-  ss_cdemo_sk,
-  ss_hdemo_sk,
-  ss_addr_sk,
-  ss_store_sk,
-  ss_promo_sk,
-  ss_ticket_number,
-  ss_quantity,
-  ss_wholesale_cost,
-  ss_list_price,
-  ss_sales_price,
-  ss_ext_discount_amt,
-  ss_ext_sales_price,
-  ss_ext_wholesale_cost,
-  ss_ext_list_price,
-  ss_ext_tax,
-  ss_coupon_amt,
-  ss_net_paid,
-  ss_net_paid_inc_tax,
-  ss_net_profit,
-  ss_sold_date_sk
-from store_sales_unpartitioned
-WHERE 2451728 <= ss_sold_date_sk and ss_sold_date_sk < 2452184
-distribute by ss_sold_date_sk;
-
-insert overwrite table {table_name} partition(ss_sold_date_sk)
-select ss_sold_time_sk,
-  ss_item_sk,
-  ss_customer_sk,
-  ss_cdemo_sk,
-  ss_hdemo_sk,
-  ss_addr_sk,
-  ss_store_sk,
-  ss_promo_sk,
-  ss_ticket_number,
-  ss_quantity,
-  ss_wholesale_cost,
-  ss_list_price,
-  ss_sales_price,
-  ss_ext_discount_amt,
-  ss_ext_sales_price,
-  ss_ext_wholesale_cost,
-  ss_ext_list_price,
-  ss_ext_tax,
-  ss_coupon_amt,
-  ss_net_paid,
-  ss_net_paid_inc_tax,
-  ss_net_profit,
-  ss_sold_date_sk
-from store_sales_unpartitioned
-WHERE 2452184 <= ss_sold_date_sk
-distribute by ss_sold_date_sk;
+FROM {db_name}.store_sales_unpartitioned
+{part_predicate}
+DISTRIBUTE BY ss_sold_date_sk;
 ====
 ---- DATASET
 tpcds
@@ -1078,85 +938,6 @@ INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
 SELECT * FROM {db_name}.{table_name};
 ---- LOAD
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/impala-data/{db_name}/store_returns/'
-OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
-====
----- DATASET
-tpcds
----- BASE_TABLE_NAME
-web_page
----- COLUMNS
-wp_web_page_sk            int
-wp_web_page_id            string
-wp_rec_start_date         string
-wp_rec_end_date           string
-wp_creation_date_sk       int
-wp_access_date_sk         int
-wp_autogen_flag           string
-wp_customer_sk            int
-wp_url                    string
-wp_type                   string
-wp_char_count             int
-wp_link_count             int
-wp_image_count            int
-wp_max_ad_count           int
-primary key (wp_web_page_sk) DISABLE NOVALIDATE RELY
-foreign key (wp_creation_date_sk) references {db_name}{db_suffix}.date_dim (d_date_sk) DISABLE NOVALIDATE RELY
-foreign key (wp_access_date_sk) references {db_name}{db_suffix}.date_dim (d_date_sk) DISABLE NOVALIDATE RELY
-foreign key (wp_customer_sk) references {db_name}{db_suffix}.customer (c_customer_sk) DISABLE NOVALIDATE RELY
----- ROW_FORMAT
-delimited fields terminated by '|'
----- TABLE_PROPERTIES
-text:serialization.null.format=
----- DEPENDENT_LOAD
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
-SELECT * FROM {db_name}.{table_name};
----- LOAD
-LOAD DATA LOCAL INPATH '{impala_home}/testdata/impala-data/{db_name}/web_page/'
-OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
-====
----- DATASET
-tpcds
----- BASE_TABLE_NAME
-web_site
----- COLUMNS
-web_site_sk           int
-web_site_id           string
-web_rec_start_date    string
-web_rec_end_date      string
-web_name              string
-web_open_date_sk      int
-web_close_date_sk     int
-web_class             string
-web_manager           string
-web_mkt_id            int
-web_mkt_class         string
-web_mkt_desc          string
-web_market_manager    string
-web_company_id        int
-web_company_name      string
-web_street_number     string
-web_street_name       string
-web_street_type       string
-web_suite_number      string
-web_city              string
-web_county            string
-web_state             string
-web_zip               string
-web_country           string
-web_gmt_offset        decimal(5,2)
-web_tax_percentage    decimal(5,2)
-primary key (web_site_sk) DISABLE NOVALIDATE RELY
-foreign key (web_open_date_sk) references {db_name}{db_suffix}.date_dim (d_date_sk) DISABLE NOVALIDATE RELY
-foreign key (web_close_date_sk) references {db_name}{db_suffix}.date_dim (d_date_sk) DISABLE NOVALIDATE RELY
----- ROW_FORMAT
-delimited fields terminated by '|'
----- TABLE_PROPERTIES
-text:serialization.null.format=
----- DEPENDENT_LOAD
-INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
-SELECT * FROM {db_name}.{table_name};
----- LOAD
-LOAD DATA LOCAL INPATH '{impala_home}/testdata/impala-data/{db_name}/web_site/'
 OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET

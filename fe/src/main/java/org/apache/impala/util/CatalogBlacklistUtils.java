@@ -18,6 +18,7 @@
 package org.apache.impala.util;
 
 import org.apache.impala.analysis.TableName;
+import org.apache.impala.catalog.Db;
 
 import java.util.Set;
 
@@ -94,6 +95,10 @@ public class CatalogBlacklistUtils {
   }
 
   public static void verifyDbName(String dbName) throws AnalysisException {
+    if (BackendConfig.INSTANCE.enableWorkloadMgmt() && dbName.equalsIgnoreCase(Db.SYS)) {
+      // Override system DB for Impala system tables.
+      return;
+    }
     if (BLACKLISTED_DBS.contains(dbName)) {
       throw new AnalysisException("Invalid db name: " + dbName
           + ". It has been blacklisted using --blacklisted_dbs");

@@ -37,6 +37,7 @@ import org.apache.hadoop.hive.metastore.api.AddDefaultConstraintRequest;
 import org.apache.hadoop.hive.metastore.api.AddDynamicPartitions;
 import org.apache.hadoop.hive.metastore.api.AddForeignKeyRequest;
 import org.apache.hadoop.hive.metastore.api.AddNotNullConstraintRequest;
+import org.apache.hadoop.hive.metastore.api.AddPackageRequest;
 import org.apache.hadoop.hive.metastore.api.AddPartitionsRequest;
 import org.apache.hadoop.hive.metastore.api.AddPartitionsResult;
 import org.apache.hadoop.hive.metastore.api.AddPrimaryKeyRequest;
@@ -44,6 +45,8 @@ import org.apache.hadoop.hive.metastore.api.AddUniqueConstraintRequest;
 import org.apache.hadoop.hive.metastore.api.AggrStats;
 import org.apache.hadoop.hive.metastore.api.AllocateTableWriteIdsRequest;
 import org.apache.hadoop.hive.metastore.api.AllocateTableWriteIdsResponse;
+import org.apache.hadoop.hive.metastore.api.AllTableConstraintsRequest;
+import org.apache.hadoop.hive.metastore.api.AllTableConstraintsResponse;
 import org.apache.hadoop.hive.metastore.api.AlreadyExistsException;
 import org.apache.hadoop.hive.metastore.api.AlterCatalogRequest;
 import org.apache.hadoop.hive.metastore.api.AlterISchemaRequest;
@@ -75,11 +78,14 @@ import org.apache.hadoop.hive.metastore.api.DefaultConstraintsRequest;
 import org.apache.hadoop.hive.metastore.api.DefaultConstraintsResponse;
 import org.apache.hadoop.hive.metastore.api.DropCatalogRequest;
 import org.apache.hadoop.hive.metastore.api.DropConstraintRequest;
+import org.apache.hadoop.hive.metastore.api.DropDatabaseRequest;
+import org.apache.hadoop.hive.metastore.api.DropPackageRequest;
 import org.apache.hadoop.hive.metastore.api.DropPartitionsRequest;
 import org.apache.hadoop.hive.metastore.api.DropPartitionsResult;
 import org.apache.hadoop.hive.metastore.api.EnvironmentContext;
 import org.apache.hadoop.hive.metastore.api.ExtendedTableInfo;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.hadoop.hive.metastore.api.FindNextCompactRequest;
 import org.apache.hadoop.hive.metastore.api.FindSchemasByColsResp;
 import org.apache.hadoop.hive.metastore.api.FindSchemasByColsRqst;
 import org.apache.hadoop.hive.metastore.api.FireEventRequest;
@@ -102,7 +108,9 @@ import org.apache.hadoop.hive.metastore.api.GetFileMetadataResult;
 import org.apache.hadoop.hive.metastore.api.GetLatestCommittedCompactionInfoRequest;
 import org.apache.hadoop.hive.metastore.api.GetLatestCommittedCompactionInfoResponse;
 import org.apache.hadoop.hive.metastore.api.GetOpenTxnsInfoResponse;
+import org.apache.hadoop.hive.metastore.api.GetOpenTxnsRequest;
 import org.apache.hadoop.hive.metastore.api.GetOpenTxnsResponse;
+import org.apache.hadoop.hive.metastore.api.GetPackageRequest;
 import org.apache.hadoop.hive.metastore.api.GetPartitionsByNamesRequest;
 import org.apache.hadoop.hive.metastore.api.GetPartitionsByNamesResult;
 import org.apache.hadoop.hive.metastore.api.GetPartitionsResponse;
@@ -143,6 +151,7 @@ import org.apache.hadoop.hive.metastore.api.ISchemaName;
 import org.apache.hadoop.hive.metastore.api.InvalidInputException;
 import org.apache.hadoop.hive.metastore.api.InvalidObjectException;
 import org.apache.hadoop.hive.metastore.api.InvalidOperationException;
+import org.apache.hadoop.hive.metastore.api.ListPackageRequest;
 import org.apache.hadoop.hive.metastore.api.LockRequest;
 import org.apache.hadoop.hive.metastore.api.LockResponse;
 import org.apache.hadoop.hive.metastore.api.MapSchemaVersionToSerdeRequest;
@@ -163,6 +172,7 @@ import org.apache.hadoop.hive.metastore.api.NotificationEventsCountResponse;
 import org.apache.hadoop.hive.metastore.api.OpenTxnRequest;
 import org.apache.hadoop.hive.metastore.api.OpenTxnsResponse;
 import org.apache.hadoop.hive.metastore.api.OptionalCompactionInfoStruct;
+import org.apache.hadoop.hive.metastore.api.Package;
 import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.PartitionEventType;
 import org.apache.hadoop.hive.metastore.api.PartitionSpec;
@@ -211,6 +221,8 @@ import org.apache.hadoop.hive.metastore.api.ShowCompactRequest;
 import org.apache.hadoop.hive.metastore.api.ShowCompactResponse;
 import org.apache.hadoop.hive.metastore.api.ShowLocksRequest;
 import org.apache.hadoop.hive.metastore.api.ShowLocksResponse;
+import org.apache.hadoop.hive.metastore.api.StoredProcedure;
+import org.apache.hadoop.hive.metastore.api.StoredProcedureRequest;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.TableMeta;
 import org.apache.hadoop.hive.metastore.api.TableStatsRequest;
@@ -225,6 +237,7 @@ import org.apache.hadoop.hive.metastore.api.UniqueConstraintsResponse;
 import org.apache.hadoop.hive.metastore.api.UnknownDBException;
 import org.apache.hadoop.hive.metastore.api.UnknownTableException;
 import org.apache.hadoop.hive.metastore.api.UnlockRequest;
+import org.apache.hadoop.hive.metastore.api.UpdateTransactionalStatsRequest;
 import org.apache.hadoop.hive.metastore.api.WMAlterPoolRequest;
 import org.apache.hadoop.hive.metastore.api.WMAlterPoolResponse;
 import org.apache.hadoop.hive.metastore.api.WMAlterResourcePlanRequest;
@@ -260,11 +273,14 @@ import org.apache.hadoop.hive.metastore.api.WMGetTriggersForResourePlanResponse;
 import org.apache.hadoop.hive.metastore.api.WMValidateResourcePlanRequest;
 import org.apache.hadoop.hive.metastore.api.WMValidateResourcePlanResponse;
 import org.apache.hadoop.hive.metastore.api.WriteEventInfo;
+import org.apache.hadoop.hive.metastore.api.WriteNotificationLogBatchRequest;
 import org.apache.hadoop.hive.metastore.api.WriteNotificationLogRequest;
+import org.apache.hadoop.hive.metastore.api.WriteNotificationLogBatchResponse;
 import org.apache.hadoop.hive.metastore.api.WriteNotificationLogResponse;
 import org.apache.hadoop.hive.metastore.conf.MetastoreConf;
 import org.apache.hadoop.hive.metastore.conf.MetastoreConf.ConfVars;
 import org.apache.hadoop.hive.metastore.utils.MetaStoreUtils;
+import org.apache.hadoop.util.StringUtils;
 import org.apache.impala.catalog.CatalogHmsAPIHelper;
 import org.apache.impala.catalog.DatabaseNotFoundException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
@@ -273,8 +289,6 @@ import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.catalog.events.EventFactory;
 import org.apache.impala.catalog.events.MetastoreEvents;
 import org.apache.impala.catalog.events.MetastoreEvents.DropTableEvent;
-import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEvent;
-import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEventFactory;
 import org.apache.impala.catalog.events.MetastoreEventsProcessor;
 import org.apache.impala.common.Metrics;
 import org.apache.impala.common.Reference;
@@ -472,22 +486,42 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
 
   @Override
   public void drop_database(String databaseName, boolean deleteData,
-      boolean ignoreUnknownDb) throws NoSuchObjectException,
+      boolean cascade) throws NoSuchObjectException,
       InvalidOperationException, MetaException, TException {
+    String[] parsedCatDbName = MetaStoreUtils.parseDbName(databaseName, serverConf_);
+
+    DropDatabaseRequest req = new DropDatabaseRequest();
+    req.setName(parsedCatDbName[1]);
+    req.setCatalogName(parsedCatDbName[0]);
+    req.setIgnoreUnknownDb(false);
+    req.setDeleteData(deleteData);
+    req.setCascade(cascade);
+    drop_database_req(req);
+  }
+
+  @Override
+  public void drop_database_req(final DropDatabaseRequest dropDatabaseRequest)
+      throws NoSuchObjectException, InvalidOperationException, MetaException {
     long currentEventId = -1;
     catalogOpExecutor_.getMetastoreDdlLock().lock();
     try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
       currentEventId = getCurrentEventId(client);
-      client.getHiveClient().getThriftClient()
-          .drop_database(databaseName, deleteData, ignoreUnknownDb);
+      client.getHiveClient().getThriftClient().drop_database_req(dropDatabaseRequest);
+      // TODO: We should add TException to method signature in hive and we can remove
+      // following two catch blocks.
+    } catch (NoSuchObjectException|InvalidOperationException|MetaException e) {
+      throw e;
+    } catch (TException e) {
+      throw new MetaException(StringUtils.stringifyException(e));
     } finally {
       catalogOpExecutor_.getMetastoreDdlLock().unlock();
     }
     if (!BackendConfig.INSTANCE.invalidateCatalogdHMSCacheOnDDLs() ||
-            !BackendConfig.INSTANCE.enableCatalogdHMSCache()) {
+        !BackendConfig.INSTANCE.enableCatalogdHMSCache()) {
       return;
     }
-    dropDbIfExists(databaseName, ignoreUnknownDb, currentEventId, "drop_database");
+    dropDbIfExists(dropDatabaseRequest.getName(), dropDatabaseRequest.isIgnoreUnknownDb(),
+        currentEventId, "drop_database");
   }
 
   @Override
@@ -691,6 +725,16 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
     try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
       client.getHiveClient().getThriftClient()
           .add_check_constraint(addCheckConstraintRequest);
+    }
+  }
+
+  @Override
+  public Table translate_table_dryrun(CreateTableRequest createTableRequest) throws
+      AlreadyExistsException, InvalidObjectException, MetaException,
+      NoSuchObjectException, TException {
+    try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      return client.getHiveClient().getThriftClient()
+          .translate_table_dryrun(createTableRequest);
     }
   }
 
@@ -1719,6 +1763,16 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
   }
 
   @Override
+  public AllTableConstraintsResponse get_all_table_constraints(
+          AllTableConstraintsRequest request) throws TException, MetaException,
+          NoSuchObjectException {
+    try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      return client.getHiveClient().getThriftClient()
+          .get_all_table_constraints(request);
+    }
+  }
+
+  @Override
   public boolean update_table_column_statistics(ColumnStatistics columnStatistics)
       throws NoSuchObjectException, InvalidObjectException, MetaException,
       InvalidInputException, TException {
@@ -2120,6 +2174,68 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
   }
 
   @Override
+  public GetOpenTxnsResponse get_open_txns_req(GetOpenTxnsRequest getOpenTxnsRequest)
+     throws TException {
+     try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+       return client.getHiveClient().getThriftClient()
+               .get_open_txns_req(getOpenTxnsRequest);
+    }
+  }
+  @Override
+  public void create_stored_procedure(StoredProcedure proc)
+          throws NoSuchObjectException, MetaException, TException {
+    try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      client.getHiveClient().getThriftClient().create_stored_procedure(proc);
+    }
+  }
+
+  @Override
+  public StoredProcedure get_stored_procedure(StoredProcedureRequest request)
+          throws MetaException, NoSuchObjectException, TException {
+    try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      return client.getHiveClient().getThriftClient().get_stored_procedure(request);
+    }
+  }
+
+  @Override
+  public void drop_stored_procedure(StoredProcedureRequest request)
+          throws MetaException, TException {
+    try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      client.getHiveClient().getThriftClient().drop_stored_procedure(request);
+    }
+  }
+
+  @Override
+  public Package find_package(GetPackageRequest request)
+          throws MetaException, NoSuchObjectException, TException {
+    try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      return client.getHiveClient().getThriftClient().find_package(request);
+    }
+  }
+
+  @Override
+  public void add_package(AddPackageRequest request) throws MetaException, TException {
+    try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      client.getHiveClient().getThriftClient().add_package(request);
+    }
+  }
+
+  @Override
+  public List<String> get_all_packages(ListPackageRequest request)
+          throws MetaException, TException {
+    try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      return client.getHiveClient().getThriftClient().get_all_packages(request);
+    }
+  }
+
+  @Override
+  public void drop_package(DropPackageRequest request) throws MetaException, TException {
+    try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      client.getHiveClient().getThriftClient().drop_package(request);
+    }
+  }
+
+  @Override
   public GetOpenTxnsInfoResponse get_open_txns_info() throws TException {
     try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
       return client.getHiveClient().getThriftClient().get_open_txns_info();
@@ -2285,6 +2401,23 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
   }
 
   @Override
+  public OptionalCompactionInfoStruct find_next_compact2(FindNextCompactRequest rqst)
+      throws MetaException, TException {
+    try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      return client.getHiveClient().getThriftClient().find_next_compact2(rqst);
+    }
+  }
+
+  @Override
+  public WriteNotificationLogBatchResponse add_write_notification_log_in_batch(
+      WriteNotificationLogBatchRequest batchRequest) throws TException {
+    try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      return client.getHiveClient().getThriftClient()
+          .add_write_notification_log_in_batch(batchRequest);
+    }
+  }
+
+  @Override
   public void update_compactor_state(CompactionInfoStruct compactionInfoStruct, long l)
       throws TException {
     try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
@@ -2406,6 +2539,14 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
     try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
       return client.getHiveClient().getThriftClient()
           .add_write_notification_log(writeNotificationLogRequest);
+    }
+  }
+
+  @Override
+  public void update_transaction_statistics(UpdateTransactionalStatsRequest req)
+      throws MetaException, TException {
+    try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
+      client.getHiveClient().getThriftClient().update_transaction_statistics(req);
     }
   }
 
@@ -3054,12 +3195,8 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
     dbName = catAndDbName[1];
     try {
       List<NotificationEvent> events = MetastoreEventsProcessor
-          .getNextMetastoreEventsInBatches(catalog_, beforeDropEventId,
-              event -> event.getEventType()
-                  .equalsIgnoreCase(DropTableEvent.DROP_TABLE_EVENT_TYPE)
-                  && catName.equalsIgnoreCase(event.getCatName())
-                  && dbName.equalsIgnoreCase(event.getDbName())
-                  && tableName.equalsIgnoreCase(event.getTableName()));
+          .getNextMetastoreEventsInBatchesForTable(catalog_, beforeDropEventId,
+              catName, dbName, tableName, DropTableEvent.EVENT_TYPE);
       if (events.isEmpty()) {
         throw new MetaException(
             "Drop table event not received. Check if notification events are "
@@ -3127,7 +3264,7 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
     LOG.debug("Renaming " + tableInfo);
     Pair<org.apache.impala.catalog.Table, org.apache.impala.catalog.Table> result =
         catalog_.renameTable(oldTable, newTable);
-    if (result.first == null || result.second == null) {
+    if (result == null || result.first == null || result.second == null) {
       LOG.debug("Couldn't rename " + tableInfo);
     } else {
       LOG.info("Successfully renamed " + tableInfo);
@@ -3150,13 +3287,8 @@ public abstract class MetastoreServiceHandler extends AbstractThriftHiveMetastor
 
     try {
       List<NotificationEvent> events = MetastoreEventsProcessor
-          .getNextMetastoreEventsInBatches(catalog_, beforeDropEventId,
-              event -> event.getEventType()
-                  .equalsIgnoreCase(MetastoreEvents.DropDatabaseEvent
-                      .DROP_DATABASE_EVENT_TYPE)
-                  && catName.equalsIgnoreCase(event.getCatName())
-                  && dbName.equalsIgnoreCase(event.getDbName()));
-
+          .getNextMetastoreEventsInBatchesForDb(catalog_, beforeDropEventId, catName,
+              dbName, MetastoreEvents.DropDatabaseEvent.EVENT_TYPE);
       if (events.size() == 0) {
         if (ignoreUnknownDb) {
           LOG.debug("db {} does not exist in metastore. Removing it from catalog if "

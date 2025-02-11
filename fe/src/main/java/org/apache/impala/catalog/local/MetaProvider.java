@@ -28,17 +28,19 @@ import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.UnknownDBException;
 import org.apache.impala.authorization.AuthorizationPolicy;
 import org.apache.impala.catalog.CatalogException;
-import org.apache.impala.catalog.FeIcebergTable;
+import org.apache.impala.catalog.DataSource;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.HdfsCachePool;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.HdfsPartitionLocationCompressor;
 import org.apache.impala.catalog.HdfsStorageDescriptor;
 import org.apache.impala.catalog.SqlConstraints;
+import org.apache.impala.catalog.VirtualColumn;
+import org.apache.impala.catalog.local.LocalIcebergTable.TableParams;
 import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TBriefTableMeta;
-import org.apache.impala.thrift.TIcebergSnapshot;
 import org.apache.impala.thrift.TNetworkAddress;
+import org.apache.impala.thrift.TPartialTableInfo;
 import org.apache.impala.thrift.TValidWriteIdList;
 import org.apache.impala.util.ListMap;
 import org.apache.thrift.TException;
@@ -66,6 +68,12 @@ public interface MetaProvider {
    */
   boolean isReady();
 
+  /**
+   * Allows waiting for isReady() to become true. May return early, so
+   * it needs to be called in a loop.
+   */
+  void waitForIsReady(long timeoutMs);
+
   ImmutableList<String> loadDbList() throws TException;
 
   Database loadDb(String dbName) throws TException;
@@ -75,6 +83,8 @@ public interface MetaProvider {
 
   Pair<Table, TableMetaRef> loadTable(String dbName, String tableName)
       throws NoSuchObjectException, MetaException, TException;
+
+  Pair<Table, TableMetaRef> getTableIfPresent(String dbName, String tableName);
 
   String loadNullPartitionKeyValue()
       throws MetaException, TException;
@@ -106,6 +116,16 @@ public interface MetaProvider {
       throws TException;
 
   /**
+   * Retrieve all DataSource objects.
+   */
+  ImmutableList<DataSource> loadDataSources() throws TException;
+
+  /**
+   * Retrieve the DataSource object for the given DataSource name.
+   */
+  DataSource loadDataSource(String dsName) throws TException;
+
+  /**
    * Load the given partitions from the specified table.
    *
    * If a requested partition does not exist, no exception will be thrown.
@@ -126,11 +146,16 @@ public interface MetaProvider {
       List<String> colNames) throws TException;
 
   /**
-   * Loads Iceberg snapshot information, i.e. snapshot id and file descriptors.
+   * Loads Iceberg related table metadata.
    */
-  public FeIcebergTable.Snapshot loadIcebergSnapshot(final TableMetaRef table,
-      ListMap<TNetworkAddress> hostIndex)
-      throws TException;
+  public TPartialTableInfo loadIcebergTable(
+      final TableMetaRef table) throws TException;
+
+  /**
+   * Loads the Iceberg API table metadata through the Iceberg library.
+   */
+  public org.apache.iceberg.Table loadIcebergApiTable(
+      final TableMetaRef table, TableParams param, Table msTable) throws TException;
 
   /**
    * Reference to a table as returned by loadTable(). This reference must be passed
@@ -143,6 +168,9 @@ public interface MetaProvider {
     List<String> getPartitionPrefixes();
     boolean isPartitioned();
     boolean isTransactional();
+    List<VirtualColumn> getVirtualColumns();
+    long getCatalogVersion();
+    long getLoadedTimeMs();
   }
 
   /**

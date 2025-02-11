@@ -17,9 +17,17 @@
 
 # This modules contians utility functions used to help verify query test results.
 
+from __future__ import absolute_import, division, print_function
+from builtins import map, range
+# Python 3 doesn't have the "unicode" type, as its regular string is Unicode. This
+# replaces Python 2's unicode with future's str. On Python 3, it is the builtin string.
+# On Python 2, it uses future's str implementation, which is similar to Python 3's string
+# but subclasses "unicode". See https://python-future.org/compatible_idioms.html#unicode
+from builtins import str as unicode_compat
 import logging
 import math
 import re
+import sys
 
 from functools import wraps
 from tests.util.test_file_parser import (join_section_lines, remove_comments,
@@ -62,6 +70,11 @@ class QueryTestResult(object):
     if not isinstance(other, self.__class__):
       return False
     return self.column_types == other.column_types and self.rows == other.rows
+
+  def __hash__(self):
+    # This is not intended to be hashed. If that is happening, then something is wrong.
+    # The regexes in ResultRow make it difficult to implement this correctly.
+    assert False
 
   def __ne__(self, other):
     return not self.__eq__(other)
@@ -136,15 +149,18 @@ class ResultRow(object):
     """Allows accessing a column value using the column alias or the position of the
     column in the result set. All values are returned as strings and an exception is
     thrown if the column label or column position does not exist."""
-    if isinstance(key, basestring):
+    # Python 2's str type won't match unicode type. This is ok, because currently the
+    # key is never unicode. On Python 3, str is unicode, and this would not have that
+    # limitation.
+    if isinstance(key, str):
       for col in self.columns:
         if col.column_label == key.lower(): return col.value
-      raise IndexError, 'No column with label: ' + key
+      raise IndexError('No column with label: ' + key)
     elif isinstance(key, int):
       # If the key (column position) does not exist this will throw an IndexError when
       # indexing into the self.columns
       return str(self.columns[key])
-    raise TypeError, 'Unsupported indexing key type: ' + type(key)
+    raise TypeError('Unsupported indexing key type: ' + type(key))
 
   def __eq__(self, other):
     if not isinstance(other, self.__class__):
@@ -155,6 +171,11 @@ class ResultRow(object):
     if other.regex is not None:
       return other.regex.match(self.row_string)
     return self.columns == other.columns
+
+  def __hash__(self):
+    # This is not intended to be hashed. If that is happening, then something is wrong.
+    # The regexes make it difficult to implement this correctly.
+    assert False
 
   def __ne__(self, other):
     return not self.__eq__(other)
@@ -173,16 +194,17 @@ def try_compile_regex(row_string):
     return regex
   return None
 
+
 # If comparing against a float or double, don't do a strict comparison
-# See: http://www.cygnus-software.com/papers/comparingfloats/comparingfloats.htm
-def compare_float(x, y, epsilon):
+# See: https://peps.python.org/pep-0485/#proposed-implementation
+def compare_float(x, y, rel_tol=1e-9, abs_tol=0.0):
   # For the purposes of test validation, we want to treat nans as equal.  The
   # floating point spec defines nan != nan.
   if math.isnan(x) and math.isnan(y):
     return True
   if math.isinf(x) or math.isinf(y):
     return x == y
-  return abs(x - y) <= epsilon
+  return abs(x - y) <= max(rel_tol * max(abs(x), abs(y)), abs_tol)
 
 # Represents a column in a row
 class ResultColumn(object):
@@ -215,13 +237,18 @@ class ResultColumn(object):
     if (self.value == 'NULL' or other.value == 'NULL'):
       return self.value == other.value
     elif self.column_type == 'float':
-      return compare_float(float(self.value), float(other.value), 10e-5)
+      return compare_float(float(self.value), float(other.value), abs_tol=10e-5)
     elif self.column_type == 'double':
-      return compare_float(float(self.value), float(other.value), 10e-10)
+      return compare_float(float(self.value), float(other.value), abs_tol=10e-10)
     elif self.column_type == 'boolean':
       return str(self.value).lower() == str(other.value).lower()
     else:
       return self.value == other.value
+
+  def __hash__(self):
+    # This is not intended to be hashed. If that is happening, then something is wrong.
+    # The regexes make it difficult to implement this correctly.
+    assert False
 
   def __ne__(self, other):
     return not self.__eq__(other)
@@ -240,8 +267,8 @@ def verify_query_result_is_subset(expected_results, actual_results):
   """Check whether the results in expected_results are a subset of the results in
   actual_results. This uses set semantics, i.e. any duplicates are ignored."""
   expected_literals, expected_non_literals = expected_results.separate_rows()
-  expected_literal_strings = set([unicode(row) for row in expected_literals])
-  actual_literal_strings = set([unicode(row) for row in actual_results.rows])
+  expected_literal_strings = set([unicode_compat(row) for row in expected_literals])
+  actual_literal_strings = set([unicode_compat(row) for row in actual_results.rows])
   # Expected literal strings must all be present in the actual strings.
   assert expected_literal_strings <= actual_literal_strings
   # Expected patterns must be present in the actual strings.
@@ -252,17 +279,17 @@ def verify_query_result_is_subset(expected_results, actual_results):
         matched = True
         break
     assert matched, u"Could not find expected row {0} in actual rows:\n{1}".format(
-        unicode(expected_row), unicode(actual_results))
+        unicode_compat(expected_row), unicode_compat(actual_results))
 
 def verify_query_result_is_superset(expected_results, actual_results):
   """Check whether the results in expected_results are a superset of the results in
   actual_results. This uses set semantics, i.e. any duplicates are ignored."""
   expected_literals, expected_non_literals = expected_results.separate_rows()
-  expected_literal_strings = set([unicode(row) for row in expected_literals])
+  expected_literal_strings = set([unicode_compat(row) for row in expected_literals])
   # Check that all actual rows are present in either expected_literal_strings or
   # expected_non_literals.
   for actual_row in actual_results.rows:
-    if unicode(actual_row) in expected_literal_strings:
+    if unicode_compat(actual_row) in expected_literal_strings:
       # Matched to a literal string
       continue
     matched = False
@@ -271,17 +298,33 @@ def verify_query_result_is_superset(expected_results, actual_results):
         matched = True
         break
     assert matched, u"Could not find actual row {0} in expected rows:\n{1}".format(
-        unicode(actual_row), unicode(expected_results))
+        unicode_compat(actual_row), unicode_compat(expected_results))
 
 def verify_query_result_is_equal(expected_results, actual_results):
   assert_args_not_none(expected_results, actual_results)
   assert expected_results == actual_results
 
-def verify_query_result_is_not_in(expected_results, actual_results):
-  assert_args_not_none(expected_results, actual_results)
-  expected_set = set(map(unicode, expected_results.rows))
-  actual_set = set(map(unicode, actual_results.rows))
-  assert expected_set.isdisjoint(actual_set)
+
+def verify_query_result_is_not_in(banned_results, actual_results):
+  assert_args_not_none(banned_results, actual_results)
+  banned_literals, banned_non_literals = banned_results.separate_rows()
+
+  # Part 1: No intersection with the banned literals
+  banned_literals_set = set([unicode_compat(row) for row in banned_literals])
+  actual_set = set(map(unicode_compat, actual_results.rows))
+  assert banned_literals_set.isdisjoint(actual_set)
+
+  # Part 2: Walk through each banned non-literal / regex and make sure that no row
+  # in the actual output matches.
+  for banned_row in banned_non_literals:
+    matched = False
+    for actual_row in actual_results.rows:
+      # Equals is overloaded, so this is doing a regex check
+      if actual_row == banned_row:
+        matched = True
+        break
+    assert not matched, u"Found banned row {0} in actual rows:\n{1}".format(
+      unicode_compat(banned_row), unicode_compat(actual_results))
 
 # Global dictionary that maps the verification type to appropriate verifier.
 # The RESULTS section of a .test file is tagged with the verifier type. We may
@@ -357,7 +400,7 @@ def verify_raw_results(test_section, exec_result, file_format, result_section,
   expected_results = None
   if result_section in test_section:
     expected_results = remove_comments(test_section[result_section])
-    if isinstance(expected_results, str):
+    if sys.version_info.major == 2 and isinstance(expected_results, str):
       # Always convert 'str' to 'unicode' since pytest will fail to report assertion
       # failures when any 'str' values contain non-ascii bytes (IMPALA-10419).
       try:
@@ -388,9 +431,9 @@ def verify_raw_results(test_section, exec_result, file_format, result_section,
     expected_types = [c.strip().upper()
                       for c in remove_comments(section).rstrip('\n').split(',')]
 
-    # Avro and Kudu represent TIMESTAMP columns as strings, so tests using TIMESTAMP are
+    # Avro represents TIMESTAMP columns as strings, so tests using TIMESTAMP are
     # skipped because results will be wrong.
-    if file_format in ('avro', 'kudu') and 'TIMESTAMP' in expected_types:
+    if file_format == 'avro' and 'TIMESTAMP' in expected_types:
         LOG.info("TIMESTAMP columns unsupported in %s, skipping verification." %\
             file_format)
         return
@@ -456,7 +499,7 @@ def verify_raw_results(test_section, exec_result, file_format, result_section,
     expected_results_list = re.findall(r'\[(.*?)\]', expected_results, flags=re.DOTALL)
     if not is_raw_string:
       # Needs escaping
-      expected_results_list = map(lambda s: s.replace('\n', '\\n'), expected_results_list)
+      expected_results_list = [s.replace('\n', '\\n') for s in expected_results_list]
   else:
     expected_results_list = split_section_lines(expected_results)
   expected = QueryTestResult(expected_results_list, expected_types,
@@ -502,10 +545,10 @@ def parse_result_rows(exec_result, escape_strings=True):
     cols = row.split('\t')
     assert len(cols) == len(col_types)
     new_cols = list()
-    for i in xrange(len(cols)):
-      if col_types[i] in ['STRING', 'CHAR', 'VARCHAR']:
+    for i in range(len(cols)):
+      if col_types[i] in ['STRING', 'CHAR', 'VARCHAR', 'BINARY']:
         col = cols[i]
-        if isinstance(col, str):
+        if sys.version_info.major == 2 and isinstance(col, str):
           try:
             col = col.decode('utf-8')
           except UnicodeDecodeError as e:
@@ -587,7 +630,7 @@ def compute_aggregation(function, field, runtime_profile):
     if (field_regex_re.search(line)):
       match_list.extend(re.findall(field_regex, line))
 
-  int_match_list = map(int, match_list)
+  int_match_list = list(map(int, match_list))
   result = None
   if function == 'SUM':
     result = sum(int_match_list)
@@ -607,20 +650,29 @@ def verify_runtime_profile(expected, actual, update_section=False):
   expected_lines = remove_comments(expected).splitlines()
   matched = [False] * len(expected_lines)
   expected_regexes = []
+  unexpected_regexes = []
+  unexpected_matched_lines = []
   expected_aggregations = []
   for expected_line in expected_lines:
-    expected_regexes.append(try_compile_regex(expected_line))
+    negate_regex = expected_line and expected_line[0] == '!'
+    regex = try_compile_regex(expected_line[1:] if negate_regex else expected_line)
+    unexpected_regexes.append(regex if negate_regex else None)
+    expected_regexes.append(regex if not negate_regex else None)
     expected_aggregations.append(try_compile_aggregation(expected_line))
 
   # Check the expected and actual rows pairwise.
   for line in actual.splitlines():
-    for i in xrange(len(expected_lines)):
+    for i in range(len(expected_lines)):
       if matched[i]: continue
       if expected_regexes[i] is not None:
         match = expected_regexes[i].match(line)
       elif expected_aggregations[i] is not None:
         # Aggregations are enforced separately
         match = True
+      elif unexpected_regexes[i] is not None:
+        if unexpected_regexes[i].match(line):
+          unexpected_matched_lines.append(line)
+        match = False
       else:
         match = expected_lines[i].strip() == line.strip()
       if match:
@@ -628,16 +680,19 @@ def verify_runtime_profile(expected, actual, update_section=False):
         break
 
   unmatched_lines = []
-  for i in xrange(len(expected_lines)):
-    if not matched[i]:
+  for i in range(len(expected_lines)):
+    if not matched[i] and unexpected_regexes[i] is None:
       unmatched_lines.append(expected_lines[i])
   assert len(unmatched_lines) == 0, ("Did not find matches for lines in runtime profile:"
       "\nEXPECTED LINES:\n%s\n\nACTUAL PROFILE:\n%s" % ('\n'.join(unmatched_lines),
         actual))
+  assert len(unexpected_matched_lines) == 0, ("Found unexpected matches in "
+      "runtime profile:\n%s\n\nACTUAL PROFILE:\n%s"
+          % ('\n'.join(unexpected_matched_lines), actual))
 
   updated_aggregations = []
   # Compute the aggregations and check against values
-  for i in xrange(len(expected_aggregations)):
+  for i in range(len(expected_aggregations)):
     if (expected_aggregations[i] is None): continue
     function, field, op, expected_value = expected_aggregations[i]
     actual_value = compute_aggregation(function, field, actual)
@@ -743,3 +798,51 @@ def assert_codegen_enabled(profile_string, exec_node_ids):
     for exec_options in get_node_exec_options(profile_string, exec_node_id):
       assert 'Codegen Enabled' in exec_options
       assert not 'Codegen Disabled' in exec_options
+
+
+def assert_codegen_cache_hit(profile_string, expect_hit):
+  assert "NumCachedFunctions" in profile_string
+  if expect_hit:
+    assert "NumCachedFunctions: 0 " not in profile_string
+  else:
+    assert "NumCachedFunctions: 0 " in profile_string
+
+
+# A query id consists of two 64-bit non-zero hex numbers connected with a ":".
+QUERY_ID_REGEX = r"(?!0{16})[0-9a-z]{16}:(?!0{16})[0-9a-z]{16}"
+
+
+def error_msg_expected(actual_msg, expected_msg="", query_id=None):
+  """
+  Check if the actual error message is expected.
+
+  As defined in `ImpalaServer::QUERY_ERROR_FORMAT`, an error message is expected to
+  has the following form:
+
+    Query <query_id> failed:\n<error_detail>\n
+
+  - For `query_id`,
+      - If a query id is specified in the parameter, it checks if the actual error
+        message contains exactly the query id.
+      - Otherwise, it checks whether `query_id` match the format using a
+        regular expresssion.
+  - For `error_detail`, it checks whether this part starts with the `expected_msg` if it
+    is specified in the parameter. This is sufficient to distinguish one kind of error
+    from another.
+  """
+  if query_id is None:
+    ERROR_REGEX = "^Query " + QUERY_ID_REGEX + " failed:\n"
+    m = re.search(ERROR_REGEX, actual_msg)
+    if m is None:
+      return False
+    return actual_msg.find(expected_msg, m.end()) != -1
+
+  # The beginning of `ImpalaServer::QUERY_ERROR_FORMAT`
+  ERROR_PROMPT = "Query {} failed:\n{}"
+  return actual_msg.startswith(ERROR_PROMPT.format(query_id, expected_msg))
+
+
+def error_msg_equal(msg1, msg2):
+  """Check if two error messages are equal ignoring the query ids."""
+  return re.sub(QUERY_ID_REGEX, "<query_id>", msg1) == \
+         re.sub(QUERY_ID_REGEX, "<query_id>", msg2)

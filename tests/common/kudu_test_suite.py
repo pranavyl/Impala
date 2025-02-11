@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import os
 import pytest
 import requests
@@ -31,7 +33,8 @@ from kudu.schema import (
     SchemaBuilder,
     STRING,
     BINARY,
-    UNIXTIME_MICROS)
+    UNIXTIME_MICROS,
+    DATE)
 from kudu.client import Partitioning
 from random import choice, sample
 from string import ascii_lowercase, digits
@@ -109,7 +112,7 @@ class KuduTestSuite(ImpalaTestSuite):
 
   @classmethod
   def random_table_name(cls):
-    return "".join(choice(string.lowercase) for _ in xrange(10))
+    return "".join(choice(string.ascii_lowercase) for _ in range(10))
 
   @classmethod
   def to_kudu_table_name(cls, db_name, tbl_name):
@@ -143,7 +146,7 @@ class KuduTestSuite(ImpalaTestSuite):
     if not col_names:
       if len(col_types) > 26:
         raise Exception("Too many columns for default naming")
-      col_names = [chr(97 + i) for i in xrange(len(col_types))]
+      col_names = [chr(97 + i) for i in range(len(col_types))]
     schema_builder = SchemaBuilder()
     for i, t in enumerate(col_types):
       column_spec = schema_builder.add_column(col_names[i], type_=t)
@@ -186,7 +189,10 @@ class KuduTestSuite(ImpalaTestSuite):
         INT32: "INT",
         INT64: "BIGINT",
         INT8: "TINYINT",
-        STRING: "STRING"}
+        STRING: "STRING",
+        BINARY: "BINARY",
+        UNIXTIME_MICROS: "TIMESTAMP",
+        DATE: "DATE"}
     if col_type not in mapping:
       raise Exception("Unexpected column type: %s" % col_type)
     return mapping[col_type]

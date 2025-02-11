@@ -130,7 +130,7 @@ MappedMemInfo MemInfo::ParseSmaps() {
     size_t colon_pos = line.find(':');
     if (colon_pos == string::npos) continue;
     string name = line.substr(0, colon_pos);
-    size_t non_space_after_colon_pos = line.find_first_not_of(" ", colon_pos + 1);
+    size_t non_space_after_colon_pos = line.find_first_not_of(' ', colon_pos + 1);
     if (non_space_after_colon_pos == string::npos) continue;
     // From the first non-space after the colon through the end of the string.
     string value = line.substr(non_space_after_colon_pos);
@@ -198,7 +198,7 @@ string ThpConfig::DebugString() const {
   return stream.str();
 }
 
-Status ChooseProcessMemLimit(int64_t* bytes_limit) {
+Status ChooseProcessMemLimit(int64_t* bytes_limit, int64_t* process_avail_mem) {
   // Depending on the system configuration, we detect the total amount of memory
   // available to the system - either the available physical memory, or if overcommitting
   // is turned off, we use the memory commit limit from /proc/meminfo (see IMPALA-1690).
@@ -262,6 +262,7 @@ Status ChooseProcessMemLimit(int64_t* bytes_limit) {
                  << " exceeds CGroup memory limit of "
                  << PrettyPrinter::PrintBytes(cgroup_mem_limit);
   }
+  if (process_avail_mem) *process_avail_mem = avail_mem;
   return Status::OK();
 }
 }

@@ -17,69 +17,150 @@
 
 package org.apache.impala.planner;
 
-import java.io.IOException;
-import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
-import java.util.ListIterator;
+import java.util.Map;
+import java.util.Random;
 
-import org.apache.hadoop.fs.Path;
-import org.apache.iceberg.DataFile;
-import org.apache.iceberg.expressions.Expressions;
-import org.apache.iceberg.expressions.Expression.Operation;
-import org.apache.iceberg.expressions.UnboundPredicate;
 import org.apache.impala.analysis.Analyzer;
-import org.apache.impala.analysis.BinaryPredicate;
-import org.apache.impala.analysis.BoolLiteral;
-import org.apache.impala.analysis.DateLiteral;
 import org.apache.impala.analysis.Expr;
-import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.MultiAggregateInfo;
-import org.apache.impala.analysis.NumericLiteral;
-import org.apache.impala.analysis.SlotRef;
-import org.apache.impala.analysis.StringLiteral;
 import org.apache.impala.analysis.TableRef;
-import org.apache.impala.analysis.TimeTravelSpec;
-import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.catalog.FeCatalogUtils;
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeIcebergTable;
-import org.apache.impala.catalog.TableLoadingException;
-import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
-import org.apache.impala.common.ImpalaException;
+import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaRuntimeException;
-import org.apache.impala.util.IcebergUtil;
-
-import com.google.common.base.Preconditions;
-import org.apache.impala.util.ExprUtil;
-
+import org.apache.impala.common.ThriftSerializationCtx;
+import org.apache.impala.fb.FbIcebergDataFileFormat;
+import org.apache.impala.thrift.TExplainLevel;
+import org.apache.impala.thrift.TPlanNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
+
 /**
- * Scan of a single iceberg table
+ * Scan of a single iceberg table.
  */
 public class IcebergScanNode extends HdfsScanNode {
-  private final static Logger LOG = LoggerFactory.getLogger(TimeTravelSpec.class);
+  private final static Logger LOG = LoggerFactory.getLogger(IcebergScanNode.class);
 
-  private final FeIcebergTable icebergTable_;
+  // List of files needed to be scanned by this scan node. The list is sorted in case of
+  // partitioned tables, so partition range scans are scheduled more evenly.
+  // See IMPALA-12765 for details.
+  private List<FileDescriptor> fileDescs_;
 
-  // Exprs in icebergConjuncts_ converted to UnboundPredicate.
-  private final List<UnboundPredicate> icebergPredicates_ = new ArrayList<>();
+  // Indicates that the files in 'fileDescs_' are sorted.
+  private boolean filesAreSorted_ = false;
 
-  private TimeTravelSpec timeTravelSpec_;
+  // Conjuncts on columns not involved in IDENTITY-partitioning. Subset of 'conjuncts_',
+  // but this does not include conjuncts on IDENTITY-partitioned columns, because such
+  // conjuncts have already been pushed to Iceberg to filter out partitions/files, so
+  // they don't have further selectivity on the surviving files.
+  private List<Expr> nonIdentityConjuncts_;
 
-  public IcebergScanNode(PlanNodeId id, TupleDescriptor desc, List<Expr> conjuncts,
-      TableRef tblRef, FeFsTable feFsTable, MultiAggregateInfo aggInfo) {
-    super(id, desc, conjuncts, getIcebergPartition(feFsTable), tblRef, aggInfo,
-        null, false);
-    icebergTable_ = (FeIcebergTable) desc_.getTable();
-    timeTravelSpec_ = tblRef.getTimeTravelSpec();
+  // Conjuncts that will be skipped from pushing down to the scan node because Iceberg
+  // already applied them and they won't filter any further rows.
+  private List<Expr> skippedConjuncts_;
+
+  // The Iceberg snapshot id used for this scan.
+  private final long snapshotId_;
+
+  // This member is set when this scan node is the left child of an IcebergDeleteNode or
+  // in other words when this scan node reads data files that have delete files
+  // associated. Holds the scan node ID of the right child of the IcebergDeleteNode
+  // responsible for reading the delete files of the corresponding table.
+  private final PlanNodeId deleteFileScanNodeId;
+
+  public IcebergScanNode(PlanNodeId id, TableRef tblRef, List<Expr> conjuncts,
+      MultiAggregateInfo aggInfo, List<FileDescriptor> fileDescs,
+      List<Expr> nonIdentityConjuncts, List<Expr> skippedConjuncts, long snapshotId) {
+    this(id, tblRef, conjuncts, aggInfo, fileDescs, nonIdentityConjuncts,
+        skippedConjuncts, null, snapshotId);
+  }
+
+  public IcebergScanNode(PlanNodeId id, TableRef tblRef, List<Expr> conjuncts,
+      MultiAggregateInfo aggInfo, List<FileDescriptor> fileDescs,
+      List<Expr> nonIdentityConjuncts, List<Expr> skippedConjuncts, PlanNodeId deleteId,
+      long snapshotId) {
+    super(id, tblRef.getDesc(), conjuncts,
+        getIcebergPartition(((FeIcebergTable)tblRef.getTable()).getFeFsTable()), tblRef,
+        aggInfo, null, false);
     // Hdfs table transformed from iceberg table only has one partition
     Preconditions.checkState(partitions_.size() == 1);
+
+    fileDescs_ = fileDescs;
+    if (((FeIcebergTable)tblRef.getTable()).isPartitioned()) {
+      // Let's order the file descriptors for better scheduling.
+      // See IMPALA-12765 for details.
+      // Create a clone of the original file descriptor list to avoid getting
+      // ConcurrentModificationException when sorting.
+      fileDescs_ = new ArrayList<>(fileDescs_);
+      Collections.sort(fileDescs_);
+      filesAreSorted_ = true;
+    }
+    nonIdentityConjuncts_ = nonIdentityConjuncts;
+    snapshotId_ = snapshotId;
+    this.skippedConjuncts_ = skippedConjuncts;
+    this.deleteFileScanNodeId = deleteId;
+  }
+
+  /**
+   * Computes cardinalities of the Iceberg scan node. Implemented based on
+   * HdfsScanNode.computeCardinalities with some modifications:
+   *   - we exactly know the record counts of the data files
+   *   - IDENTITY-based partition conjuncts already filtered out the files, so
+   *     we don't need their selectivity
+   */
+  @Override
+  protected void computeCardinalities(Analyzer analyzer) {
+    cardinality_ = 0;
+
+    if (sampledFiles_ != null) {
+      for (List<FileDescriptor> sampledFileDescs : sampledFiles_.values()) {
+        for (FileDescriptor fd : sampledFileDescs) {
+          cardinality_ += fd.getFbFileMetadata().icebergMetadata().recordCount();
+        }
+      }
+    } else {
+      for (FileDescriptor fd : fileDescs_) {
+        cardinality_ += fd.getFbFileMetadata().icebergMetadata().recordCount();
+      }
+    }
+
+    // Adjust cardinality for all collections referenced along the tuple's path.
+    for (Type t: desc_.getPath().getMatchedTypes()) {
+      if (t.isCollectionType()) cardinality_ *= PlannerContext.AVG_COLLECTION_SIZE;
+    }
+    inputCardinality_ = cardinality_;
+
+    if (cardinality_ > 0) {
+      double selectivity = computeCombinedSelectivity(nonIdentityConjuncts_);
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("cardinality_=" + Long.toString(cardinality_) +
+                  " sel=" + Double.toString(selectivity));
+      }
+      cardinality_ = applySelectivity(cardinality_, selectivity);
+    }
+
+    cardinality_ = capCardinalityAtLimit(cardinality_);
+
+    if (countStarSlot_ != null) {
+      // We are doing optimized count star. Override cardinality with total num files.
+      inputCardinality_ = fileDescs_.size();
+      cardinality_ = fileDescs_.size();
+    }
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("IcebergScanNode: cardinality_=" + Long.toString(cardinality_));
+    }
   }
 
   /**
@@ -93,188 +174,114 @@ public class IcebergScanNode extends HdfsScanNode {
   }
 
   @Override
-  public void init(Analyzer analyzer) throws ImpalaException {
-    extractIcebergConjuncts(analyzer);
-    super.init(analyzer);
-  }
-
-  /**
-   * We need prune hdfs partition FileDescriptor by iceberg predicates
-   */
-  public List<FileDescriptor> getFileDescriptorByIcebergPredicates()
-      throws ImpalaRuntimeException {
-    List<DataFile> dataFileList;
-    try {
-      dataFileList = IcebergUtil.getIcebergDataFiles(icebergTable_, icebergPredicates_,
-          timeTravelSpec_);
-    } catch (TableLoadingException e) {
-      throw new ImpalaRuntimeException(String.format(
-          "Failed to load data files for Iceberg table: %s", icebergTable_.getFullName()),
-          e);
-    }
-    long dataFilesCacheMisses = 0;
-    List<FileDescriptor> fileDescList = new ArrayList<>();
-    for (DataFile dataFile : dataFileList) {
-      FileDescriptor fileDesc = icebergTable_.getPathHashToFileDescMap()
-          .get(IcebergUtil.getDataFilePathHash(dataFile));
-      if (fileDesc == null) {
-        if (timeTravelSpec_ == null) {
-          // We should always find the data files in the cache when not doing time travel.
-          throw new ImpalaRuntimeException("Cannot find file in cache: " + dataFile.path()
-              + " with snapshot id: " + String.valueOf(icebergTable_.snapshotId()));
-        }
-        ++dataFilesCacheMisses;
-        try {
-          fileDesc = FeIcebergTable.Utils.getFileDescriptor(
-              new Path(dataFile.path().toString()),
-              new Path(icebergTable_.getIcebergTableLocation()),
-              icebergTable_.getHostIndex());
-        } catch (IOException ex) {
-          throw new ImpalaRuntimeException(
-              "Cannot load file descriptor for " + dataFile.path(), ex);
-        }
-        if (fileDesc == null) {
-          throw new ImpalaRuntimeException(
-              "Cannot load file descriptor for: " + dataFile.path());
-        }
-        // Add file descriptor to the cache.
-        icebergTable_.getPathHashToFileDescMap().put(
-            IcebergUtil.getDataFilePathHash(dataFile), fileDesc);
+  protected List<FileDescriptor> getFileDescriptorsWithLimit(
+      FeFsPartition partition, boolean fsHasBlocks, long limit) {
+    if (limit != -1) {
+      long cnt = 0;
+      List<FileDescriptor> ret = new ArrayList<>();
+      for (FileDescriptor fd : fileDescs_) {
+        if (cnt == limit) break;
+        ret.add(fd);
+        ++cnt;
       }
-      fileDescList.add(fileDesc);
-    }
-
-    if (dataFilesCacheMisses > 0) {
-      Preconditions.checkState(timeTravelSpec_ != null);
-      LOG.info("File descriptors had to be loaded on demand during time travel: " +
-          String.valueOf(dataFilesCacheMisses));
-    }
-
-    return fileDescList;
-  }
-
-  /**
-   * Extracts predicates from conjuncts_ that can be pushed down to Iceberg.
-   *
-   * Since Iceberg will filter data files by metadata instead of scan data files,
-   * we pushdown all predicates to Iceberg to get the minimum data files to scan.
-   * Here are three cases for predicate pushdown:
-   * 1.The column is not part of any Iceberg partition expression
-   * 2.The column is part of all partition keys without any transformation (i.e. IDENTITY)
-   * 3.The column is part of all partition keys with transformation (i.e. MONTH/DAY/HOUR)
-   * We can use case 1 and 3 to filter data files, but also need to evaluate it in the
-   * scan, for case 2 we don't need to evaluate it in the scan. So we evaluate all
-   * predicates in the scan to keep consistency. More details about Iceberg scanning,
-   * please refer: https://iceberg.apache.org/spec/#scan-planning
-   */
-  private void extractIcebergConjuncts(Analyzer analyzer) throws ImpalaException {
-    ListIterator<Expr> it = conjuncts_.listIterator();
-    while (it.hasNext()) {
-      tryConvertBinaryIcebergPredicate(analyzer, it.next());
+      return ret;
+    } else {
+      return fileDescs_;
     }
   }
 
   /**
-   * Transform impala binary predicate to iceberg predicate
+   * Returns a sample of file descriptors associated to this scan node.
+   * The algorithm is based on FeFsTable.Utils.getFilesSample()
    */
-  private boolean tryConvertBinaryIcebergPredicate(Analyzer analyzer, Expr expr)
-      throws ImpalaException {
-    if (! (expr instanceof BinaryPredicate)) return false;
+  @Override
+  protected Map<Long, List<FileDescriptor>> getFilesSample(
+      long percentBytes, long minSampleBytes, long randomSeed) {
+    Preconditions.checkState(percentBytes >= 0 && percentBytes <= 100);
+    Preconditions.checkState(minSampleBytes >= 0);
 
-    BinaryPredicate predicate = (BinaryPredicate) expr;
-    Operation op = getIcebergOperator(predicate.getOp());
-    if (op == null) return false;
-
-    if (!(predicate.getChild(0) instanceof SlotRef)) return false;
-    SlotRef ref = (SlotRef) predicate.getChild(0);
-
-    if (!(predicate.getChild(1) instanceof LiteralExpr)) return false;
-    LiteralExpr literal = (LiteralExpr) predicate.getChild(1);
-
-    // If predicate contains map/struct, this column would be null
-    if (ref.getDesc().getColumn() == null) return false;
-
-    String colName = ref.getDesc().getColumn().getName();
-    UnboundPredicate unboundPredicate = null;
-    switch (literal.getType().getPrimitiveType()) {
-      case BOOLEAN: {
-        unboundPredicate = Expressions.predicate(op, colName,
-            ((BoolLiteral) literal).getValue());
-        break;
-      }
-      case TINYINT:
-      case SMALLINT:
-      case INT: {
-        unboundPredicate = Expressions.predicate(op, colName,
-            ((NumericLiteral) literal).getIntValue());
-        break;
-      }
-      case BIGINT: {
-        unboundPredicate = Expressions.predicate(op, colName,
-            ((NumericLiteral) literal).getLongValue());
-        break;
-      }
-      case FLOAT: {
-        unboundPredicate = Expressions.predicate(op, colName,
-            (float)((NumericLiteral) literal).getDoubleValue());
-        break;
-      }
-      case DOUBLE: {
-        unboundPredicate = Expressions.predicate(op, colName,
-            ((NumericLiteral) literal).getDoubleValue());
-        break;
-      }
-      case STRING:
-      case DATETIME:
-      case CHAR: {
-        unboundPredicate = Expressions.predicate(op, colName,
-            ((StringLiteral) literal).getUnescapedValue());
-        break;
-      }
-      case TIMESTAMP: {
-        // TODO(IMPALA-10850): interpret timestamps in local timezone.
-        long unixMicros = ExprUtil.utcTimestampToUnixTimeMicros(analyzer, literal);
-        unboundPredicate = Expressions.predicate(op, colName, unixMicros);
-        break;
-      }
-      case DATE: {
-        int daysSinceEpoch = ((DateLiteral) literal).getValue();
-        unboundPredicate = Expressions.predicate(op, colName, daysSinceEpoch);
-        break;
-      }
-      case DECIMAL: {
-        Type colType = ref.getDesc().getColumn().getType();
-        int scale = colType.getDecimalDigits();
-        BigDecimal literalValue = ((NumericLiteral) literal).getValue();
-        if (literalValue.scale() <= scale) {
-          // Iceberg DecimalLiteral needs to have the exact same scale.
-          if (literalValue.scale() < scale) literalValue = literalValue.setScale(scale);
-          unboundPredicate = Expressions.predicate(op, colName, literalValue);
-        }
-        break;
-      }
-      default: break;
+    // Ensure a consistent ordering of files for repeatable runs.
+    List<FileDescriptor> orderedFds = Lists.newArrayList(fileDescs_);
+    if (!filesAreSorted_) {
+      Collections.sort(orderedFds);
     }
-    if (unboundPredicate == null) return false;
 
-    icebergPredicates_.add(unboundPredicate);
+    Preconditions.checkState(partitions_.size() == 1);
+    FeFsPartition part = partitions_.get(0);
 
-    return true;
+    long totalBytes = 0;
+    for (FileDescriptor fd : orderedFds) {
+      totalBytes += fd.getFileLength();
+    }
+
+    int numFilesRemaining = orderedFds.size();
+    double fracPercentBytes = (double) percentBytes / 100;
+    long targetBytes = (long) Math.round(totalBytes * fracPercentBytes);
+    targetBytes = Math.max(targetBytes, minSampleBytes);
+
+    // Randomly select files until targetBytes has been reached or all files have been
+    // selected.
+    Random rnd = new Random(randomSeed);
+    long selectedBytes = 0;
+    List<FileDescriptor> sampleFiles = Lists.newArrayList();
+    while (selectedBytes < targetBytes && numFilesRemaining > 0) {
+      int selectedIdx = rnd.nextInt(numFilesRemaining);
+      FileDescriptor fd = orderedFds.get(selectedIdx);
+      sampleFiles.add(fd);
+      selectedBytes += fd.getFileLength();
+      // Avoid selecting the same file multiple times.
+      orderedFds.set(selectedIdx, orderedFds.get(numFilesRemaining - 1));
+      --numFilesRemaining;
+    }
+    Map<Long, List<FileDescriptor>> result = new HashMap<>();
+    result.put(part.getId(), sampleFiles);
+    return result;
   }
 
-  /**
-   * Returns Iceberg operator by BinaryPredicate operator, or null if the operation
-   * is not supported by Iceberg.
-   */
-  private Operation getIcebergOperator(BinaryPredicate.Operator op) {
-    switch (op) {
-      case EQ: return Operation.EQ;
-      case NE: return Operation.NOT_EQ;
-      case LE: return Operation.LT_EQ;
-      case GE: return Operation.GT_EQ;
-      case LT: return Operation.LT;
-      case GT: return Operation.GT;
-      default: return null;
+  @Override
+  protected void toThrift(TPlanNode msg, ThriftSerializationCtx serialCtx) {
+    super.toThrift(msg, serialCtx);
+    Preconditions.checkNotNull(msg.hdfs_scan_node);
+    if (deleteFileScanNodeId != null) {
+      msg.hdfs_scan_node.setDeleteFileScanNodeId(deleteFileScanNodeId.asInt());
     }
+  }
+
+  @Override
+  protected String getDerivedExplainString(
+      String indentPrefix, TExplainLevel detailLevel) {
+    StringBuilder output = new StringBuilder();
+    output.append(
+        indentPrefix + "Iceberg snapshot id: " + String.valueOf(snapshotId_) + "\n");
+    if (!skippedConjuncts_.isEmpty()) {
+      output.append(indentPrefix +
+          String.format("skipped Iceberg predicates: %s\n",
+              Expr.getExplainString(skippedConjuncts_, detailLevel)));
+    }
+    return output.toString();
+  }
+
+  @Override
+  protected void populateFileFormats() throws ImpalaRuntimeException {
+    //TODO IMPALA-11577: optimize file format counting
+    boolean hasParquet = false;
+    boolean hasOrc = false;
+    boolean hasAvro = false;
+    for (FileDescriptor fileDesc : fileDescs_) {
+      byte fileFormat = fileDesc.getFbFileMetadata().icebergMetadata().fileFormat();
+      if (fileFormat == FbIcebergDataFileFormat.PARQUET) {
+        hasParquet = true;
+      } else if (fileFormat == FbIcebergDataFileFormat.ORC) {
+        hasOrc = true;
+      } else if (fileFormat == FbIcebergDataFileFormat.AVRO) {
+        hasAvro = true;
+      } else {
+        throw new ImpalaRuntimeException(String.format(
+            "Invalid Iceberg file format of file: %s", fileDesc.getAbsolutePath()));
+      }
+    }
+    if (hasParquet) fileFormats_.add(HdfsFileFormat.PARQUET);
+    if (hasOrc) fileFormats_.add(HdfsFileFormat.ORC);
+    if (hasAvro) fileFormats_.add(HdfsFileFormat.AVRO);
   }
 }

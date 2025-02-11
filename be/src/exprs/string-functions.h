@@ -54,6 +54,38 @@ class StringFunctions {
     TRAILING, // Trim from the right, or trailing end
     BOTH // Trim from both ends of string
   };
+
+  // A utility class for supporting the UTF-8 Trim() function, initialized with the input
+  // string to be trimmed. After Reset(), the Contains function can be used to determine
+  // if a character needs to be trimmed.
+  class TrimContext {
+   public:
+    TrimContext(bool utf8_mode) : utf8_mode_(utf8_mode) { }
+
+    void Reset(const StringVal& chars_to_trim);
+
+    inline bool Contains(uint8_t single_char) const {
+      return single_byte_chars_.test(single_char);
+    }
+
+    inline bool Contains(const uint8_t* utf8_char, int len) const;
+
+    bool utf8_mode() const { return utf8_mode_; }
+
+   private:
+    const bool utf8_mode_;
+
+    // The bitset to hold the unique characters to trim, used for non-UTF-8 characters
+    // or single-byte UTF-8 characters.
+    std::bitset<256> single_byte_chars_;
+
+    // Pointers to multi-byte UTF-8 characters used to check whether characters of the
+    // corresponding byte count need to be trimmed.
+    std::vector<const uint8_t*> double_byte_chars_;
+    std::vector<const uint8_t*> triple_byte_chars_;
+    std::vector<const uint8_t*> quadruple_byte_chars_;
+  };
+
   static StringVal Substring(FunctionContext*, const StringVal& str, const BigIntVal& pos,
       const BigIntVal& len);
   static StringVal Substring(FunctionContext*, const StringVal& str,
@@ -77,8 +109,14 @@ class StringFunctions {
   static IntVal CharLength(FunctionContext*, const StringVal& str);
   static IntVal Utf8Length(FunctionContext*, const StringVal& str);
   static StringVal Lower(FunctionContext*, const StringVal& str);
+  static StringVal LowerAscii(FunctionContext*, const StringVal& str);
+  static StringVal LowerUtf8(FunctionContext*, const StringVal& str);
   static StringVal Upper(FunctionContext*, const StringVal& str);
+  static StringVal UpperAscii(FunctionContext*, const StringVal& str);
+  static StringVal UpperUtf8(FunctionContext*, const StringVal& str);
   static StringVal InitCap(FunctionContext*, const StringVal& str);
+  static StringVal InitCapAscii(FunctionContext*, const StringVal& str);
+  static StringVal InitCapUtf8(FunctionContext*, const StringVal& str);
   static void ReplacePrepare(FunctionContext*, FunctionContext::FunctionStateScope);
   static void ReplaceClose(FunctionContext*, FunctionContext::FunctionStateScope);
   static StringVal Replace(FunctionContext*, const StringVal& str,
@@ -93,8 +131,23 @@ class StringFunctions {
 
   /// Sets up arguments and function context for the *TrimString functions below.
   static void TrimPrepare(FunctionContext*, FunctionContext::FunctionStateScope);
+  static void Utf8TrimPrepare(FunctionContext*, FunctionContext::FunctionStateScope);
   /// Cleans up the work done by TrimPrepare above.
   static void TrimClose(FunctionContext*, FunctionContext::FunctionStateScope);
+
+  /// AES encryption functions in Impala, using openSSL libraries.
+  static void AesPrepare(FunctionContext* context,
+      FunctionContext::FunctionStateScope scope);
+  static StringVal AesDecrypt(FunctionContext* ctx, const StringVal& expr,
+      const StringVal& key, const StringVal& mode, const StringVal& iv);
+  static StringVal AesEncrypt(FunctionContext* ctx, const StringVal& expr,
+      const StringVal& key, const StringVal& mode, const StringVal& iv);
+  static StringVal AesDecryptImpl(FunctionContext* ctx, const StringVal& expr,
+      const StringVal& key, const StringVal& mode, const StringVal& iv);
+  static StringVal AesEncryptImpl(FunctionContext* ctx, const StringVal& expr,
+      const StringVal& key, const StringVal& mode, const StringVal& iv);
+  static void AesClose(FunctionContext* context,
+      FunctionContext::FunctionStateScope scope);
 
   /// Trims occurrences of the characters in 'chars_to_trim' string from
   /// the beginning of string 'str'.
@@ -122,6 +175,7 @@ class StringFunctions {
 
   static bool SetRE2Options(const StringVal& match_parameter, std::string* error_str,
       re2::RE2::Options* opts);
+  static void SetRE2MemOpt(re2::RE2::Options* opts);
   static void RegexpPrepare(FunctionContext*, FunctionContext::FunctionStateScope);
   static void RegexpClose(FunctionContext*, FunctionContext::FunctionStateScope);
   static StringVal RegexpEscape(FunctionContext*, const StringVal& str);
@@ -148,6 +202,8 @@ class StringFunctions {
   static StringVal ParseUrlKey(FunctionContext*, const StringVal& url,
       const StringVal& key, const StringVal& part);
   static void ParseUrlClose(FunctionContext*, FunctionContext::FunctionStateScope);
+
+  static void SetRE2MemLimit(int64_t re2_mem_limit);
 
   /// Converts ASCII 'val' to corresponding character.
   static StringVal Chr(FunctionContext* context, const IntVal& val);
@@ -194,7 +250,19 @@ class StringFunctions {
       const StringVal& s2, const DoubleVal& scaling_factor,
       const DoubleVal& boost_threshold);
 
+  /// Converts bytes stored as an integer value into human readable memory measurements.
+  /// For example, 123456789012 bytes is converted to "114.98 GB".
+  static StringVal PrettyPrintMemory(FunctionContext*, const BigIntVal& bytes);
+  static StringVal PrettyPrintMemory(FunctionContext*, const IntVal& bytes);
+  static StringVal PrettyPrintMemory(FunctionContext*, const SmallIntVal& bytes);
+  static StringVal PrettyPrintMemory(FunctionContext*, const TinyIntVal& bytes);
+
  private:
+  static uint64_t re2_mem_limit_;
+
+  static void DoTrimPrepare(FunctionContext* context,
+      FunctionContext::FunctionStateScope scope, bool utf8_mode);
+
   /// Templatized implementation of the actual string trimming function.
   /// The first parameter, 'D', is one of StringFunctions::TrimPosition values.
   /// The second parameter, 'IS_IMPLICIT_WHITESPACE', is true when the set of characters
@@ -203,6 +271,12 @@ class StringFunctions {
   template <TrimPosition D, bool IS_IMPLICIT_WHITESPACE>
   static StringVal DoTrimString(FunctionContext* ctx, const StringVal& str,
       const StringVal& chars_to_trim);
+
+  /// Templatized implementation of the actual string trimming function with UTF-8
+  /// character handling.
+  /// The first parameter, 'D', is one of the values of StringFunctions::TrimPosition.
+  template <StringFunctions::TrimPosition D>
+  static StringVal DoUtf8TrimString(const StringVal& str, const TrimContext& trim_ctx);
 };
 }
 #endif

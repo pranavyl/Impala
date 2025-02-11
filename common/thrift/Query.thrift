@@ -60,6 +60,7 @@ enum TKuduReplicaSelection {
 enum TJoinDistributionMode {
   BROADCAST = 0
   SHUFFLE = 1
+  DIRECTED = 2
 }
 
 // The order of the enum values needs to be kept in sync with
@@ -85,6 +86,15 @@ enum TMinmaxFilterFastCodePathMode {
   VERIFICATION=2
 }
 
+// The options for CodeGen Cache.
+// The debug options allow more logs, the value equal to the mode plus 256.
+enum TCodeGenCacheMode {
+  NORMAL = 0
+  OPTIMAL = 1
+  NORMAL_DEBUG = 256
+  OPTIMAL_DEBUG = 257
+}
+
 // Options for when to write Parquet Bloom filters for supported types.
 enum TParquetBloomFilterWrite {
   // Never write Parquet Bloom filters.
@@ -99,9 +109,46 @@ enum TParquetBloomFilterWrite {
   ALWAYS
 }
 
+enum TCodeGenOptLevel {
+  O0,
+  O1,
+  Os,
+  O2,
+  O3
+}
+
+// Option to decide how to compute slots_to_use for a query.
+// See Scheduler::ComputeBackendExecParams.
+enum TSlotCountStrategy {
+  // Compute slots to use for each backend based on the max number of instances of any
+  // fragment on that backend. This is the default and only strategy available if
+  // COMPUTE_PROCESSING_COST option is disabled. See IMPALA-8998.
+  LARGEST_FRAGMENT = 0,
+
+  // Compute slots to use for each backend based on CpuAsk counter from Planner.
+  // The CpuAsk is the largest sum of fragments instances subset that can run in-parallel
+  // without waiting for each other. This strategy relies on blocking operator analysis
+  // that is only available if COMPUTE_PROCESSING_COST option is enabled, and will
+  // schedule more or equal admission control slots than the LARGEST_FRAGMENT strategy.
+  // The scheduler will silently ignore this choice and fallback to LARGEST_FRAGMENT if
+  // COMPUTE_PROCESSING_COST is disabled.
+  PLANNER_CPU_ASK = 1
+}
+
 // constants for TQueryOptions.num_nodes
 const i32 NUM_NODES_ALL = 0
 const i32 NUM_NODES_ALL_RACKS = -1
+// constant used as upperbound for TQueryOptions.processing_cost_min_threads and
+// TQueryOptions.max_fragment_instances_per_node
+const i32 MAX_FRAGMENT_INSTANCES_PER_NODE = 128
+// Conservative minimum size of hash table for low-cardinality aggregations.
+const i64 MIN_HASH_TBL_MEM = 10485760  // 10MB
+
+// Used to represent a 128-bit hash of query option values that are relevant to a cache.
+struct TQueryOptionsHash {
+  1: required i64 hi
+  2: required i64 lo
+}
 
 // Query options that correspond to ImpalaService.ImpalaQueryOptions, with their
 // respective defaults. Query options can be set in the following ways:
@@ -197,8 +244,10 @@ struct TQueryOptions {
   // be rounded up to the nearest power of two.
   38: optional i32 runtime_bloom_filter_size = 1048576
 
-  // Time in ms to wait until runtime filters are delivered. If 0, the default defined
-  // by the startup flag of the same name is used.
+  // Time in ms to wait until runtime filters are delivered. Note that the wait time for
+  // a runtime filter is with respect to the start of processing the query in the given
+  // executor instead of the beginning of the Open phase of a scan node. If 0, the
+  // default defined by the startup flag of the same name is used.
   39: optional i32 runtime_filter_wait_time_ms = 0
 
   // If true, per-row runtime filtering is disabled
@@ -330,7 +379,7 @@ struct TQueryOptions {
   68: optional TKuduReadMode kudu_read_mode = TKuduReadMode.DEFAULT;
 
   // Allow reading of erasure coded files in HDFS.
-  69: optional bool allow_erasure_coded_files = false;
+  69: optional bool allow_erasure_coded_files = true;
 
   // See comment in ImpalaService.thrift.
   70: optional string timezone = ""
@@ -348,7 +397,7 @@ struct TQueryOptions {
   // See comment in ImpalaService.thrift
   74: optional string client_identifier;
 
-  75: optional double resource_trace_ratio = 0;
+  75: optional double resource_trace_ratio = 1;
 
   // See comment in ImpalaService.thrift.
   // The default value is set to 3 as this is the default value of HDFS replicas.
@@ -446,8 +495,8 @@ struct TQueryOptions {
   103: optional bool retry_failed_queries = false;
 
   // See comment in ImpalaService.thrift
-  104: optional PlanNodes.TEnabledRuntimeFilterTypes enabled_runtime_filter_types =
-      PlanNodes.TEnabledRuntimeFilterTypes.ALL;
+  104: optional set<PlanNodes.TRuntimeFilterType> enabled_runtime_filter_types =
+      [PlanNodes.TRuntimeFilterType.BLOOM, PlanNodes.TRuntimeFilterType.MIN_MAX];
 
   // See comment in ImpalaService.thrift
   105: optional bool async_codegen = false;
@@ -567,6 +616,149 @@ struct TQueryOptions {
   // enable runtime filtering on the row group. For example, 2 means that runtime filter
   // will be evaluated when the dictionary size is smaller or equal to 2.
   140: optional i32 parquet_dictionary_runtime_filter_entry_limit = 1024;
+
+  // Abort the Java UDF if an exception is thrown. Default is that only a
+  // warning will be logged if the Java UDF throws an exception.
+  141: optional bool abort_java_udf_on_exception = false;
+
+  // Indicates whether to use ORC's async read.
+  142: optional bool orc_async_read = true;
+
+  // See comment in ImpalaService.thrift
+  143: optional i32 runtime_in_list_filter_entry_limit = 1024;
+
+  // Indicates whether to enable auto-scaling which is a process to generate a suitable
+  // plan among different-sized executor group sets. The returned plan satisfies the
+  // resource requirement imposed on the executor group set. Default is to enable.
+  144: optional bool enable_replan = true;
+
+  // Set to true to programmatically treat the default executor group as a two-executor
+  // groups in FE as follows.
+  //   1. regular: <num_nodes> nodes with 64MB of per-host estimated memory threshold
+  //   2. large:   <num_nodes> nodes with 8PB of per-host estimated memory threshold
+  145: optional bool test_replan = false;
+
+  // See comment in ImpalaService.thrift
+  146: optional i32 lock_max_wait_time_s = 300
+
+  // See comment in ImpalaService.thrift
+  147: optional TSchemaResolutionStrategy orc_schema_resolution = 0;
+
+  // See comment in ImpalaService.thrift
+  148: optional bool expand_complex_types = false;
+
+  149: optional string fallback_db_for_functions;
+
+  // See comment in ImpalaService.thrift
+  150: optional bool disable_codegen_cache = false;
+
+  151: optional TCodeGenCacheMode codegen_cache_mode = TCodeGenCacheMode.NORMAL;
+
+  // See comment in ImpalaService.thrift
+  152: optional bool stringify_map_keys = false;
+
+  // See comment in ImpalaService.thrift
+  153: optional bool enable_trivial_query_for_admission = true;
+
+  // See comment in ImpalaService.thrift
+  154: optional bool compute_processing_cost = false;
+
+  // See comment in ImpalaService.thrift
+  155: optional i32 processing_cost_min_threads = 1;
+
+  // See comment in ImpalaService.thrift
+  156: optional double join_selectivity_correlation_factor = 0.0;
+  // See comment in ImpalaService.thrift
+  157: optional i32 max_fragment_instances_per_node = MAX_FRAGMENT_INSTANCES_PER_NODE
+
+  // Configures the in-memory sort algorithm used in the sorter.
+  // See comment in ImpalaService.thrift
+  158: optional i32 max_sort_run_size = 0;
+
+  // See comment in ImpalaService.thrift
+  159: optional bool allow_unsafe_casts = false;
+
+  // See comment in ImpalaService.thrift
+  160: optional i32 num_threads_for_table_migration = 1;
+
+  // See comment in ImpalaService.thrift
+  161: optional bool disable_optimized_iceberg_v2_read = false;
+
+  // See comment in ImpalaService.thrift
+  162: optional bool values_stmt_avoid_lossy_char_padding = false;
+
+  // See comment in ImpalaService.thrift
+  163: optional i64 large_agg_mem_threshold = 536870912  // 512MB
+
+  // See comment in ImpalaService.thrift
+  164: optional double agg_mem_correlation_factor = 0.5
+
+  // See comment in ImpalaService.thrift
+  165: optional i64 mem_limit_coordinators = 0;
+
+  // See comment in ImpalaService.thrift
+  166: optional bool iceberg_predicate_pushdown_subsetting = true;
+
+  // See comment in ImpalaService.thrift
+  167: optional i64 hdfs_scanner_non_reserved_bytes = -1
+
+  // See comment in ImpalaService.thrift
+  168: optional TCodeGenOptLevel codegen_opt_level = TCodeGenOptLevel.O2
+
+  // See comment in ImpalaService.thrift
+  169: optional i32 kudu_table_reserve_seconds = 0;
+
+  // See comment in ImpalaService.thrift
+  170: optional bool convert_kudu_utc_timestamps = false;
+
+  // See comment in ImpalaService.thrift
+  171: optional bool disable_kudu_local_timestamp_bloom_filter = true;
+
+  // See comment in ImpalaService.thrift
+  172: optional double runtime_filter_cardinality_reduction_scale = 1.0
+
+  // See comment in ImpalaService.thrift
+  173: optional i32 max_num_filters_aggregated_per_host = -1
+
+  // See comment in ImpalaService.thrift
+  174: optional double query_cpu_count_divisor
+
+  // See comment in ImpalaService.thrift
+  175: optional bool enable_tuple_cache = false;
+
+  // See comment in ImpalaService.thrift
+  176: optional bool iceberg_disable_count_star_optimization = false;
+
+  // See comment in ImpalaService.thrift
+  177: optional set<i32> runtime_filter_ids_to_skip
+
+  // See comment in ImpalaService.thrift
+  178: optional TSlotCountStrategy slot_count_strategy =
+    TSlotCountStrategy.LARGEST_FRAGMENT
+
+  // See comment in ImpalaService.thrift
+  179: optional bool clean_dbcp_ds_cache = true;
+
+  // See comment in ImpalaService.thrift
+  180: optional bool use_null_slots_cache = true;
+
+  // See comment in ImpalaService.thrift
+  181: optional bool write_kudu_utc_timestamps = false;
+
+  // See comment in ImpalaService.thrift
+  182: optional bool disable_optimized_json_count_star = false;
+
+  // See comment in ImpalaService.thrift
+  183: optional i32 long_polling_time_ms = 0;
+
+  // See comment in ImpalaService.thrift
+  184: optional bool enable_tuple_cache_verification = false;
+
+  // See comment in ImpalaService.thrift
+  185: optional bool enable_tuple_analysis_in_aggregate = true
+
+  // See comment in ImpalaService.thrift
+  186: optional bool estimate_duplicate_in_preagg = true
 }
 
 // Impala currently has three types of sessions: Beeswax, HiveServer2 and external
@@ -588,6 +780,9 @@ struct TClientRequest {
 
   // Redacted SQL stmt
   3: optional string redacted_stmt
+
+  // Indicates if an HS2 metadata operation code was provided in the client request
+  4: optional bool hs2_metadata_op
 }
 
 // Per-client session state
@@ -741,6 +936,12 @@ struct TQueryCtx {
 
   // True if the query is transactional for Kudu table.
   29: required bool is_kudu_transactional = false
+
+  // True if the query can be optimized for Iceberg V2 table.
+  30: required bool optimize_count_star_for_iceberg_v2 = false
+
+  // 128-bit hash representing query option values that affect query results.
+  31: optional TQueryOptionsHash query_options_result_hash
 }
 
 
@@ -757,8 +958,42 @@ struct TPlanExecInfo {
       per_node_scan_ranges
 }
 
+// Determines the type of the OPTIMIZE operation. Based on the number of files selected
+// for compaction, it can be
+// 1. a full table rewrite,
+// 2. a partial optimization with file filtering, or
+// 3. no-op with no selected files.
+enum TIcebergOptimizationMode {
+  REWRITE_ALL = 0
+  PARTIAL = 1
+  NOOP = 2
+}
+
+struct TIcebergOptimizeParams {
+  1: required TIcebergOptimizationMode mode;
+
+  // Stores the file paths to the data files without deletes that are targeted by the
+  // OPTIMIZE operation. Set only if the mode is PARTIAL, which means that data files are
+  // filtered (by size).
+  2: optional set<string> selected_data_files_without_deletes;
+}
+
+struct TIcebergDmlFinalizeParams {
+  // Type of the Iceberg operation
+  1: required Types.TIcebergOperation operation
+
+  // Stores the Iceberg spec id of the partition spec used for this DML operation.
+  2: optional i32 spec_id;
+
+  // Stores the Iceberg snapshot id of the target table for this DML operation.
+  3: optional i64 initial_snapshot_id;
+
+  // Stores additional information about the OPTIMIZE operation.
+  4: optional TIcebergOptimizeParams optimize_params;
+}
+
 // Metadata required to finalize a query - that is, to clean up after the query is done.
-// Only relevant for INSERT queries.
+// Only relevant for DML statements.
 struct TFinalizeParams {
   // True if the INSERT query was OVERWRITE, rather than INTO
   1: required bool is_overwrite
@@ -787,8 +1022,8 @@ struct TFinalizeParams {
   // Stores the ACID write id of the target table for transactional INSERTs.
   8: optional i64 write_id;
 
-  // Stores the Iceberg spec id of the partition spec used for this INSERT.
-  9: optional i32 spec_id;
+  // Stores params for Iceberg operation
+  9: optional TIcebergDmlFinalizeParams iceberg_params;
 }
 
 // Result of call to ImpalaPlanService/JniFrontend.CreateQueryRequest()
@@ -838,5 +1073,27 @@ struct TQueryExecRequest {
   // fragment will run on a dedicated coordinator. Set by the planner and used by
   // admission control.
   12: optional i64 dedicated_coord_mem_estimate;
+
+  // Indicate whether the request is a trivial query. Used by admission control.
+  13: optional bool is_trivial_query
+
+  // CPU core count required to run the query. Used by Frontend to do executor group-set
+  // assignment for the query. Should either be unset or set with positive value.
+  14: optional i32 cores_required
+
+  // Estimated per-host memory. The planner generates this value which may or may not be
+  // overridden to come up with a final per-host memory estimate.
+  15: optional i64 planner_per_host_mem_estimate;
+
+  // Used for system tables that need to run on all nodes.
+  16: optional bool include_all_coordinators
+
+  // Maximum admission control slot to use per executor backend.
+  // Only set if COMPUTE_PROCESSING_COST option is True.
+  17: optional i32 max_slot_per_executor
+
+  // The unbounded version of cores_required. Used by Frontend to do executor group-set
+  // assignment for the query. Should either be unset or set with positive value.
+  18: optional i32 cores_required_unbounded
 }
 

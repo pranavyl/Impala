@@ -238,7 +238,7 @@ public:
   // the provided lambda in a loop until the compare and swap succeeds.
   // The lambda is required to mutate the AtomicState argument passed to it.
   // This returns a structure containing the old atomic value and new atomic value.
-  AtomicStateTransition modify_atomic_state(std::function<void(AtomicState&)> fn) {
+  AtomicStateTransition modify_atomic_state(const std::function<void(AtomicState&)>& fn) {
     AtomicState old_atomic_state = atomic_state_.load();
     AtomicState new_atomic_state = old_atomic_state;
     while (true) {
@@ -322,14 +322,16 @@ class LIRSCacheShard : public CacheShard {
   ~LIRSCacheShard();
 
   Status Init() override;
-  HandleBase* Allocate(Slice key, uint32_t hash, int val_len, int charge) override;
+  HandleBase* Allocate(Slice key, uint32_t hash, int val_len, size_t charge) override;
   void Free(HandleBase* handle) override;
   HandleBase* Insert(HandleBase* handle,
       Cache::EvictionCallback* eviction_callback) override;
   HandleBase* Lookup(const Slice& key, uint32_t hash, bool no_updates) override;
+  void UpdateCharge(HandleBase* handle, size_t charge) override;
   void Release(HandleBase* handle) override;
   void Erase(const Slice& key, uint32_t hash) override;
   size_t Invalidate(const Cache::InvalidationControl& ctl) override;
+  vector<HandleBase*> Dump() override;
 
  private:
 
@@ -406,7 +408,7 @@ class LIRSCacheShard : public CacheShard {
   void UnprotectedToTombstone(LIRSThreadState* tstate, LIRSHandle* e);
 
   // Exit the cache
-  void ToUninitialized(LIRSThreadState* tstate, LIRSHandle* e);
+  void ToUninitialized(LIRSThreadState* tstate, LIRSHandle* e, bool is_trim = false);
 
   // Functions move evictions and frees outside the critical section for mutex_ by
   // placing the affected entries on the LIRSThreadState. This function handles the
@@ -478,7 +480,7 @@ LIRSCacheShard::~LIRSCacheShard() {
   LIRSThreadState tstate;
   // Start with the recency list.
   while (!recency_list_.empty()) {
-    LIRSHandle* e = &*recency_list_.begin();
+    LIRSHandle* e = &recency_list_.front();
     DCHECK_NE(e->state(), UNINITIALIZED);
     DCHECK_EQ(e->num_references(), 0);
     // This removes it from the recency list and the unprotected list (if appropriate)
@@ -548,7 +550,7 @@ void LIRSCacheShard::EnforceProtectedCapacity(LIRSThreadState* tstate) {
   while (protected_usage_ > protected_capacity_) {
     DCHECK(!recency_list_.empty());
     // Get pointer to oldest entry and remove it
-    LIRSHandle* oldest = &*recency_list_.begin();
+    LIRSHandle* oldest = &recency_list_.front();
     // The oldest entry must be protected (i.e. the recency list must be trimmed)
     DCHECK_EQ(oldest->state(), PROTECTED);
     ProtectedToUnprotected(tstate, oldest);
@@ -562,9 +564,9 @@ void LIRSCacheShard::TrimRecencyList(LIRSThreadState* tstate) {
   // deleted. Unprotected entries still exist in the unprotected list, so UNPROTECTED
   // entries should only be removed from the recency list.
   while (!recency_list_.empty() && recency_list_.front().state() != PROTECTED) {
-    LIRSHandle* oldest = &*recency_list_.begin();
+    LIRSHandle* oldest = &recency_list_.front();
     if (oldest->state() == TOMBSTONE) {
-      ToUninitialized(tstate, oldest);
+      ToUninitialized(tstate, oldest, /* is_trim */ true);
     } else {
       DCHECK_EQ(oldest->state(), UNPROTECTED);
       recency_list_.pop_front();
@@ -622,7 +624,7 @@ void LIRSCacheShard::MoveToRecencyListBack(LIRSThreadState* tstate, LIRSHandle *
   bool need_trim = false;
   if (in_list) {
     // Is this the oldest entry in the list (the front)?
-    LIRSHandle* oldest = &*recency_list_.begin();
+    LIRSHandle* oldest = &recency_list_.front();
     // Invariant: the oldest entry in the list is always a protected entry
     CHECK_EQ(oldest->state(), PROTECTED);
     if (oldest == e) {
@@ -692,6 +694,8 @@ void LIRSCacheShard::UnprotectedToProtected(LIRSThreadState* tstate, LIRSHandle 
 void LIRSCacheShard::ProtectedToUnprotected(LIRSThreadState* tstate, LIRSHandle* e) {
   DCHECK(!e->unprotected_tombstone_list_hook_.is_linked());
   DCHECK(e->recency_list_hook_.is_linked());
+  // Must be the oldest on the recency list
+  DCHECK(&recency_list_.front() == e);
   recency_list_.erase(recency_list_.iterator_to(*e));
   // Trim the recency list after the removal
   TrimRecencyList(tstate);
@@ -788,13 +792,29 @@ bool LIRSCacheShard::UninitializedToUnprotected(LIRSThreadState* tstate, LIRSHan
   return true;
 }
 
-void LIRSCacheShard::ToUninitialized(LIRSThreadState* tstate, LIRSHandle* e) {
+void LIRSCacheShard::ToUninitialized(LIRSThreadState* tstate, LIRSHandle* e,
+    bool is_trim) {
   DCHECK_NE(e->state(), UNINITIALIZED);
   LIRSHandle* removed_elem = static_cast<LIRSHandle*>(table_.Remove(e->key(), e->hash()));
   DCHECK(e == removed_elem || removed_elem == nullptr);
   // Remove from the list (if it is in the list)
   if (e->recency_list_hook_.is_linked()) {
+    // If we are removing the last entry on the recency list, then we may need to call
+    // TrimRecencyList to maintain our invariant that the last entry on the recency list
+    // is a PROTECTED element. TrimRecencyList itself calls this function while enforcing
+    // the invariant, so this passes is_trim=true from TrimRecencyList to avoid the
+    // unnecessary recursion.
+    bool need_trim = false;
+    // Is this the oldest entry in the list (the front)?
+    LIRSHandle* oldest = &recency_list_.front();
+    if (!is_trim and oldest == e) {
+      DCHECK_EQ(e->state(), PROTECTED);
+      need_trim = true;
+    }
     recency_list_.erase(recency_list_.iterator_to(*e));
+    if (need_trim) {
+      TrimRecencyList(tstate);
+    }
   }
   if (e->state() == UNPROTECTED) {
     if (e->unprotected_tombstone_list_hook_.is_linked()) {
@@ -842,7 +862,8 @@ void LIRSCacheShard::ToUninitialized(LIRSThreadState* tstate, LIRSHandle* e) {
   }
 }
 
-HandleBase* LIRSCacheShard::Allocate(Slice key, uint32_t hash, int val_len, int charge) {
+HandleBase* LIRSCacheShard::Allocate(Slice key, uint32_t hash, int val_len,
+    size_t charge) {
   DCHECK(initialized_);
   int key_len = key.size();
   DCHECK_GE(key_len, 0);
@@ -921,7 +942,7 @@ HandleBase* LIRSCacheShard::Lookup(const Slice& key, uint32_t hash,
         }
         break;
       default:
-        CHECK(false);
+        CHECK(false) << "Unexpected state for Lookup: " << e->state();
       }
     }
   }
@@ -930,6 +951,47 @@ HandleBase* LIRSCacheShard::Lookup(const Slice& key, uint32_t hash,
   CleanupThreadState(&tstate);
 
   return e;
+}
+
+void LIRSCacheShard::UpdateCharge(HandleBase* handle, size_t charge) {
+  DCHECK(initialized_);
+  LIRSThreadState tstate;
+  {
+    // Hold the lock to avoid concurrent evictions
+    std::lock_guard<MutexType> l(mutex_);
+    LIRSHandle* e = static_cast<LIRSHandle*>(handle);
+    // Entries that are UNINITIALIZED or TOMBSTONE do not count towards
+    // the usage and will be destroyed without interacting with the usage.
+    // Skip modifying the charge.
+    //
+    // In the case of UNINITIALIZED, we know that the caller has a handle
+    // for the entry, so it needs to have been in the cache previously
+    // (i.e. it was found via Lookup() or added via Insert()). So, in this
+    // context, UNINITIALIZED can only mean that it has been evicted.
+    if (e->state() == UNINITIALIZED || e->state() == TOMBSTONE) {
+      return;
+    }
+    DCHECK(e->state() == PROTECTED || e->state() == UNPROTECTED);
+    int64_t delta = charge - handle->charge();
+    handle->set_charge(charge);
+    UpdateMemTracker(delta);
+    // Update usage in existing state, then evict as needed.
+    switch (e->state()) {
+    case PROTECTED:
+      protected_usage_ += delta;
+      EnforceProtectedCapacity(&tstate);
+      break;
+    case UNPROTECTED:
+      unprotected_usage_ += delta;
+      EnforceUnprotectedCapacity(&tstate);
+      break;
+    default:
+      // This can't happen.
+      CHECK(false) << "Unexpected state for UpdateCharge: " << e->state();
+      break;
+    }
+  }
+  CleanupThreadState(&tstate);
 }
 
 void LIRSCacheShard::Release(HandleBase* handle) {
@@ -1077,6 +1139,39 @@ size_t LIRSCacheShard::Invalidate(const Cache::InvalidationControl& ctl) {
   DCHECK(initialized_);
   DCHECK(false) << "Invalidate() is not implemented for LIRS";
   return 0;
+}
+
+vector<HandleBase*> LIRSCacheShard::Dump() {
+  DCHECK(initialized_);
+  std::lock_guard<MutexType> l(mutex_);
+
+  // For LIRS cache we only collect resident entries (i.e. PROTECTED/UNPROTECTED entries),
+  // and ignore entries that are not resident (i.e. TOMBSTONE entries).
+  vector<HandleBase*> handles;
+
+  for (LIRSHandle& h : recency_list_) {
+    // First walk through 'recency_list_', only collecting PROTECTED entries, ignoring
+    // the UNPROTECTED/TOMBSTONE entries. UNPROTECTED entries will be collected later from
+    // the unprotected_tombstone_list_.
+    if (h.state() == PROTECTED) {
+      h.get_reference();
+      handles.push_back(&h);
+    }
+  }
+
+  if (unprotected_list_front_ != nullptr) {
+    DCHECK(unprotected_list_front_->unprotected_tombstone_list_hook_.is_linked());
+    // From 'unprotected_list_front_' to the end of 'unprotected_tombstone_list_' are all
+    // UNPROTECTED entries, collecting them all.
+    auto iter = unprotected_tombstone_list_.iterator_to(*unprotected_list_front_);
+    while (iter != unprotected_tombstone_list_.end()) {
+      iter->get_reference();
+      handles.push_back(&*iter);
+      ++iter;
+    }
+  }
+
+  return handles;
 }
 
 }  // end anonymous namespace

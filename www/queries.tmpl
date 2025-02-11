@@ -17,48 +17,83 @@ specific language governing permissions and limitations
 under the License.
 -->
 {{> www/common-header.tmpl }}
+
+<style>
+#json_profile_chooser {
+  display: none;
+}
+</style>
+
 <h2>Queries</h2>
-<p class="lead">This page lists all running queries, plus any completed queries that are
-archived in memory. The size of that archive is controlled with the
-<samp>--query_log_size</samp> command line parameter.</p>
-<p>The length of the statements are controlled with the <samp>--query_stmt_size</samp>
+<p class="lead">This page lists all running queries, completed queries that are archived
+in memory, and imported query profiles.
+<p>The in-memory archive size is controlled by <samp>--query_log_size</samp>
+and <samp>--query_log_size_in_bytes</samp> command line parameters.
+The length of the statements are controlled by <samp>--query_stmt_size</samp>
 command line parameter.</p>
 
 <h3>{{num_executing_queries}} queries in flight</h3>
 
 <table class='table table-hover table-border'>
   <tr>
-    <th>User</th>
-    <th>Default Db</th>
-    <th>Statement</th>
-    <th>Query Type</th>
-    <th>Start Time</th>
-    <th>Duration</th>
-    <th>Scan Progress</th>
-    <th>State</th>
-    <th>Last Event</th>
-    <th># rows fetched</th>
-    <th>Resource Pool</th>
-    <th>Details</th>
-    <th>Action</th>
+    <th title="{{tips_query_id}}">Query ID</th>
+    <th title="{{tips_action_cancel}}">Action</th>
+    <th title="{{tips_user}}">User</th>
+    <th title="{{tips_default_db}}">Default Db</th>
+    <th title="{{tips_query_type}}">Query Type</th>
+    <th title="{{tips_start_time}}">Start Time</th>
+    <th>
+      <span title="{{tips_first_fetch}}">First&nbsp;Fetch</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_client_fetch_duration}}">Client&nbsp;Fetch&nbsp;Duration</span>
+    </th>
+    <th>
+      <span title="{{tips_duration}}">Duration</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <!-- Using &nbsp; instead of ' ' prevents line breaks in the table header. -->
+      <span title="{{tips_queued_duration}}">Queued&nbsp;Duration</span>
+    </th>
+    <th>
+      <span title="{{tips_mem_usage}}">Mem&nbsp;Usage</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_mem_estimate}}">Mem&nbsp;Estimate</span>
+    </th>
+    <th>
+      <span title="{{tips_scan_progress}}">Scan&nbsp;Progress</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_query_progress}}">Query&nbsp;Progress</span>
+    </th>
+    <th>
+      <span title="{{tips_bytes_read}}">Bytes&nbsp;Read</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_bytes_sent}}">Bytes&nbsp;Sent</span>
+    </th>
+    <th title="{{tips_state}}">State</th>
+    <th title="{{tips_last_event}}">Last Event</th>
+    <th title="{{tips_rows_fetched}}"># rows fetched</th>
+    <th title="{{tips_resource_pool}}">Resource Pool</th>
+    <th title="{{tips_statement}}">Statement</th>
   </tr>
 {{! filter to get just executing queries from in_flight_queries}}
 {{#in_flight_queries}}
 {{?executing}}
   <tr>
+    <td style="min-width:150px;word-break:break-all;"><a href='{{ __common__.host-url }}/query_plan?query_id={{query_id}}'>{{query_id}}</a></td>
+    <td><a href='{{ __common__.host-url }}/cancel_query?query_id={{query_id}}'>Cancel</a></td>
     <td>{{effective_user}}</td>
     <td>{{default_db}}</td>
-    <td><samp>{{stmt}}</samp></td>
     <td><samp>{{stmt_type}}</samp></td>
     <td>{{start_time}}</td>
-    <td>{{duration}}</td>
-    <td>{{progress}}</td>
+    <td>{{first_fetch}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{client_fetch_duration}}</td>
+    <td>{{duration}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{queued_duration}}</td>
+    <td>{{mem_usage}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{mem_est}}</td>
+    <td>{{progress}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{query_progress}}</td>
+    <td>{{bytes_read}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{bytes_sent}}</td>
     <td><samp>{{state}}</samp></td>
     <td><samp>{{last_event}}</samp></td>
     <td>{{rows_fetched}}</td>
     <td>{{resource_pool}}</td>
-    <td><a href='{{ __common__.host-url }}/query_plan?query_id={{query_id}}'>Details</a></td>
-    <td><a href='{{ __common__.host-url }}/cancel_query?query_id={{query_id}}'>Cancel</a></td>
+    <td><samp>{{stmt}}</samp></td>
   </tr>
 {{/executing}}
 {{/in_flight_queries}}
@@ -71,39 +106,65 @@ command line parameter.</p>
 
 <table class='table table-hover table-border'>
   <tr>
-    <th>User</th>
-    <th>Default Db</th>
-    <th>Statement</th>
-    <th>Query Type</th>
-    <th>Start Time</th>
-    <th>Waiting Time</th>
-    <th>Duration</th>
-    <th>Scan Progress</th>
-    <th>State</th>
-    <th>Last Event</th>
-    <th># rows fetched</th>
-    <th>Resource Pool</th>
-    <th>Details</th>
-    <th>Action</th>
+    <th title="{{tips_query_id}}">Query ID</th>
+    <th title="{{tips_action_close}}">Action</th>
+    <th title="{{tips_user}}">User</th>
+    <th title="{{tips_default_db}}">Default Db</th>
+    <th title="{{tips_query_type}}">Query Type</th>
+    <th title="{{tips_start_time}}">Start Time</th>
+    <th title="{{tips_waiting_time}}">Waiting Time</th>
+    <th>
+      <span title="{{tips_first_fetch}}">First&nbsp;Fetch</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_client_fetch_duration}}">Client&nbsp;Fetch&nbsp;Duration</span>
+    </th>
+    <th>
+      <span title="{{tips_duration}}">Duration</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_queued_duration}}">Queued&nbsp;Duration</span>
+    </th>
+    <th>
+      <span title="{{tips_mem_usage}}">Mem&nbsp;Usage</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_mem_estimate}}">Mem&nbsp;Estimate</span>
+    </th>
+    <th>
+      <span title="{{tips_scan_progress}}">Scan&nbsp;Progress</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_query_progress}}">Query&nbsp;Progress</span>
+    </th>
+    <th>
+      <span title="{{tips_bytes_read}}">Bytes&nbsp;Read</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_bytes_sent}}">Bytes&nbsp;Sent</span>
+    </th>
+    <th title="{{tips_state}}">State</th>
+    <th title="{{tips_last_event}}">Last Event</th>
+    <th title="{{tips_rows_fetched}}"># rows fetched</th>
+    <th title="{{tips_resource_pool}}">Resource Pool</th>
+    <th title="{{tips_statement}}">Statement</th>
   </tr>
 {{! filter to get just waiting queries from in_flight_queries}}
 {{#in_flight_queries}}
 {{?waiting}}
   <tr>
+    <td style="min-width:150px;word-break:break-all;"><a href='{{ __common__.host-url }}/query_plan?query_id={{query_id}}'>{{query_id}}</a></td>
+    <td><a href='{{ __common__.host-url }}/cancel_query?query_id={{query_id}}'>Close</a></td>
     <td>{{effective_user}}</td>
     <td>{{default_db}}</td>
-    <td><samp>{{stmt}}</samp></td>
     <td><samp>{{stmt_type}}</samp></td>
     <td>{{start_time}}</td>
     <td>{{waiting_time}}</td>
-    <td>{{duration}}</td>
-    <td>{{progress}}</td>
+    <td>{{first_fetch}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{client_fetch_duration}}</td>
+    <td>{{duration}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{queued_duration}}</td>
+    <td>{{mem_usage}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{mem_est}}</td>
+    <td>{{progress}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{query_progress}}</td>
+    <td>{{bytes_read}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{bytes_sent}}</td>
     <td><samp>{{state}}</samp></td>
     <td><samp>{{last_event}}</samp></td>
     <td>{{rows_fetched}}</td>
     <td>{{resource_pool}}</td>
-    <td><a href='{{ __common__.host-url }}/query_plan?query_id={{query_id}}'>Details</a></td>
-    <td><a href='{{ __common__.host-url }}/cancel_query?query_id={{query_id}}'>Close</a></td>
+    <td><samp>{{stmt}}</samp></td>
   </tr>
 {{/waiting}}
 {{/in_flight_queries}}
@@ -113,35 +174,93 @@ command line parameter.</p>
 
 <table class='table table-hover table-border'>
   <tr>
-    <th>User</th>
-    <th>Default Db</th>
-    <th>Statement</th>
-    <th>Query Type</th>
-    <th>Start Time</th>
-    <th>End Time</th>
-    <th>Duration</th>
-    <th>Scan Progress</th>
-    <th>State</th>
-    <th># rows fetched</th>
-    <th>Resource Pool</th>
-    <th>Details</th>
+    <th title="{{tips_query_id}}">Query ID</th>
+    <th title="{{tips_user}}">User</th>
+    <th title="{{tips_default_db}}">Default Db</th>
+    <th title="{{tips_query_type}}">Query Type</th>
+    <th title="{{tips_start_time}}">Start Time</th>
+    <th title="{{tips_end_time}}">End Time</th>
+    <th>
+      <span title="{{tips_first_fetch}}">First&nbsp;Fetch</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_client_fetch_duration}}">Client&nbsp;Fetch&nbsp;Duration</span>
+    </th>
+    <th>
+      <span title="{{tips_duration}}">Duration</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_queued_duration}}">Queued&nbsp;Duration</span>
+    </th>
+    <th>
+      <span title="{{tips_mem_usage}}">Mem&nbsp;Usage</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_mem_estimate}}">Mem&nbsp;Estimate</span>
+    </th>
+    <th>
+      <span title="{{tips_scan_progress}}">Scan&nbsp;Progress</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_query_progress}}">Query&nbsp;Progress</span>
+    </th>
+    <th>
+      <span title="{{tips_bytes_read}}">Bytes&nbsp;Read</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_bytes_sent}}">Bytes&nbsp;Sent</span>
+    </th>
+    <th title="{{tips_state}}">State</th>
+    <th title="{{tips_rows_fetched}}"># rows fetched</th>
+    <th title="{{tips_resource_pool}}">Resource Pool</th>
+    <th title="{{tips_statement}}">Statement</th>
   </tr>
 {{#completed_queries}}
   <tr>
+    <td style="min-width:150px;word-break:break-all;"><a href='{{ __common__.host-url }}/query_plan?query_id={{query_id}}'>{{query_id}}</a></td>
     <td>{{effective_user}}</td>
     <td>{{default_db}}</td>
-    <td><samp>{{stmt}}</samp></td>
     <td><samp>{{stmt_type}}</samp></td>
     <td>{{start_time}}</td>
     <td>{{end_time}}</td>
-    <td>{{duration}}</td>
-    <td>{{progress}}</td>
+    <td>{{first_fetch}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{client_fetch_duration}}</td>
+    <td>{{duration}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{queued_duration}}</td>
+    <td>{{mem_usage}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{mem_est}}</td>
+    <td>{{progress}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{query_progress}}</td>
+    <td>{{bytes_read}}<hr style="margin-top:0px;margin-bottom:0px;"/>{{bytes_sent}}</td>
     <td><samp>{{state}}</samp></td>
     <td>{{rows_fetched}}</td>
     <td>{{resource_pool}}</td>
-    <td><a href='{{ __common__.host-url }}/query_plan?query_id={{query_id}}'>Details</a></td>
+    <td><samp>{{stmt}}</samp></td>
   </tr>
 {{/completed_queries}}
+</table>
+
+<h3 id="imported_queries_header">
+  0 Imported Query Profiles
+  <sup><a href='#' data-toggle="tooltip" title="These are locally stored queries parsed from JSON query profiles.">[?]</a></sup>
+  <input id="json_profile_chooser" type="file" accept=".json" onchange="startProfilesUpload();" multiple/>
+  <label for="json_profile_chooser">
+    <span class="btn btn-primary">Import JSON Profile</span>
+  </label>
+  <input id="clear_profiles_button" type="button" class="btn btn-primary" title="Clear All" onclick="clearProfiles();" value="X"/>
+  <span id="error_message" class="alert-sm alert-danger" style="display: none;"></span>
+</h3>
+
+<table id="imported_queries_table" class='table table-hover table-border'>
+  <tr>
+    <th title="{{tips_query_id}}">Query ID</th>
+    <th title="{{tips_user}}">User</th>
+    <th title="{{tips_default_db}}">Default Db</th>
+    <th title="{{tips_query_type}}">Query Type</th>
+    <th title="{{tips_start_time}}">Start Time</th>
+    <th title="{{tips_end_time}}">End Time</th>
+    <th>
+      <span title="{{tips_bytes_read}}">Bytes&nbsp;Read</span>
+      <hr style="margin-top:0px;margin-bottom:0px;"/>
+      <span title="{{tips_bytes_sent}}">Bytes&nbsp;Sent</span>
+    </th>
+    <th title="{{tips_state}}">State</th>
+    <th title="{{tips_rows_fetched}}"># rows fetched</th>
+    <th title="{{tips_resource_pool}}">Resource Pool</th>
+    <th title="{{tips_statement}}">Statement</th>
+    <th>Delete</th>
+  </tr>
 </table>
 
 <h3>Query Locations</h3>
@@ -160,5 +279,151 @@ command line parameter.</p>
   </tr>
 {{/query_locations}}
 </table>
+<script>
+  var dbOpenReq = indexedDB.open("imported_queries");
+  var db;
 
+  const profileParseWorker = new Worker(
+      "{{ __common__.host-url }}/www/scripts/queries/profileParseWorker.js");
+  var query_processor_start_time, raw_total_size, compressed_total_size, upload_count;
+
+  function insertRowVal(row, val) {
+    row.insertCell().innerHTML = val;
+  }
+
+  function setScrollReload() {
+    localStorage.setItem("imported", "T");
+    window.location.reload();
+  }
+
+  function deleteProfile(el) {
+    var row = el.parentElement.parentElement;
+    var profileStore = db.transaction("profiles", "readwrite").objectStore("profiles");
+    profileStore.delete(row.cells[0].textContent).onsuccess = () => {
+      setScrollReload();
+    };
+  }
+
+  function showImportedQueriesStatusMessage(status_message) {
+    error_message.style.display = "unset";
+    error_message.textContent = status_message;
+  }
+
+  function clearProfiles() {
+    indexedDB.deleteDatabase("imported_queries");
+    showImportedQueriesStatusMessage("Clearing imported query profiles in progress."
+        + " Do not close/refresh the page.");
+    setTimeout(setScrollReload, 1000);
+  }
+
+  function startProfilesUpload() {
+    raw_total_size = 0;
+    compressed_total_size = 0;
+    upload_count = 0;
+    query_processor_start_time = Date.now();
+    showImportedQueriesStatusMessage("Query profiles import in progress."
+        + " Do not close/refresh the page.");
+    uploadProfile();
+  }
+
+  function uploadProfile() {
+    json_profile_chooser.disabled = true;
+    var fileReader = new FileReader();
+    fileReader.readAsText(json_profile_chooser.files[upload_count]);
+    fileReader.onload = (e) => {
+      profileParseWorker.postMessage(e.target.result);
+    };
+  }
+
+  profileParseWorker.onmessage = (e) => {
+    if (e.data.error) {
+      showImportedQueriesStatusMessage("Error parsing some JSON profiles");
+      setTimeout(setScrollReload, 1500);
+      console.log(e.data.error);
+      return;
+    }
+    var profileStore = db.transaction("profiles", "readwrite").objectStore("profiles");
+    profileStore.put(e.data).onsuccess = () => {
+      raw_total_size += json_profile_chooser.files[upload_count].size;
+      compressed_total_size += e.data.profile.length;
+      upload_count++;
+      if (upload_count >= json_profile_chooser.files.length) {
+        console.log("Raw total size : " + getReadableSize(raw_total_size, 2));
+        console.log("Compressed total size : "
+            + getReadableSize(compressed_total_size, 2));
+        console.log("Query Profile(s) Processing time : " + getReadableTimeMS(Date.now()
+            - query_processor_start_time));
+        setTimeout(setScrollReload, 2000);
+      } else {
+        // Recursively call uploadProfile() until all selected JSON profiles
+        // are parsed and stored
+        uploadProfile();
+      }
+    };
+  };
+
+  dbOpenReq.onupgradeneeded = (e) => {
+    db = e.target.result;
+    var profileStore = db.createObjectStore("profiles", { keyPath : "id" });
+
+    profileStore.createIndex("start_time", "start_time");
+  };
+
+  dbOpenReq.onsuccess = (e) => {
+    db = e.target.result;
+    db.onerror = (e) => {
+      console.log("IndexedDB error");
+      console.log(e);
+    }
+
+    var profileStore = db.transaction("profiles", "readonly").objectStore("profiles");
+    var countReq = profileStore.count();
+
+    countReq.onsuccess = () => {
+      if (countReq.result) {
+        imported_queries_header.innerHTML = imported_queries_header.innerHTML
+            .replace("0", String(countReq.result));
+      } else {
+        clear_profiles_button.remove();
+      }
+    };
+
+    profileStore.index("start_time").openCursor(null, "prev").onsuccess = (e) => {
+      var cursor = e.target.result;
+      if (cursor) {
+        var query = cursor.value;
+        var row = imported_queries_table.insertRow();
+        var query_link = document.createElement("a");
+        query_link.href = `{{ __common__.host-url }}/query_timeline?query_id=${query.id}&imported=true`;
+        query_link.innerHTML = query.id;
+        insertRowVal(row, query_link.outerHTML);
+        insertRowVal(row, query.user);
+        insertRowVal(row, query.default_db);
+        insertRowVal(row, query.type);
+        insertRowVal(row, query.start_time);
+        insertRowVal(row, query.end_time);
+        insertRowVal(row, `${query.bytes_read}
+          <hr style="margin-top:0px;margin-bottom:0px;"/>${query.bytes_sent}`);
+        insertRowVal(row, query.state);
+        insertRowVal(row, query.rows_fetched);
+        insertRowVal(row, query.resource_pool);
+        insertRowVal(row, query.statement);
+        var deleteButton = document.createElement("input");
+        deleteButton.type = "button";
+        deleteButton.value = "X";
+        deleteButton.className = "btn btn-primary";
+        deleteButton.setAttribute("onclick", "deleteProfile(this);");
+        insertRowVal(row, deleteButton.outerHTML);
+        cursor.continue();
+      }
+    };
+  };
+
+  window.onload = () => {
+    if (localStorage.getItem("imported") === "T") {
+      imported_queries_header.scrollIntoView({ behavior : "instant", block : "start" });
+      localStorage.setItem("imported", "F");
+    }
+  };
+</script>
 {{> www/common-footer.tmpl }}

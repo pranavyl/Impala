@@ -17,17 +17,18 @@
 
 package org.apache.impala.planner;
 
-import java.nio.ByteBuffer;
 import java.util.List;
 
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeHBaseTable;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TSinkAction;
 import org.apache.impala.thrift.TSortingOrder;
+import org.apache.impala.util.ExprUtil;
 
 import com.google.common.base.Preconditions;
 
@@ -128,6 +129,15 @@ public abstract class TableSink extends DataSink {
     Preconditions.checkNotNull(partitionKeyExprs);
     Preconditions.checkNotNull(referencedColumns);
     Preconditions.checkNotNull(sortProperties.first);
+    if (table instanceof FeIcebergTable) {
+      if (sinkAction == Op.INSERT) {
+        return new HdfsTableSink(table, partitionKeyExprs,outputExprs, overwrite,
+            inputIsClustered, sortProperties, writeId, maxTableSinks, isResultSink);
+      } else {
+        // Other SINK actions are either not supported or created directly.
+        Preconditions.checkState(false);
+      }
+    }
     if (table instanceof FeFsTable) {
       // Hdfs only supports inserts.
       Preconditions.checkState(sinkAction == Op.INSERT);
@@ -159,5 +169,11 @@ public abstract class TableSink extends DataSink {
       throw new UnsupportedOperationException(
           "Cannot create data sink into table of type: " + table.getClass().getName());
     }
+  }
+
+  protected ProcessingCost computeDefaultProcessingCost() {
+    // TODO: consider including materialization cost into the returned cost.
+    return ProcessingCost.basicCost(getLabel(), fragment_.getPlanRoot().getCardinality(),
+        ExprUtil.computeExprsTotalCost(outputExprs_));
   }
 }

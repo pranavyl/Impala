@@ -116,9 +116,12 @@ void AdmissionControlService::Join() {
 
 Status AdmissionControlService::GetProxy(
     unique_ptr<AdmissionControlServiceProxy>* proxy) {
+  NetworkAddressPB admission_service_address;
+  RETURN_IF_ERROR(ExecEnv::GetInstance()->GetAdmissionServiceAddress(
+      admission_service_address));
   // Create a AdmissionControlService proxy to the destination.
   RETURN_IF_ERROR(ExecEnv::GetInstance()->rpc_mgr()->GetProxy(
-      ExecEnv::GetInstance()->admission_service_address(), FLAGS_admission_service_host,
+      admission_service_address, FLAGS_admission_service_host,
       proxy));
   return Status::OK();
 }
@@ -164,10 +167,14 @@ void AdmissionControlService::GetQueryStatus(const GetQueryStatusRequestPB* req,
     if (admission_state->submitted) {
       if (!admission_state->admission_done) {
         bool timed_out;
+        int64_t wait_start_time_ms, wait_end_time_ms;
         admission_state->admit_status =
             AdmissiondEnv::GetInstance()->admission_controller()->WaitOnQueued(
                 req->query_id(), &admission_state->schedule,
-                FLAGS_admission_status_wait_time_ms, &timed_out);
+                FLAGS_admission_status_wait_time_ms, &timed_out,
+                &wait_start_time_ms, &wait_end_time_ms);
+        resp->set_wait_start_time_ms(wait_start_time_ms);
+        resp->set_wait_end_time_ms(wait_end_time_ms);
         if (!timed_out) {
           admission_state->admission_done = true;
           if (admission_state->admit_status.ok()) {
@@ -295,7 +302,7 @@ void AdmissionControlService::AdmissionHeartbeat(const AdmissionHeartbeatRequest
 }
 
 void AdmissionControlService::CancelQueriesOnFailedCoordinators(
-    std::unordered_set<UniqueIdPB> current_backends) {
+    const std::unordered_set<UniqueIdPB>& current_backends) {
   std::unordered_map<UniqueIdPB, vector<UniqueIdPB>> cleaned_up =
       AdmissiondEnv::GetInstance()
           ->admission_controller()
@@ -310,7 +317,7 @@ void AdmissionControlService::CancelQueriesOnFailedCoordinators(
   }
 }
 
-void AdmissionControlService::AdmitFromThreadPool(UniqueIdPB query_id) {
+void AdmissionControlService::AdmitFromThreadPool(const UniqueIdPB& query_id) {
   shared_ptr<AdmissionState> admission_state;
   Status s = admission_state_map_.Get(query_id, &admission_state);
   if (!s.ok()) {

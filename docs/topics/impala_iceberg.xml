@@ -43,10 +43,6 @@ under the License.
       Iceberg Catalogs (e.g. HiveCatalog, HadoopCatalog). It also supports location-based
       tables (HadoopTables).
     </p>
-    <p>
-      Currently only Iceberg V1 DML operations are allowed, i.e. INSERT INTO /INSERT OVERWRITE.
-      Iceberg V2 operations like row-level modifications (UPDATE, DELETE) are not supported yet.
-    </p>
 
     <p>
       For more information on Iceberg, see <xref keyref="upstream_iceberg_site"/>.
@@ -86,6 +82,10 @@ under the License.
       <li>
         Time travel: enables reproducible queries that use exactly the same table
         snapshot, or lets users easily examine changes.
+      </li>
+      <li>
+        Cloning Iceberg tables: create an empty Iceberg table based on the definition of
+        another Iceberg table.
       </li>
     </ul>
   </conbody>
@@ -135,7 +135,9 @@ TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
         <li>
           Alternatively, you can also use custom catalogs to use existing tables. It means you need to define
           your catalog in hive-site.xml.
-          The adventage of this method is that other engines are more likely to be able to interact with this table.
+          The advantage of this method is that other engines are more likely to be able to interact with this table.
+          Please note that the automatic metadata update will not work for these tables, you will have to manually
+          call REFRESH on the table when it changes outside Impala.
           To globally register different catalogs, set the following Hadoop configurations:
           <table rowsep="1" colsep="1" id="iceberg_custom_catalogs">
             <tgroup cols="2">
@@ -192,8 +194,8 @@ CREATE TABLE ice_t (i INT) STORED AS ICEBERG;
         </codeblock>
       </p>
       <p>
-        By default Impala assumes that the Iceberg table uses Parquet data files. ORC is also supported,
-        but we need to tell Impala via setting the table property 'write.format.default' to 'ORC'.
+        By default Impala assumes that the Iceberg table uses Parquet data files. ORC and AVRO are also supported,
+        but we need to tell Impala via setting the table property 'write.format.default' to e.g. 'ORC'.
       </p>
       <p>
         You can also use <codeph>CREATE TABLE AS SELECT</codeph> to create new Iceberg tables, e.g.:
@@ -203,6 +205,37 @@ CREATE TABLE ice_ctas STORED AS ICEBERG AS SELECT i, b FROM value_tbl;
 CREATE TABLE ice_ctas_part PARTITIONED BY(d) STORED AS ICEBERG AS SELECT s, ts, d FROM value_tbl;
 
 CREATE TABLE ice_ctas_part_spec PARTITIONED BY SPEC (truncate(3, s)) STORED AS ICEBERG AS SELECT cast(t as INT), s, d FROM value_tbl;
+        </codeblock>
+      </p>
+    </conbody>
+  </concept>
+
+  <concept id="iceberg_v2">
+    <title>Iceberg V2 tables</title>
+    <conbody>
+      <p>
+        Iceberg V2 tables support row-level modifications (DELETE, UPDATE) via "merge-on-read", which means instead
+        of rewriting existing data files, separate so-called delete files are being written that store information
+        about the deleted records. There are two kinds of delete files in Iceberg:
+        <ul>
+          <li>position deletes</li>
+          <li>equality deletes</li>
+        </ul>
+        Impala only supports position delete files. These files contain the file path and file position of the deleted
+        rows.
+      </p>
+      <p>
+        One can create Iceberg V2 tables via the <codeph>CREATE TABLE</codeph> statement, they just need to specify
+        the 'format-version' table property:
+        <codeblock>
+CREATE TABLE ice_v2 (i int) STORED BY ICEBERG TBLPROPERTIES('format-version'='2');
+        </codeblock>
+      </p>
+      <p>
+        It is also possible to upgrade existing Iceberg V1 tables to Iceberg V2 tables. One can use the following
+        <codeph>ALTER TABLE</codeph> statement to do so:
+        <codeblock>
+ALTER TABLE ice_v1_to_v2 SET TBLPROPERTIES('format-version'='2');
         </codeblock>
       </p>
     </conbody>
@@ -234,8 +267,8 @@ CREATE TABLE ice_ctas_part_spec PARTITIONED BY SPEC (truncate(3, s)) STORED AS I
     <conbody>
 
       <p>
-        You can get information about the supported Iceberg data tyeps in
-        <xref href="https://iceberg.apache.org/#spec/%23schemas-and-data-types" scope="external" format="html">
+        You can get information about the supported Iceberg data types in
+        <xref href="https://iceberg.apache.org/docs/latest/schemas/" scope="external" format="html">
           the Iceberg spec</xref>.
       </p>
 
@@ -351,8 +384,11 @@ CREATE TABLE ice_ctas_part_spec PARTITIONED BY SPEC (truncate(3, s)) STORED AS I
         </ul>
       </p>
       <p>
+        Impala currently does not support schema evolution for tables with AVRO file format.
+      </p>
+      <p>
         See
-        <xref href="https://iceberg.apache.org/#spec/%23schema-evolution" scope="external" format="html">
+        <xref href="https://iceberg.apache.org/docs/latest/evolution/#schema-evolution" scope="external" format="html">
         schema evolution </xref> for more details.
       </p>
     </conbody>
@@ -362,7 +398,7 @@ CREATE TABLE ice_ctas_part_spec PARTITIONED BY SPEC (truncate(3, s)) STORED AS I
     <title>Partitioning Iceberg tables</title>
     <conbody>
       <p>
-        <xref href="https://iceberg.apache.org/#spec/%23partitioning" scope="external" format="html">
+        <xref href="https://iceberg.apache.org/docs/latest/partitioning/" scope="external" format="html">
         The Iceberg spec </xref> has information about partitioning Iceberg tables. With Iceberg,
         we are not limited to value-based partitioning, we can also partition our tables via
         several partition transforms.
@@ -379,7 +415,7 @@ STORED AS ICEBERG;
       </p>
       <p>
         Iceberg also supports
-        <xref href="https://iceberg.apache.org/#spec/%23partition-evolution" scope="external" format="html">
+        <xref href="https://iceberg.apache.org/docs/latest/evolution/#partition-evolution" scope="external" format="html">
         partition evolution</xref> which means that the partitioning of a table can be changed, even
         without the need of rewriting existing data files. You can change an existing table's
         partitioning via an <codeph>ALTER TABLE SET PARTITION SPEC</codeph> statement, e.g.:
@@ -409,7 +445,7 @@ CREATE TABLE ice_p (i INT, b INT) PARTITIONED BY (p1 INT, p2 STRING) STORED AS I
   </concept>
 
   <concept id="iceberg_inserts">
-    <title>Writing Iceberg tables</title>
+    <title>Inserting data into Iceberg tables</title>
     <conbody>
       <p>
         Impala is also able to insert new data to Iceberg tables. Currently the <codeph>INSERT INTO</codeph>
@@ -438,6 +474,193 @@ INSERT INTO ice_p VALUES (1, 2);
     </conbody>
   </concept>
 
+  <concept id="iceberg_delete">
+    <title>Delete data from Iceberg tables</title>
+    <conbody>
+      <p>
+        Since <keyword keyref="impala43"/> Impala is able to run <codeph>DELETE</codeph> statements against
+        Iceberg V2 tables. E.g.:
+        <codeblock>
+DELETE FROM ice_t where i = 3;
+        </codeblock>
+      </p>
+      <p>
+        More information about the <codeph>DELETE</codeph> statement can be found at <xref href="impala_delete.xml#delete"/>.
+      </p>
+    </conbody>
+  </concept>
+
+  <concept id="iceberg_drop_partition">
+    <title>Dropping partitions from Iceberg tables</title>
+    <conbody>
+      <p>
+        Since <keyword keyref="impala44"/> Impala is able to run <codeph>ALTER TABLE DROP PARTITION</codeph> statements. E.g.:
+        <codeblock>
+ALTER TABLE ice_t DROP PARTITION (i = 3);
+ALTER TABLE ice_t DROP PARTITION (day(date_col) &lt; '2024-10-01');
+ALTER TABLE ice_t DROP PARTITION (year(timestamp_col) = '2024');
+        </codeblock>
+      </p>
+      <p>
+      Any non-identity transforms must be included in the partition selector like <codeph>(day(date_col))</codeph>. Operands for filtering date and
+      timestamp-based columns with transforms must be provided as strings, for example: <codeph>(day(date_col) = '2024-10-01')</codeph>.
+      This is a metadata-only operation, the datafiles targeted by the deleted partitions do not get purged or removed from the filesystem,
+      only a new snapshot is getting created with the remaining partitions.
+      </p>
+      <p>
+      Limitations:
+        <ul>
+          <li>Binary filter predicates must consist of one partition selector and one constant expression;
+          e.g.: <codeph>(day(date_col) = '2024-10-01')</codeph> is allowed, but <codeph>(another_date_col = date_col)</codeph> is not allowed.</li>
+          <li>Filtering expressions must target the latest partition spec of the table.</li>
+        </ul>
+      </p>
+      <p>
+        More information about the <codeph>ALTER TABLE DROP PARTITION</codeph> statement can be found at
+        <xref href="impala_alter_table.xml"/>.
+      </p>
+    </conbody>
+  </concept>
+
+  <concept id="iceberg_update">
+    <title>Updating data in Iceberg tables</title>
+    <conbody>
+      <p>
+        Since <keyword keyref="impala44"/> Impala is able to run <codeph>UPDATE</codeph> statements against
+        Iceberg V2 tables. E.g.:
+        <codeblock>
+UPDATE ice_t SET val = val + 1;
+UPDATE ice_t SET k = 4 WHERE i = 5;
+UPDATE ice_t SET ice_t.k = o.k, ice_t.j = o.j, FROM ice_t, other_table o where ice_t.id = o.id;
+        </codeblock>
+      </p>
+      <p>
+        The UPDATE FROM statement can be used to update a target Iceberg table based on a source table (or view) that doesn't need
+        to be an Iceberg table. If there are multiple matches on the JOIN condition, Impala will raise an error.
+      </p>
+      <p>
+        Limitations:
+        <ul>
+          <li>Only the merge-on-read update mode is supported.</li>
+          <li>Only writes position delete files, i.e. no support for writing equality deletes.</li>
+          <li>Cannot update tables with complex types.</li>
+          <li>
+            Can only write data and delete files in Parquet format. This means if table properties 'write.format.default'
+            and 'write.delete.format.default' are set, their values must be PARQUET.
+          </li>
+          <li>
+            Updating partitioning column with non-constant expression via the UPDATE FROM statement is not allowed.
+            This limitation could be eliminated by using a <codeph>MERGE</codeph> statement.
+          </li>
+        </ul>
+      </p>
+      <p>
+        More information about the <codeph>UPDATE</codeph> statement can be found at <xref href="impala_update.xml#update"/>.
+      </p>
+    </conbody>
+  </concept>
+
+    <concept id="iceberg_merge">
+    <title>Merging data into Iceberg tables</title>
+    <conbody>
+      <p>
+        Impala can execute MERGE statements against Iceberg tables, e.g:
+        <codeblock>
+MERGE INTO ice_t USING source ON ice_t.a = source.id WHEN NOT MATCHED THEN INSERT VALUES(id, source.column1);
+MERGE INTO ice_t USING source ON ice_t.a = source.id WHEN MATCHED THEN DELETE;
+MERGE INTO ice_t USING source ON ice_t.a = source.id WHEN MATCHED THEN UPDATE SET b = source.b;
+MERGE INTO ice_t USING source ON ice_t.a = source.id
+  WHEN MATCHED AND ice_t.a &lt; 100 THEN UPDATE SET b = source.b
+  WHEN MATCHED THEN DELETE
+  WHEN NOT MATCHED THEN INSERT VALUES(id, source.column1);
+        </codeblock>
+      </p>
+      <p>
+        The limitations of the <codeph>UPDATE</codeph> statement also apply to the <codeph>MERGE</codeph> statement; in addition,
+        the limitations of the <codeph>MERGE</codeph> statement:
+        <ul>
+          <li>Subqueries in source statements must be simple queries as internal rewrite is not supported.</li>
+        </ul>
+      </p>
+      <p>
+        More information about the <codeph>MERGE</codeph> statement can be found at <xref href="impala_merge.xml"/>.
+      </p>
+    </conbody>
+  </concept>
+
+  <concept id="iceberg_load">
+    <title>Loading data into Iceberg tables</title>
+    <conbody>
+      <p>
+        <codeph>LOAD DATA</codeph> statement can be used to load a single file or directory into
+        an existing Iceberg table. This operation is executed differently compared to HMS tables, the
+        data is being inserted into the table via sequentially executed statements, which has
+        some limitations:
+        <ul>
+          <li>Only Parquet or ORC files can be loaded.</li>
+          <li><codeph>PARTITION</codeph> clause is not supported, but the partition transformations
+          are respected.</li>
+          <li>The loaded files will be re-written as Parquet files.</li>
+        </ul>
+      </p>
+    </conbody>
+  </concept>
+
+  <concept id="iceberg_optimize_table">
+    <title>Optimizing (Compacting) Iceberg tables</title>
+    <conbody>
+      <p>
+        Frequent updates and row-level modifications on Iceberg tables can write many small
+        data files and delete files, which have to be merged-on-read.
+        This causes read performance to degrade over time.
+        The following statement can be used to compact the table and optimize it for reading.
+        <codeblock>
+OPTIMIZE TABLE [<varname>db_name</varname>.]<varname>table_name</varname> [FILE_SIZE_THRESHOLD_MB=<varname>value</varname>];
+        </codeblock>
+      </p>
+
+      <p>
+        The <codeph>OPTIMIZE TABLE</codeph> statement rewrites the table, executing the
+        following tasks:
+        <ul>
+          <li>Merges delete files with the corresponding data files.</li>
+          <li>Compacts data files that are smaller than the specified file size threshold in megabytes.</li>
+        </ul>
+        If no <codeph>FILE_SIZE_THRESHOLD_MB</codeph> was specified, the command compacts
+        ALL files and also
+        <ul>
+          <li>Converts data files to the latest table schema.</li>
+          <li>Rewrites all partitions according to the latest partition spec.</li>
+        </ul>
+      </p>
+
+      <p>
+        To execute table optimization:
+        <ul>
+          <li>The user needs ALL privileges on the table.</li>
+          <li>The table can contain any file formats that Impala can read, but <codeph>write.format.default</codeph>
+          has to be <codeph>parquet</codeph>.</li>
+          <li>General write limitations apply, e.g. the table cannot contain complex types.</li>
+        </ul>
+      </p>
+
+      <p>
+        When a table is optimized, a new snapshot is created. The old table state is still
+        accessible by time travel to previous snapshots, because the rewritten data and
+        delete files are not removed physically.
+        Issue the <codeph>ALTER TABLE ... EXECUTE expire_snapshots(...)</codeph> command
+        to remove the old files from the file system.
+      </p>
+      <p>
+        Note that <codeph>OPTIMIZE TABLE</codeph> without a specified <codeph>FILE_SIZE_THRESHOLD_MB</codeph>
+        rewrites the entire table, therefore the operation can take a long time to complete
+        depending on the size of the table.
+        It is recommended to specify a file size threshold for recurring table maintenance
+        jobs to save resources.
+      </p>
+    </conbody>
+  </concept>
+
   <concept id="iceberg_time_travel">
     <title>Time travel for Iceberg tables</title>
     <conbody>
@@ -460,17 +683,241 @@ SELECT * FROM ice_t FOR SYSTEM_VERSION AS OF 123456;
 
       <p>
         If one needs to check the available snapshots of a table they can use the <codeph>DESCRIBE HISTORY</codeph>
-        statement:
+        statement with the following syntax:
         <codeblock>
-DESCRIBE HISTORY ice_t;
+DESCRIBE HISTORY [<varname>db_name</varname>.]<varname>table_name</varname>
+  [FROM <varname>timestamp</varname>];
+
+DESCRIBE HISTORY [<varname>db_name</varname>.]<varname>table_name</varname>
+  [BETWEEN <varname>timestamp</varname> AND <varname>timestamp</varname>]
         </codeblock>
+        For example:
+<codeblock>
+DESCRIBE HISTORY ice_t FROM '2022-01-04 10:00:00';
+DESCRIBE HISTORY ice_t FROM now() - interval 5 days;
+DESCRIBE HISTORY ice_t BETWEEN '2022-01-04 10:00:00' AND '2022-01-05 10:00:00';
+</codeblock>
+      </p>
+      <p>
+        The output of the <codeph>DESCRIBE HISTORY</codeph> statement is formed
+        of the following columns:
+        <ul>
+          <li><codeph>creation_time</codeph>: the snapshot's creation timestamp.</li>
+          <li><codeph>snapshot_id</codeph>: the snapshot's ID or null.</li>
+          <li><codeph>parent_id</codeph>: the snapshot's parent ID or null.</li>
+          <li><codeph>is_current_ancestor</codeph>: TRUE if the snapshot is a current ancestor of the table.</li>
+        </ul>
+      </p>
+
+      <p rev="4.3.0 IMPALA-10893">
+        Please note that time travel queries are executed using the old schema of the table
+        from the point specified by the time travel parameters.
+        Prior to Impala 4.3.0 the current table schema is used to query an older
+        snapshot of the table, which might have had a different schema in the past.
+      </p>
+
+    </conbody>
+  </concept>
+
+  <concept id="iceberg_execute_rollback">
+    <title>Rolling Iceberg tables back to a previous state</title>
+    <conbody>
+      <p>
+        Iceberg table modifications cause new table snapshots to be created;
+        these snapshots represent an earlier version of the table.
+        The <codeph>ALTER TABLE [<varname>db_name</varname>.]<varname>table_name</varname> EXECUTE ROLLBACK</codeph>
+        statement can be used to roll back the table to a previous snapshot.
       </p>
 
       <p>
-        Please note that during time travel, Impala uses the current table schema to query an older
-        snapshot of the table which might have had a different schema in the past.
+        For example, to roll the table back to the snapshot id <codeph>123456</codeph> use:
+        <codeblock>
+ALTER TABLE ice_tbl EXECUTE ROLLBACK(123456);
+        </codeblock>
+        To roll the table back to the most recent (newest) snapshot
+        that has a creation timestamp that is older than the timestamp '2022-01-04 10:00:00' use:
+        <codeblock>
+ALTER TABLE ice_tbl EXECUTE ROLLBACK('2022-01-04 10:00:00');
+        </codeblock>
+        The timestamp is evaluated using the Timezone for the current session.
       </p>
 
+      <p>
+        It is only possible to roll back to a snapshot that is a current ancestor of the table.
+      </p>
+      <p>
+        When a table is rolled back to a snapshot, a new snapshot is
+        created with the same snapshot id, but with a new creation timestamp.
+      </p>
+    </conbody>
+  </concept>
+
+  <concept id="iceberg_expire_snapshots">
+    <title>Expiring snapshots</title>
+    <conbody>
+      <p>
+        Iceberg snapshots accumulate until they are deleted by a user action. Snapshots
+        can be deleted with <codeph>ALTER TABLE ... EXECUTE expire_snapshots(...)</codeph>
+        statement, which will expire snapshots that are older than the specified
+        timestamp. For example:
+        <codeblock>
+ALTER TABLE ice_tbl EXECUTE expire_snapshots('2022-01-04 10:00:00');
+ALTER TABLE ice_tbl EXECUTE expire_snapshots(now() - interval 5 days);
+        </codeblock>
+      </p>
+      <p>
+        Expire snapshots:
+        <ul>
+          <li>removes data files that are no longer referenced by non-expired snapshots.</li>
+          <li>does not remove orphaned data files.</li>
+          <li>does not remove old metadata files by default.</li>
+          <li>respects the minimum number of snapshots to keep:
+          <codeph>history.expire.min-snapshots-to-keep</codeph> table property.</li>
+        </ul>
+      </p>
+      <p>
+        Old metadata file clean up can be configured with
+        <codeph>write.metadata.delete-after-commit.enabled=true</codeph> and
+        <codeph>write.metadata.previous-versions-max</codeph> table properties. This
+        allows automatic metadata file removal after operations that modify metadata
+        such as expiring snapshots or inserting data.
+      </p>
+    </conbody>
+  </concept>
+
+  <concept id="iceberg_metadata_tables">
+    <title>Iceberg metadata tables</title>
+    <conbody>
+      <p>
+        Iceberg stores extensive metadata for each table (e.g. snapshots, manifests, data
+        and delete files etc.), which is accessible in Impala in the form of virtual
+        tables called metadata tables.
+      </p>
+      <p>
+        Metadata tables can be queried just like regular tables, including filtering,
+        aggregation and joining with other metadata and regular tables. On the other hand,
+        they are read-only, so it is not possible to change, add or remove records from
+        them, they cannot be dropped and new metadata tables cannot be created. Metadata
+        changes made in other ways (not through metadata tables) are reflected in the
+        tables.
+      </p>
+      <p>
+        To list the metadata tables available for an Iceberg table, use the <codeph>SHOW
+        METADATA TABLES</codeph> command:
+
+        <codeblock>
+SHOW METADATA TABLES IN [db.]tbl [[LIKE] “pattern”]
+        </codeblock>
+
+        It is possible to filter the result using <codeph>pattern</codeph>. All Iceberg
+        tables have the same metadata tables, so this command is mostly for convenience.
+        Using <codeph>SHOW METADATA TABLES</codeph> on a non-Iceberg table results in an
+        error.
+      </p>
+      <p>
+        Just like regular tables, metadata tables have schemas that can be queried with
+        the <codeph>DESCRIBE</codeph> command. Note, however, that <codeph>DESCRIBE
+        FORMATTED|EXTENDED</codeph> are not available for metadata tables.
+      </p>
+      <p>
+        Example:
+        <codeblock>
+DESCRIBE functional_parquet.iceberg_alltypes_part.history;
+        </codeblock>
+      </p>
+      <p>
+        To retrieve information from metadata tables, use the usual
+        <codeph>SELECT</codeph> statement. You can select any subset of the columns or all
+        of them using ‘*’. Note that in contrast to regular tables, <codeph>SELECT
+        *</codeph> on metadata tables always includes complex-typed columns in the result.
+        Therefore, the query option <codeph>EXPAND_COMPLEX_TYPES</codeph> only applies to
+        regular tables. This holds also in queries that mix metadata tables and regular
+        tables: for <codeph>SELECT *</codeph> expressions from metadata tables, complex
+        types will always be included, and for <codeph>SELECT *</codeph> expressions from
+        regular tables, complex types will be included if and only if
+        <codeph>EXPAND_COMPLEX_TYPES</codeph> is true.
+      </p>
+      <p>
+        Note that unnesting collections from metadata tables is not supported.
+      </p>
+      <p>
+        Example:
+        <codeblock>
+SELECT
+    s.operation,
+    h.is_current_ancestor,
+    s.summary
+FROM functional_parquet.iceberg_alltypes_part.history h
+JOIN functional_parquet.iceberg_alltypes_part.snapshots s
+  ON h.snapshot_id = s.snapshot_id
+WHERE s.operation = 'append'
+ORDER BY made_current_at;
+        </codeblock>
+      </p>
+    </conbody>
+  </concept>
+
+  <concept id="iceberg_puffin_stats">
+    <title>Iceberg Puffin statistics</title>
+    <conbody>
+      <p>
+      Impala supports reading NDV (Number of Distinct Values) statistics from Puffin files.
+      For the Puffin specification, see <xref keyref="upstream_iceberg_puffin_site"/>.
+      </p>
+      <p>
+      If there are Puffin stats for multiple snapshots, Impala chooses the most recent
+      one for each column. Note that this means that the stats for different columns may
+      come from different snapshots.
+      </p>
+      <p>
+      In case there are both HMS and Puffin stats for a column, the more recent one will
+      be used - for HMS stats we use the 'impala.lastComputeStatsTime' table property, and
+      for Puffin stats we use the snapshot timestamp to determine which one is more
+      recent.
+      </p>
+      <p>
+      Reading Puffin stats is disabled by default; set the "--enable_reading_puffin_stats"
+      startup flag to true to enable it.
+      </p>
+      <p>
+      Some engines, e.g. Trino, also write the NDV as a property (with key "ndv") in the
+      "statistics" section of the metadata.json file for each blob, in addition to the
+      Puffin file. If such a property is present for a blob, Impala will read the value
+      from the metadata.json file instead of the Puffin file to reduce file I/O.
+      </p>
+      <p>
+      Note that it is currently not possible to drop Puffin stats from Impala.
+      For this reason, it is possible to disable reading Puffin stats in two ways:
+      <ul>
+        <li>Globally, with the aforementioned
+            <codeph>enable_reading_puffin_stats</codeph> startup flag - when it is set
+            to false, Impala will never read Puffin stats.</li>
+        <li>For specific tables, by setting the
+            <codeph>impala.iceberg_read_puffin_stats</codeph> table property to
+            "false".</li>
+      </ul>
+      </p>
+      <p>
+      Note that Impala does not yet support writing Puffin statistics files.
+      </p>
+    </conbody>
+  </concept>
+
+  <concept id="iceberg_table_cloning">
+    <title>Cloning Iceberg tables (LIKE clause)</title>
+    <conbody>
+      <p>
+        Use <codeph>CREATE TABLE ... LIKE ...</codeph> to create an empty Iceberg table
+        based on the definition of another Iceberg table, including any column attributes in
+        the original table:
+        <codeblock>
+          CREATE TABLE new_ice_tbl LIKE orig_ice_tbl;
+        </codeblock>
+      </p>
+      <p>
+        Because of the Data Types of Iceberg and Impala do not correspond one by one, Impala
+        can only clone between Iceberg tables.
+      </p>
     </conbody>
   </concept>
 
@@ -487,7 +934,7 @@ DESCRIBE HISTORY ice_t;
           </li>
           <li><codeph>iceberg.catalog_location</codeph>: Iceberg table catalog location when <codeph>iceberg.catalog</codeph> is <codeph>'hadoop.catalog'</codeph></li>
           <li><codeph>iceberg.table_identifier</codeph>: Iceberg table identifier. We use &lt;database&gt;.&lt;table&gt; instead if this property is not set</li>
-          <li><codeph>write.format.default</codeph>: data file format of the table. Impala can read ORC and PARQUET data files in Iceberg tables, and can write PARQUET data files only.</li>
+          <li><codeph>write.format.default</codeph>: data file format of the table. Impala can read AVRO, ORC and PARQUET data files in Iceberg tables, and can write PARQUET data files only.</li>
           <li><codeph>write.parquet.compression-codec</codeph>:
             Parquet compression codec. Supported values are: NONE, GZIP, SNAPPY
             (default value), LZ4, ZSTD. The table property will be ignored if
@@ -519,6 +966,66 @@ DESCRIBE HISTORY ice_t;
             page size will remain unchanged.
           </li>
         </ul>
+      </p>
+    </conbody>
+  </concept>
+
+  <concept id="iceberg_manifest_caching">
+    <title>Iceberg manifest caching</title>
+    <conbody>
+      <p>
+        Starting from version 1.1.0, Apache Iceberg provides a mechanism to cache the
+        contents of Iceberg manifest files in memory. This manifest caching feature helps
+        to reduce repeated reads of small Iceberg manifest files from remote storage by
+        Coordinators and Catalogd. This feature can be enabled for Impala Coordinators and
+        Catalogd by setting properties in Hadoop's core-site.xml as in the following:
+        <codeblock>
+iceberg.io-impl=org.apache.iceberg.hadoop.HadoopFileIO;
+iceberg.io.manifest.cache-enabled=true;
+iceberg.io.manifest.cache.max-total-bytes=104857600;
+iceberg.io.manifest.cache.expiration-interval-ms=3600000;
+iceberg.io.manifest.cache.max-content-length=8388608;
+        </codeblock>
+      </p>
+      <p>
+        The description of each property is as follows:
+        <ul>
+          <li>
+            <codeph>iceberg.io-impl</codeph>: custom FileIO implementation to use in a
+            catalog. Must be set to enable manifest caching. Impala defaults to
+            HadoopFileIO. It is recommended to not change this to other than HadoopFileIO.
+          </li>
+          <li>
+            <codeph>iceberg.io.manifest.cache-enabled</codeph>: enable/disable the
+            manifest caching feature.
+          </li>
+          <li>
+            <codeph>iceberg.io.manifest.cache.max-total-bytes</codeph>: maximum total
+            amount of bytes to cache in the manifest cache. Must be a positive value.
+          </li>
+          <li>
+            <codeph>iceberg.io.manifest.cache.expiration-interval-ms</codeph>: maximum
+            duration for which an entry stays in the manifest cache. Must be a
+            non-negative value. Setting zero means cache entries expire only if it gets
+            evicted due to memory pressure from
+            <codeph>iceberg.io.manifest.cache.max-total-bytes</codeph>.
+          </li>
+          <li>
+            <codeph>iceberg.io.manifest.cache.max-content-length</codeph>: maximum length
+            of a manifest file to be considered for caching in bytes. Manifest files with
+            a length exceeding this property value will not be cached. Must be set with a
+            positive value and lower than
+            <codeph>iceberg.io.manifest.cache.max-total-bytes</codeph>.
+          </li>
+        </ul>
+      </p>
+      <p>
+        Manifest caching only works for tables that are loaded with either of
+        HadoopCatalogs or HiveCatalogs. Individual HadoopCatalog and HiveCatalog will have
+        separate manifest caches with the same configuration. By default, only 8 catalogs
+        can have their manifest cache active in memory. This number can be raised by
+        setting a higher value in the java system property
+        <codeph>iceberg.io.manifest.cache.fileio-max</codeph>.
       </p>
     </conbody>
   </concept>

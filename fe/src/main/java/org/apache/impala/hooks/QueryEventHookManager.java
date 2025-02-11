@@ -16,7 +16,7 @@
 // under the License.
 package org.apache.impala.hooks;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TBackendGflags;
@@ -30,6 +30,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.stream.Collectors;
+
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
  * {@link QueryEventHookManager} manages the registration and execution of
@@ -117,7 +119,8 @@ public class QueryEventHookManager {
   private QueryEventHookManager(int nHookExecutorThreads, String[] hookClasses)
       throws InternalException {
 
-    this.hookExecutor_ = Executors.newFixedThreadPool(nHookExecutorThreads);
+    this.hookExecutor_ = Executors.newFixedThreadPool(nHookExecutorThreads,
+        new ThreadFactoryBuilder().setNameFormat("QueryEventHookExecutor-%d").build());
     Runtime.getRuntime().addShutdownHook(new Thread(() -> this.cleanUp()));
 
     final List<QueryEventHook> hooks = new ArrayList<>(hookClasses.length);

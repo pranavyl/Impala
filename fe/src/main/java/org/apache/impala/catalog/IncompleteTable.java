@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Set;
 
 import com.google.common.base.Preconditions;
+import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 
 import org.apache.impala.common.ImpalaException;
@@ -29,12 +30,17 @@ import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TGetPartialCatalogObjectRequest;
 import org.apache.impala.thrift.TGetPartialCatalogObjectResponse;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TStatus;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableDescriptor;
+import org.apache.impala.thrift.TTableType;
 import com.google.common.base.Joiner;
 import com.google.common.base.Throwables;
 import com.google.common.collect.Lists;
+import org.apache.impala.util.EventSequence;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Represents a table with incomplete metadata. The metadata may be incomplete because
@@ -46,16 +52,30 @@ import com.google.common.collect.Lists;
  * FailedLoadLocalTable to represent a failed table.
  */
 public class IncompleteTable extends Table implements FeIncompleteTable {
+  public static final Logger LOG = LoggerFactory.getLogger(IncompleteTable.class);
+
   // The cause for the incomplete metadata. If there is no cause given (cause_ = null),
   // then this is assumed to be an uninitialized table (table that does not have
   // its metadata loaded).
   private ImpalaException cause_;
+  private TImpalaTableType tableType_;
+  private String comment_;
 
-  private IncompleteTable(Db db, String name,
+  private IncompleteTable(Db db, String name, TImpalaTableType type, String comment,
       ImpalaException cause) {
     super(null, db, name, null);
     cause_ = cause;
+    tableType_ = type;
+    comment_ = comment;
+    LOG.trace("Created IncompleteTable for {}.{}: type={}, comment={}",
+        db.getName(), name, type, comment);
   }
+
+  @Override
+  public TImpalaTableType getTableType() { return tableType_; }
+
+  @Override
+  public String getTableComment() { return comment_; }
 
   /**
    * Returns the cause (ImpalaException) which led to this table's metadata being
@@ -65,13 +85,36 @@ public class IncompleteTable extends Table implements FeIncompleteTable {
   public ImpalaException getCause() { return cause_; }
 
   /**
+   * Returns true if the load has failed due to recoverable errors such as
+   * metastore connection error
+   * @return
+   */
+  @Override
+  public boolean isLoadFailedByRecoverableError() {
+    if (cause_ instanceof TableLoadingException) {
+      String metastoreConnectionError = "Could not connect to meta store";
+      if (cause_.getMessage().contains(metastoreConnectionError)
+          || (cause_.getCause() instanceof MetaException
+                 && cause_.getCause().getMessage().contains(metastoreConnectionError))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * See comment on cause_.
    */
   @Override
   public boolean isLoaded() { return cause_ != null; }
 
   @Override
-  public TCatalogObjectType getCatalogObjectType() { return TCatalogObjectType.TABLE; }
+  public TCatalogObjectType getCatalogObjectType() {
+    // Respect the table type if it's actually a view. It's essential to be consistent
+    // with CatalogServiceCatalog#addTableToCatalogDeltaHelper().
+    if (tableType_ == TImpalaTableType.VIEW) return TCatalogObjectType.VIEW;
+    return TCatalogObjectType.TABLE;
+  }
 
   @Override
   public TTableDescriptor toThriftDescriptor(int tableId, Set<Long> referencedPartitions) {
@@ -80,8 +123,8 @@ public class IncompleteTable extends Table implements FeIncompleteTable {
 
   @Override
   public void load(boolean reuseMetadata, IMetaStoreClient client,
-      org.apache.hadoop.hive.metastore.api.Table msTbl, String reason)
-      throws TableLoadingException {
+      org.apache.hadoop.hive.metastore.api.Table msTbl, String reason,
+      EventSequence catalogTimeline) throws TableLoadingException {
     if (cause_ instanceof TableLoadingException) {
       throw (TableLoadingException) cause_;
     } else {
@@ -97,11 +140,26 @@ public class IncompleteTable extends Table implements FeIncompleteTable {
           Lists.newArrayList(JniUtil.throwableToString(cause_),
                              JniUtil.throwableToStackTrace(cause_))));
     }
+    if (tableType_ == TImpalaTableType.VIEW) {
+      table.setTable_type(TTableType.VIEW);
+    } else if (tableType_ == TImpalaTableType.MATERIALIZED_VIEW) {
+      table.setTable_type(TTableType.MATERIALIZED_VIEW);
+    } else {
+      table.setTable_type(TTableType.UNLOADED_TABLE);
+    }
+    if (comment_ != null) {
+      LOG.trace("Setting comment of {}: {}", getFullName(), comment_);
+      table.setTbl_comment(comment_);
+    }
     return table;
   }
 
   @Override
-  protected void loadFromThrift(TTable thriftTable) throws TableLoadingException {
+  protected void loadFromThrift(TTable thriftTable) {
+    if (thriftTable.isSetTbl_comment()) {
+      comment_ = thriftTable.getTbl_comment();
+      LOG.trace("Loaded comment from thriftTable of {}: {}", getFullName(), comment_);
+    }
     if (thriftTable.isSetLoad_status()) {
       // Since the load status is set, it indicates the table is incomplete due to
       // an error loading the table metadata. The error message in the load status
@@ -131,13 +189,21 @@ public class IncompleteTable extends Table implements FeIncompleteTable {
     }
   }
 
-  public static IncompleteTable createUninitializedTable(Db db, String name) {
-    return new IncompleteTable(db, name, null);
+  public static IncompleteTable createUninitializedTable(Db db, String name,
+      TImpalaTableType tableType, String tableComment) {
+    return new IncompleteTable(db, name, tableType, tableComment, null);
   }
 
   public static IncompleteTable createFailedMetadataLoadTable(Db db, String name,
       ImpalaException e) {
-    return new IncompleteTable(db, name, e);
+    return new IncompleteTable(db, name, TImpalaTableType.UNKNOWN, null, e);
+  }
+
+  /**
+   * Create an instance for DropTable ops where the table type and comment is not used.
+   */
+  public static IncompleteTable createUninitializedTableForRemove(Db db, String name) {
+    return new IncompleteTable(db, name, /*type*/null, /*comment*/null, /*cause*/null);
   }
 
   @Override

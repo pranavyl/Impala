@@ -56,7 +56,19 @@
 #
 # Additional examples of usage can be found within the test suites.
 
+from __future__ import absolute_import, division, print_function
 from itertools import product
+from copy import deepcopy
+import logging
+
+
+LOG = logging.getLogger(__name__)
+EXEC_OPTION_KEY = 'exec_option'
+
+
+def assert_exec_option_key(key):
+  assert key.islower(), "Exec option " + key + " is not in lower case"
+
 
 # A list of test dimension values.
 class ImpalaTestDimension(list):
@@ -83,6 +95,18 @@ class ImpalaTestVector(object):
         return vector_value.value
     raise ValueError("Test vector does not contain value '%s'" % name)
 
+  def get_exec_option_dict(self):
+    return self.get_value(EXEC_OPTION_KEY)
+
+  def get_exec_option(self, option_name):
+    return self.get_value(EXEC_OPTION_KEY)[option_name]
+
+  def set_exec_option(self, option_name, option_value):
+    self.get_value(EXEC_OPTION_KEY)[option_name] = option_value
+
+  def unset_exec_option(self, option_name):
+    del self.get_value(EXEC_OPTION_KEY)[option_name]
+
   def __str__(self):
       return ' | '.join(['%s' % vector_value for vector_value in self.vector_values])
 
@@ -103,22 +127,66 @@ class ImpalaTestMatrix(object):
   def __init__(self, *args):
     self.dimensions = dict((arg.name, arg) for arg in args)
     self.constraint_list = list()
+    self.independent_exec_option_names = set()
 
   def add_dimension(self, dimension):
     self.dimensions[dimension.name] = dimension
+    if dimension.name == EXEC_OPTION_KEY:
+      for name in list(self.independent_exec_option_names):
+        LOG.warn("Reassigning {} dimension will remove exec option {}={} that was "
+            "independently declared through add_exec_option_dimension.".format(
+              EXEC_OPTION_KEY, name, [v.value for v in self.dimensions[name]]))
+        self.clear_dimension(name)
 
-  def add_mandatory_exec_option(self, exec_option_key, exec_option_value):
-    for vector in self.dimensions['exec_option']:
-      vector.value[exec_option_key] = exec_option_value
+  def assert_unique_exec_option_key(self, key):
+    """Assert that 'exec_option' dimension exist and 'key' is not exist yet
+    in self.dimension['exec_option']."""
+    assert_exec_option_key(key)
+    assert EXEC_OPTION_KEY in self.dimensions, (
+        "Must have '" + EXEC_OPTION_KEY + "' dimension previously declared!")
+
+    for vector in self.dimensions[EXEC_OPTION_KEY]:
+      assert key not in vector.value, (
+          "'{}' is already exist in '{}' dimension!".format(key, EXEC_OPTION_KEY))
+
+    # 'key' must not previously declared with add_exec_option_dimension().
+    assert key not in self.independent_exec_option_names, (
+        "['{}']['{}'] was previously declared with non-unique value: {}".format(
+          EXEC_OPTION_KEY, key, [dim.value for dim in self.dimensions[key]]))
+
+  def add_mandatory_exec_option(self, key, value):
+    """Append key=value pair into 'exec_option' dimension."""
+    self.assert_unique_exec_option_key(key)
+
+    for vector in self.dimensions[EXEC_OPTION_KEY]:
+      vector.value[key] = value
+
+  def add_exec_option_dimension(self, dimension):
+    """
+    Add 'dimension' into 'self.dimensions' and memorize the name.
+    During vector generation, all dimensions registered through this method will be
+    embedded into 'exec_option' dimension. This is intended to maintain pairwise and
+    exhaustive combination correct while eliminating the need for individual test method
+    to append the custom exec options into 'exec_option' dimension themself.
+    """
+    self.assert_unique_exec_option_key(dimension.name)
+    assert len(dimension) > 1, (
+        "Dimension " + dimension.name + " must have more than 1 possible value! "
+        "Use add_mandatory_exec_option() instead.")
+
+    self.add_dimension(dimension)
+    self.independent_exec_option_names.add(dimension.name)
 
   def clear(self):
     self.dimensions.clear()
+    self.independent_exec_option_names = set()
 
   def clear_dimension(self, dimension_name):
     del self.dimensions[dimension_name]
+    self.independent_exec_option_names.discard(dimension_name)
 
   def has_dimension(self, dimension_name):
-    return self.dimensions.has_key(dimension_name)
+    return dimension_name in self.dimensions
 
   def generate_test_vectors(self, exploration_strategy):
     if not self.dimensions:
@@ -129,22 +197,46 @@ class ImpalaTestMatrix(object):
     elif exploration_strategy in ['core', 'pairwise']:
       return self.__generate_pairwise_combinations()
     else:
-      raise ValueError, 'Unknown exploration strategy: %s' % exploration_strategy
+      raise ValueError('Unknown exploration strategy: %s' % exploration_strategy)
+
+  def __deepcopy_vector_values(self, vector_values):
+    """Return a deepcopy of vector_values and merge exec options declared through
+    add_exec_option_dimension() into 'exec_option' dimension."""
+    values = []
+    exec_values = []
+    exec_option = None
+    for val in vector_values:
+      if val.name == EXEC_OPTION_KEY:
+        # 'exec_option' is a map. We need to deepcopy the value for each vector.
+        exec_option = deepcopy(val.value)
+      elif val.name in self.independent_exec_option_names:
+        # save this to merge into exec_option later.
+        exec_values.append(val)
+      else:
+        values.append(val)
+    if self.independent_exec_option_names:
+      assert exec_option is not None, (
+        "Must have '" + EXEC_OPTION_KEY + "' dimension previously declared!")
+      for val in exec_values:
+        exec_option[val.name] = val.value
+    if exec_option:
+      values.append(ImpalaTestVector.Value(EXEC_OPTION_KEY, exec_option))
+    return values
 
   def __generate_exhaustive_combinations(self):
-    return [ImpalaTestVector(vec) for vec in product(*self.__extract_vector_values())
-              if self.is_valid(vec)]
+    return [ImpalaTestVector(self.__deepcopy_vector_values(vec))
+      for vec in product(*self.__extract_vector_values()) if self.is_valid(vec)]
 
   def __generate_pairwise_combinations(self):
-    import metacomm.combinatorics.all_pairs2
-    all_pairs = metacomm.combinatorics.all_pairs2.all_pairs2
+    from allpairspy import AllPairs
+    all_pairs = AllPairs
 
     # Pairwise fails if the number of inputs == 1. Use exhaustive in this case the
     # results will be the same.
     if len(self.dimensions) == 1:
       return self.__generate_exhaustive_combinations()
-    return [ImpalaTestVector(vec) for vec in all_pairs(self.__extract_vector_values(),
-                                                 filter_func = self.is_valid)]
+    return [ImpalaTestVector(self.__deepcopy_vector_values(vec))
+      for vec in all_pairs(self.__extract_vector_values(), filter_func=self.is_valid)]
 
   def add_constraint(self, constraint_func):
     self.constraint_list.append(constraint_func)

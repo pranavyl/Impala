@@ -16,28 +16,46 @@
 // under the License.
 package org.apache.impala.catalog;
 
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.apache.hadoop.hive.common.ValidWriteIdList;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.thrift.TCatalogObjectType;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableStats;
+import org.apache.impala.util.AcidUtils;
 
 /**
  * Frontend interface for interacting with a table.
  */
 public interface FeTable {
-
   Comparator<FeTable> NAME_COMPARATOR = new Comparator<FeTable>() {
     @Override
     public int compare(FeTable t1, FeTable t2) {
       return t1.getFullName().compareTo(t2.getFullName());
     }
   };
+
+  // Internal table property that specifies the number of rows in the table.
+  public static final String NUM_ROWS = "numRows";
+
+  // Internal table property that specifies which user the table was last modified by.
+  public static final String LAST_MODIFIED_BY = "last_modified_by";
+
+  // Internal table property that specifies when the table was last modified.
+  public static final String LAST_MODIFIED_TIME = "last_modified_time";
+
+  // Internal table property that specifies the catalog service id.
+  public static final String CATALOG_SERVICE_ID = "impala.events.catalogServiceId";
+
+  // Internal table property that specifies the catalog version of the table.
+  public static final String CATALOG_VERSION = "impala.events.catalogVersion";
 
   /** @see CatalogObject#isLoaded() */
   boolean isLoaded();
@@ -75,14 +93,31 @@ public interface FeTable {
   TableName getTableName();
 
   /**
+   * @return the general type of this table (e.g. "TABLE" or "VIEW")
+   */
+  TImpalaTableType getTableType();
+
+  /**
+   * @return the comment of this table
+   */
+  String getTableComment();
+
+  /**
    * @return the columns in this table
    */
   List<Column> getColumns();
 
   /**
+   * @return the virtual columns of this table
+   */
+  default List<VirtualColumn> getVirtualColumns() {
+    return Collections.emptyList();
+  }
+
+  /**
    * @return an unmodifiable list of all columns, but with partition columns at the end of
    * the list rather than the beginning. This is equivalent to the order in
-   * which Hive enumerates columns.
+   * which Hive enumerates columns. Removes columns that are not in the HMS schema.
    */
   List<Column> getColumnsInHiveOrder();
 
@@ -105,6 +140,19 @@ public interface FeTable {
    * @return an unmodifiable list of all columns excluding any partition columns.
    */
   List<Column> getNonClusteringColumns();
+
+  /**
+   * Filter columns not stored in HMS (currently row__id in full ACID tables).
+   */
+  default List<Column> filterColumnsNotStoredInHms(List<Column> columns) {
+    Table tbl = getMetaStoreTable();
+    boolean isFullAcid = tbl != null && AcidUtils.isFullAcidTable(tbl.getParameters());
+    if (!isFullAcid) return columns;
+    // Filter out row__id as it doesn't exist in HMS.
+    return columns.stream()
+        .filter(c -> !c.getName().equals("row__id"))
+        .collect(Collectors.toList());
+  }
 
   int getNumClusteringCols();
 
@@ -164,4 +212,13 @@ public interface FeTable {
    */
   String getOwnerUser();
 
+  /**
+   * @return the catalog version of this table assigned in catalogd.
+   */
+  long getCatalogVersion();
+
+  /**
+   * @return the timestamp when the table is last loaded or reloaded in catalogd.
+   */
+  long getLastLoadedTimeMs();
 }

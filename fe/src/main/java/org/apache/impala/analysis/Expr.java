@@ -25,6 +25,8 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 
 import org.apache.impala.analysis.BinaryPredicate.Operator;
@@ -34,9 +36,11 @@ import org.apache.impala.catalog.Function.CompareMode;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.TypeCompatibility;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.SqlCastException;
+import org.apache.impala.common.ThriftSerializationCtx;
 import org.apache.impala.common.TreeNode;
 import org.apache.impala.rewrite.ExprRewriter;
 import org.apache.impala.service.FeSupport;
@@ -363,6 +367,18 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         }
       };
 
+  // Returns true if an Expr is a builtin sleep function.
+  public static final com.google.common.base.Predicate<Expr> IS_FN_SLEEP =
+      new com.google.common.base.Predicate<Expr>() {
+        @Override
+        public boolean apply(Expr arg) {
+          return arg instanceof FunctionCallExpr
+              && ((FunctionCallExpr) arg).getFnName().isBuiltin()
+              && ((FunctionCallExpr) arg).getFnName().getFunction() != null
+              && ((FunctionCallExpr) arg).getFnName().getFunction().equals("sleep");
+        }
+      };
+
   // id that's unique across the entire query statement and is assigned by
   // Analyzer.registerConjuncts(); only assigned for the top-level terms of a
   // conjunction, and therefore null for most Exprs
@@ -406,6 +422,8 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   // True after analysis successfully completed. Protected by accessors isAnalyzed() and
   // analysisDone().
   private boolean isAnalyzed_ = false;
+  private boolean isRewritten_ = false;
+
 
   // True if this has already been counted towards the number of statement expressions
   private boolean isCountedForNumStmtExprs_ = false;
@@ -431,6 +449,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     isAuxExpr_ = other.isAuxExpr_;
     type_ = other.type_;
     isAnalyzed_ = other.isAnalyzed_;
+    isRewritten_ = other.isRewritten_;
     isOnClauseConjunct_ = other.isOnClauseConjunct_;
     printSqlInParens_ = other.printSqlInParens_;
     selectivity_ = other.selectivity_;
@@ -448,6 +467,8 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   public boolean isAnalyzed() { return isAnalyzed_; }
+  public boolean isRewritten() { return isRewritten_; }
+  public void setRewritten(boolean isRewritten) { isRewritten_ = isRewritten; }
   public ExprId getId() { return id_; }
   protected void setId(ExprId id) { id_ = id; }
   public Type getType() { return type_; }
@@ -636,15 +657,16 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    *      called with fn(decimal(10,2), decimal(5,3))
    * both children will be cast to (11, 3).
    *
-   * If strictDecimal is true, we will only consider casts between decimal types that
-   * result in no loss of information. If it is not possible to come with such casts,
-   * we will throw an exception.
+   * 'compatibility' defines the mode of wildcard type resolution;
+   * if TypeCompatibility.isStrictDecimal() is true, it only considers casts that result
+   * in no loss of information, if 'compatibility' is DEFAULT it does not guarantee
+   * decimal cast without information loss.
    */
-  protected void castForFunctionCall(
-      boolean ignoreWildcardDecimals, boolean strictDecimal) throws AnalysisException {
+  protected void castForFunctionCall(boolean ignoreWildcardDecimals,
+      TypeCompatibility compatibility) throws AnalysisException {
     Preconditions.checkState(fn_ != null);
     Type[] fnArgs = fn_.getArgs();
-    Type resolvedWildcardType = getResolvedWildCardType(strictDecimal);
+    Type resolvedWildcardType = getResolvedWildCardType(compatibility);
     if (resolvedWildcardType != null) {
       if (resolvedWildcardType.isNull()) {
         throw new SqlCastException(String.format(
@@ -692,11 +714,13 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
 
   /**
    * Returns the max resolution type of all the wild card decimal types.
-   * Returns null if there are no wild card types. If strictDecimal is enabled, will
-   * return an invalid type if it is not possible to come up with a decimal type that
-   * is guaranteed to not lose information.
+   * Returns null if there are no wild card types. If compatibility.isStrictDecimal() is
+   * true, it will return an invalid type if it is not possible to come up with a decimal
+   * type that is guaranteed to not lose information.
    */
-  Type getResolvedWildCardType(boolean strictDecimal) {
+  Type getResolvedWildCardType(TypeCompatibility compatibility) {
+    Preconditions.checkState(compatibility.equals(TypeCompatibility.DEFAULT)
+        || compatibility.equals(TypeCompatibility.STRICT_DECIMAL));
     Type result = null;
     Type[] fnArgs = fn_.getArgs();
     for (int i = 0; i < children_.size(); ++i) {
@@ -713,8 +737,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         ScalarType decimalType = (ScalarType) childType;
         result = decimalType.getMinResolutionDecimal();
       } else {
-        result = Type.getAssignmentCompatibleType(
-            result, childType, false, strictDecimal);
+        result = Type.getAssignmentCompatibleType(result, childType, compatibility);
       }
     }
     if (result != null && !result.isNull()) {
@@ -840,23 +863,29 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
 
   protected String toSqlImpl() { return toSqlImpl(DEFAULT); };
 
-  // Convert this expr, including all children, to its Thrift representation.
+  // For locations that don't need to handle tuple caching yet, keep the
+  // old signature with a default ThriftSerializationCtx.
   public TExpr treeToThrift() {
+    return treeToThrift(new ThriftSerializationCtx());
+  }
+
+  // Convert this expr, including all children, to its Thrift representation.
+  public TExpr treeToThrift(ThriftSerializationCtx serialCtx) {
     if (type_.isNull()) {
       // Hack to ensure BE never sees TYPE_NULL. If an expr makes it this far without
       // being cast to a non-NULL type, the type doesn't matter and we can cast it
       // arbitrarily.
       Preconditions.checkState(IS_NULL_LITERAL.apply(this) ||
           this instanceof SlotRef);
-      return NullLiteral.create(ScalarType.BOOLEAN).treeToThrift();
+      return NullLiteral.create(ScalarType.BOOLEAN).treeToThrift(serialCtx);
     }
     TExpr result = new TExpr();
-    treeToThriftHelper(result);
+    treeToThriftHelper(result, serialCtx);
     return result;
   }
 
   // Append a flattened version of this expr, including all children, to 'container'.
-  protected void treeToThriftHelper(TExpr container) {
+  protected void treeToThriftHelper(TExpr container, ThriftSerializationCtx serialCtx) {
     Preconditions.checkState(isAnalyzed_,
         "Must be analyzed before serializing to thrift. %s", this);
     Preconditions.checkState(!type_.isWildcardDecimal());
@@ -873,16 +902,24 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       msg.setFn(thriftFn);
       if (fn_.hasVarArgs()) msg.setVararg_start_idx(fn_.getNumArgs() - 1);
     }
-    toThrift(msg);
+    toThrift(msg, serialCtx);
     container.addToNodes(msg);
     for (Expr child: children_) {
-      child.treeToThriftHelper(container);
+      child.treeToThriftHelper(container, serialCtx);
     }
   }
 
   // Convert this expr into msg (excluding children), which requires setting
   // msg.op as well as the expr-specific field.
   protected abstract void toThrift(TExprNode msg);
+
+  // Exprs should override this signature of toThrift() if they need access to
+  // the ThriftSerializationContext. That is necessary if the Expr is non-deterministic
+  // or uses SlotIds/TupleIds. Everything else can simply keep using the old signature
+  // for toThrift().
+  protected void toThrift(TExprNode msg, ThriftSerializationCtx serialCtx) {
+    toThrift(msg);
+  }
 
   /**
    * Returns the product of the given exprs' number of distinct values or -1 if any of
@@ -903,12 +940,17 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     return numDistinctValues;
   }
 
-  public static List<TExpr> treesToThrift(List<? extends Expr> exprs) {
+  public static List<TExpr> treesToThrift(List<? extends Expr> exprs,
+      ThriftSerializationCtx serialCtx) {
     List<TExpr> result = new ArrayList<>();
     for (Expr expr: exprs) {
-      result.add(expr.treeToThrift());
+      result.add(expr.treeToThrift(serialCtx));
     }
     return result;
+  }
+
+  public static List<TExpr> treesToThrift(List<? extends Expr> exprs) {
+    return treesToThrift(exprs, new ThriftSerializationCtx());
   }
 
   public boolean isAggregate() {
@@ -980,11 +1022,31 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
 
   /**
    * Returns true if two expressions are equal. The equality comparison works on analyzed
-   * as well as unanalyzed exprs by ignoring implicit casts.
+   * as well as unanalyzed exprs by ignoring implicit casts. If overridden by a subclass,
+   * also provide an appropriate implementation for hashCode.
    */
   @Override
   public final boolean equals(Object obj) {
     return obj instanceof Expr && matches((Expr) obj, SlotRef.SLOTREF_EQ_CMP);
+  }
+
+  /**
+   * Local hash code that ignores children.
+   */
+  protected int localHash() {
+    return Objects.hash(getClass(), fn_);
+  }
+
+  /**
+   * Returns a hash code based on the same keys used for equals. Any subclasses that
+   * override equals must ensure hashCode is defined such that a.equals(b) implies
+   * a.hashCode() == b.hashCode(), as required by
+   * https://docs.oracle.com/javase/8/docs/api/java/lang/Object.html#hashCode--
+   */
+  @Override
+  public int hashCode() {
+    // CastExpr and SlotRef overload hashCode rather than mirroring 'matches'.
+    return Objects.hash(localHash(), children_);
   }
 
   /**
@@ -1026,15 +1088,6 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       if (l2.contains(element)) result.add(element);
     }
     return result;
-  }
-
-  @Override
-  public int hashCode() {
-    if (id_ == null) {
-      throw new UnsupportedOperationException("Expr.hashCode() is not implemented");
-    } else {
-      return id_.asInt();
-    }
   }
 
   /**
@@ -1088,7 +1141,14 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     if (smap == null) return result;
     result = result.substituteImpl(smap, analyzer);
     result.analyze(analyzer);
-    if (preserveRootType && !type_.equals(result.getType())) result = result.castTo(type_);
+    if (preserveRootType && !type_.equals(result.getType())) {
+      if (this instanceof CastExpr) {
+        CastExpr thisCastExpr = (CastExpr) this;
+        TypeCompatibility compatibility = thisCastExpr.getCompatibility();
+        return result.castTo(type_, compatibility);
+      }
+      return result.castTo(type_);
+    }
     return result;
   }
 
@@ -1142,14 +1202,16 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       Expr substExpr = smap.get(this);
       if (substExpr != null) return substExpr.clone();
     }
+    substituteImplOnChildren(smap, analyzer);
+    resetAnalysisState();
+    return this;
+  }
+
+  protected final void substituteImplOnChildren(ExprSubstitutionMap smap,
+      Analyzer analyzer) {
     for (int i = 0; i < children_.size(); ++i) {
       children_.set(i, children_.get(i).substituteImpl(smap, analyzer));
     }
-    // SlotRefs must remain analyzed to support substitution across query blocks. All
-    // other exprs must be analyzed again after the substitution to add implicit casts
-    // and for resolving their correct function signature.
-    if (!(this instanceof SlotRef)) resetAnalysisState();
-    return this;
   }
 
   /**
@@ -1518,48 +1580,57 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   /**
-   * Casts this expr to a specific target type. It checks the validity of the cast and
-   * calls uncheckedCastTo().
+   * Casts this expr to a specific target type. It checks the validity of the cast
+   * according to 'compatibility' and calls uncheckedCastTo().
    * @param targetType
    *          type to be cast to
+   * @param compatibility
+   *          compatibility level that defines the relation between 'targetType' and the
+   *          type of the expression
    * @return cast expression, or converted literal,
    *         should never return null
    * @throws AnalysisException
    *           when an invalid cast is asked for, for example,
    *           failure to convert a string literal to a date literal
    */
-  public final Expr castTo(Type targetType) throws AnalysisException {
-    Type type = Type.getAssignmentCompatibleType(this.type_, targetType, false, false);
+  public final Expr castTo(Type targetType, TypeCompatibility compatibility)
+      throws AnalysisException {
+    Type type = Type.getAssignmentCompatibleType(this.type_, targetType, compatibility);
     Preconditions.checkState(type.isValid(), "cast %s to %s", this.type_, targetType);
     // If the targetType is NULL_TYPE then ignore the cast because NULL_TYPE
     // is compatible with all types and no cast is necessary.
     if (targetType.isNull()) return this;
-    if (!targetType.isDecimal()) {
-      // requested cast must be to assignment-compatible type
-      // (which implies no loss of precision)
-      if (!targetType.equals(type)) {
-        throw new SqlCastException(
-          "targetType=" + targetType + " type=" + type);
-      }
-    }
-    return uncheckedCastTo(targetType);
+    // If decimal, cast to the target type.
+    if (targetType.isDecimal()) return uncheckedCastTo(targetType, compatibility);
+    // If they match, cast to the type both values can be assigned to (the definition of
+    // getAssignmentCompatibleType), which implies no loss of precision. Note that
+    // getAssignmentCompatibleType always returns a "real" (not wildcard) type.
+    if (type.matchesType(targetType)) return uncheckedCastTo(type, compatibility);
+    throw new SqlCastException("targetType=" + targetType + " type=" + type);
+  }
+
+  public final Expr castTo(Type targetType) throws AnalysisException {
+    return castTo(targetType, TypeCompatibility.DEFAULT);
   }
 
   /**
-   * Create an expression equivalent to 'this' but returning targetType;
-   * possibly by inserting an implicit cast,
-   * or by returning an altogether new expression
-   * or by returning 'this' with a modified return type'.
-   * @param targetType
-   *          type to be cast to
-   * @return cast expression, or converted literal,
-   *         should never return null
-   * @throws AnalysisException
-   *           when an invalid cast is asked for, for example,
-   *           failure to convert a string literal to a date literal
+   * Create an expression equivalent to 'this' but returning targetType; possibly by
+   * inserting an implicit cast, or by returning an altogether new expression or by
+   * returning 'this' with a modified return type'.
+   *
+   * @param targetType    type to be cast to
+   * @param compatibility compatibility level used to calculate the cast
+   * @return cast expression, or converted literal, should never return null
+   * @throws AnalysisException when an invalid cast is asked for, for example, failure to
+   *                           convert a string literal to a date literal
    */
+  protected Expr uncheckedCastTo(Type targetType, TypeCompatibility compatibility)
+      throws AnalysisException {
+    return new CastExpr(targetType, this, compatibility);
+  }
+
   protected Expr uncheckedCastTo(Type targetType) throws AnalysisException {
-    return new CastExpr(targetType, this);
+    return uncheckedCastTo(targetType, TypeCompatibility.DEFAULT);
   }
 
   /**
@@ -1640,22 +1711,45 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   /**
+   * Returns the source expression for this expression. Traverses the source
+   * exprs of intermediate slot descriptors to resolve materialization points
+   * (e.g., aggregations). Returns null if there are multiple source Exprs
+   * mapped to the expression at any given point.
+   */
+  public Expr findSrcExpr() {
+    // If the source expression is a constant expression, it won't have a scanSlotRef
+    // and we can return this.
+    if (isConstant()) {
+      return this;
+    }
+    SlotRef slotRef = unwrapSlotRef(false);
+    if (slotRef == null) return null;
+    SlotDescriptor slotDesc = slotRef.getDesc();
+    if (slotDesc.isScanSlot()) return slotRef;
+    if (slotDesc.getSourceExprs().size() == 1) {
+      return slotDesc.getSourceExprs().get(0).findSrcExpr();
+    }
+    // No known source expr, or there are several source exprs meaning the slot is
+    // has no single source table.
+    return null;
+  }
+
+  /**
    * Returns the descriptor of the scan slot that directly or indirectly produces
    * the values of 'this' SlotRef. Traverses the source exprs of intermediate slot
    * descriptors to resolve materialization points (e.g., aggregations).
    * Returns null if 'e' or any source expr of 'e' is not a SlotRef or cast SlotRef.
    */
   public SlotDescriptor findSrcScanSlot() {
-    SlotRef slotRef = unwrapSlotRef(false);
-    if (slotRef == null) return null;
-    SlotDescriptor slotDesc = slotRef.getDesc();
-    if (slotDesc.isScanSlot()) return slotDesc;
-    if (slotDesc.getSourceExprs().size() == 1) {
-      return slotDesc.getSourceExprs().get(0).findSrcScanSlot();
+    Expr sourceExpr = findSrcExpr();
+    if (sourceExpr == null) {
+      return null;
     }
-    // No known source expr, or there are several source exprs meaning the slot is
-    // has no single source table.
-    return null;
+    SlotRef slotRef = sourceExpr.unwrapSlotRef(false);
+    if (slotRef == null) {
+      return null;
+    }
+    return slotRef.getDesc();
   }
 
   /**
@@ -1788,9 +1882,11 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    * Analyzes and evaluates expression to an integral value, returned as a long.
    * Throws if the expression cannot be evaluated or if the value evaluates to null.
    * The 'name' parameter is used in exception messages, e.g. "LIMIT expression
-   * evaluates to NULL".
+   * evaluates to NULL". If 'acceptDate' is true, treat Date expression as integral
+   * expression as well.
    */
-  public long evalToInteger(Analyzer analyzer, String name) throws AnalysisException {
+  public long evalToInteger(Analyzer analyzer, String name, boolean acceptDate)
+      throws AnalysisException {
     // Check for slotrefs and subqueries before analysis so we can provide a more
     // helpful error message.
     if (contains(SlotRef.class) || contains(Subquery.class)) {
@@ -1802,7 +1898,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       throw new AnalysisException(name + " expression must be a constant expression: " +
           toSql());
     }
-    if (!getType().isIntegerType()) {
+    if (!getType().isIntegerType() && !(acceptDate && getType().isDate())) {
       throw new AnalysisException(name + " expression must be an integer type but is '" +
           getType() + "': " + toSql());
     }
@@ -1812,6 +1908,16 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     } catch (InternalException e) {
       throw new AnalysisException("Failed to evaluate expr: " + toSql(), e);
     }
+
+    try {
+      return evalToInteger(val, acceptDate);
+    } catch (AnalysisException e) {
+      throw new AnalysisException(name + " expression evaluates to NULL: " + toSql());
+    }
+  }
+
+  public static long evalToInteger(TColumnValue val, boolean acceptDate)
+      throws AnalysisException {
     long value;
     if (val.isSetLong_val()) {
       value = val.getLong_val();
@@ -1821,10 +1927,16 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       value = val.getShort_val();
     } else if (val.isSetByte_val()) {
       value = val.getByte_val();
+    } else if (acceptDate && val.isSetDate_val()) {
+      value = val.getDate_val();
     } else {
-      throw new AnalysisException(name + " expression evaluates to NULL: " + toSql());
+      throw new AnalysisException("TColumnValue evaluates to NULL: " + val);
     }
     return value;
+  }
+
+  public long evalToInteger(Analyzer analyzer, String name) throws AnalysisException {
+    return evalToInteger(analyzer, name, false);
   }
 
   /**
@@ -1881,4 +1993,50 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     }
     return null;
   }
+
+  /**
+   * Returns the first non-const expression on the following path:
+   *  - checking whether the expression itself is constant or not
+   *  If there's an underlying slot ref:
+   *  - checking the slot desc's source expressions constness
+   */
+  public Optional<Expr> getFirstNonConstSourceExpr() {
+    SlotRef slotRef = unwrapSlotRef(false);
+
+    if (slotRef == null) {
+      Preconditions.checkState(isAnalyzed());
+      return isConstant() ? Optional.empty() : Optional.of(this);
+    }
+
+    SlotDescriptor slotDesc = slotRef.getDesc();
+    Preconditions.checkNotNull(slotDesc);
+
+    if (slotDesc.getSourceExprs().isEmpty()) {
+      return Optional.of(this);
+    }
+
+    Optional<Expr> nonConstSourceExpr = Optional.empty();
+    for (Expr expr : slotDesc.getSourceExprs()) {
+      Preconditions.checkState(expr.isAnalyzed());
+      if (!expr.isConstant()) {
+        nonConstSourceExpr = Optional.of(expr);
+        break;
+      }
+    }
+    return nonConstSourceExpr;
+  }
+
+  /**
+   * Returns true if 'this' is a constant.
+   */
+  public boolean shouldConvertToCNF() {
+    return isConstant();
+  }
+
+  /**
+   * For use with workload management. Returns {@code true} if this instance has child
+   * {@link SlotRef}s that need to be included in the workload management lists of columns
+   * used in the query.
+   */
+  public boolean recordChildrenInWorkloadManagement() { return false; }
 }

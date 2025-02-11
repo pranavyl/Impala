@@ -19,6 +19,7 @@ package org.apache.impala.service;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -37,8 +38,10 @@ import org.apache.impala.thrift.TAlterTableAddDropRangePartitionParams;
 import org.apache.impala.thrift.TColumn;
 import org.apache.impala.thrift.TCreateTableParams;
 import org.apache.impala.thrift.TKuduPartitionParam;
+import org.apache.impala.thrift.TKuduPartitionByHashParam;
 import org.apache.impala.thrift.TRangePartition;
 import org.apache.impala.thrift.TRangePartitionOperationType;
+import org.apache.impala.util.EventSequence;
 import org.apache.impala.util.KuduUtil;
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.ColumnSchema.ColumnSchemaBuilder;
@@ -49,6 +52,7 @@ import org.apache.kudu.client.KuduClient;
 import org.apache.kudu.client.KuduException;
 import org.apache.kudu.client.PartialRow;
 import org.apache.kudu.client.RangePartitionBound;
+import org.apache.kudu.client.RangePartitionWithCustomHashSchema;
 import org.apache.kudu.util.CharUtil;
 import org.apache.kudu.util.DecimalUtil;
 import org.apache.log4j.Logger;
@@ -67,16 +71,50 @@ import com.google.common.collect.Sets;
 public class KuduCatalogOpExecutor {
   public static final Logger LOG = Logger.getLogger(KuduCatalogOpExecutor.class);
 
+  // Labels used in catalog timeline
+  private static final String CHECKED_KUDU_TABLE_EXISTENCE =
+      "Checked table existence in Kudu";
+  private static final String CREATED_KUDU_TABLE = "Created table in Kudu";
+  private static final String ALTERED_KUDU_TABLE = "Altered table in Kudu";
+  public static final String GOT_KUDU_CLIENT = "Got Kudu client";
+  private static final String GOT_KUDU_DDL_LOCK = "Got kuduDdlLock";
+  public static final String OPENED_KUDU_TABLE = "Opened Kudu table";
+  private static final String POPULATED_COLS_FROM_KUDU =
+      "Populated external table cols from Kudu";
+
   private static final Object kuduDdlLock_ = new Object();
+
+  /**
+   * Wrapper to check kudu table existence and mark the given 'catalogTimeline' when it
+   * finishes.
+   */
+  private static boolean checkTableExistence(KuduClient client, String kuduTableName,
+      EventSequence catalogTimeline) throws KuduException {
+    boolean tableExists = client.tableExists(kuduTableName);
+    catalogTimeline.markEvent(CHECKED_KUDU_TABLE_EXISTENCE);
+    return tableExists;
+  }
+
+  /**
+   * Wrapper to create the kudu table and mark the given 'catalogTimeline' when it
+   * finishes.
+   */
+  private static org.apache.kudu.client.KuduTable createKuduTable(KuduClient client,
+      String name, Schema schema, CreateTableOptions tableOpts,
+      EventSequence catalogTimeline) throws KuduException {
+    org.apache.kudu.client.KuduTable table = client.createTable(name, schema, tableOpts);
+    catalogTimeline.markEvent(CREATED_KUDU_TABLE);
+    return table;
+  }
 
   /**
    * Create a table in Kudu with a schema equivalent to the schema stored in 'msTbl'.
    * Throws an exception if 'msTbl' represents an external table or if the table couldn't
    * be created in Kudu.
    */
-  public static void createSynchronizedTable(
-          org.apache.hadoop.hive.metastore.api.Table msTbl,
-          TCreateTableParams params) throws ImpalaRuntimeException {
+  public static void createSynchronizedTable(EventSequence catalogTimeline,
+      org.apache.hadoop.hive.metastore.api.Table msTbl,
+      TCreateTableParams params) throws ImpalaRuntimeException {
     Preconditions.checkState(KuduTable.isSynchronizedTable(msTbl));
     Preconditions.checkState(
         msTbl.getParameters().get(KuduTable.KEY_TABLE_ID) == null);
@@ -86,13 +124,14 @@ public class KuduCatalogOpExecutor {
       LOG.trace(String.format("Creating table '%s' in master '%s'", kuduTableName,
           masterHosts));
     }
-    KuduClient kudu = KuduUtil.getKuduClient(masterHosts);
+    KuduClient kudu = KuduUtil.getKuduClient(masterHosts, catalogTimeline);
     try {
       // Acquire lock to protect table existence check and table creation, see IMPALA-8984
       synchronized (kuduDdlLock_) {
+        catalogTimeline.markEvent(GOT_KUDU_DDL_LOCK);
         // TODO: The IF NOT EXISTS case should be handled by Kudu to ensure atomicity.
         // (see KUDU-1710).
-        boolean tableExists = kudu.tableExists(kuduTableName);
+        boolean tableExists = checkTableExistence(kudu, kuduTableName, catalogTimeline);
         if (tableExists && params.if_not_exists) return;
 
         // if table is managed or external with external.purge.table = true in
@@ -104,8 +143,8 @@ public class KuduCatalogOpExecutor {
         Preconditions.checkState(!Strings.isNullOrEmpty(kuduTableName));
         Schema schema = createTableSchema(params);
         CreateTableOptions tableOpts = buildTableOptions(msTbl, params, schema);
-        org.apache.kudu.client.KuduTable table =
-            kudu.createTable(kuduTableName, schema, tableOpts);
+        org.apache.kudu.client.KuduTable table = createKuduTable(
+            kudu, kuduTableName, schema, tableOpts, catalogTimeline);
         // Populate table ID from Kudu table if Kudu's integration with the Hive
         // Metastore is enabled.
         if (KuduTable.isHMSIntegrationEnabled(masterHosts)) {
@@ -120,14 +159,18 @@ public class KuduCatalogOpExecutor {
     }
   }
 
-  private static ColumnSchema createColumnSchema(TColumn column, boolean isKey)
-      throws ImpalaRuntimeException {
+  private static ColumnSchema createColumnSchema(TColumn column, boolean isKey,
+      boolean isKeyUnique) throws ImpalaRuntimeException {
     Type type = Type.fromThrift(column.getColumnType());
     Preconditions.checkState(type != null);
     org.apache.kudu.Type kuduType = KuduUtil.fromImpalaType(type);
 
     ColumnSchemaBuilder csb = new ColumnSchemaBuilder(column.getColumnName(), kuduType);
-    csb.key(isKey);
+    if (isKey && !isKeyUnique) {
+      csb.nonUniqueKey(true);
+    } else {
+      csb.key(isKey);
+    }
     if (column.isSetIs_nullable()) {
       // If nullability is explicitly set and the column is a key, it must have been
       // set as NOT NULL. This is the default, but it is also valid to specify it.
@@ -179,8 +222,9 @@ public class KuduCatalogOpExecutor {
 
     if (!leadingColNames.equals(keyColNames)) {
       throw new ImpalaRuntimeException(String.format(
-          "Kudu PRIMARY KEY columns must be specified as the first columns " +
+          "Kudu %s columns must be specified as the first columns " +
           "in the table (expected leading columns (%s) but found (%s))",
+          KuduUtil.getPrimaryKeyString(params.is_primary_key_unique),
           PrintUtils.joinQuoted(keyColNames),
           PrintUtils.joinQuoted(leadingColNames)));
     }
@@ -188,7 +232,8 @@ public class KuduCatalogOpExecutor {
     List<ColumnSchema> colSchemas = new ArrayList<>(params.getColumnsSize());
     for (TColumn column: params.getColumns()) {
       boolean isKey = colSchemas.size() < keyColNames.size();
-      colSchemas.add(createColumnSchema(column, isKey));
+      boolean isKeyUnique = isKey ? params.is_primary_key_unique : false;
+      colSchemas.add(createColumnSchema(column, isKey, isKeyUnique));
     }
     return new Schema(colSchemas);
   }
@@ -221,8 +266,14 @@ public class KuduCatalogOpExecutor {
             Preconditions.checkState(rangeBounds.size() == 2);
             Pair<PartialRow, RangePartitionBound> lowerBound = rangeBounds.get(0);
             Pair<PartialRow, RangePartitionBound> upperBound = rangeBounds.get(1);
-            tableOpts.addRangePartition(lowerBound.first, upperBound.first,
-                lowerBound.second, upperBound.second);
+            if (rangePartition.isSetHash_specs()) {
+              RangePartitionWithCustomHashSchema rangePart =
+                  getRangePartitionWithCustomHashSchema(rangePartition, rangeBounds);
+              tableOpts.addRangePartition(rangePart);
+            } else {
+              tableOpts.addRangePartition(lowerBound.first, upperBound.first,
+                  lowerBound.second, upperBound.second);
+            }
           }
         }
       }
@@ -254,18 +305,23 @@ public class KuduCatalogOpExecutor {
       tableOpts.setNumReplicas(parsedReplicas);
     }
 
-    // Set the table's owner.
+    // Set the table's owner and table comment.
     tableOpts.setOwner(msTbl.getOwner());
+    if (params.getComment() != null) tableOpts.setComment(params.getComment());
+
     return tableOpts;
   }
 
   /**
    * Drops the table in Kudu. If the table does not exist and 'ifExists' is false, a
    * TableNotFoundException is thrown. If the table exists and could not be dropped,
-   * an ImpalaRuntimeException is thrown.
+   * an ImpalaRuntimeException is thrown. If 'kudu_table_reserve_seconds' is 0, the
+   * table will be deleted immediately, otherwise the table will be reserved in the
+   * kudu cluster for 'kudu_table_reserve_seconds'.
    */
   public static void dropTable(org.apache.hadoop.hive.metastore.api.Table msTbl,
-      boolean ifExists) throws ImpalaRuntimeException, TableNotFoundException {
+      boolean ifExists, int kudu_table_reserve_seconds, EventSequence catalogTimeline)
+      throws ImpalaRuntimeException, TableNotFoundException {
     Preconditions.checkState(KuduTable.isSynchronizedTable(msTbl));
     String tableName = msTbl.getParameters().get(KuduTable.KEY_TABLE_NAME);
     String masterHosts = msTbl.getParameters().get(KuduTable.KEY_MASTER_HOSTS);
@@ -273,13 +329,14 @@ public class KuduCatalogOpExecutor {
       LOG.trace(String.format("Dropping table '%s' from master '%s'", tableName,
           masterHosts));
     }
-    KuduClient kudu = KuduUtil.getKuduClient(masterHosts);
+    KuduClient kudu = KuduUtil.getKuduClient(masterHosts, catalogTimeline);
     try {
       Preconditions.checkState(!Strings.isNullOrEmpty(tableName));
       // TODO: The IF EXISTS case should be handled by Kudu to ensure atomicity.
       // (see KUDU-1710).
       if (kudu.tableExists(tableName)) {
-        kudu.deleteTable(tableName);
+        kudu.deleteTable(tableName, kudu_table_reserve_seconds);
+        catalogTimeline.markEvent("Deleted table in Kudu");
       } else if (!ifExists) {
         throw new TableNotFoundException(String.format(
             "Table '%s' does not exist in Kudu master(s) '%s'.", tableName, masterHosts));
@@ -295,7 +352,7 @@ public class KuduCatalogOpExecutor {
    * an equivalent schema for external tables. Throws an exception if any errors
    * are encountered.
    */
-  public static void populateExternalTableColsFromKudu(
+  public static void populateExternalTableColsFromKudu(EventSequence catalogTimeline,
       org.apache.hadoop.hive.metastore.api.Table msTbl) throws ImpalaRuntimeException {
     org.apache.hadoop.hive.metastore.api.Table msTblCopy = msTbl.deepCopy();
     List<FieldSchema> cols = msTblCopy.getSd().getCols();
@@ -310,13 +367,14 @@ public class KuduCatalogOpExecutor {
       LOG.trace(String.format("Loading schema of table '%s' from master '%s'",
           kuduTableName, masterHosts));
     }
-    KuduClient kudu = KuduUtil.getKuduClient(masterHosts);
+    KuduClient kudu = KuduUtil.getKuduClient(masterHosts, catalogTimeline);
     try {
-      if (!kudu.tableExists(kuduTableName)) {
+      if (!checkTableExistence(kudu, kuduTableName, catalogTimeline)) {
         throw new ImpalaRuntimeException(String.format("Table does not exist in Kudu: " +
             "'%s'", kuduTableName));
       }
       org.apache.kudu.client.KuduTable kuduTable = kudu.openTable(kuduTableName);
+      catalogTimeline.markEvent(OPENED_KUDU_TABLE);
       // Replace the columns in the Metastore table with the columns from the recently
       // accessed Kudu schema.
       cols.clear();
@@ -341,6 +399,7 @@ public class KuduCatalogOpExecutor {
     List<FieldSchema> newCols = msTbl.getSd().getCols();
     newCols.clear();
     newCols.addAll(cols);
+    catalogTimeline.markEvent(POPULATED_COLS_FROM_KUDU);
   }
 
   /**
@@ -370,29 +429,52 @@ public class KuduCatalogOpExecutor {
   /**
    * Renames a Kudu table.
    */
-  public static void renameTable(KuduTable tbl, String newName)
-      throws ImpalaRuntimeException {
+  public static void renameTable(KuduTable tbl, String newName,
+      EventSequence catalogTimeline) throws ImpalaRuntimeException {
     Preconditions.checkState(!Strings.isNullOrEmpty(newName));
     AlterTableOptions alterTableOptions = new AlterTableOptions();
     alterTableOptions.renameTable(newName);
     String errMsg = String.format("Error renaming Kudu table " +
         "%s to %s", tbl.getKuduTableName(), newName);
-    KuduClient client = KuduUtil.getKuduClient(tbl.getKuduMasterHosts());
+    KuduClient client = KuduUtil.getKuduClient(tbl.getKuduMasterHosts(), catalogTimeline);
     try {
       client.alterTable(tbl.getKuduTableName(), alterTableOptions);
       if (!client.isAlterTableDone(newName)) {
         throw new ImpalaRuntimeException(errMsg + ": Kudu operation timed out");
       }
+      catalogTimeline.markEvent(ALTERED_KUDU_TABLE);
     } catch (KuduException e) {
       throw new ImpalaRuntimeException(errMsg, e);
     }
   }
 
+  private static RangePartitionWithCustomHashSchema getRangePartitionWithCustomHashSchema(
+      TRangePartition rangePartition,
+      List<Pair<PartialRow, RangePartitionBound>> rangeBounds) {
+    Pair<PartialRow, RangePartitionBound> lowerBound = rangeBounds.get(0);
+    Pair<PartialRow, RangePartitionBound> upperBound = rangeBounds.get(1);
+    RangePartitionWithCustomHashSchema rangePart =
+      new RangePartitionWithCustomHashSchema(
+          lowerBound.first,
+          upperBound.first,
+          lowerBound.second,
+          upperBound.second);
+    Iterator<TKuduPartitionParam> specIter = rangePartition.getHash_specsIterator();
+    while (specIter.hasNext()) {
+      TKuduPartitionParam param = specIter.next();
+      TKuduPartitionByHashParam hash = param.getBy_hash_param();
+      // Seed parameter is currently not supported at all in the Impala grammar
+      int seed = 0;
+      rangePart.addHashPartitions(hash.getColumns(), hash.getNum_partitions(), seed);
+    }
+    return rangePart;
+  }
   /**
    * Adds/drops a range partition.
    */
   public static void addDropRangePartition(KuduTable tbl,
-      TAlterTableAddDropRangePartitionParams params) throws ImpalaRuntimeException {
+      TAlterTableAddDropRangePartitionParams params, EventSequence catalogTimeline)
+      throws ImpalaRuntimeException {
     TRangePartition rangePartition = params.getRange_partition_spec();
     List<Pair<PartialRow, RangePartitionBound>> rangeBounds =
         getRangePartitionBounds(rangePartition, tbl);
@@ -402,8 +484,14 @@ public class KuduCatalogOpExecutor {
     AlterTableOptions alterTableOptions = new AlterTableOptions();
     TRangePartitionOperationType type = params.getType();
     if (type == TRangePartitionOperationType.ADD) {
-      alterTableOptions.addRangePartition(lowerBound.first, upperBound.first,
-          lowerBound.second, upperBound.second);
+      if (rangePartition.isSetHash_specs()) {
+        RangePartitionWithCustomHashSchema rangePart =
+            getRangePartitionWithCustomHashSchema(rangePartition, rangeBounds);
+        alterTableOptions.addRangePartition(rangePart);
+      } else {
+        alterTableOptions.addRangePartition(lowerBound.first, upperBound.first,
+            lowerBound.second, upperBound.second);
+      }
     } else {
       alterTableOptions.dropRangePartition(lowerBound.first, upperBound.first,
           lowerBound.second, upperBound.second);
@@ -412,7 +500,7 @@ public class KuduCatalogOpExecutor {
         "table %s", (type == TRangePartitionOperationType.ADD ? "adding" : "dropping"),
         tbl.getName());
     try {
-      alterKuduTable(tbl, alterTableOptions, errMsg);
+      alterKuduTable(tbl, alterTableOptions, errMsg, catalogTimeline);
     } catch (ImpalaRuntimeException e) {
       if (!params.isIgnore_errors()) throw e;
     }
@@ -461,28 +549,28 @@ public class KuduCatalogOpExecutor {
   /**
    * Adds a column to an existing Kudu table.
    */
-  public static void addColumn(KuduTable tbl, List<TColumn> columns)
-      throws ImpalaRuntimeException {
+  public static void addColumn(KuduTable tbl, List<TColumn> columns,
+      EventSequence catalogTimeline) throws ImpalaRuntimeException {
     AlterTableOptions alterTableOptions = new AlterTableOptions();
     for (TColumn column: columns) {
-      alterTableOptions.addColumn(createColumnSchema(column, false));
+      alterTableOptions.addColumn(createColumnSchema(column, false, false));
     }
     String errMsg = "Error adding columns to Kudu table " + tbl.getName();
-    alterKuduTable(tbl, alterTableOptions, errMsg);
+    alterKuduTable(tbl, alterTableOptions, errMsg, catalogTimeline);
   }
 
   /**
    * Drops a column from a Kudu table.
    */
-  public static void dropColumn(KuduTable tbl, String colName)
-      throws ImpalaRuntimeException {
+  public static void dropColumn(KuduTable tbl, String colName,
+      EventSequence catalogTimeline) throws ImpalaRuntimeException {
     Preconditions.checkState(!Strings.isNullOrEmpty(colName));
     KuduColumn col = (KuduColumn) tbl.getColumn(colName);
     AlterTableOptions alterTableOptions = new AlterTableOptions();
     alterTableOptions.dropColumn(col.getKuduName());
     String errMsg = String.format("Error dropping column %s from " +
         "Kudu table %s", colName, tbl.getName());
-    alterKuduTable(tbl, alterTableOptions, errMsg);
+    alterKuduTable(tbl, alterTableOptions, errMsg, catalogTimeline);
   }
 
   /**
@@ -495,8 +583,8 @@ public class KuduCatalogOpExecutor {
    * new rowsets as they are written out, and possibly to old rowsets if they are
    * compacted into new rowsets depending on cost based decisions Kudu makes.
    */
-  public static void alterColumn(KuduTable tbl, String colName, TColumn newCol)
-      throws ImpalaRuntimeException {
+  public static void alterColumn(KuduTable tbl, String colName, TColumn newCol,
+      EventSequence catalogTimeline) throws ImpalaRuntimeException {
     Preconditions.checkState(!Strings.isNullOrEmpty(colName));
     Preconditions.checkNotNull(newCol);
     Preconditions.checkState(!newCol.isIs_key());
@@ -540,11 +628,11 @@ public class KuduCatalogOpExecutor {
 
     String errMsg = String.format(
         "Error altering column %s in Kudu table %s", colName, tbl.getName());
-    alterKuduTable(tbl, alterTableOptions, errMsg);
+    alterKuduTable(tbl, alterTableOptions, errMsg, catalogTimeline);
   }
 
-  public static void alterSetOwner(KuduTable tbl, String newOwner)
-      throws ImpalaRuntimeException {
+  public static void alterSetOwner(KuduTable tbl, String newOwner,
+      EventSequence catalogTimeline) throws ImpalaRuntimeException {
     // We still need to call alterKuduTable() even if tbl.getOwnerUser() equals
     // 'newOwner'. It is possible that the owner of 'tbl' from Kudu's perspective is
     // different than that from HMS' perspective, i.e., tbl.getOwnerUser(). Such a
@@ -555,7 +643,7 @@ public class KuduCatalogOpExecutor {
     alterTableOptions.setOwner(newOwner);
     String errMsg = String.format(
         "Error setting the owner of Kudu table %s to %s", tbl.getName(), newOwner);
-    alterKuduTable(tbl, alterTableOptions, errMsg);
+    alterKuduTable(tbl, alterTableOptions, errMsg, catalogTimeline);
   }
 
   /**
@@ -563,14 +651,15 @@ public class KuduCatalogOpExecutor {
    * the alter table operation is finished or until the operation timeout is reached.
    * Throws an ImpalaRuntimeException if the operation cannot be completed successfully.
    */
-  public static void alterKuduTable(KuduTable tbl, AlterTableOptions ato, String errMsg)
-      throws ImpalaRuntimeException {
-    KuduClient client = KuduUtil.getKuduClient(tbl.getKuduMasterHosts());
+  public static void alterKuduTable(KuduTable tbl, AlterTableOptions ato, String errMsg,
+      EventSequence catalogTimeline) throws ImpalaRuntimeException {
+    KuduClient client = KuduUtil.getKuduClient(tbl.getKuduMasterHosts(), catalogTimeline);
     try {
       client.alterTable(tbl.getKuduTableName(), ato);
       if (!client.isAlterTableDone(tbl.getKuduTableName())) {
         throw new ImpalaRuntimeException(errMsg + ": Kudu operation timed out");
       }
+      catalogTimeline.markEvent(ALTERED_KUDU_TABLE);
     } catch (KuduException e) {
       throw new ImpalaRuntimeException(errMsg, e);
     }

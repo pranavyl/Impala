@@ -30,8 +30,10 @@
 #include <boost/unordered_map.hpp>
 
 #include "codegen/codegen-fn-ptr.h"
+#include "exec/file-metadata-utils.h"
 #include "exec/filter-context.h"
 #include "exec/scan-node.h"
+#include "exec/scan-range-queue-mt.h"
 #include "runtime/descriptors.h"
 #include "runtime/io/request-context.h"
 #include "runtime/io/request-ranges.h"
@@ -40,6 +42,10 @@
 #include "util/progress-updater.h"
 #include "util/spinlock.h"
 #include "util/unique-id-hash.h"
+
+namespace org { namespace apache { namespace impala { namespace fb {
+struct FbFileMetadata;
+}}}}
 
 namespace impala {
 
@@ -64,6 +70,11 @@ struct HdfsFileDesc {
       file_compression(THdfsCompression::NONE),
       file_format(THdfsFileFormat::TEXT) {}
 
+  io::ScanRange::FileInfo GetFileInfo() const {
+    return io::ScanRange::FileInfo{
+        filename.c_str(), fs, mtime, is_encrypted, is_erasure_coded};
+  }
+
   /// Connection to the filesystem containing the file.
   hdfsFS fs;
 
@@ -82,6 +93,19 @@ struct HdfsFileDesc {
 
   /// Splits (i.e. raw byte ranges) for this file, assigned to this scan node.
   std::vector<io::ScanRange*> splits;
+
+  /// Extra file metadata, e.g. Iceberg-related file-level info.
+  const ::org::apache::impala::fb::FbFileMetadata* file_metadata;
+
+  /// Whether file is encrypted.
+  bool is_encrypted = false;
+
+  /// Whether file is erasure coded.
+  bool is_erasure_coded = false;
+
+  /// Fragment instance assignment from the scheduler (used for maintaining
+  /// deterministic assignments when that mode is enabled).
+  TUniqueId fragment_instance_id;
 
   /// Some useful typedefs for creating HdfsFileDesc related data structures.
   /// This is a pair for partition ID and filename which uniquely identifies a file.
@@ -160,7 +184,7 @@ class ScanRangeSharedState {
   /// for which initial scan ranges need to be issued. Returns nullptr if the instance
   /// has not been assigned anything.
   std::vector<HdfsFileDesc*>* GetFilesForIssuingScanRangesForInstance(
-      const TUniqueId fragment_instance_id) {
+      const TUniqueId& fragment_instance_id) {
     auto it = file_assignment_per_instance_.find(fragment_instance_id);
     if (it == file_assignment_per_instance_.end()) return nullptr;
     return &it->second;
@@ -182,6 +206,9 @@ class ScanRangeSharedState {
   /// Add the required hooks to the runtime state that gets triggered in case of
   /// cancellation. Must be called before adding or removing scan ranges to the queue.
   void AddCancellationHook(RuntimeState* state);
+
+  /// Transfers all memory from 'pool' to 'template_pool_'.
+  void TransferToSharedStatePool(MemPool* pool);
 
  private:
   friend class HdfsScanPlanNode;
@@ -245,7 +272,7 @@ class ScanRangeSharedState {
 
   /// Queue of all scan ranges that need to be read. Shared by all instances of this
   /// fragment. Only used for MT scans.
-  InternalQueue<io::ScanRange> scan_range_queue_;
+  ScanRangeQueueMt scan_range_queue_;
 
   /// END: Members that are used only by MT scan nodes(use_mt_scan_node_ is true).
   /////////////////////////////////////////////////////////////////////
@@ -270,6 +297,9 @@ class HdfsScanPlanNode : public ScanPlanNode {
   /// order set to conjuncts.size(). Only valid to call after Init().
   void ComputeSlotMaterializationOrder(
       const DescriptorTbl& desc_tbl, std::vector<int>* order) const;
+
+ /// Returns true if it has a virtual column that we can materialize in the template tuple
+  bool HasVirtualColumnInTemplateTuple() const;
 
   /// Conjuncts for each materialized tuple (top-level row batch tuples and collection
   /// item tuples). Includes a copy of PlanNode.conjuncts_.
@@ -309,6 +339,9 @@ class HdfsScanPlanNode : public ScanPlanNode {
 
   /// Vector containing slot descriptors for all partition key slots.
   std::vector<SlotDescriptor*> partition_key_slots_;
+
+  /// Vector containing slot descriptors for virtual columns.
+  std::vector<SlotDescriptor*> virtual_column_slots_;
 
   /// Descriptor for the hdfs table, including partition and format metadata.
   /// Set in Init, owned by QueryState
@@ -412,6 +445,10 @@ class HdfsScanNodeBase : public ScanNode {
   const std::vector<SlotDescriptor*>& materialized_slots()
       const { return materialized_slots_; }
 
+  const std::vector<SlotDescriptor*>& virtual_column_slots() const {
+      return virtual_column_slots_;
+  }
+
   /// Returns number of partition keys in the table.
   int num_partition_keys() const { return hdfs_table_->num_clustering_cols(); }
 
@@ -430,10 +467,8 @@ class HdfsScanNodeBase : public ScanNode {
   const AvroSchemaElement& avro_schema() const { return avro_schema_; }
   int skip_header_line_count() const { return skip_header_line_count_; }
   io::RequestContext* reader_context() const { return reader_context_.get(); }
-  bool optimize_parquet_count_star() const {
-    return parquet_count_star_slot_offset_ != -1;
-  }
-  int parquet_count_star_slot_offset() const { return parquet_count_star_slot_offset_; }
+  bool optimize_count_star() const { return count_star_slot_offset_ != -1; }
+  int count_star_slot_offset() const { return count_star_slot_offset_; }
   bool is_partition_key_scan() const { return is_partition_key_scan_; }
 
   typedef std::unordered_map<TupleId, std::vector<ScalarExprEvaluator*>>
@@ -484,23 +519,21 @@ class HdfsScanNodeBase : public ScanNode {
   /// If not NULL, the 'original_split' pointer is stored for reference in the scan range
   /// metadata of the scan range that is to be allocated.
   /// This is thread safe.
-  io::ScanRange* AllocateScanRange(hdfsFS fs, const char* file, int64_t len,
+  io::ScanRange* AllocateScanRange(const io::ScanRange::FileInfo &fi, int64_t len,
       int64_t offset, int64_t partition_id, int disk_id, bool expected_local,
-      int64_t mtime, const io::BufferOpts& buffer_opts,
-      const io::ScanRange* original_split = nullptr);
+      const io::BufferOpts& buffer_opts, const io::ScanRange* original_split = nullptr);
 
   /// Same as the first overload, but it takes sub-ranges as well.
-  io::ScanRange* AllocateScanRange(hdfsFS fs, const char* file, int64_t len,
+  io::ScanRange* AllocateScanRange(const io::ScanRange::FileInfo &fi, int64_t len,
       int64_t offset, std::vector<io::ScanRange::SubRange>&& sub_ranges,
       int64_t partition_id, int disk_id, bool expected_local,
-      int64_t mtime, const io::BufferOpts& buffer_opts,
-      const io::ScanRange* original_split = nullptr);
+      const io::BufferOpts& buffer_opts, const io::ScanRange* original_split = nullptr);
 
   /// Same as above, but it takes both sub-ranges and metadata.
-  io::ScanRange* AllocateScanRange(hdfsFS fs, const char* file, int64_t len,
+  io::ScanRange* AllocateScanRange(const io::ScanRange::FileInfo &fi, int64_t len,
       int64_t offset, std::vector<io::ScanRange::SubRange>&& sub_ranges,
       ScanRangeMetadata* metadata, int disk_id, bool expected_local,
-      int64_t mtime, const io::BufferOpts& buffer_opts);
+      const io::BufferOpts& buffer_opts);
 
   /// Adds ranges to be read later by scanners. Must not be called once
   /// remaining_scan_range_submissions_ is 0. The enqueue_location specifies whether the
@@ -563,11 +596,12 @@ class HdfsScanNodeBase : public ScanNode {
 
   /// Returns true if there are no materialized slots, such as a count(*) over the table.
   inline bool IsZeroSlotTableScan() const {
-    return materialized_slots().empty() && tuple_desc()->tuple_path().empty();
+    return materialized_slots().empty() && tuple_desc()->tuple_path().empty() &&
+        virtual_column_slots().empty();
   }
 
-  /// Transfers all memory from 'pool' to 'scan_node_pool_'.
-  virtual void TransferToScanNodePool(MemPool* pool);
+  /// Transfers all memory from 'pool' to shared state of all scanners.
+  void TransferToSharedStatePool(MemPool* pool);
 
   /// map from volume id to <number of split, per volume split lengths>
   typedef boost::unordered_map<int32_t, std::pair<int, int64_t>> PerVolumeStats;
@@ -593,6 +627,18 @@ class HdfsScanNodeBase : public ScanNode {
   /// function returns true, or a set of filter contexts to evaluate.
   bool PartitionPassesFilters(int32_t partition_id, const std::string& stats_name,
       const std::vector<FilterContext>& filter_ctxs);
+
+  /// Returns true if Iceberg partition passes all the filter predicates in 'filter_ctxs'
+  /// and should not be filtered out. Iceberg partition information is in the 'file'
+  /// object. 'partition_id' is used to get the template tuple. 'stats_name' is the key of
+  /// one of the counter groups in FilterStats, and is used to update the correct
+  /// statistics. 'state' is used for logging.
+  ///
+  /// 'filter_ctxs' is either an empty list, in which case filtering is disabled and the
+  /// function returns true, or a set of filter contexts to evaluate.
+  bool IcebergPartitionPassesFilters(int64_t partition_id, const std::string& stats_name,
+      const std::vector<FilterContext>& filter_ctxs, HdfsFileDesc* file,
+      RuntimeState* state);
 
   /// Update book-keeping to skip the scan range if it has been issued but will not be
   /// processed by a scanner. E.g. used to cancel ranges that are filtered out by
@@ -642,11 +688,11 @@ class HdfsScanNodeBase : public ScanNode {
   /// Tuple id of the tuple descriptor to be used.
   const int tuple_id_;
 
-  /// The byte offset of the slot for Parquet metadata if Parquet count star optimization
+  /// The byte offset of the slot for Parquet/ORC metadata if count star optimization
   /// is enabled. When set, this scan node can optimize a count(*) query by populating
   /// the tuple with data from the Parquet num rows statistic. See
-  /// applyParquetCountStartOptimization() in HdfsScanNode.java.
-  const int parquet_count_star_slot_offset_;
+  /// applyCountStarOptimization() in ScanNode.java.
+  const int count_star_slot_offset_;
 
   // True if this is a partition key scan that needs only to return at least one row from
   // each scan range. If true, the scan node and scanner implementations should attempt
@@ -699,6 +745,8 @@ class HdfsScanNodeBase : public ScanNode {
   /// Vector containing slot descriptors for all partition key slots.
   const std::vector<SlotDescriptor*>& partition_key_slots_;
 
+  const std::vector<SlotDescriptor*>& virtual_column_slots_;
+
   /// Counters which track the number of scanners that have codegen enabled for the
   /// materialize and conjuncts evaluation code paths.
   AtomicInt32 num_scanners_codegen_enabled_;
@@ -718,6 +766,8 @@ class HdfsScanNodeBase : public ScanNode {
   RuntimeProfile::Counter* bytes_read_local_ = nullptr;
   RuntimeProfile::Counter* bytes_read_short_circuit_ = nullptr;
   RuntimeProfile::Counter* bytes_read_dn_cache_ = nullptr;
+  RuntimeProfile::Counter* bytes_read_encrypted_ = nullptr;
+  RuntimeProfile::Counter* bytes_read_ec_ = nullptr;
   RuntimeProfile::Counter* num_remote_ranges_ = nullptr;
   RuntimeProfile::Counter* unexpected_remote_bytes_ = nullptr;
   RuntimeProfile::Counter* cached_file_handles_hit_count_ = nullptr;
@@ -735,18 +785,13 @@ class HdfsScanNodeBase : public ScanNode {
   RuntimeProfile::Counter* hdfs_open_file_timer_ = nullptr;
   RuntimeProfile::SummaryStatsCounter* initial_range_ideal_reservation_stats_ = nullptr;
   RuntimeProfile::SummaryStatsCounter* initial_range_actual_reservation_stats_ = nullptr;
-  RuntimeProfile::SummaryStatsCounter* compressed_bytes_read_per_column_counter_ =
-      nullptr;
-  RuntimeProfile::SummaryStatsCounter* uncompressed_bytes_read_per_column_counter_ =
-      nullptr;
 
   /// HDFS read thread concurrency bucket: bucket[i] refers to the number of sample
   /// taken where there are i concurrent hdfs read thread running. Created in Open().
   std::vector<RuntimeProfile::Counter*>* hdfs_read_thread_concurrency_bucket_ = nullptr;
 
-  /// Pool for allocating some amounts of memory that is shared between scanners.
-  /// e.g. partition key tuple and their string buffers
-  boost::scoped_ptr<MemPool> scan_node_pool_;
+  /// Pool for allocating memory for Iceberg partition filtering.
+  boost::scoped_ptr<MemPool> iceberg_partition_filtering_pool_;
 
   /// Status of failed operations.  This is set in the ScannerThreads
   /// Returned in GetNext() if an error occurred.  An non-ok status triggers cleanup
@@ -773,6 +818,15 @@ class HdfsScanNodeBase : public ScanNode {
 
   /// Pointer to the scan range related state that is shared across all node instances.
   ScanRangeSharedState* shared_state_ = nullptr;
+
+  /// Whether mt_dop uses deterministic scan range assignment
+  /// If true, each fragment instance has its own list of scan ranges.
+  /// If false, the fragment instances get scan ranges from the shared queue.
+  /// Not used for mt_dop=0.
+  bool deterministic_scanrange_assignment_;
+
+  /// Utility class for handling file metadata.
+  FileMetadataUtils file_metadata_utils_;
 
   /// Performs dynamic partition pruning, i.e., applies runtime filters to files, and
   /// issues initial ranges for all file types. Waits for runtime filters if necessary.
@@ -819,10 +873,9 @@ class HdfsScanNodeBase : public ScanNode {
   void InitNullCollectionValues(RowBatch* row_batch) const;
 
   /// Returns false if, according to filters in 'filter_ctxs', 'file' should be filtered
-  /// and therefore not processed. 'file_type' is the the format of 'file', and is used
-  /// for bookkeeping. Returns true if all filters pass or are not present.
-  bool FilePassesFilterPredicates(const std::vector<FilterContext>& filter_ctxs,
-      const THdfsFileFormat::type& file_type, HdfsFileDesc* file);
+  /// and therefore not processed. Returns true if all filters pass or are not present.
+  bool FilePassesFilterPredicates(RuntimeState* state, HdfsFileDesc* file,
+      const std::vector<FilterContext>& filter_ctxs);
 
   /// Stops periodic counters and aggregates counter values for the entire scan node.
   /// This should be called as soon as the scan node is complete to get the most accurate

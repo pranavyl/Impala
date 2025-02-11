@@ -48,7 +48,7 @@ void UnnestPlanNode::Close() {
   PlanNode::Close();
 }
 
-Status UnnestPlanNode::InitCollExpr(FragmentState* state) {
+Status UnnestPlanNode::InitCollExprs(FragmentState* state) {
   DCHECK(containing_subplan_ != nullptr)
       << "set_containing_subplan() must have been called";
   const RowDescriptor& row_desc = *containing_subplan_->children_[0]->row_descriptor_;
@@ -62,7 +62,14 @@ Status UnnestPlanNode::InitCollExpr(FragmentState* state) {
     SlotDescriptor* slot_desc = state->desc_tbl().GetSlotDescriptor(slot_ref->slot_id());
     DCHECK(slot_desc != nullptr);
     coll_slot_descs_.push_back(slot_desc);
-    coll_tuple_idxs_.push_back(row_desc.GetTupleIdx(slot_desc->parent()->id()));
+
+    // If the collection is in a struct we don't use the itemTupleDesc of the struct but
+    // the tuple in which the top level struct is placed.
+    const TupleDescriptor* parent_tuple = slot_desc->parent();
+    const TupleDescriptor* master_tuple = parent_tuple->getMasterTuple();
+    const TupleDescriptor* top_level_tuple = master_tuple == nullptr ?
+        parent_tuple : master_tuple;
+    coll_tuple_idxs_.push_back(row_desc.GetTupleIdx(top_level_tuple->id()));
   }
   return Status::OK();
 }

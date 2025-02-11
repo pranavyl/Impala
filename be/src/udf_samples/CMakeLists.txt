@@ -28,7 +28,7 @@ separate_arguments(HIDE_SYMBOLS_ARGS)
 # This should be called with the .cc src file and it will generate a
 # src-file-ir target that can be built.
 # e.g. COMPILE_TO_IR(test.cc) generates the "test-ir" make target.
-set(IR_COMPILE_FLAGS "-emit-llvm" "-O3" "-std=c++14" "-c" "-I../" ${HIDE_SYMBOLS_ARGS})
+set(IR_COMPILE_FLAGS "-emit-llvm" "-O3" "-std=c++17" "-c" "-I../" ${HIDE_SYMBOLS_ARGS})
 set(IR_COMPILE_FLAGS ${IR_COMPILE_FLAGS} ${CLANG_BASE_FLAGS})
 function(COMPILE_TO_IR SRC_FILE)
   get_filename_component(BASE_NAME ${SRC_FILE} NAME_WE)
@@ -53,6 +53,10 @@ COMPILE_TO_IR(udf-sample.cc )
 add_dependencies(udf-sample-ir gen-deps)
 COMPILE_TO_IR(uda-sample.cc )
 add_dependencies(uda-sample-ir gen-deps)
+
+if (BUILD_WITH_NO_TESTS)
+  return()
+endif()
 
 # This is an example of how to use the test harness to help develop UDF and UDAs.
 add_executable(udf-sample-test udf-sample-test.cc)

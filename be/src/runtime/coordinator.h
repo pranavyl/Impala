@@ -17,9 +17,11 @@
 
 #pragma once
 
+#include <list>
 #include <memory>
 #include <string>
 #include <vector>
+#include <utility>
 #include <boost/unordered_map.hpp>
 #include <rapidjson/document.h>
 
@@ -116,6 +118,8 @@ class TUpdateCatalogRequest;
 /// and unnest them
 class Coordinator { // NOLINT: The member variables could be re-ordered to save space
  public:
+  static const std::string PROFILE_EVENT_LABEL_FIRST_ROW_FETCHED;
+
   Coordinator(ClientRequestState* parent, const TExecRequest& exec_request,
       const QuerySchedulePB& query_schedule, RuntimeProfile::EventSequence* events);
   ~Coordinator();
@@ -184,7 +188,9 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// individual fragment instances are merged into a single output to retain readability.
   std::string GetErrorLog();
 
-  const ProgressUpdater& progress() const { return progress_; }
+  const ProgressUpdater& scan_progress() const { return scan_progress_; }
+
+  const ProgressUpdater& query_progress() const { return query_progress_; }
 
   /// Get a copy of the current exec summary. Thread-safe.
   void GetTExecSummary(TExecSummary* exec_summary);
@@ -212,6 +218,10 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
     /// peak value from any backend.
     int64_t peak_per_host_mem_consumption = 0;
 
+    /// Total peak memory usage for this query at all backend.
+    /// Note that it is the sum of peaks, not the peak of the sum.
+    int64_t total_peak_mem_usage = 0;
+
     /// Total bytes read across all scan nodes.
     int64_t bytes_read = 0;
 
@@ -234,6 +244,7 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
     void Merge(const ResourceUtilization& other) {
       peak_per_host_mem_consumption =
           std::max(peak_per_host_mem_consumption, other.peak_per_host_mem_consumption);
+      total_peak_mem_usage += other.peak_per_host_mem_consumption;
       bytes_read += other.bytes_read;
       exchange_bytes_sent += other.exchange_bytes_sent;
       scan_bytes_sent += other.scan_bytes_sent;
@@ -256,6 +267,10 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// Aggregate resource utilization for the query (i.e. across all backends based on the
   /// latest status reports received from those backends).
   ResourceUtilization ComputeQueryResourceUtilization();
+
+  /// Return the backends and their associated resource utilization.
+  std::list<std::pair<NetworkAddressPB, ResourceUtilization>>
+      BackendResourceUtilization();
 
   /// Return the backends in 'candidates' that still have at least one fragment instance
   /// executing on them. The returned backends may not be in the same order as the input.
@@ -330,7 +345,11 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
 
   /// Keeps track of number of completed ranges and total scan ranges. Initialized by
   /// Exec().
-  ProgressUpdater progress_;
+  ProgressUpdater scan_progress_;
+
+  /// Keeps track of number of completed fragment instances and total fragment instances.
+  /// Initialized by Exec().
+  ProgressUpdater query_progress_;
 
   /// Aggregate counters for the entire query. Lives in 'obj_pool_'. Set in Exec().
   RuntimeProfile* query_profile_ = nullptr;

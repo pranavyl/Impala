@@ -51,47 +51,29 @@ class TupleRow;
 // Forward declaration to avoid including descriptors.h.
 typedef std::vector<int> SchemaPath;
 
-// TODO: remove these functions and use operator << after upgrading to Thrift 0.11.0 or
-// higher.
-std::string PrintThriftEnum(const beeswax::QueryState::type& value);
-std::string PrintThriftEnum(const parquet::Encoding::type& value);
-std::string PrintThriftEnum(const TCatalogObjectType::type& value);
-std::string PrintThriftEnum(const TCatalogOpType::type& value);
-std::string PrintThriftEnum(const TDdlType::type& value);
-std::string PrintThriftEnum(const TExplainLevel::type& value);
-std::string PrintThriftEnum(const THdfsCompression::type& value);
-std::string PrintThriftEnum(const THdfsFileFormat::type& value);
-std::string PrintThriftEnum(const THdfsSeqCompressionMode::type& value);
-std::string PrintThriftEnum(const TImpalaQueryOptions::type& value);
-std::string PrintThriftEnum(const TJoinDistributionMode::type& value);
-std::string PrintThriftEnum(const TJoinOp::type& value);
-std::string PrintThriftEnum(const TKuduReadMode::type& value);
-std::string PrintThriftEnum(const TMetricKind::type& value);
-std::string PrintThriftEnum(const TParquetArrayResolution::type& value);
-std::string PrintThriftEnum(const TSchemaResolutionStrategy::type& value);
-std::string PrintThriftEnum(const TPlanNodeType::type& value);
-std::string PrintThriftEnum(const TPrefetchMode::type& value);
-std::string PrintThriftEnum(const TReplicaPreference::type& value);
-std::string PrintThriftEnum(const TRuntimeFilterMode::type& value);
-std::string PrintThriftEnum(const TRuntimeFilterType::type& value);
-std::string PrintThriftEnum(const TSessionType::type& value);
-std::string PrintThriftEnum(const TStmtType::type& value);
-std::string PrintThriftEnum(const TUnit::type& value);
-std::string PrintThriftEnum(const TParquetTimestampType::type& value);
-std::string PrintThriftEnum(const TTransactionalType::type& value);
-std::string PrintThriftEnum(const TEnabledRuntimeFilterTypes::type& value);
-std::string PrintThriftEnum(const TMinmaxFilteringLevel::type& value);
-std::string PrintThriftEnum(const TKuduReplicaSelection::type& value);
-std::string PrintThriftEnum(const TMinmaxFilterFastCodePathMode::type& value);
-std::string PrintThriftEnum(const TParquetBloomFilterWrite::type& value);
+// Used to convert Thrift objects to strings. Thrift defines a 'to_string()' function for
+// each type.
+template<class T>
+std::string PrintValue(const T& value) {
+  return to_string(value);
+}
 
 std::string PrintTuple(const Tuple* t, const TupleDescriptor& d);
 std::string PrintRow(TupleRow* row, const RowDescriptor& d);
 std::string PrintBatch(RowBatch* batch);
-/// Converts id to a string represantation. If necessary, the gdb equivalent is:
+/// Converts id to a string representation. If necessary, the gdb equivalent is:
 ///    printf "%lx:%lx\n", id.hi, id.lo
 std::string PrintId(const TUniqueId& id, const std::string& separator = ":");
 std::string PrintId(const UniqueIdPB& id, const std::string& separator = ":");
+std::string PrintIdSet(
+    const std::set<TUniqueId>& ids, const std::string& separator = ",");
+
+/// Converts id to a string representation without using any shared library calls.
+/// Follows Breakpad's guidance for compromised contexts, see
+/// https://github.com/google/breakpad/blob/main/docs/linux_starter_guide.md
+constexpr int TUniqueIdBufferSize = 33;
+void PrintIdCompromised(const TUniqueId& id, char out[TUniqueIdBufferSize],
+    const char separator = ':');
 
 inline ostream& operator<<(ostream& os, const UniqueIdPB& id) {
   return os << PrintId(id);
@@ -109,6 +91,9 @@ std::string PrintNumericPath(const SchemaPath& path);
 template<typename ThriftStruct> std::string PrintThrift(const ThriftStruct& t) {
   return apache::thrift::ThriftDebugString(t);
 }
+
+/// Return a list of TTableName as a comma-separated string.
+std::string PrintTableList(const std::vector<TTableName>& tbls);
 
 /// Parse 's' into a TUniqueId object.  The format of s needs to be the output format
 /// from PrintId.  (<hi_part>:<low_part>)

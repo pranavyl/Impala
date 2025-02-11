@@ -21,7 +21,9 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.fs.CommonConfigurationKeys;
 import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
 import org.apache.hadoop.fs.FileSystem;
@@ -40,9 +42,8 @@ import org.apache.impala.authorization.ImpalaInternalAdminUser;
 import org.apache.impala.authorization.User;
 import org.apache.impala.catalog.FeDataSource;
 import org.apache.impala.catalog.FeDb;
+import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function;
-import org.apache.impala.catalog.StructType;
-import org.apache.impala.catalog.Type;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
@@ -55,7 +56,6 @@ import org.apache.impala.thrift.TBuildTestDescriptorTableParams;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TDatabase;
 import org.apache.impala.thrift.TDescribeDbParams;
-import org.apache.impala.thrift.TDescribeOutputStyle;
 import org.apache.impala.thrift.TDescribeResult;
 import org.apache.impala.thrift.TDescribeTableParams;
 import org.apache.impala.thrift.TDescriptorTable;
@@ -74,6 +74,7 @@ import org.apache.impala.thrift.TGetHadoopConfigResponse;
 import org.apache.impala.thrift.TGetHadoopGroupsRequest;
 import org.apache.impala.thrift.TGetHadoopGroupsResponse;
 import org.apache.impala.thrift.TGetTableHistoryResult;
+import org.apache.impala.thrift.TGetMetadataTablesParams;
 import org.apache.impala.thrift.TGetTablesParams;
 import org.apache.impala.thrift.TGetTablesResult;
 import org.apache.impala.thrift.TLoadDataReq;
@@ -88,7 +89,9 @@ import org.apache.impala.thrift.TShowGrantPrincipalParams;
 import org.apache.impala.thrift.TShowRolesParams;
 import org.apache.impala.thrift.TShowStatsOp;
 import org.apache.impala.thrift.TShowStatsParams;
+import org.apache.impala.thrift.TStringLiteral;
 import org.apache.impala.thrift.TDescribeHistoryParams;
+import org.apache.impala.thrift.TSessionState;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.thrift.TUpdateCatalogCacheRequest;
@@ -98,6 +101,7 @@ import org.apache.impala.thrift.TWrappedHttpResponse;
 import org.apache.impala.util.AuthorizationUtil;
 import org.apache.impala.util.ExecutorMembershipSnapshot;
 import org.apache.impala.util.GlogAppender;
+import org.apache.impala.util.JniRequestPoolService;
 import org.apache.impala.util.PatternMatcher;
 import org.apache.impala.util.TSessionStateUtil;
 import org.apache.log4j.Appender;
@@ -115,6 +119,7 @@ import java.util.Collections;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * JNI-callable interface onto a wrapped Frontend instance. The main point is to serialise
@@ -125,6 +130,8 @@ public class JniFrontend {
   private final static TBinaryProtocol.Factory protocolFactory_ =
       new TBinaryProtocol.Factory();
   private final Frontend frontend_;
+  public final static String KEYSTORE_ERROR_MSG = "Failed to get password from" +
+      "keystore, error: invalid key '%s' or password doesn't exist";
 
   /**
    * Create a new instance of the Jni Frontend.
@@ -168,8 +175,8 @@ public class JniFrontend {
     }
 
     // TODO: avoid creating serializer for each query?
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -208,12 +215,21 @@ public class JniFrontend {
     TLoadDataReq request = new TLoadDataReq();
     JniUtil.deserializeThrift(protocolFactory_, request, thriftLoadTableDataParams);
     TLoadDataResp response = frontend_.loadTableData(request);
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(response);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
     }
+  }
+
+  /**
+   * Jni wrapper for Frontend#convertTable(TConvertRequest).
+   */
+  public void convertTable(byte[] params) throws ImpalaException {
+    TExecRequest execRequest = new TExecRequest();
+    JniUtil.deserializeThrift(protocolFactory_, execRequest, params);
+    frontend_.convertTable(execRequest);
   }
 
   /**
@@ -232,8 +248,8 @@ public class JniFrontend {
   public byte[] getCatalogMetrics() throws ImpalaException {
     Preconditions.checkNotNull(frontend_);
     TGetCatalogMetricsResult metrics = frontend_.getCatalogMetrics();
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(metrics);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -241,10 +257,11 @@ public class JniFrontend {
   }
 
   /**
-   * Implement Hive's pattern-matching semantics for "SHOW TABLE [[LIKE] 'pattern']", and
-   * return a list of table names matching an optional pattern.
-   * The only metacharacters are '*' which matches any string of characters, and '|'
-   * which denotes choice.  Doing the work here saves loading tables or databases from the
+   * Returns a list of table names matching an optional pattern.
+   *
+   * Implements Hive's pattern-matching semantics for "SHOW TABLE [[LIKE] 'pattern']". The
+   * only metacharacters are '*' which matches any string of characters, and '|' which
+   * denotes choice. Doing the work here saves loading tables or databases from the
    * metastore (which Hive would do if we passed the call through to the metastore
    * client). If the pattern is null, all strings are considered to match. If it is an
    * empty string, no strings match.
@@ -257,20 +274,54 @@ public class JniFrontend {
     Preconditions.checkNotNull(frontend_);
     TGetTablesParams params = new TGetTablesParams();
     JniUtil.deserializeThrift(protocolFactory_, params, thriftGetTablesParams);
-    // If the session was not set it indicates this is an internal Impala call.
-    User user = params.isSetSession() ?
-        new User(TSessionStateUtil.getEffectiveUser(params.getSession())) :
-        ImpalaInternalAdminUser.getInstance();
+
+    TSessionState session = params.isSetSession() ? params.getSession() : null;
+    User user = getUser(session);
 
     Preconditions.checkState(!params.isSetSession() || user != null );
     List<String> tables = frontend_.getTableNames(params.db,
+        PatternMatcher.createHivePatternMatcher(params.pattern), user,
+        params.getTable_types());
+
+    TGetTablesResult result = new TGetTablesResult();
+    result.setTables(tables);
+
+    try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
+      return serializer.serialize(result);
+    } catch (TException e) {
+      throw new InternalException(e.getMessage());
+    }
+  }
+
+  /**
+   * Returns the metadata tables available for the given table. Currently only Iceberg
+   * metadata tables are supported.
+   *
+   * Pattern matching is done as in getTableNames().
+   *
+   * The argument is a serialized TGetMetadataTablesParams object.
+   * The return type is a serialised TGetTablesResult object.
+   * @see Frontend#getTableNames
+   */
+  public byte[] getMetadataTableNames(byte[] thriftGetMetadataTablesParams)
+      throws ImpalaException {
+    Preconditions.checkNotNull(frontend_);
+    TGetMetadataTablesParams params = new TGetMetadataTablesParams();
+    JniUtil.deserializeThrift(protocolFactory_, params, thriftGetMetadataTablesParams);
+
+    TSessionState session = params.isSetSession() ? params.getSession() : null;
+    User user = getUser(session);
+
+    Preconditions.checkState(!params.isSetSession() || user != null );
+    List<String> tables = frontend_.getMetadataTableNames(params.db, params.tbl,
         PatternMatcher.createHivePatternMatcher(params.pattern), user);
 
     TGetTablesResult result = new TGetTablesResult();
     result.setTables(tables);
 
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -289,8 +340,8 @@ public class JniFrontend {
     JniUtil.deserializeThrift(protocolFactory_, params, thriftShowFilesParams);
     TResultSet result = frontend_.getTableFiles(params);
 
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -310,18 +361,18 @@ public class JniFrontend {
     Preconditions.checkNotNull(frontend_);
     TGetDbsParams params = new TGetDbsParams();
     JniUtil.deserializeThrift(protocolFactory_, params, thriftGetTablesParams);
-    // If the session was not set it indicates this is an internal Impala call.
-    User user = params.isSetSession() ?
-        new User(TSessionStateUtil.getEffectiveUser(params.getSession())) :
-        ImpalaInternalAdminUser.getInstance();
+
+    TSessionState session = params.isSetSession() ? params.getSession() : null;
+    User user = getUser(session);
+
     List<? extends FeDb> dbs = frontend_.getDbs(
         PatternMatcher.createHivePatternMatcher(params.pattern), user);
     TGetDbsResult result = new TGetDbsResult();
     List<TDatabase> tDbs = Lists.newArrayListWithCapacity(dbs.size());
     for (FeDb db: dbs) tDbs.add(db.toThrift());
     result.setDbs(tDbs);
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -336,11 +387,9 @@ public class JniFrontend {
     Preconditions.checkNotNull(frontend_);
     TDescribeHistoryParams params = new TDescribeHistoryParams();
     JniUtil.deserializeThrift(protocolFactory_, params, thriftParams);
-    TGetTableHistoryResult result = frontend_.getTableHistory(
-        params.getTable_name().getDb_name(), params.getTable_name().getTable_name());
-
-    TSerializer serializer = new TSerializer(protocolFactory_);
+    TGetTableHistoryResult result = frontend_.getTableHistory(params);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -370,8 +419,8 @@ public class JniFrontend {
       result.addToClass_names(dataSource.getClassName());
       result.addToApi_versions(dataSource.getApiVersion());
     }
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -393,8 +442,8 @@ public class JniFrontend {
       result = frontend_.getTableStats(params.getTable_name().getDb_name(),
           params.getTable_name().getTable_name(), params.op);
     }
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -429,8 +478,8 @@ public class JniFrontend {
     result.setFn_ret_types(retTypes);
     result.setFn_binary_types(fnBinaryTypes);
     result.setFn_persistence(fnIsPersistent);
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -464,8 +513,8 @@ public class JniFrontend {
     TDescribeResult result = frontend_.describeDb(
         params.getDb(), params.getOutput_style());
 
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -482,20 +531,11 @@ public class JniFrontend {
     Preconditions.checkNotNull(frontend_);
     TDescribeTableParams params = new TDescribeTableParams();
     JniUtil.deserializeThrift(protocolFactory_, params, thriftDescribeTableParams);
-
     Preconditions.checkState(params.isSetTable_name() ^ params.isSetResult_struct());
     User user = new User(TSessionStateUtil.getEffectiveUser(params.getSession()));
-    TDescribeResult result = null;
-    if (params.isSetTable_name()) {
-      result = frontend_.describeTable(params.getTable_name(), params.output_style, user);
-    } else {
-      Preconditions.checkState(params.output_style == TDescribeOutputStyle.MINIMAL);
-      StructType structType = (StructType)Type.fromThrift(params.result_struct);
-      result = DescribeResultFactory.buildDescribeMinimalResult(structType);
-    }
-
-    TSerializer serializer = new TSerializer(protocolFactory_);
+    TDescribeResult result = frontend_.describeTable(params, user);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -538,8 +578,8 @@ public class JniFrontend {
     Preconditions.checkNotNull(params.slot_types);
     TDescriptorTable result =
         DescriptorTable.buildTestDescriptorTable(params.slot_types);
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       byte[] ret = serializer.serialize(result);
       return ret;
     } catch (TException e) {
@@ -554,8 +594,8 @@ public class JniFrontend {
     Preconditions.checkNotNull(frontend_);
     TShowRolesParams params = new TShowRolesParams();
     JniUtil.deserializeThrift(protocolFactory_, params, showRolesParams);
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(frontend_.getAuthzManager().getRoles(params));
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -570,8 +610,8 @@ public class JniFrontend {
     Preconditions.checkNotNull(frontend_);
     TShowGrantPrincipalParams params = new TShowGrantPrincipalParams();
     JniUtil.deserializeThrift(protocolFactory_, params, showGrantPrincipalParams);
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(frontend_.getAuthzManager().getPrivileges(params));
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -588,8 +628,8 @@ public class JniFrontend {
     JniUtil.deserializeThrift(protocolFactory_, params, metadataOpsParams);
     TResultSet result = frontend_.execHiveServer2MetadataOp(params);
 
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -606,23 +646,33 @@ public class JniFrontend {
     frontend_.waitForCatalog();
   }
 
-  // Caching this saves ~50ms per call to getHadoopConfigAsHtml
+  FeTable getCatalogTable(byte[] tableNameParam) throws ImpalaException {
+    Preconditions.checkNotNull(frontend_);
+    TTableName tableName = new TTableName();
+    JniUtil.deserializeThrift(protocolFactory_, tableName, tableNameParam);
+    return frontend_.getCatalog().getTable(tableName.db_name, tableName.table_name);
+  }
+
+  // Caching this saves ~50ms per call to getHadoopConfig
   private static final Configuration CONF = new Configuration();
   private static final Groups GROUPS = Groups.getUserToGroupsMappingService(CONF);
 
+  // Caching this saves ~50ms per call to getAllHadoopConfigs
+  // org.apache.hadoop.hive.conf.HiveConf inherrits org.apache.hadoop.conf.Configuration
+  private static final HiveConf HIVE_CONF = new HiveConf();
+
   /**
-   * Returns a string of all loaded Hadoop configuration parameters as a table of keys
-   * and values. If asText is true, output in raw text. Otherwise, output in html.
+   * Returns the serialized byte array of TGetAllHadoopConfigsResponse
    */
   public byte[] getAllHadoopConfigs() throws ImpalaException {
     Map<String, String> configs = Maps.newHashMap();
-    for (Map.Entry<String, String> e: CONF) {
+    for (Map.Entry<String, String> e: HIVE_CONF) {
       configs.put(e.getKey(), e.getValue());
     }
     TGetAllHadoopConfigsResponse result = new TGetAllHadoopConfigsResponse();
     result.setConfigs(configs);
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -639,8 +689,8 @@ public class JniFrontend {
     JniUtil.deserializeThrift(protocolFactory_, request, serializedRequest);
     TGetHadoopConfigResponse result = new TGetHadoopConfigResponse();
     result.setValue(CONF.get(request.getName()));
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(result);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -651,28 +701,7 @@ public class JniFrontend {
    * Returns the list of Hadoop groups for the given user name.
    */
   public byte[] getHadoopGroups(byte[] serializedRequest) throws ImpalaException {
-    TGetHadoopGroupsRequest request = new TGetHadoopGroupsRequest();
-    JniUtil.deserializeThrift(protocolFactory_, request, serializedRequest);
-    TGetHadoopGroupsResponse result = new TGetHadoopGroupsResponse();
-    try {
-      result.setGroups(GROUPS.getGroups(request.getUser()));
-    } catch (IOException e) {
-      // HACK: https://issues.apache.org/jira/browse/HADOOP-15505
-      // There is no easy way to know if no groups found for a user
-      // other than reading the exception message.
-      if (e.getMessage().startsWith("No groups found for user")) {
-        result.setGroups(Collections.<String>emptyList());
-      } else {
-        LOG.error("Error getting Hadoop groups for user: " + request.getUser(), e);
-        throw new InternalException(e.getMessage());
-      }
-    }
-    TSerializer serializer = new TSerializer(protocolFactory_);
-    try {
-      return serializer.serialize(result);
-    } catch (TException e) {
-      throw new InternalException(e.getMessage());
-    }
+    return JniRequestPoolService.getHadoopGroupsInternal(serializedRequest);
   }
 
   /**
@@ -730,8 +759,8 @@ public class JniFrontend {
     JniUtil.deserializeThrift(protocolFactory_, request, serializedRequest);
     WrappedWebContext webContext = new WrappedWebContext(request, response);
     frontend_.getSaml2Client().setRedirect(webContext);
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(response);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
@@ -746,12 +775,37 @@ public class JniFrontend {
     JniUtil.deserializeThrift(protocolFactory_, request, serializedRequest);
     WrappedWebContext webContext = new WrappedWebContext(request, response);
     frontend_.getSaml2Client().validateAuthnResponse(webContext);
-    TSerializer serializer = new TSerializer(protocolFactory_);
     try {
+      TSerializer serializer = new TSerializer(protocolFactory_);
       return serializer.serialize(response);
     } catch (TException e) {
       throw new InternalException(e.getMessage());
     }
+  }
+
+  /**
+   * Returns secret from the configured KeyStore.
+   * @param secretKeyRequest the serialized secret key to be used for extracting secret.
+   */
+  public static String getSecretFromKeyStore(byte[] secretKeyRequest)
+      throws ImpalaException {
+    final TStringLiteral secretKey = new TStringLiteral();
+    JniUtil.deserializeThrift(protocolFactory_, secretKey, secretKeyRequest);
+    String secret = null;
+    try {
+      char[] secretCharArray = CONF.getPassword(secretKey.getValue());
+      if (secretCharArray != null) {
+        secret = new String(secretCharArray);
+      } else {
+        String errMsg = String.format(KEYSTORE_ERROR_MSG, secretKey.getValue());
+        LOG.error(errMsg);
+        throw new InternalException(errMsg);
+      }
+    } catch (IOException e) {
+      LOG.error("Failed to get password from keystore, error: " + e);
+      throw new InternalException(e.getMessage());
+    }
+    return secret;
   }
 
   public String validateSaml2Bearer(byte[] serializedRequest) throws ImpalaException{
@@ -908,6 +962,14 @@ public class JniFrontend {
     return output.toString();
   }
 
+  private User getUser(TSessionState session) {
+    // If the session was not set it indicates this is an internal Impala call.
+    User user = session == null ?
+        ImpalaInternalAdminUser.getInstance() :
+        new User(TSessionStateUtil.getEffectiveUser(session));
+    return user;
+  }
+
   /**
    * Return an empty string if the default FileSystem configured in CONF refers to a
    * DistributedFileSystem and Impala can list the root directory "/". Otherwise,
@@ -958,5 +1020,9 @@ public class JniFrontend {
       }
     }
     return "";
+  }
+
+  public Frontend getFrontend() {
+    return frontend_;
   }
 }

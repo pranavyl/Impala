@@ -68,7 +68,11 @@
 #   --load                load databases for the chosen workloads
 #   --start_minicluster   start a new Hadoop minicluster
 #   --ninja               use ninja, rather than Make, as the build tool
+#   --exec_options        query exec option string to run workload
+#                         (formatted as 'opt1:val1;opt2:val2')
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from optparse import OptionParser
 from tempfile import mkdtemp
 
@@ -84,6 +88,7 @@ import textwrap
 from tests.common.test_dimensions import TableFormatInfo
 
 IMPALA_HOME = os.environ["IMPALA_HOME"]
+IMPALA_PERF_RESULTS = os.path.join(IMPALA_HOME, "perf_results")
 
 
 def configured_call(cmd):
@@ -96,14 +101,18 @@ def configured_call(cmd):
 
 def load_data(db_to_load, table_formats, scale):
   """Loads a database with a particular scale factor."""
+  all_formats = ("text/none," + table_formats if "text/none" not in table_formats
+                 else table_formats)
   configured_call(["{0}/bin/load-data.py".format(IMPALA_HOME),
                    "--workloads", db_to_load, "--scale_factor", str(scale),
-                   "--table_formats", "text/none," + table_formats])
+                   "--table_formats", all_formats])
   for table_format in table_formats.split(","):
     suffix = TableFormatInfo.create_from_string(None, table_format).db_suffix()
     db_name = db_to_load + scale + suffix
     configured_call(["{0}/tests/util/compute_table_stats.py".format(IMPALA_HOME),
-                     "--stop_on_error", "--db_names", db_name])
+                     "--stop_on_error", "--db_names", db_name,
+                     "--parallelism", "1"])
+
 
 def get_git_hash_for_name(name):
   return sh.git("rev-parse", name).strip()
@@ -125,8 +134,8 @@ def start_minicluster():
 
 def start_impala(num_impalads, options):
   configured_call(["{0}/bin/start-impala-cluster.py".format(IMPALA_HOME), "-s",
-                   str(num_impalads), "-c", str(num_impalads)] +
-                  ["--impalad_args={0}".format(arg) for arg in options.impalad_args])
+                   str(num_impalads), "-c", str(num_impalads)]
+                  + ["--impalad_args={0}".format(arg) for arg in options.impalad_args])
 
 
 def run_workload(base_dir, workloads, options):
@@ -148,6 +157,9 @@ def run_workload(base_dir, workloads, options):
                    "--table_formats={0}".format(options.table_formats),
                    "--plan_first"]
 
+  if options.exec_options:
+    run_workload += ["--exec_options={0}".format(options.exec_options)]
+
   if options.query_names:
     run_workload += ["--query_names={0}".format(options.query_names)]
 
@@ -156,7 +168,7 @@ def run_workload(base_dir, workloads, options):
 
 def report_benchmark_results(file_a, file_b, description):
   """Wrapper around report_benchmark_result.py."""
-  result = "{0}/perf_results/latest/performance_result.txt".format(IMPALA_HOME)
+  result = os.path.join(IMPALA_PERF_RESULTS, "latest", "performance_result.txt")
   with open(result, "w") as f:
     subprocess.check_call(
       ["{0}/tests/benchmark/report_benchmark_results.py".format(IMPALA_HOME),
@@ -167,7 +179,7 @@ def report_benchmark_results(file_a, file_b, description):
   sh.cat(result, _out=sys.stdout)
 
 
-def compare(base_dir, hash_a, hash_b):
+def compare(base_dir, hash_a, hash_b, options):
   """Take the results of two performance runs and compare them."""
   file_a = os.path.join(base_dir, hash_a + ".json")
   file_b = os.path.join(base_dir, hash_b + ".json")
@@ -175,14 +187,22 @@ def compare(base_dir, hash_a, hash_b):
   report_benchmark_results(file_a, file_b, description)
 
   # From the two json files extract the profiles and diff them
-  generate_profile_file(file_a, hash_a, base_dir)
-  generate_profile_file(file_b, hash_b, base_dir)
-
-  sh.diff("-u",
-          os.path.join(base_dir, hash_a + "_profile.txt"),
-          os.path.join(base_dir, hash_b + "_profile.txt"),
-          _out=os.path.join(IMPALA_HOME, "performance_result_profile_diff.txt"),
-          _ok_code=[0, 1])
+  if options.split_profiles:
+    generate_profile_files(file_a, hash_a, base_dir)
+    generate_profile_files(file_b, hash_b, base_dir)
+    sh.diff("-u",
+            os.path.join(base_dir, hash_a + "_profiles"),
+            os.path.join(base_dir, hash_b + "_profiles"),
+            _out=os.path.join(IMPALA_HOME, "performance_result_profile_diff.txt"),
+            _ok_code=[0, 1])
+  else:
+    generate_profile_file(file_a, hash_a, base_dir)
+    generate_profile_file(file_b, hash_b, base_dir)
+    sh.diff("-u",
+            os.path.join(base_dir, hash_a + "_profile.txt"),
+            os.path.join(base_dir, hash_b + "_profile.txt"),
+            _out=os.path.join(IMPALA_HOME, "performance_result_profile_diff.txt"),
+            _ok_code=[0, 1])
 
 
 def generate_profile_file(name, hash, base_dir):
@@ -191,13 +211,40 @@ def generate_profile_file(name, hash, base_dir):
   Writes the runtime profiles back in a simple text file in the same directory.
   """
   with open(name) as fid:
-    data = json.load(fid)
+    data = json.loads(fid.read().decode("utf-8", "ignore"))
     with open(os.path.join(base_dir, hash + "_profile.txt"), "w+") as out:
       # For each query
       for key in data:
         for iteration in data[key]:
           out.write(iteration["runtime_profile"])
           out.write("\n\n")
+
+
+def generate_profile_files(name, hash, base_dir):
+  """Extracts runtime profiles from the JSON file 'name'.
+
+  Writes the runtime profiles back as separated simple text file in '[hash]_profiles' dir
+  in base_dir.
+  """
+  profile_dir = os.path.join(base_dir, hash + "_profiles")
+  if not os.path.exists(profile_dir):
+    os.makedirs(profile_dir)
+  with open(name) as fid:
+    data = json.loads(fid.read().decode("utf-8", "ignore"))
+    iter_num = {}
+    # For each query
+    for key in data:
+      for iteration in data[key]:
+        query_name = iteration["query"]["name"]
+        if query_name in iter_num:
+          iter_num[query_name] += 1
+        else:
+          iter_num[query_name] = 1
+        curr_iter = iter_num[query_name]
+
+        file_name = "{}_iter{:03d}.txt".format(query_name, curr_iter)
+        with open(os.path.join(profile_dir, file_name), "w") as out:
+          out.write(iteration["runtime_profile"])
 
 
 def backup_workloads():
@@ -208,7 +255,7 @@ def backup_workloads():
   temp_dir = mkdtemp()
   sh.cp(os.path.join(IMPALA_HOME, "testdata", "workloads"),
         temp_dir, R=True, _out=sys.stdout, _err=sys.stderr)
-  print "Backed up workloads to {0}".format(temp_dir)
+  print("Backed up workloads to {0}".format(temp_dir))
   return temp_dir
 
 
@@ -223,7 +270,7 @@ def perf_ab_test(options, args):
   hash_a = get_git_hash_for_name(args[0])
 
   # Create the base directory to store the results in
-  results_path = os.path.join(IMPALA_HOME, "perf_results")
+  results_path = IMPALA_PERF_RESULTS
   if not os.access(results_path, os.W_OK):
     os.makedirs(results_path)
 
@@ -241,12 +288,20 @@ def perf_ab_test(options, args):
     start_minicluster()
   start_impala(options.num_impalads, options)
 
-  workloads = set(options.workloads.split(","))
+  workloads = options.workloads.split(",")
 
   if options.load:
-    WORKLOAD_TO_DATASET = {"tpch": "tpch", "tpcds": "tpcds", "targeted-perf": "tpch",
-                           "tpcds-unmodified": "tpcds-unmodified"}
-    datasets = set([WORKLOAD_TO_DATASET[workload] for workload in workloads])
+    WORKLOAD_TO_DATASET = {
+      "tpch": "tpch",
+      "tpcds": "tpcds",
+      "targeted-perf": "tpch",
+      "tpcds-unmodified": "tpcds-unmodified",
+      "tpcds_partitioned": "tpcds_partitioned"
+    }
+    datasets = [WORKLOAD_TO_DATASET[workload] for workload in workloads]
+    if "tpcds_partitioned" in datasets and "tpcds" not in datasets:
+      # "tpcds_partitioned" require the text "tpcds" database.
+      load_data("tpcds", "text/none", options.scale)
     for dataset in datasets:
       load_data(dataset, options.table_formats, options.scale)
 
@@ -264,7 +319,7 @@ def perf_ab_test(options, args):
     restore_workloads(workload_dir)
     start_impala(options.num_impalads, options)
     run_workload(temp_dir, workloads, options)
-    compare(temp_dir, hash_a, hash_b)
+    compare(temp_dir, hash_a, hash_b, options)
 
 
 def parse_options():
@@ -287,10 +342,19 @@ def parse_options():
   parser.add_option("--start_minicluster", action="store_true",
                     help="start a new Hadoop minicluster")
   parser.add_option("--ninja", action="store_true",
-                    help = "use ninja, rather than Make, as the build tool")
+                    help="use ninja, rather than Make, as the build tool")
   parser.add_option("--impalad_args", dest="impalad_args", action="append", type="string",
                     default=[],
                     help="Additional arguments to pass to each Impalad during startup")
+  parser.add_option("--split_profiles", action="store_true", dest="split_profiles",
+                    default=True, help=("If specified, query profiles will be generated "
+                      "as separate files"))
+  parser.add_option("--no_split_profiles", action="store_false", dest="split_profiles",
+                    help=("If specified, query profiles will be generated as a "
+                      "single-combined file"))
+  parser.add_option("--exec_options", dest="exec_options",
+                    help=("Query exec option string to run workload (formatted as "
+                      "'opt1:val1;opt2:val2')"))
 
   parser.set_usage(textwrap.dedent("""
     single_node_perf_run.py [options] git_hash_A [git_hash_B]
@@ -337,6 +401,11 @@ def main():
 
   if sh.git("status", "--porcelain", "--untracked-files=no", _out=None).strip():
     sh.git("status", "--porcelain", "--untracked-files=no", _out=sys.stdout)
+    # Something went wrong, let's dump the actual diff to make it easier to
+    # track down
+    print("#### Working copy is dirty, dumping the diff #####")
+    sh.git("--no-pager", "diff", _out=sys.stdout)
+    print("#### End of diff #####")
     raise Exception("Working copy is dirty. Consider 'git stash' and try again.")
 
   # Save the current hash to be able to return to this place in the tree when done

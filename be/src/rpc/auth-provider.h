@@ -42,7 +42,8 @@ class AuthProvider {
   /// Creates a new Thrift transport factory in the out parameter that performs
   /// authorisation per this provider's protocol. The type of the transport returned is
   /// determined by 'underlying_transport_type' and there may be multiple levels of
-  /// wrapped transports, eg. a TBufferedTransport around a TSaslServerTransport.
+  /// wrapped transports, eg. a ThriftServer::BufferedTransport around a
+  /// TSaslServerTransport.
   virtual Status GetServerTransportFactory(
       ThriftServer::TransportType underlying_transport_type,
       const std::string& server_name, MetricGroup* metrics,
@@ -83,7 +84,8 @@ class AuthProvider {
 class SecureAuthProvider : public AuthProvider {
  public:
   SecureAuthProvider(bool is_internal)
-    : has_ldap_(false), has_saml_(false), has_jwt_(false), is_internal_(is_internal) {}
+    : has_ldap_(false), has_saml_(false), has_jwt_(false), has_oauth_(false),
+      is_internal_(is_internal) {}
 
   /// Performs initialization of external state.
   /// If we're using ldap, set up appropriate certificate usage.
@@ -133,6 +135,8 @@ class SecureAuthProvider : public AuthProvider {
 
   void InitJwt() { has_jwt_ = true; }
 
+  void InitOauth() { has_oauth_ = true; }
+
   /// Used for testing
   const std::string& principal() const { return principal_; }
   const std::string& service_name() const { return service_name_; }
@@ -147,6 +151,8 @@ class SecureAuthProvider : public AuthProvider {
   bool has_saml_;
 
   bool has_jwt_;
+
+  bool has_oauth_;
 
   /// Hostname of this machine - if kerberos, derived from principal.  If there
   /// is no kerberos, but LDAP is used, then acquired via GetHostname().

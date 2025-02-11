@@ -21,7 +21,7 @@
 #include <mutex>
 #include <queue>
 
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/trace.h"
@@ -639,14 +639,16 @@ void KrpcDataStreamRecvr::SenderQueue::Close() {
   current_batch_.reset();
 }
 
-Status KrpcDataStreamRecvr::CreateMerger(const TupleRowComparator& less_than) {
+Status KrpcDataStreamRecvr::CreateMerger(const TupleRowComparator& less_than,
+    const CodegenFnPtr<SortedRunMerger::HeapifyHelperFn>& codegend_heapify_helper_fn) {
   DCHECK(is_merging_);
   DCHECK(TestInfo::is_test() || FragmentInstanceState::IsFragmentExecThread());
   vector<SortedRunMerger::RunBatchSupplierFn> input_batch_suppliers;
   input_batch_suppliers.reserve(sender_queues_.size());
 
   // Create the merger that will a single stream of sorted rows.
-  merger_.reset(new SortedRunMerger(less_than, row_desc_, profile_, false));
+  merger_.reset(new SortedRunMerger(less_than, row_desc_, profile_, false,
+      codegend_heapify_helper_fn));
 
   for (SenderQueue* queue: sender_queues_) {
     input_batch_suppliers.push_back(
@@ -671,9 +673,8 @@ void KrpcDataStreamRecvr::TransferAllResources(RowBatch* transfer_batch) {
 KrpcDataStreamRecvr::KrpcDataStreamRecvr(KrpcDataStreamMgr* stream_mgr,
     MemTracker* parent_tracker, const RowDescriptor* row_desc,
     const RuntimeState& runtime_state, const TUniqueId& fragment_instance_id,
-    PlanNodeId dest_node_id, int num_senders, bool is_merging,
-    int64_t total_buffer_limit, RuntimeProfile* profile,
-    BufferPool::ClientHandle* client)
+    PlanNodeId dest_node_id, int num_senders, bool is_merging, int64_t total_buffer_limit,
+    RuntimeProfile* profile, BufferPool::ClientHandle* client)
   : mgr_(stream_mgr),
     runtime_state_(runtime_state),
     fragment_instance_id_(fragment_instance_id),
@@ -687,8 +688,8 @@ KrpcDataStreamRecvr::KrpcDataStreamRecvr(KrpcDataStreamMgr* stream_mgr,
     parent_tracker_(parent_tracker),
     buffer_pool_client_(client),
     profile_(profile),
-    dequeue_profile_(RuntimeProfile::Create(&pool_, "Dequeue")),
-    enqueue_profile_(RuntimeProfile::Create(&pool_, "Enqueue")) {
+    dequeue_profile_(RuntimeProfile::Create(&pool_, RuntimeProfile::DEQUEUE, false)),
+    enqueue_profile_(RuntimeProfile::Create(&pool_, RuntimeProfile::ENQUEUE, false)) {
   // Create one queue per sender if is_merging is true.
   int num_queues = is_merging ? num_senders : 1;
   sender_queues_.reserve(num_queues);
@@ -706,7 +707,7 @@ KrpcDataStreamRecvr::KrpcDataStreamRecvr(KrpcDataStreamMgr* stream_mgr,
   // Initialize various counters for measuring dequeuing from queues.
   bytes_dequeued_counter_ =
       ADD_COUNTER(dequeue_profile_, "TotalBytesDequeued", TUnit::BYTES);
-  bytes_dequeued_time_series_counter_ = ADD_TIME_SERIES_COUNTER(
+  bytes_dequeued_time_series_counter_ = ADD_SYSTEM_TIME_SERIES_COUNTER(
       dequeue_profile_, "BytesDequeued", bytes_dequeued_counter_);
   queue_get_batch_timer_ = ADD_TIMER(dequeue_profile_, "TotalGetBatchTime");
   data_wait_timer_ =
@@ -718,7 +719,7 @@ KrpcDataStreamRecvr::KrpcDataStreamRecvr(KrpcDataStreamMgr* stream_mgr,
   // Initialize various counters for measuring enqueuing into queues.
   bytes_received_counter_ =
       ADD_COUNTER(enqueue_profile_, "TotalBytesReceived", TUnit::BYTES);
-  bytes_received_time_series_counter_ = ADD_TIME_SERIES_COUNTER(
+  bytes_received_time_series_counter_ = ADD_SYSTEM_TIME_SERIES_COUNTER(
       enqueue_profile_, "BytesReceived", bytes_received_counter_);
   deserialize_row_batch_timer_ =
       ADD_TIMER(enqueue_profile_, "DeserializeRowBatchTime");
@@ -734,7 +735,7 @@ KrpcDataStreamRecvr::KrpcDataStreamRecvr(KrpcDataStreamMgr* stream_mgr,
       ADD_COUNTER(enqueue_profile_, "TotalRPCsDeferred", TUnit::UNIT);
   deferred_rpcs_time_series_counter_ =
       enqueue_profile_->AddSamplingTimeSeriesCounter("DeferredQueueSize", TUnit::UNIT,
-      bind<int64_t>(mem_fn(&KrpcDataStreamRecvr::num_deferred_rpcs), this));
+      bind<int64_t>(mem_fn(&KrpcDataStreamRecvr::num_deferred_rpcs), this), true);
   total_has_deferred_rpcs_timer_ =
       ADD_TIMER(enqueue_profile_, "TotalHasDeferredRPCsTime");
   dispatch_timer_ =

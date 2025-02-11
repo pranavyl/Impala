@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import re
 from datetime import datetime
 
@@ -22,7 +23,7 @@ from datetime import datetime
 # changed, and the stress test loses the ability to run the full set of queries. Set
 # these constants and assert that when a workload is used, all the queries we expect to
 # use are there.
-EXPECTED_TPCDS_QUERIES_COUNT = 111
+EXPECTED_TPCDS_QUERIES_COUNT = 114
 EXPECTED_TPCH_NESTED_QUERIES_COUNT = 22
 EXPECTED_TPCH_QUERIES_COUNT = 22
 # Add the number of stress test specific queries, i.e. in files like '*-stress-*.test'
@@ -33,6 +34,7 @@ EXPECTED_TPCH_STRESS_QUERIES_COUNT = EXPECTED_TPCH_QUERIES_COUNT + 3
 MEM_ESTIMATE_PATTERN = re.compile(
     r"Per-Host Resource Estimates: Memory=(\d+\.?\d*)(P|T|G|M|K)?B")
 NEW_GLOG_ENTRY_PATTERN = re.compile(r"[IWEF](?P<Time>\d{4} \d{2}:\d{2}:\d{2}\.\d{6}).*")
+CACHE_KEY_PATTERN = re.compile(r"cache key: ([a-f0-9]+)")
 
 
 def parse_glog(text, start_time=None):
@@ -101,6 +103,31 @@ def parse_duration_string_ms(duration):
   return (times['h'] * 60 * 60 + times['m'] * 60 + times['s']) * 1000 + times['ms']
 
 
+def parse_duration_string_ns(duration):
+  """Parses a duration string of the form 1h2h3m4s5.6ms4.5us7.8ns into nanoseconds."""
+  pattern = r'(?P<value>[0-9]+\.?[0-9]*?)(?P<units>\D+)'
+  matches = list(re.finditer(pattern, duration))
+  assert matches, 'Failed to parse duration string %s' % duration
+
+  times = {'h': 0, 'm': 0, 's': 0, 'ms': 0, 'us': 0, 'ns': 0}
+  for match in matches:
+    parsed = match.groupdict()
+    times[parsed['units']] = float(parsed['value'])
+
+  value_ns = (times['h'] * 60 * 60 + times['m'] * 60 + times['s']) * 1000000000
+  value_ns += times['ms'] * 1000000 + times['us'] * 1000 + times['ns']
+
+  return value_ns
+
+
+def get_duration_us_from_str(duration_str):
+  """Parses the duration string got in profile and returns the duration in us"""
+  match_res = re.search(r"\((\d+) us\)", duration_str)
+  if match_res:
+    return int(match_res.group(1))
+  raise Exception("Illegal duration string: " + duration_str)
+
+
 def match_memory_estimate(explain_lines):
   """
   Given a list of strings from EXPLAIN output, find the estimated memory needed. This is
@@ -127,6 +154,31 @@ def match_memory_estimate(explain_lines):
   if None in (mem_limit, units):
     raise Exception('could not parse explain string:\n' + '\n'.join(explain_lines))
   return mem_limit, units
+
+
+def match_cache_key(explain_lines):
+  """
+  Given a list of strings from EXPLAIN output, find the cache key.
+
+  Params:
+    explain_lines: list of str
+
+  Returns:
+    str - The cache key if found
+
+  Raises:
+    Exception if no cache key is found
+  """
+  cache_key = None
+  for line in explain_lines:
+    regex_result = CACHE_KEY_PATTERN.search(line)
+    if regex_result:
+      cache_key = regex_result.group(1)
+      break
+  if cache_key is None:
+    raise Exception(
+      'could not find cache key in explain string:\n' + '\n'.join(explain_lines))
+  return cache_key
 
 
 def get_bytes_summary_stats_counter(counter_name, runtime_profile):
@@ -178,5 +230,56 @@ def get_bytes_summary_stats_counter(counter_name, runtime_profile):
       summary_stats.append(TSummaryStatsCounter(sum=num_samples *
           int(summary_stat['avg']), total_num_values=num_samples,
           min_value=int(summary_stat['min']), max_value=int(summary_stat['max'])))
+
+  return summary_stats
+
+
+def get_time_summary_stats_counter(counter_name, runtime_profile):
+  """Extracts a list of TSummaryStatsCounters from a given runtime profile where the
+     units are time. Each entry in the returned list corresponds to a single occurrence
+     of the counter in the profile. If the counter is present, but it has not been
+     updated, an empty TSummaryStatsCounter is returned for that entry. If the counter
+     is not in the given profile, an empty list is returned. All time values are returned
+     as nanoseconds. Here is an example of how this method should be used:
+
+       # A single line in a runtime profile used for example purposes.
+       runtime_profile = "- ExampleTimer: (Avg: 100.000ms ; " \
+                                          "Min: 100.000ms ; " \
+                                          "Max: 100.000ms ; " \
+                                          "Number of samples: 6)"
+       summary_stats = get_bytes_summary_stats_counter("ExampleTimer",
+                                                      runtime_profile)
+       assert len(summary_stats) == 1
+       assert summary_stats[0].sum == summary_stats[0].min_value == \
+              summary_stats[0].max_value == 100000000 and \
+              summary_stats[0].total_num_values == 6
+  """
+  # This requires the Thrift definitions to be generated. We limit the scope of the import
+  # to allow tools like the stress test to import this file without building Impala.
+  from RuntimeProfile.ttypes import TSummaryStatsCounter
+
+  regex_summary_stat = re.compile(r"""\(
+    Avg:\s(?P<avg>.*)\s;\s # Matches Avg: ? ;
+    Min:\s(?P<min>.*)\s;\s # Matches Min: ? ;
+    Max:\s(?P<max>.*)\s;\s # Matches Max: ? ;
+    Number\sof\ssamples:\s(?P<samples>[0-9]+)\) # Matches Number of samples: ?)""",
+                                  re.VERBOSE)
+
+  summary_stats = []
+  for counter in re.findall(counter_name + ".*", runtime_profile):
+    summary_stat = re.search(regex_summary_stat, counter)
+    # We need to special-case when the counter has not been updated at all because empty
+    # summary counters have a different format than updated ones.
+    if not summary_stat:
+      assert "0ns (Number of samples: 0)" in counter
+      summary_stats.append(TSummaryStatsCounter(sum=0, total_num_values=0, min_value=0,
+                                                max_value=0))
+    else:
+      summary_stat = summary_stat.groupdict()
+      num_samples = int(summary_stat['samples'])
+      summary_stats.append(TSummaryStatsCounter(total_num_values=num_samples,
+          sum=num_samples * parse_duration_string_ns(summary_stat['avg']),
+          min_value=parse_duration_string_ns(summary_stat['min']),
+          max_value=parse_duration_string_ns(summary_stat['max'])))
 
   return summary_stats

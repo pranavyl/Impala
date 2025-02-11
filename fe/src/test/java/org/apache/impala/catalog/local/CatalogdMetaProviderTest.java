@@ -19,7 +19,9 @@ package org.apache.impala.catalog.local;
 
 import static org.junit.Assert.*;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -27,10 +29,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.impala.catalog.HdfsPartition;
 import org.apache.impala.catalog.local.CatalogdMetaProvider.SizeOfWeigher;
 import org.apache.impala.catalog.local.MetaProvider.PartitionMetadata;
 import org.apache.impala.catalog.local.MetaProvider.PartitionRef;
@@ -54,8 +58,13 @@ import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TRuntimeProfileNode;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.util.ListMap;
+import org.apache.impala.util.TByteBuffer;
+import org.apache.thrift.TConfiguration;
+import org.apache.thrift.transport.TTransportException;
 import org.junit.Assume;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestName;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -75,6 +84,8 @@ public class CatalogdMetaProviderTest {
   private final TableMetaRef tableRef_;
 
   private CacheStats prevStats_;
+  @Rule
+  public TestName name = new TestName();
 
   private static HiveJdbcClientPool hiveJdbcClientPool_;
   private static final String testDbName_ = "catalogd_meta_provider_test";
@@ -107,6 +118,8 @@ public class CatalogdMetaProviderTest {
   }
 
   private void createTestTbls() throws Exception {
+    LOG.info("Creating test tables for {}", name.getMethodName());
+    Stopwatch st = Stopwatch.createStarted();
     ImpalaJdbcClient client = ImpalaJdbcClient.createClientUsingHiveJdbcDriver();
     client.connect();
     try {
@@ -122,6 +135,8 @@ public class CatalogdMetaProviderTest {
           + " (c1 int) partitioned by (part int) stored as orc "
           + "tblproperties ('transactional'='true')");
     } finally {
+      LOG.info("Time taken for createTestTbls {} msec",
+          st.stop().elapsed(TimeUnit.MILLISECONDS));
       client.close();
     }
   }
@@ -257,6 +272,12 @@ public class CatalogdMetaProviderTest {
     // TPartialPartitionInfo in future.
     SizeOfWeigher weigher = new SizeOfWeigher();
     int weigh = weigher.weigh(refs, null);
+    assertTrue("Actual weigh: " + weigh, weigh > 4000);
+    assertTrue("Actual weigh: " + weigh, weigh < 5000);
+
+    // Also continue to test ehcache.
+    weigher = new SizeOfWeigher(false, null);
+    weigh = weigher.weigh(refs, null);
     assertTrue("Actual weigh: " + weigh, weigh > 4000);
     assertTrue("Actual weigh: " + weigh, weigh < 5000);
   }
@@ -590,6 +611,21 @@ public class CatalogdMetaProviderTest {
     }
   }
 
+  @Test
+  public void testLoadNullPartitionKeyValue() throws Exception {
+    provider_.cache_.invalidateAll();
+    CacheStats stats = diffStats();
+    String nullPartitionName = provider_.loadNullPartitionKeyValue();
+    assertNotNull(nullPartitionName);
+    stats = diffStats();
+    assertEquals(1, stats.missCount());
+    assertEquals(0, stats.hitCount());
+    assertEquals(nullPartitionName, provider_.loadNullPartitionKeyValue());
+    stats = diffStats();
+    assertEquals(0, stats.missCount());
+    assertEquals(1, stats.hitCount());
+  }
+
   private void testFileMetadataAfterCompaction(String dbName, String tableName,
       String partition, boolean isMajorCompaction) throws Exception {
     String tableOrPartition = dbName + "." + tableName + " " + partition;
@@ -622,9 +658,25 @@ public class CatalogdMetaProviderTest {
       Map<String, TCounter> counters = Maps.uniqueIndex(prof.counters, TCounter::getName);
       assertEquals(1, counters.get("CatalogFetch.Partitions.Requests").getValue());
       assertEquals(1, counters.get("CatalogFetch.Partitions.Misses").getValue());
-      int afterFileCount = partMap.values().stream()
-          .map(PartitionMetadata::getFileDescriptors).mapToInt(List::size).sum();
-      assertEquals(1, afterFileCount);
+      List<String> paths = partMap.values().stream()
+          .map(PartitionMetadata::getFileDescriptors)
+          .flatMap(Collection::stream)
+          .map(HdfsPartition.FileDescriptor::getPath)
+          .collect(Collectors.toList());
+      assertEquals("Actual paths: " + paths, 1, paths.size());
     }
+  }
+
+  public void testLargeTConfiguration() throws Exception {
+    // THRIFT-5696: Test that TByteBuffer init pass with large max message size beyond
+    // TConfiguration.DEFAULT_MAX_MESSAGE_SIZE.
+    int maxSize = BackendConfig.INSTANCE.getThriftRpcMaxMessageSize();
+    assertEquals(1024 * 1024 * 1024, maxSize);
+    int bufferSize = (100 * 1024 + 512) * 1024;
+    final TConfiguration configLarge = new TConfiguration(maxSize,
+        TConfiguration.DEFAULT_MAX_FRAME_SIZE, TConfiguration.DEFAULT_RECURSION_DEPTH);
+    TByteBuffer validTByteBuffer =
+        new TByteBuffer(configLarge, ByteBuffer.allocate(bufferSize));
+    validTByteBuffer.close();
   }
 }

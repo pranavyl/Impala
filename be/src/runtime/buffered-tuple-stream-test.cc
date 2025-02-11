@@ -91,6 +91,12 @@ class SimpleTupleStreamTest : public testing::Test {
     string_desc_ =
         pool_.Add(new RowDescriptor(*string_builder.Build(), tuple_ids, nullable_tuples));
 
+    DescriptorTblBuilder zero_sized_row_builder(
+        test_env_->exec_env()->frontend(), &pool_);
+    zero_sized_row_builder.DeclareTuple();
+    zero_sized_row_desc_ = pool_.Add(
+        new RowDescriptor(*zero_sized_row_builder.Build(), tuple_ids, nullable_tuples));
+
     // Construct descriptors for big rows with and without nullable tuples.
     // Each tuple contains 8 slots of TYPE_INT and a single byte for null indicator.
     DescriptorTblBuilder big_row_builder(test_env_->exec_env()->frontend(), &pool_);
@@ -230,9 +236,11 @@ class SimpleTupleStreamTest : public testing::Test {
       results->push_back(StringValue());
     } else {
       StringValue sv = *reinterpret_cast<StringValue*>(ptr);
-      uint8_t* copy = mem_pool_->Allocate(sv.len);
-      memcpy(copy, sv.ptr, sv.len);
-      sv.ptr = reinterpret_cast<char*>(copy);
+      if (!sv.IsSmall()) {
+        uint8_t* copy = mem_pool_->Allocate(sv.Len());
+        memcpy(copy, sv.Ptr(), sv.Len());
+        sv.SetPtr(reinterpret_cast<char*>(copy));
+      }
       results->push_back(sv);
     }
   }
@@ -452,6 +460,7 @@ class SimpleTupleStreamTest : public testing::Test {
   ObjectPool pool_;
   RowDescriptor* int_desc_;
   RowDescriptor* string_desc_;
+  RowDescriptor* zero_sized_row_desc_;
 
   static const int64_t BIG_ROW_BYTES = 16 * 1024;
   RowDescriptor* big_row_desc_;
@@ -599,6 +608,15 @@ class StreamStateTest : public SimpleTupleStreamTest {
   // Test that stream's debug string is capped only for the first
   // BufferedTupleStream::MAX_PAGE_ITER_DEBUG.
   void TestShortDebugString();
+
+  // Helper method to add one zero-sized row to the stream.
+  void TestAddOneZeroSizedRow(BufferedTupleStream& stream, RowBatch& batch);
+
+  // Helper method to get one zero-sized row from the stream.
+  void TestGetOneZeroSizedRow(BufferedTupleStream& stream);
+
+  // Test adding more than INT_MAX or UINT_MAX zero-size rows to a stream.
+  void TestAddAndGetZeroSizedRows();
 };
 
 // Basic API test. No data should be going to disk.
@@ -1207,13 +1225,12 @@ TEST_F(SimpleTupleStreamTest, BigStringReadWrite) {
   // Make the string large enough to fill a page.
   const int64_t string_len = BIG_ROW_BYTES - tuple_desc->byte_size();
   vector<char> data(string_len);
-  write_str->len = string_len;
-  write_str->ptr = data.data();
+  write_str->Assign(data.data(), string_len);
 
   // We should be able to append MAX_BUFFERS without problem.
   for (int i = 0; i < MAX_BUFFERS; ++i) {
     // Fill the string with the value i.
-    memset(write_str->ptr, i, write_str->len);
+    memset(write_str->Ptr(), i, write_str->Len());
     bool success = stream.AddRow(write_row, &status);
     ASSERT_TRUE(success);
     // We should have one large page per row, plus a default-size read/write page, plus
@@ -1230,14 +1247,14 @@ TEST_F(SimpleTupleStreamTest, BigStringReadWrite) {
     EXPECT_TRUE(eos) << i << " " << stream.DebugString();
     Tuple* tuple = read_batch.GetRow(0)->GetTuple(0);
     StringValue* str = tuple->GetStringSlot(tuple_desc->slots()[0]->tuple_offset());
-    EXPECT_EQ(string_len, str->len);
+    EXPECT_EQ(string_len, str->Len());
     for (int j = 0; j < string_len; ++j) {
-      EXPECT_EQ(i, str->ptr[j]) << j;
+      EXPECT_EQ(i, str->Ptr()[j]) << j;
     }
   }
 
   // We can't fit another row in memory - need to unpin to make progress.
-  memset(write_str->ptr, MAX_BUFFERS, write_str->len);
+  memset(write_str->Ptr(), MAX_BUFFERS, write_str->Len());
   bool success = stream.AddRow(write_row, &status);
   ASSERT_FALSE(success);
   ASSERT_OK(status);
@@ -1256,9 +1273,9 @@ TEST_F(SimpleTupleStreamTest, BigStringReadWrite) {
     EXPECT_EQ(eos, i == MAX_BUFFERS) << i;
     Tuple* tuple = read_batch.GetRow(0)->GetTuple(0);
     StringValue* str = tuple->GetStringSlot(tuple_desc->slots()[0]->tuple_offset());
-    EXPECT_EQ(string_len, str->len);
+    EXPECT_EQ(string_len, str->Len());
     for (int j = 0; j < string_len; ++j) {
-      ASSERT_EQ(i, str->ptr[j]) << j;
+      ASSERT_EQ(i, str->Ptr()[j]) << j;
     }
   }
   stream.Close(nullptr, RowBatch::FlushMode::NO_FLUSH_RESOURCES);
@@ -1843,7 +1860,8 @@ TEST_F(MultiTupleStreamTest, MultiTupleAddRowCustom) {
       for (int k = 0; k < string_desc_->tuple_descriptors().size(); k++) {
         TupleDescriptor* tuple_desc = string_desc_->tuple_descriptors()[k];
         fixed_size += tuple_desc->byte_size();
-        varlen_size += row->GetTuple(k)->VarlenByteSize(*tuple_desc);
+        varlen_size += row->GetTuple(k)->VarlenByteSize(
+            *tuple_desc, false /*assume_smallify*/);
       }
       uint8_t* data = stream.AddRowCustomBegin(fixed_size + varlen_size, &status);
       ASSERT_TRUE(data != nullptr);
@@ -1879,10 +1897,11 @@ void SimpleTupleStreamTest::WriteStringRow(const RowDescriptor* row_desc, TupleR
     memcpy(dst, src, tuple_desc->byte_size());
     for (SlotDescriptor* slot : tuple_desc->slots()) {
       StringValue* src_string = src->GetStringSlot(slot->tuple_offset());
+      if (src_string->IsSmall()) continue;
       StringValue* dst_string = dst->GetStringSlot(slot->tuple_offset());
-      dst_string->ptr = reinterpret_cast<char*>(varlen_write_ptr);
-      memcpy(dst_string->ptr, src_string->ptr, src_string->len);
-      varlen_write_ptr += src_string->len;
+      dst_string->Assign(reinterpret_cast<char*>(varlen_write_ptr), src_string->Len());
+      memcpy(dst_string->Ptr(), src_string->Ptr(), src_string->Len());
+      varlen_write_ptr += src_string->Len();
     }
   }
   ASSERT_EQ(data + fixed_size + varlen_size, varlen_write_ptr);
@@ -1977,15 +1996,15 @@ TEST_F(MultiNullableTupleStreamTest, TestComputeRowSize) {
   // Tuple 0 has some data.
   const SlotDescriptor* string_slot = tuple_descs[0]->slots()[0];
   StringValue* sv = tuple0->GetStringSlot(string_slot->tuple_offset());
-  *sv = STRINGS[0];
+  sv->Assign(StringValue::MakeSmallStringFrom(STRINGS[0]));
   int64_t expected_len =
-      tuple_null_indicator_bytes + string_desc_->GetRowSize() + sv->len;
+      tuple_null_indicator_bytes + string_desc_->GetRowSize() +
+      (sv->IsSmall() ? 0 : sv->Len());
   EXPECT_EQ(expected_len, stream.ComputeRowSize(row.get()));
 
   // Check that external slots aren't included in count.
   sv = tuple1->GetStringSlot(external_string_slot->tuple_offset());
-  sv->ptr = reinterpret_cast<char*>(1234);
-  sv->len = 1234;
+  sv->Assign(reinterpret_cast<char*>(1234), 1234);
   EXPECT_EQ(expected_len, stream.ComputeRowSize(row.get()));
 
   stream.Close(nullptr, RowBatch::FlushMode::NO_FLUSH_RESOURCES);
@@ -2047,7 +2066,7 @@ TEST_F(ArrayTupleStreamTest, TestArrayDeepCopy) {
       array_data->SetNotNull(item_desc->slots()[0]->null_indicator_offset());
       RawValue::Write(string, array_data, item_desc->slots()[0], mem_pool_.get());
       array_data += item_desc->byte_size();
-      expected_row_size += string->len;
+      expected_row_size += string->Len();
     }
     builder.CommitTuples(array_len);
 
@@ -2126,7 +2145,8 @@ TEST_F(ArrayTupleStreamTest, TestComputeRowSize) {
   // All tuples are NULL - only need null indicators.
   row->SetTuple(0, nullptr);
   row->SetTuple(1, nullptr);
-  EXPECT_EQ(tuple_null_indicator_bytes, stream.ComputeRowSize(row.get()));
+  EXPECT_EQ(tuple_null_indicator_bytes,
+      stream.ComputeRowSize(row.get()));
 
   // Tuples are initialized to empty and have no var-len data.
   row->SetTuple(0, tuple0.get());
@@ -2153,7 +2173,7 @@ TEST_F(ArrayTupleStreamTest, TestComputeRowSize) {
     array_data->SetNotNull(item_desc->slots()[0]->null_indicator_offset());
     RawValue::Write(str, array_data, item_desc->slots()[0], mem_pool_.get());
     array_data += item_desc->byte_size();
-    expected_row_size += str->len;
+    expected_row_size += str->Len();
   }
   builder.CommitTuples(array_len);
   EXPECT_EQ(expected_row_size, stream.ComputeRowSize(row.get()));
@@ -2238,6 +2258,86 @@ TEST_F(StreamStateTest, UnpinFullyExhaustedReadPageOnReadOnlyStreamNoAttach) {
 
 TEST_F(StreamStateTest, ShortDebugString) {
   TestShortDebugString();
+}
+
+void StreamStateTest::TestAddOneZeroSizedRow(
+    BufferedTupleStream& stream, RowBatch& batch) {
+  Status status;
+  uint8_t* write_ptr_before = stream.write_ptr_;
+  int64_t num_rows_before =
+      stream.write_page_ == nullptr ? 0 : stream.write_page_->num_rows;
+  bool b = stream.AddRow(batch.GetRow(0), &status);
+  ASSERT_OK(status);
+  ASSERT_TRUE(b);
+  if (write_ptr_before != nullptr) {
+    ASSERT_EQ(stream.write_ptr_, write_ptr_before);
+  }
+  ASSERT_EQ(stream.write_page_->num_rows, num_rows_before + 1);
+}
+
+void StreamStateTest::TestGetOneZeroSizedRow(BufferedTupleStream& stream) {
+  RowBatch read_batch(zero_sized_row_desc_, 1, &tracker_);
+  uint8_t* read_ptr_before = stream.read_it_.read_ptr_;
+  int64_t num_rows_before = stream.read_it_.read_page_rows_returned_;
+  bool eos = false;
+  Status status = stream.GetNext(&read_batch, &eos);
+  ASSERT_OK(status);
+  if (read_ptr_before != nullptr) {
+    ASSERT_EQ(stream.read_it_.read_ptr_, read_ptr_before);
+  }
+  ASSERT_EQ(stream.read_it_.read_page_rows_returned_, num_rows_before + 1);
+}
+
+void StreamStateTest::TestAddAndGetZeroSizedRows() {
+  Init(BUFFER_POOL_LIMIT);
+  BufferedTupleStream stream(
+      runtime_state_, zero_sized_row_desc_, &client_, PAGE_LEN, PAGE_LEN);
+  ASSERT_OK(stream.Init("StreamStateTest::TestAddAndGetZeroSizedRows", false));
+  bool got_reservation = false;
+  ASSERT_OK(stream.PrepareForReadWrite(true, &got_reservation));
+  ASSERT_TRUE(got_reservation);
+
+  RowBatch write_batch(zero_sized_row_desc_, 1, &tracker_);
+  write_batch.CommitRows(1);
+
+  // Adding 1 row to initialize the row counters
+  TestAddOneZeroSizedRow(stream, write_batch);
+
+  // Set the row counters to mock a stream with INT_MAX rows
+  stream.num_rows_ = INT_MAX;
+  stream.write_page_->num_rows = INT_MAX;
+
+  // Test if the stream can hold more than INT_MAX rows.
+  TestAddOneZeroSizedRow(stream, write_batch);
+
+  // Set the row counters to mock a stream with UINT_MAX rows
+  stream.num_rows_ = UINT_MAX;
+  stream.write_page_->num_rows = UINT_MAX;
+
+  // Test if the stream can hold more than UINT_MAX rows.
+  TestAddOneZeroSizedRow(stream, write_batch);
+
+  stream.DoneWriting();
+
+  // Test if we can get 1 row after getting 0 rows.
+  TestGetOneZeroSizedRow(stream);
+
+  // Test if we can get 1 row after getting INT_MAX rows.
+  stream.read_it_.IncrRowsReturned(INT_MAX - 1);
+  ASSERT_EQ(stream.read_it_.read_page_rows_returned_, INT_MAX);
+  TestGetOneZeroSizedRow(stream);
+
+  // Test if we can get 1 row after getting UINT_MAX rows.
+  stream.read_it_.IncrRowsReturned(UINT_MAX - INT_MAX - 1);
+  ASSERT_EQ(stream.read_it_.read_page_rows_returned_, UINT_MAX);
+  TestGetOneZeroSizedRow(stream);
+
+  ASSERT_EQ(stream.read_it_.GetRowsLeftInPage(), 0);
+  stream.Close(nullptr, RowBatch::FlushMode::NO_FLUSH_RESOURCES);
+}
+
+TEST_F(StreamStateTest, AddAndGetZeroSizedRows) {
+  TestAddAndGetZeroSizedRows();
 }
 }
 

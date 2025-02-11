@@ -24,6 +24,7 @@ import static org.junit.Assert.fail;
 
 import java.io.File;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -34,12 +35,13 @@ import org.apache.directory.server.annotations.CreateTransport;
 import org.apache.directory.server.core.annotations.ApplyLdifFiles;
 import org.apache.directory.server.core.integ.CreateLdapServerRule;
 import org.apache.hive.service.rpc.thrift.*;
-import org.apache.impala.util.Metrics;
+import org.apache.impala.testutil.WebClient;
 import org.apache.thrift.transport.THttpClient;
 import org.apache.thrift.protocol.TBinaryProtocol;
-import org.junit.Before;
 import org.junit.ClassRule;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @CreateDS(name = "myDS",
     partitions = { @CreatePartition(name = "test", suffix = "dc=myorg,dc=com") })
@@ -51,10 +53,12 @@ import org.junit.Test;
  * ldap authentication is being used.
  */
 public class LdapHS2Test {
+  private static final Logger LOG = LoggerFactory.getLogger(LdapHS2Test.class);
+
   @ClassRule
   public static CreateLdapServerRule serverRule = new CreateLdapServerRule();
 
-  Metrics metrics = new Metrics();
+  WebClient client_ = new WebClient();
 
   public void setUp(String extraArgs) throws Exception {
     String uri =
@@ -92,7 +96,9 @@ public class LdapHS2Test {
     verifySuccess(fetchResp.getStatus());
     List<TColumn> columns = fetchResp.getResults().getColumns();
     assertEquals(1, columns.size());
-    assertEquals(expectedResult, columns.get(0).getStringVal().getValues().get(0));
+    if (expectedResult != null) {
+      assertEquals(expectedResult, columns.get(0).getStringVal().getValues().get(0));
+    }
 
     return execResp.getOperationHandle();
   }
@@ -112,26 +118,26 @@ public class LdapHS2Test {
 
   private void verifyMetrics(long expectedBasicAuthSuccess, long expectedBasicAuthFailure)
       throws Exception {
-    long actualBasicAuthSuccess = (long) metrics.getMetric(
+    long actualBasicAuthSuccess = (long) client_.getMetric(
         "impala.thrift-server.hiveserver2-http-frontend.total-basic-auth-success");
     assertEquals(expectedBasicAuthSuccess, actualBasicAuthSuccess);
-    long actualBasicAuthFailure = (long) metrics.getMetric(
+    long actualBasicAuthFailure = (long) client_.getMetric(
         "impala.thrift-server.hiveserver2-http-frontend.total-basic-auth-failure");
     assertEquals(expectedBasicAuthFailure, actualBasicAuthFailure);
   }
 
   private void verifyCookieMetrics(
       long expectedCookieAuthSuccess, long expectedCookieAuthFailure) throws Exception {
-    long actualCookieAuthSuccess = (long) metrics.getMetric(
+    long actualCookieAuthSuccess = (long) client_.getMetric(
         "impala.thrift-server.hiveserver2-http-frontend.total-cookie-auth-success");
     assertEquals(expectedCookieAuthSuccess, actualCookieAuthSuccess);
-    long actualCookieAuthFailure = (long) metrics.getMetric(
+    long actualCookieAuthFailure = (long) client_.getMetric(
         "impala.thrift-server.hiveserver2-http-frontend.total-cookie-auth-failure");
     assertEquals(expectedCookieAuthFailure, actualCookieAuthFailure);
   }
 
   private void verifyTrustedDomainMetrics(long expectedAuthSuccess) throws Exception {
-    long actualAuthSuccess = (long) metrics
+    long actualAuthSuccess = (long) client_
         .getMetric("impala.thrift-server.hiveserver2-http-frontend."
             + "total-trusted-domain-check-success");
     assertEquals(expectedAuthSuccess, actualAuthSuccess);
@@ -139,20 +145,21 @@ public class LdapHS2Test {
 
   private void verifyTrustedAuthHeaderMetrics(long expectedAuthSuccess) throws Exception {
     long actualAuthSuccess =
-        (long) metrics.getMetric("impala.thrift-server.hiveserver2-http-frontend."
+        (long) client_.getMetric("impala.thrift-server.hiveserver2-http-frontend."
             + "total-trusted-auth-header-check-success");
     assertEquals(expectedAuthSuccess, actualAuthSuccess);
   }
 
-  private void verifyJwtAuthMetrics(long expectedAuthSuccess, long expectedAuthFailure)
+  private void verifyAuthMetrics(
+      long expectedAuthSuccess, long expectedAuthFailure, String authType)
       throws Exception {
     long actualAuthSuccess =
-        (long) metrics.getMetric("impala.thrift-server.hiveserver2-http-frontend."
-            + "total-jwt-token-auth-success");
+        (long) client_.getMetric("impala.thrift-server.hiveserver2-http-frontend."
+            + "total-" + authType + "-token-auth-success");
     assertEquals(expectedAuthSuccess, actualAuthSuccess);
     long actualAuthFailure =
-        (long) metrics.getMetric("impala.thrift-server.hiveserver2-http-frontend."
-            + "total-jwt-token-auth-failure");
+        (long) client_.getMetric("impala.thrift-server.hiveserver2-http-frontend."
+            + "total-" + authType + "-token-auth-failure");
     assertEquals(expectedAuthFailure, actualAuthFailure);
   }
 
@@ -202,7 +209,7 @@ public class LdapHS2Test {
     TCancelOperationResp cancelResp = client.CancelOperation(cancelReq);
     verifyMetrics(5, 0);
     assertEquals(cancelResp.getStatus().getStatusCode(), TStatusCode.ERROR_STATUS);
-    assertEquals(cancelResp.getStatus().getErrorMessage(), expectedError);
+    assertTrue(cancelResp.getStatus().getErrorMessage().contains(expectedError));
 
     // Open another session which will get username 'Test2Ldap'.
     TOpenSessionReq openReq2 = new TOpenSessionReq();
@@ -234,7 +241,7 @@ public class LdapHS2Test {
       }
     }
 
-    // Attempt to authenticate with a different mechanism. SHould fail, but won't
+    // Attempt to authenticate with a different mechanism. Should fail, but won't
     // increment the total-basic-auth-failure metric because its not considered a 'Basic'
     // auth attempt.
     headers.put("Authorization", "Negotiate VGVzdDFMZGFwOjEyMzQ1");
@@ -283,6 +290,27 @@ public class LdapHS2Test {
         assertEquals(e.getMessage(), "HTTP Response code: 401");
       }
     }
+
+    // Authenticate as 'Test1Ldap' with password '12345' - the request
+    // contains an empty 'a' header to test the fix of IMPALA-12341
+    // should succeed
+    Map<String, String> orderedHeaders = new LinkedHashMap<>();
+    orderedHeaders.put("Authorization", "Basic VGVzdDFMZGFwOjEyMzQ1");
+    // This empty "a" header breaks authentication in builds prior to IMPALA-12341
+    orderedHeaders.put("a", "");
+    transport.setCustomHeaders(orderedHeaders);
+    transport.open();
+
+    // Open a session which will get username 'Test1Ldap'.
+    TOpenSessionReq openReq6 = new TOpenSessionReq();
+    TOpenSessionResp openResp6 = client.OpenSession(openReq);
+    // One successful authentication.
+    verifyMetrics(10, numFailures);
+    // Running a query should succeed.
+    TOperationHandle operationHandle6 = execAndFetch(
+            client, openResp.getSessionHandle(), "select logged_in_user()", "Test1Ldap");
+    // Two more successful authentications - for the Exec() and the Fetch().
+    verifyMetrics(12, numFailures);
   }
 
   /**
@@ -347,11 +375,16 @@ public class LdapHS2Test {
 
   /**
    * Tests if authentication is skipped when connections to the HTTP hiveserver2
-   * endpoint originate from a trusted domain.
+   * endpoint originate from a trusted domain. This is a shared test function
+   * that is used for both the trusted_domain_strict_localhost=true and false
+   * cases.
    */
-  @Test
-  public void testHiveserver2TrustedDomainAuth() throws Exception {
-    setUp("--trusted_domain=localhost --trusted_domain_use_xff_header=true");
+  private void hiveserver2TrustedDomainAuthTestBody(boolean strictLocalhost)
+      throws Exception {
+    String strictLocalhostArgs = "--trusted_domain_strict_localhost=" +
+        String.valueOf(strictLocalhost);
+    setUp("--trusted_domain=localhost --trusted_domain_use_xff_header=true "
+        + strictLocalhostArgs);
     verifyMetrics(0, 0);
     THttpClient transport = new THttpClient("http://localhost:28000");
     Map<String, String> headers = new HashMap<String, String>();
@@ -406,7 +439,10 @@ public class LdapHS2Test {
     // Case 3: Case 1: Authenticate as 'Test1Ldap' with the right password
     // '12345' but with a non trusted address in X-Forwarded-For header
     headers.put("Authorization", "Basic VGVzdDFMZGFwOjEyMzQ1");
-    headers.put("X-Forwarded-For", "127.23.0.1");
+    // Sometimes RDNS resolves 127.* addresses as localhost, so this uses a 126.*
+    // address for non-strict localhost to avoid RDNS issues.
+    String nontrustedIp = strictLocalhost ? "127.0.23.1" : "126.0.23.1";
+    headers.put("X-Forwarded-For", nontrustedIp);
     transport.setCustomHeaders(headers);
     openResp = client.OpenSession(openReq);
     verifyMetrics(1, 0);
@@ -431,7 +467,7 @@ public class LdapHS2Test {
     // Case 5: Case 1: Authenticate as 'Test1Ldap' with the no password
     // and a non trusted address in X-Forwarded-For header
     headers.put("Authorization", "Basic VGVzdDFMZGFwOg==");
-    headers.put("X-Forwarded-For", "127.23.0.1");
+    headers.put("X-Forwarded-For", nontrustedIp);
     transport.setCustomHeaders(headers);
     try {
       openResp = client.OpenSession(openReq);
@@ -451,6 +487,98 @@ public class LdapHS2Test {
     // Account for 1 successful basic auth increment.
     verifyMetrics(4, 1);
     verifyTrustedDomainMetrics(9);
+  }
+
+  @Test
+  public void testHiveserver2TrustedDomainAuthStrict() throws Exception {
+    // Test variant with trusted_domain_strict_localhost=true
+    hiveserver2TrustedDomainAuthTestBody(true);
+  }
+
+  @Test
+  public void testHiveserver2TrustedDomainAuthNonstrict() throws Exception {
+    // Test variant with trusted_domain_strict_localhost=false
+    hiveserver2TrustedDomainAuthTestBody(false);
+  }
+
+  @Test
+  public void testHiveserver2TrustedDomainEmptyXffHeaderUseOrigin() throws Exception {
+    setUp("--trusted_domain=localhost --trusted_domain_use_xff_header=true " +
+          "--trusted_domain_empty_xff_header_use_origin=true");
+    verifyMetrics(0, 0);
+    verifyTrustedDomainMetrics(0);
+    THttpClient transport = new THttpClient("http://localhost:28000");
+    Map<String, String> headers = new HashMap<String, String>();
+
+    // Case 1: Authenticate as 'Test1Ldap' without password, send X-Forwarded-For header
+    headers.put("Authorization", "Basic VGVzdDFMZGFwOg==");
+    headers.put("X-Forwarded-For", "127.0.0.1, 120.76.80.91");
+    transport.setCustomHeaders(headers);
+    transport.open();
+    TCLIService.Iface client = new TCLIService.Client(new TBinaryProtocol(transport));
+
+    // Open a session which will get username 'Test1Ldap'.
+    TOpenSessionReq openReq = new TOpenSessionReq();
+    TOpenSessionResp openResp = client.OpenSession(openReq);
+    // One successful authentication.
+    verifyMetrics(0, 0);
+    verifyTrustedDomainMetrics(1);
+    // Running a query should succeed.
+    TOperationHandle operationHandle = execAndFetch(
+            client, openResp.getSessionHandle(), "select logged_in_user()", "Test1Ldap");
+    // Two more successful authentications - for the Exec() and the Fetch().
+    verifyMetrics(0, 0);
+    verifyTrustedDomainMetrics(3);
+
+    // Case 2: Authenticate as 'Test1Ldap' without password, do not send X-Forwarded-For
+    // header
+    headers.put("Authorization", "Basic VGVzdDFMZGFwOg==");
+    headers.remove("X-Forwarded-For");
+    transport.setCustomHeaders(headers);
+    openResp = client.OpenSession(openReq);
+    verifyMetrics(0, 0);
+    verifyTrustedDomainMetrics(4);
+    operationHandle = execAndFetch(client, openResp.getSessionHandle(),
+            "select logged_in_user()", "Test1Ldap");
+    verifyMetrics(0, 0);
+    // Two more successful authentications - for the Exec() and the Fetch().
+    verifyTrustedDomainMetrics(6);
+
+    // Case 3: Authenticate as 'Test1Ldap' without password, send X-Forwarded-For header
+    // that does not match trusted_domain
+    headers.put("Authorization", "Basic VGVzdDFMZGFwOg==");
+    headers.put("X-Forwarded-For", "126.0.23.1, 127.0.0.1, 127.0.0.6");
+    transport.setCustomHeaders(headers);
+    try {
+      openResp = client.OpenSession(openReq);
+      fail("Authentication should fail without password.");
+    } catch (Exception e) {
+      assertEquals(e.getMessage(), "HTTP Response code: 401");
+      // One basic auth failure
+      verifyMetrics(0, 1);
+      // And no more successful authentication
+      verifyTrustedDomainMetrics(6);
+    }
+
+    // Case 4: Authenticate as 'Test1Ldap' without password, do not send X-Forwarded-For
+    // header and the origin does not match trusted_domain
+    setUp("--trusted_domain=any.domain --trusted_domain_use_xff_header=true " +
+            "--trusted_domain_empty_xff_header_use_origin=true");
+    headers.put("Authorization", "Basic VGVzdDFMZGFwOg==");
+    headers.remove("X-Forwarded-For");
+    transport.setCustomHeaders(headers);
+    verifyMetrics(0, 0);
+    verifyTrustedDomainMetrics(0);
+    try {
+      openResp = client.OpenSession(openReq);
+      fail("Authentication should fail without password.");
+    } catch (Exception e) {
+      assertEquals(e.getMessage(), "HTTP Response code: 401");
+      // One basic auth failure
+      verifyMetrics(0, 1);
+      // No successful trusted domain authentications
+      verifyTrustedDomainMetrics(0);
+    }
   }
 
   /**
@@ -511,7 +639,7 @@ public class LdapHS2Test {
     // Case 4: Verify that there are no changes in metrics for trusted auth
     // header check if the X-Trusted-Proxy-Auth-Header header is not present
     long successMetricBefore =
-        (long) metrics.getMetric("impala.thrift-server.hiveserver2-http-frontend."
+        (long) client_.getMetric("impala.thrift-server.hiveserver2-http-frontend."
             + "total-trusted-auth-header-check-success");
     headers.put("Authorization", "Basic VGVzdDFMZGFwOjEyMzQ1");
     headers.remove("X-Trusted-Proxy-Auth-Header");
@@ -559,13 +687,13 @@ public class LdapHS2Test {
     TOpenSessionResp openResp = client.OpenSession(openReq);
     // One successful authentication.
     verifyMetrics(0, 0);
-    verifyJwtAuthMetrics(1, 0);
+    verifyAuthMetrics(1, 0, "jwt");
     // Running a query should succeed.
     TOperationHandle operationHandle = execAndFetch(
         client, openResp.getSessionHandle(), "select logged_in_user()", "impala");
     // Two more successful authentications - for the Exec() and the Fetch().
     verifyMetrics(0, 0);
-    verifyJwtAuthMetrics(3, 0);
+    verifyAuthMetrics(3, 0, "jwt");
 
     // case 2: Authenticate fails with invalid JWT token which does not have signature.
     String invalidJwtToken =
@@ -579,8 +707,249 @@ public class LdapHS2Test {
       openResp = client.OpenSession(openReq);
       fail("Exception exception.");
     } catch (Exception e) {
-      verifyJwtAuthMetrics(3, 1);
+      verifyAuthMetrics(3, 1, "jwt");
       assertEquals(e.getMessage(), "HTTP Response code: 401");
     }
+  }
+
+  /**
+   * Tests if sessions are authenticated by verifying both JWT and OAuth token for
+   * connections to the HTTP hiveserver2 endpoint.
+   */
+  @Test
+  public void testHiveserver2JwtAndOAuthAuth() throws Exception {
+    String jwtJwksFilename =
+        new File(System.getenv("IMPALA_HOME"), "testdata/jwt/jwks_rs256.json").getPath();
+    String oauthJwksFilename =
+        new File(System.getenv("IMPALA_HOME"),
+            "testdata/jwt/jwks_signing.json").getPath();
+    setUp(String.format(
+        "--jwt_token_auth=true --jwt_validate_signature=true --jwks_file_path=%s "
+            + "--jwt_allow_without_tls=true --oauth_token_auth=true "
+            + "--oauth_jwt_validate_signature=true --oauth_jwks_file_path=%s "
+            + "--jwt_allow_without_tls=true --oauth_jwt_custom_claim_username=sub "
+            + "--oauth_allow_without_tls=true",
+        jwtJwksFilename, oauthJwksFilename));
+    verifyMetrics(0, 0);
+    THttpClient transport = new THttpClient("http://localhost:28000");
+    Map<String, String> headers = new HashMap<String, String>();
+
+    // Case 1: Authenticate with valid JWT Token in HTTP header.
+    String jwtToken =
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6InB1YmxpYzpjNDI0YjY3Yi1mZTI4LTQ1ZDctYjAxNS1m"
+        + "NzlkYTUwYjViMjEiLCJ0eXAiOiJKV1MifQ.eyJpc3MiOiJhdXRoMCIsInVzZXJuYW1lIjoia"
+        + "W1wYWxhIn0.OW5H2SClLlsotsCarTHYEbqlbRh43LFwOyo9WubpNTwE7hTuJDsnFoVrvHiWI"
+        + "02W69TZNat7DYcC86A_ogLMfNXagHjlMFJaRnvG5Ekag8NRuZNJmHVqfX-qr6x7_8mpOdU55"
+        + "4kc200pqbpYLhhuK4Qf7oT7y9mOrtNrUKGDCZ0Q2y_mizlbY6SMg4RWqSz0RQwJbRgXIWSgc"
+        + "bZd0GbD_MQQ8x7WRE4nluU-5Fl4N2Wo8T9fNTuxALPiuVeIczO25b5n4fryfKasSgaZfmk0C"
+        + "oOJzqbtmQxqiK9QNSJAiH2kaqMwLNgAdgn8fbd-lB1RAEGeyPH8Px8ipqcKsPk0bg";
+    headers.put("Authorization", "Bearer " + jwtToken);
+    headers.put("X-Forwarded-For", "127.0.0.1");
+    transport.setCustomHeaders(headers);
+    transport.open();
+    TCLIService.Iface client = new TCLIService.Client(new TBinaryProtocol(transport));
+
+    // Open a session which will get username 'impala' from JWT token and use it as
+    // login user.
+    TOpenSessionReq openReq = new TOpenSessionReq();
+    TOpenSessionResp openResp = client.OpenSession(openReq);
+    // One successful authentication.
+    verifyMetrics(0, 0);
+    verifyAuthMetrics(1, 0, "jwt");
+    // Running a query should succeed.
+    TOperationHandle operationHandle = execAndFetch(
+        client, openResp.getSessionHandle(), "select logged_in_user()", "impala");
+    // Two more successful authentications - for the Exec() and the Fetch().
+    verifyMetrics(0, 0);
+    verifyAuthMetrics(3, 0, "jwt");
+    verifyAuthMetrics(0, 0, "oauth");
+
+    // Authenticate with a valid OAuth token in HTTP header.
+    String oauthToken =
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6IjIwMjMwNTA5LTE2MDQxNSIsInR5cGUiOiJKV1QifQ.eyJ"
+        + "hdWQiOiJpbXBhbGEtdGVzdHMiLCJleHAiOjE5OTkwMDgyNTUsImlhdCI6MTY4MzY0ODI1NSw"
+        + "iaXNzIjoiZmlsZTovL3Rlc3RzL3V0aWwvand0L2p3dF91dGlsLnB5Iiwia2lkIjoiMjAyMzA"
+        + "1MDktMTYwNDE1Iiwic3ViIjoidGVzdC11c2VyIn0.dWMOkcBrwRansZrCZrlbYzr9alIQ23q"
+        + "lnw4t8Kx_v87CBB90qtmTV88nZAh4APtTE8IUnP0e45R2XyDoH3a8UVrrSOkEzI47wJ0I3Gq"
+        + "Sc_R_MsGoeGlKreZmcjGhY_ceOo7RWYaBdzsAZe1YXcKJbq2sQJ3issfjBa_fWt0Qhy0Dvzs"
+        + "sUf3V-g5nQUM3W3pOULiFtMhA8YmIdheHalRz3D_NWMAqe79iUv6tG0Eg08x-cl8GXYsDm45"
+        + "sU4WkP5fZps6Q4Fm05640FWXG8K0PoLzSI_Iac3zzSAPs-iYNeeNE6C9QxBYSLBvQrWL0SET"
+        + "afP82Mo-nEZsAJbMMSqm0cQ";
+
+    transport = new THttpClient("http://localhost:28000");
+    headers = new HashMap<String, String>();
+    headers.put("Authorization", "Bearer " + oauthToken);
+    headers.put("X-Forwarded-For", "127.0.0.1");
+    transport.setCustomHeaders(headers);
+    transport.open();
+    client = new TCLIService.Client(new TBinaryProtocol(transport));
+
+    // Open a session which will get username 'test-user' from OAuth token and use
+    // it as login user.
+    openReq = new TOpenSessionReq();
+    openResp = client.OpenSession(openReq);
+    // One successful authentication.
+    verifyMetrics(0, 0);
+    verifyAuthMetrics(1, 0, "oauth");
+    // Running a query should succeed.
+    operationHandle = execAndFetch(
+        client, openResp.getSessionHandle(), "select logged_in_user()", "test-user");
+    // Two more successful authentications - for the Exec() and the Fetch().
+    verifyMetrics(0, 0);
+    verifyAuthMetrics(3, 0, "oauth");
+    verifyAuthMetrics(3, 0, "jwt");
+
+    // case 2: Authenticate fails with invalid token for both JWT and OAuth which does
+    // not have signature.
+    headers.clear();
+    String invalidJwtToken =
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6InB1YmxpYzpjNDI0YjY3Yi1mZTI4LTQ1ZDctYjAxNS1m"
+        + "NzlkYTUwYjViMjEiLCJ0eXAiOiJKV1MifQ.eyJpc3MiOiJhdXRoMCIsInVzZXJuYW1lIjoia"
+        + "W1wYWxhIn0.";
+    headers.put("Authorization", "Bearer " + invalidJwtToken);
+    headers.put("X-Forwarded-For", "127.0.0.1");
+    transport.setCustomHeaders(headers);
+    try {
+      openResp = client.OpenSession(openReq);
+      fail("Exception exception.");
+    } catch (Exception e) {
+      // Both JWT and OAuth have 3 successes and 1 failure each.
+      verifyAuthMetrics(3, 1, "jwt");
+      verifyAuthMetrics(3, 1, "oauth");
+      assertEquals(e.getMessage(), "HTTP Response code: 401");
+    }
+  }
+
+  /**
+   * Tests LDAP for reading Impala table through JDBC external data source.
+   * Assume that Impala JDBC driver has been downloaded and copied to
+   * ${FILESYSTEM_PREFIX}/test-warehouse/data-sources/jdbc-drivers/.
+   */
+  @Test
+  public void testImpalaExtJdbcTables() throws Exception {
+    setUp("");
+    verifyMetrics(0, 0);
+    THttpClient transport = new THttpClient("http://localhost:28000");
+    Map<String, String> headers = new HashMap<String, String>();
+    // Authenticate as 'Test1Ldap' with password '12345'
+    headers.put("Authorization", "Basic VGVzdDFMZGFwOjEyMzQ1");
+    transport.setCustomHeaders(headers);
+    transport.open();
+    TCLIService.Iface client = new TCLIService.Client(new TBinaryProtocol(transport));
+
+    // Open a session which will get username 'Test1Ldap'.
+    TOpenSessionReq openReq = new TOpenSessionReq();
+    TOpenSessionResp openResp = client.OpenSession(openReq);
+    TSessionHandle session = openResp.getSessionHandle();
+    // One successful authentication.
+    verifyMetrics(1, 0);
+
+    // Define queries.
+    String fileSystemPrefix = System.getenv("FILESYSTEM_PREFIX");
+    String internalListenHost = System.getenv("INTERNAL_LISTEN_HOST");
+    String dropTableQuery = "DROP TABLE IF EXISTS %s";
+    // Set JDBC authentication mechanisms as LDAP (3) with username/password as
+    // TEST_USER_1/TEST_PASSWORD_1.
+    String createTableQuery =
+        String.format("CREATE EXTERNAL TABLE impala_jdbc_ext_test_table (" +
+        "id INT, bool_col BOOLEAN, tinyint_col TINYINT, smallint_col SMALLINT, " +
+        "int_col INT, bigint_col BIGINT, float_col FLOAT, double_col DOUBLE, " +
+        "date_string_col STRING, string_col STRING, timestamp_col TIMESTAMP) " +
+        "STORED BY JDBC TBLPROPERTIES (" +
+        "\"database.type\"=\"IMPALA\", " +
+        "\"jdbc.url\"=\"jdbc:impala://%s:21050/functional\", " +
+        "\"jdbc.auth\"=\"AuthMech=3\", " +
+        "\"jdbc.driver\"=\"com.cloudera.impala.jdbc.Driver\", " +
+        "\"driver.url\"=\"%s/test-warehouse/data-sources/jdbc-drivers/" +
+        "ImpalaJDBC42.jar\", " +
+        "\"dbcp.username\"=\"%s\", " +
+        "\"dbcp.password\"=\"%s\", " +
+        "\"table\"=\"alltypes\")",
+        internalListenHost, fileSystemPrefix, TEST_USER_1, TEST_PASSWORD_1);
+    // Set JDBC authentication mechanisms as LDAP with wrong password.
+    String createTableWithWrongPassword =
+        String.format("CREATE EXTERNAL TABLE impala_jdbc_tbl_wrong_password (" +
+        "id INT, bool_col BOOLEAN, tinyint_col TINYINT, smallint_col SMALLINT, " +
+        "int_col INT, bigint_col BIGINT, float_col FLOAT, double_col DOUBLE, " +
+        "date_string_col STRING, string_col STRING, timestamp_col TIMESTAMP) " +
+       "STORED BY JDBC TBLPROPERTIES (" +
+        "\"database.type\"=\"IMPALA\", " +
+        "\"jdbc.url\"=\"jdbc:impala://%s:21050/functional\", " +
+        "\"jdbc.auth\"=\"AuthMech=3\", " +
+        "\"jdbc.driver\"=\"com.cloudera.impala.jdbc.Driver\", " +
+        "\"driver.url\"=\"%s/test-warehouse/data-sources/jdbc-drivers/" +
+        "ImpalaJDBC42.jar\", " +
+        "\"dbcp.username\"=\"%s\", " +
+        "\"dbcp.password\"=\"wrong-password\", " +
+        "\"table\"=\"alltypes\")",
+        internalListenHost, fileSystemPrefix, TEST_USER_1);
+    // Set JDBC authentication mechanisms as LDAP without AuthMech.
+    String createTableWithoutAuthMech =
+        String.format("CREATE EXTERNAL TABLE impala_jdbc_tbl_without_auth_mech (" +
+        "id INT, bool_col BOOLEAN, tinyint_col TINYINT, smallint_col SMALLINT, " +
+        "int_col INT, bigint_col BIGINT, float_col FLOAT, double_col DOUBLE, " +
+        "date_string_col STRING, string_col STRING, timestamp_col TIMESTAMP) " +
+        "STORED BY JDBC TBLPROPERTIES (" +
+        "\"database.type\"=\"IMPALA\", " +
+        "\"jdbc.url\"=\"jdbc:impala://%s:21050/functional\", " +
+        "\"jdbc.driver\"=\"com.cloudera.impala.jdbc.Driver\", " +
+        "\"driver.url\"=\"%s/test-warehouse/data-sources/jdbc-drivers/" +
+        "ImpalaJDBC42.jar\", " +
+        "\"dbcp.username\"=\"%s\", " +
+        "\"dbcp.password\"=\"%s\", " +
+        "\"table\"=\"alltypes\")",
+        internalListenHost, fileSystemPrefix, TEST_USER_1, TEST_PASSWORD_1);
+    String selectQuery = "select string_col from %s where id=9";
+
+    // Run queries.
+    //
+    // Create JDBC tables.
+    execAndFetch(client, session,
+        String.format(dropTableQuery, "impala_jdbc_ext_test_table"), null);
+    execAndFetch(client, session, createTableQuery, "Table has been created.");
+    execAndFetch(client, session,
+        String.format(dropTableQuery, "impala_jdbc_tbl_wrong_password"), null);
+    execAndFetch(client, session, createTableWithWrongPassword,
+        "Table has been created.");
+    execAndFetch(client, session,
+        String.format(dropTableQuery, "impala_jdbc_tbl_without_auth_mech"), null);
+    execAndFetch(client, session, createTableWithoutAuthMech, "Table has been created.");
+
+    // Successfully access JDBC data source table with LDAP.
+    execAndFetch(client, session,
+        String.format(selectQuery, "impala_jdbc_ext_test_table"), "9");
+    // Negative case for JDBC data source table with wrong password.
+    String expectedError = "Error initialized or created transport for authentication";
+    try {
+      execAndFetch(client, session,
+          String.format(selectQuery, "impala_jdbc_tbl_wrong_password"), "9");
+      fail("Expected error: " + expectedError);
+    } catch (Exception e) {
+      assertTrue(e.getMessage().contains(expectedError));
+    }
+    // Negative case for JDBC data source table without AuthMech.
+    expectedError = "Communication link failure. Failed to connect to server";
+    try {
+      execAndFetch(client, session,
+          String.format(selectQuery, "impala_jdbc_tbl_without_auth_mech"), "9");
+      fail("Expected error: " + expectedError);
+    } catch (Exception e) {
+      assertTrue(String.format("Authentication failed with error: %s", e.getMessage()),
+          e.getMessage().contains(expectedError));
+    }
+
+    // Drop JDBC tables.
+    execAndFetch(client, session,
+        String.format(dropTableQuery, "impala_jdbc_ext_test_table"),
+        "Table has been dropped.");
+    execAndFetch(client, session,
+        String.format(dropTableQuery, "impala_jdbc_tbl_wrong_password"),
+        "Table has been dropped.");
+    execAndFetch(client, session,
+        String.format(dropTableQuery, "impala_jdbc_tbl_without_auth_mech"),
+        "Table has been dropped.");
+
+    // Two successful authentications for each ExecAndFetch().
+    verifyMetrics(25, 0);
   }
 }

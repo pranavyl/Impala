@@ -25,6 +25,7 @@
 #
 # TODO Add support for SQL Error Codes
 #      https://msdn.microsoft.com/en-us/library/ms714687%28v=vs.85%29.aspx
+from __future__ import absolute_import, division, print_function
 error_codes = (
   ("OK", 0, ""),
 
@@ -475,6 +476,24 @@ error_codes = (
   ("JWKS_PARSE_ERROR", 153, "Error parsing JWKS: $0."),
 
   ("JWT_VERIFY_FAILED", 154, "Error verifying JWT Token: $0."),
+
+  ("PARQUET_ROWS_SKIPPING", 155, "Couldn't skip rows in column '$0' in file '$1'."),
+
+  ("QUERY_OPTION_PARSE_FAILED", 156, "Failed to parse query option '$0': $1"),
+
+  ("CATALOG_INCOMPATIBLE_PROTOCOL", 157,
+   "Client has incompatible protocol version V$0 conflicting with catalogd's version "
+   "V$1"),
+
+  ("STATESTORE_INCOMPATIBLE_PROTOCOL", 158,
+   "Subscriber '$0' has incompatible protocol version V$1 conflicting with statestored's "
+   "version V$2"),
+
+  ("JDBC_CONFIGURATION_ERROR", 159, "Error in JDBC table configuration: $0."),
+
+  ("TUPLE_CACHE_INCONSISTENCY", 160, "Inconsistent tuple cache found: $0."),
+
+  ("OAUTH_VERIFY_FAILED", 161, "Error verifying OAuth Token: $0.")
 )
 
 import sys

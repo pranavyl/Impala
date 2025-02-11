@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
 
 import org.apache.impala.analysis.AggregateInfoBase;
 import org.apache.impala.analysis.AnalyticExpr;
@@ -101,10 +102,13 @@ public class AnalyticPlanner {
    */
   public PlanNode createSingleNodePlan(PlanNode root,
       List<Expr> groupingExprs, List<Expr> inputPartitionExprs) throws ImpalaException {
-    // Identify predicates that reference the logical analytic tuple (this logical
-    // analytic tuple is replaced by different physical ones during planning)
+    // If the plan node is not an EmptySetNode, identify predicates that reference the
+    // logical analytic tuple (this logical analytic tuple is replaced by different
+    // physical ones during planning)
     List<TupleId> tids = new ArrayList<>();
-    tids.addAll(root.getTupleIds());
+    if (!(root instanceof EmptySetNode)) {
+      tids.addAll(root.getTupleIds());
+    }
     tids.add(analyticInfo_.getOutputTupleId());
     List<Expr> analyticConjs = analyzer_.getUnassignedConjuncts(tids);
     if (LOG.isTraceEnabled()) {
@@ -316,7 +320,7 @@ public class AnalyticPlanner {
     return createSortInfo(input, sortExprs, isAsc, nullsFirst, TSortingOrder.LEXICAL);
   }
 
-   /**
+  /**
    * Same as above, but with extra parameter, sorting order.
    */
   private SortInfo createSortInfo(PlanNode input, List<Expr> sortExprs,
@@ -325,21 +329,25 @@ public class AnalyticPlanner {
     for (TupleId tid: input.getTupleIds()) {
       TupleDescriptor tupleDesc = analyzer_.getTupleDesc(tid);
       for (SlotDescriptor inputSlotDesc: tupleDesc.getSlots()) {
-        if (!inputSlotDesc.isMaterialized()) continue;
-        if (inputSlotDesc.getType().isComplexType()) {
-          // Project out collection slots since they won't be used anymore and may cause
-          // troubles like IMPALA-8718. They won't be used since outputs of the analytic
-          // node must be in the select list of the block with the analytic, and we don't
-          // allow collection types to be returned from a select block, and also don't
-          // support any builtin or UDF functions that take collection types as an
-          // argument.
-          if (LOG.isTraceEnabled()) {
-            LOG.trace("Project out collection slot in sort tuple of analytic: slot={}",
-                inputSlotDesc.debugString());
+        // Only add fully materialized slot descriptors. It is possible that a slot desc
+        // shows up that is materialized but not all of its children are, see
+        // IMPALA-13272. This can happen for example if only a subset of the fields of a
+        // struct is queried - the overall struct needs to be marked materialized to allow
+        // the required children to be materialized where they are needed, but the struct
+        // as a whole does not need to be added to the sorting tuple (or any other tuple)
+        // - the required fields are added separately in their own right.
+        if (inputSlotDesc.isFullyMaterialized()) {
+          // Project out collection slots that are not supported in the sorting tuple
+          // (collections within structs).
+          if (SortInfo.isValidInSortingTuple(inputSlotDesc.getType())) {
+            inputSlotRefs.add(new SlotRef(inputSlotDesc));
+          } else {
+            if (LOG.isTraceEnabled()) {
+              LOG.trace("Project out unsupported collection slot in " +
+                  "sort tuple of analytic: slot={}", inputSlotDesc.debugString());
+            }
           }
-          continue;
         }
-        inputSlotRefs.add(new SlotRef(inputSlotDesc));
       }
     }
 
@@ -402,10 +410,10 @@ public class AnalyticPlanner {
       List<Expr> sortExprs = Lists.newArrayList(partitionByExprs);
       // for PB exprs use ASC, NULLS LAST to match the behavior of the default
       // order-by and to ensure that limit pushdown works correctly
-      List<Boolean> isAsc =
-          Lists.newArrayList(Collections.nCopies(sortExprs.size(), new Boolean(true)));
-      List<Boolean> nullsFirst =
-          Lists.newArrayList(Collections.nCopies(sortExprs.size(), new Boolean(false)));
+      List<Boolean> isAsc = Lists.newArrayList(
+          Collections.nCopies(sortExprs.size(), Boolean.valueOf(true)));
+      List<Boolean> nullsFirst = Lists.newArrayList(
+          Collections.nCopies(sortExprs.size(), Boolean.valueOf(false)));
 
       // then sort on orderByExprs
       for (OrderByElement orderByElement: sortGroup.orderByElements) {
@@ -910,7 +918,7 @@ public class AnalyticPlanner {
       if (!(lhs instanceof SlotRef)) continue;
 
       List<Expr> lhsSourceExprs = ((SlotRef) lhs).getDesc().getSourceExprs();
-      if (lhsSourceExprs.size() > 1 ||
+      if (lhsSourceExprs.size() != 1 ||
             !(lhsSourceExprs.get(0) instanceof AnalyticExpr)) {
         continue;
       }

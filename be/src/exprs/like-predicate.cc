@@ -64,8 +64,9 @@ void LikePredicate::LikePrepareInternal(FunctionContext* context,
     FunctionContext::FunctionStateScope scope, bool case_sensitive) {
   if (scope != FunctionContext::THREAD_LOCAL) return;
   LikePredicateState* state = new LikePredicateState();
-  state->function_ = LikeFn;
   context->SetFunctionState(scope, state);
+  state->function_ = LikeFn;
+  state->case_sensitive_ = case_sensitive;
   if (context->IsArgConstant(1)) {
     StringVal pattern_val = *reinterpret_cast<StringVal*>(context->GetConstantArg(1));
     if (pattern_val.is_null) return;
@@ -75,7 +76,7 @@ void LikePredicate::LikePrepareInternal(FunctionContext* context,
     re2::RE2 starts_with_re("([^%_]*)(?:%+)");
     re2::RE2 equals_re("([^%_]*)");
     re2::RE2 ends_with_escaped_wildcard(".*\\\\%$");
-    string pattern_str(pattern.ptr, pattern.len);
+    string pattern_str(pattern.Ptr(), pattern.Len());
     string search_string;
     if (case_sensitive && RE2::FullMatch(pattern_str, substring_re, &search_string)) {
       state->SetSearchString(search_string);
@@ -101,6 +102,7 @@ void LikePredicate::LikePrepareInternal(FunctionContext* context,
       opts.set_never_nl(false);
       opts.set_dot_nl(true);
       opts.set_case_sensitive(case_sensitive);
+      StringFunctions::SetRE2MemOpt(&opts);
       state->regex_.reset(new RE2(re_pattern, opts));
       if (!state->regex_->ok()) {
         context->SetError(Substitute("Invalid regex: $0", pattern_str).c_str());
@@ -135,6 +137,7 @@ void LikePredicate::RegexPrepareInternal(FunctionContext* context,
   LikePredicateState* state = new LikePredicateState();
   context->SetFunctionState(scope, state);
   state->function_ = RegexFn;
+  state->case_sensitive_ = case_sensitive;
   if (context->IsArgConstant(1)) {
     StringVal* pattern = reinterpret_cast<StringVal*>(context->GetConstantArg(1));
     if (pattern->is_null) return;
@@ -164,6 +167,7 @@ void LikePredicate::RegexPrepareInternal(FunctionContext* context,
     } else {
       RE2::Options opts;
       opts.set_case_sensitive(case_sensitive);
+      StringFunctions::SetRE2MemOpt(&opts);
       state->regex_.reset(new RE2(pattern_str, opts));
       if (!state->regex_->ok()) {
         context->SetError(
@@ -196,6 +200,7 @@ void LikePredicate::RegexpLikePrepare(FunctionContext* context,
     }
     RE2::Options opts;
     string error_str;
+    StringFunctions::SetRE2MemOpt(&opts);
     if (!StringFunctions::SetRE2Options(*match_parameter, &error_str, &opts)) {
       context->SetError(error_str.c_str());
       return;
@@ -220,6 +225,7 @@ BooleanVal LikePredicate::RegexpLikeInternal(FunctionContext* context,
     if (match_parameter.is_null) return BooleanVal::null();
     RE2::Options opts;
     string error_str;
+    StringFunctions::SetRE2MemOpt(&opts);
     if (!StringFunctions::SetRE2Options(match_parameter, &error_str, &opts)) {
       context->SetError(error_str.c_str());
       return BooleanVal(false);
@@ -262,7 +268,7 @@ BooleanVal LikePredicate::ConstantSubstringFn(FunctionContext* context,
   if (val.is_null) return BooleanVal::null();
   LikePredicateState* state = reinterpret_cast<LikePredicateState*>(
       context->GetFunctionState(FunctionContext::THREAD_LOCAL));
-  if (state->search_string_sv_.len == 0) return BooleanVal(true);
+  if (state->search_string_sv_.Len() == 0) return BooleanVal(true);
   StringValue pattern_value = StringValue::FromStringVal(val);
   return BooleanVal(state->substring_pattern_.Search(&pattern_value) != -1);
 }
@@ -272,11 +278,11 @@ BooleanVal LikePredicate::ConstantStartsWithFn(FunctionContext* context,
   if (val.is_null) return BooleanVal::null();
   LikePredicateState* state = reinterpret_cast<LikePredicateState*>(
       context->GetFunctionState(FunctionContext::THREAD_LOCAL));
-  if (val.len < state->search_string_sv_.len) {
+  if (val.len < state->search_string_sv_.Len()) {
     return BooleanVal(false);
   } else {
     StringValue v =
-        StringValue(reinterpret_cast<char*>(val.ptr), state->search_string_sv_.len);
+        StringValue(reinterpret_cast<char*>(val.ptr), state->search_string_sv_.Len());
     return BooleanVal(state->search_string_sv_.Eq((v)));
   }
 }
@@ -286,12 +292,11 @@ BooleanVal LikePredicate::ConstantEndsWithFn(FunctionContext* context,
   if (val.is_null) return BooleanVal::null();
   LikePredicateState* state = reinterpret_cast<LikePredicateState*>(
       context->GetFunctionState(FunctionContext::THREAD_LOCAL));
-  if (val.len < state->search_string_sv_.len) {
+  int len = state->search_string_sv_.Len();
+  if (val.len < len) {
     return BooleanVal(false);
   } else {
-    char* ptr =
-        reinterpret_cast<char*>(val.ptr) + val.len - state->search_string_sv_.len;
-    int len = state->search_string_sv_.len;
+    char* ptr = reinterpret_cast<char*>(val.ptr) + val.len - len;
     StringValue v = StringValue(ptr, len);
     return BooleanVal(state->search_string_sv_.Eq(v));
   }
@@ -327,9 +332,10 @@ BooleanVal LikePredicate::RegexMatch(FunctionContext* context,
     const StringVal& operand_value, const StringVal& pattern_value,
     bool is_like_pattern) {
   if (operand_value.is_null || pattern_value.is_null) return BooleanVal::null();
+
+  LikePredicateState* state = reinterpret_cast<LikePredicateState*>(
+      context->GetFunctionState(FunctionContext::THREAD_LOCAL));
   if (context->IsArgConstant(1)) {
-    LikePredicateState* state = reinterpret_cast<LikePredicateState*>(
-        context->GetFunctionState(FunctionContext::THREAD_LOCAL));
     if (is_like_pattern) {
       return RE2::FullMatch(re2::StringPiece(reinterpret_cast<const char*>(
           operand_value.ptr), operand_value.len), *state->regex_.get());
@@ -340,6 +346,8 @@ BooleanVal LikePredicate::RegexMatch(FunctionContext* context,
   } else {
     string re_pattern;
     RE2::Options opts;
+    opts.set_case_sensitive(state->case_sensitive_);
+    StringFunctions::SetRE2MemOpt(&opts);
     if (is_like_pattern) {
       ConvertLikePattern(context, pattern_value, &re_pattern);
       opts.set_never_nl(false);

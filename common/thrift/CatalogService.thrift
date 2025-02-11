@@ -23,13 +23,19 @@ include "JniCatalog.thrift"
 include "Types.thrift"
 include "Status.thrift"
 include "Results.thrift"
+include "RuntimeProfile.thrift"
 include "hive_metastore.thrift"
 include "SqlConstraints.thrift"
 
 // CatalogServer service API and related structs.
 
 enum CatalogServiceVersion {
-  V1
+  V1 = 0
+  // There is back version incompatibility for Thrift structure since some entries were
+  // added in the middle of Thrift structure, like IMPALA-11350. We need to increase
+  // the service version for Catalog so that CatalogServer will refuse the requests
+  // from the incompatible clients.
+  V2 = 1
 }
 
 // Prefix used on statestore topic entry keys to indicate that the entry
@@ -59,6 +65,12 @@ struct TCatalogServiceRequestHeader {
   // Set by LocalCatalog coordinators. The response will contain minimal catalog objects
   // (for invalidations) instead of full catalog objects.
   4: optional bool want_minimal_response
+
+  // The query id if this request comes from a query
+  5: optional Types.TUniqueId query_id
+
+  // Hostname of the coordinator
+  6: optional string coordinator_hostname
 }
 
 // Returns details on the result of an operation that updates the catalog. Information
@@ -86,9 +98,28 @@ struct TCatalogUpdateResult {
   6: optional list<CatalogObjects.TCatalogObject> removed_catalog_objects
 }
 
+// Subset of query options passed to DDL operations
+// When changing default values, CatalogOperationTracker#increment() should also be
+// updated.
+struct TDdlQueryOptions {
+  // True if SYNC_DDL is set in query options
+  1: required bool sync_ddl
+
+  // Passes the debug actions to catalogd if the query option is set.
+  2: optional string debug_action
+
+  // Maximum wait time on an HMS ACID lock in seconds.
+  3: optional i32 lock_max_wait_time_s
+
+  // The reservation time (in seconds) for deleted impala-managed kudu table.
+  // During this time deleted Kudu tables can be recovered by Kudu's 'recall table' API.
+  // See KUDU-3326 for details.
+  4: optional i32 kudu_table_reserve_seconds
+}
+
 // Request for executing a DDL operation (CREATE, ALTER, DROP).
 struct TDdlExecRequest {
-  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V2
 
   // Common header included in all CatalogService requests.
   2: optional TCatalogServiceRequestHeader header
@@ -149,20 +180,17 @@ struct TDdlExecRequest {
   // Parameters for GRANT/REVOKE privilege
   21: optional JniCatalog.TGrantRevokePrivParams grant_revoke_priv_params
 
-  // True if SYNC_DDL is set in query options
-  22: required bool sync_ddl
-
   // Parameters for COMMENT ON
-  23: optional JniCatalog.TCommentOnParams comment_on_params
+  22: optional JniCatalog.TCommentOnParams comment_on_params
 
   // Parameters for ALTER DATABASE
-  24: optional JniCatalog.TAlterDbParams alter_db_params
+  23: optional JniCatalog.TAlterDbParams alter_db_params
 
   // Parameters for replaying an exported testcase.
-  25: optional JniCatalog.TCopyTestCaseReq copy_test_case_params
+  24: optional JniCatalog.TCopyTestCaseReq copy_test_case_params
 
-  // Passes the debug actions to catalogd if the query option is set.
-  26: optional string debug_action
+  // Query options passed to DDL operations.
+  25: required TDdlQueryOptions query_options
 }
 
 // Response from executing a TDdlExecRequest
@@ -192,18 +220,37 @@ struct TDdlExecResponse {
   // created table. This is useful for establishing lineage between table and it's
   // location for external tables.
   6: optional string table_location
+
+  // Profile of the DDL execution in catalogd
+  7: optional RuntimeProfile.TRuntimeProfileNode profile
 }
+
 
 // Parameters for the Iceberg operation.
 struct TIcebergOperationParam {
+  5: required Types.TIcebergOperation operation
+
   // Iceberg partition spec used by this operation
   1: optional i32 spec_id;
 
   // Iceberg data files to append to the table, encoded in FlatBuffers.
-  2: required list<binary> iceberg_data_files_fb;
+  2: optional list<binary> iceberg_data_files_fb;
+
+  // Iceberg delete files to append to the table, encoded in FlatBuffers.
+  6: optional list<binary> iceberg_delete_files_fb;
 
   // Is overwrite operation
   3: required bool is_overwrite = false;
+
+  // The snapshot id when the operation was started
+  4: optional i64 initial_snapshot_id;
+
+  // The data files referenced by the position delete files.
+  7: optional list<string> data_files_referenced_by_position_deletes
+
+  // Data files without deletes that are replaced by OPTIMIZE operation. Set only if there
+  // is file filtering. Unset in case of full table compaction, which rewrites all files.
+  8: optional set<string> replaced_data_files_without_deletes;
 }
 
 // Per-partion info needed by Catalog to handle an INSERT.
@@ -215,9 +262,11 @@ struct TUpdatedPartition {
 // with details on the result of the operation. Used to add partitions after executing
 // DML operations, and could potentially be used in the future to update column stats
 // after DML operations.
+// When changing default values, CatalogOperationTracker#increment() should also be
+// updated.
 // TODO: Rename this struct to something more descriptive.
 struct TUpdateCatalogRequest {
-  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V2
 
   // True if SYNC_DDL is set in query options.
   2: required bool sync_ddl
@@ -246,16 +295,24 @@ struct TUpdateCatalogRequest {
 
   // Descriptor object about the Iceberg operation.
   10: optional TIcebergOperationParam iceberg_operation
+
+  // Passes the debug actions to catalogd if the query option is set.
+  11: optional string debug_action
 }
 
 // Response from a TUpdateCatalogRequest
 struct TUpdateCatalogResponse {
   1: required TCatalogUpdateResult result
+
+  // Profile of the DDL/DML execution in catalogd
+  2: optional RuntimeProfile.TRuntimeProfileNode profile
 }
 
 // Parameters of REFRESH/INVALIDATE METADATA commands
+// When changing default values, CatalogOperationTracker#increment() should also be
+// updated.
 struct TResetMetadataRequest {
-  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V2
 
   // Common header included in all CatalogService requests.
   2: optional TCatalogServiceRequestHeader header
@@ -291,11 +348,14 @@ struct TResetMetadataRequest {
 // Response from TResetMetadataRequest
 struct TResetMetadataResponse {
   1: required TCatalogUpdateResult result
+
+  // Profile of the DDL execution in catalogd
+  2: optional RuntimeProfile.TRuntimeProfileNode profile
 }
 
 // Request to GetFunctions()
 struct TGetFunctionsRequest {
-  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V2
 
   // Common header included in all CatalogService requests.
   3: optional TCatalogServiceRequestHeader header
@@ -390,9 +450,8 @@ struct TTableInfoSelector {
   // it in cases the clients do need HMS partition structs.
   12: bool want_hms_partition
 
-  // The response should contain information about the Iceberg snapshot, i.e. the snapshot
-  // id and the file descriptors.
-  13: bool want_iceberg_snapshot
+  // The response should contain information about the Iceberg table.
+  13: bool want_iceberg_table
 }
 
 // Returned information about a particular partition.
@@ -442,11 +501,6 @@ struct TPartialPartitionInfo {
   13: optional CatalogObjects.THdfsPartitionLocation location
 }
 
-struct TIcebergSnapshot {
-  1: required i64 snapshot_id
-  2: optional map<string, CatalogObjects.THdfsFileDesc> iceberg_file_desc_map
-}
-
 // Returned information about a Table, as selected by TTableInfoSelector.
 struct TPartialTableInfo {
   1: optional hive_metastore.Table hms_table
@@ -462,33 +516,43 @@ struct TPartialTableInfo {
 
   3: optional list<hive_metastore.ColumnStatisticsObj> column_stats
 
+  4: optional list<CatalogObjects.TColumn> virtual_columns
+
   // Set if this table needs storage access during metadata load.
   // Time used for storage loading in nanoseconds.
-  4: optional i64 storage_metadata_load_time_ns
+  5: optional i64 storage_metadata_load_time_ns
 
   // Each TNetworkAddress is a datanode which contains blocks of a file in the table.
   // Used so that each THdfsFileBlock can just reference an index in this list rather
   // than duplicate the list of network address, which helps reduce memory usage.
   // Only used when partition files are fetched.
-  7: optional list<Types.TNetworkAddress> network_addresses
+  8: optional list<Types.TNetworkAddress> network_addresses
 
   // SqlConstraints for the table, small enough that we can
   // return them wholesale.
-  8: optional SqlConstraints.TSqlConstraints sql_constraints
+  9: optional SqlConstraints.TSqlConstraints sql_constraints
 
   // Valid write id list of ACID table.
-  9: optional CatalogObjects.TValidWriteIdList valid_write_ids;
+  10: optional CatalogObjects.TValidWriteIdList valid_write_ids;
 
   // Set if this table is marked as cached by hdfs caching. Does not necessarily mean the
   // data is cached or that all/any partitions are cached. Only used in analyzing DDLs.
-  10: optional bool is_marked_cached
+  11: optional bool is_marked_cached
 
   // The prefixes of locations of partitions in this table. See THdfsPartitionLocation for
   // the description of how a prefix is computed.
-  11: optional list<string> partition_prefixes
+  12: optional list<string> partition_prefixes
 
-  // Iceberg snapshot information
-  12: optional TIcebergSnapshot iceberg_snapshot
+  // Iceberg table information
+  13: optional CatalogObjects.TIcebergTable iceberg_table
+}
+
+// Table types in the user's perspective.
+enum TImpalaTableType {
+  TABLE,
+  VIEW,
+  UNKNOWN,
+  MATERIALIZED_VIEW
 }
 
 struct TBriefTableMeta {
@@ -497,10 +561,14 @@ struct TBriefTableMeta {
 
   // HMS table type of the table: EXTERNAL_TABLE, MANAGED_TABLE, VIRTUAL_VIEW, etc.
   // Unset if the table is unloaded.
+  // Deprecated since 4.2 (IMPALA-9670).
   2: optional string msType
 
   // Comment(remark) of the table. Unset if the table is unloaded.
   3: optional string comment
+
+  // Impala table type of the table: TABLE, VIEW, UNKNOWN
+  4: optional TImpalaTableType tblType
 }
 
 // Selector for partial information about a Database.
@@ -524,7 +592,7 @@ struct TPartialDbInfo {
 
 // RPC request for GetPartialCatalogObject.
 struct TGetPartialCatalogObjectRequest {
-  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V2
 
   // A catalog object descriptor: a TCatalogObject with the object name and type fields
   // set. This may be a TABLE, DB, CATALOG, or FUNCTION. The selectors below can
@@ -546,7 +614,9 @@ enum CatalogLookupStatus {
   // change over the lifetime of a table with queries like invalidate metadata. In such
   // cases this lookup status is set and the caller can retry the fetch.
   // TODO: Fix partition lookup logic to not do it with IDs.
-  PARTITION_NOT_FOUND
+  PARTITION_NOT_FOUND,
+  DATA_SOURCE_NOT_FOUND,
+  VERSION_MISMATCH
 }
 
 // RPC response for GetPartialCatalogObject.
@@ -565,13 +635,18 @@ struct TGetPartialCatalogObjectResponse {
 
   // Functions are small enough that we return them wholesale.
   7: optional list<Types.TFunction> functions
+  // DataSource objects are small enough that we return them wholesale.
+  8: optional list<CatalogObjects.TDataSource> data_srcs
+
+  // Loaded time in catalogd corresponding to 'object_version_number'.
+  9: optional i64 object_loaded_time_ms
 }
 
 
 // Request the complete metadata for a given catalog object. May trigger a metadata load
 // if the object is not already in the catalog cache.
 struct TGetCatalogObjectRequest {
-  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V2
 
   // Common header included in all CatalogService requests.
   3: optional TCatalogServiceRequestHeader header
@@ -583,12 +658,14 @@ struct TGetCatalogObjectRequest {
 
 // Response from TGetCatalogObjectRequest
 struct TGetCatalogObjectResponse {
-  1: required CatalogObjects.TCatalogObject catalog_object
+  1: required Status.TStatus status;
+
+  2: required CatalogObjects.TCatalogObject catalog_object
 }
 
 // Request the partition statistics for the specified table.
 struct TGetPartitionStatsRequest {
-  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V2
   2: required CatalogObjects.TTableName table_name
   // if the table is transactional then this field represents the client's view
   // of the table snapshot view in terms of ValidWriteIdList.
@@ -612,11 +689,40 @@ struct TGetPartitionStatsResponse {
   2: optional map<string, binary> partition_stats
 }
 
+// Request null partition name.
+struct TGetNullPartitionNameRequest {
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V2
+}
+
+// Response for null partition name request.
+struct TGetNullPartitionNameResponse {
+  1: required Status.TStatus status
+  // Null partition name.
+  2: required string partition_value
+}
+
+// Request latest compactions.
+struct TGetLatestCompactionsRequest {
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V2
+  2: required string db_name
+  3: required string table_name
+  4: required string non_parition_name
+  5: optional list<string> partition_names
+  6: required i64 last_compaction_id
+}
+
+// Response for latest compactions request.
+struct TGetLatestCompactionsResponse {
+  1: required Status.TStatus status
+  // Map of partition name to the compaction id
+  2: required map<string, i64> partition_to_compaction_id
+}
+
 // Instructs the Catalog Server to prioritizing loading of metadata for the specified
 // catalog objects. Currently only used for controlling the priority of loading
 // tables/views since Db/Function metadata is loaded on startup.
 struct TPrioritizeLoadRequest {
-  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V2
 
   // Common header included in all CatalogService requests.
   2: optional TCatalogServiceRequestHeader header
@@ -638,12 +744,32 @@ struct TTableUsage {
 }
 
 struct TUpdateTableUsageRequest {
-  1: required list<TTableUsage> usages
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V2
+
+  2: required list<TTableUsage> usages
 }
 
 struct TUpdateTableUsageResponse {
   // The operation may fail if the catalogd is in a bad state or if there is a bug.
   1: optional Status.TStatus status
+}
+
+struct TEventProcessorCmdParams {
+  // See allowed actions in Java enum MetastoreEventsProcessor.EventProcessorCmdType.
+  // Use string type instead of enum to avoid incompatible thrift changes in the future.
+  1: required string action
+  2: optional i64 event_id
+}
+
+struct TSetEventProcessorStatusRequest {
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V2
+  2: optional TCatalogServiceRequestHeader header
+  3: required TEventProcessorCmdParams params
+}
+
+struct TSetEventProcessorStatusResponse {
+  1: required Status.TStatus status
+  2: optional string info
 }
 
 // The CatalogService API
@@ -680,4 +806,14 @@ service CatalogService {
   // Update recently used tables and their usage counts in an impalad since the last
   // report.
   TUpdateTableUsageResponse UpdateTableUsage(1: TUpdateTableUsageRequest req);
+
+  // Gets the null partition name used at HMS.
+  TGetNullPartitionNameResponse GetNullPartitionName(1: TGetNullPartitionNameRequest req);
+
+  // Gets the latest compactions.
+  TGetLatestCompactionsResponse GetLatestCompactions(1: TGetLatestCompactionsRequest req);
+
+  // Update the status of EventProcessor.
+  TSetEventProcessorStatusResponse SetEventProcessorStatus(
+      1: TSetEventProcessorStatusRequest req);
 }

@@ -15,15 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import getpass
 import logging
 import os
 import pytest
 import re
-import shutil
-import unittest
 
-from tempfile import mkdtemp
 from time import sleep
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
@@ -32,9 +30,8 @@ from tests.common.file_utils import grep_file, assert_file_in_dir_contains,\
 
 LOG = logging.getLogger(__name__)
 
-# This class needs to inherit from unittest.TestCase otherwise py.test will ignore it
-# because a __init__ method is used.
-class TestRedaction(CustomClusterTestSuite, unittest.TestCase):
+
+class TestRedaction(CustomClusterTestSuite):
   '''Test various redaction related functionality.
 
      Redaction is about preventing sensitive data from leaking into logs, the web ui,
@@ -45,13 +42,6 @@ class TestRedaction(CustomClusterTestSuite, unittest.TestCase):
   @classmethod
   def get_workload(cls):
     return 'functional-query'
-
-  def __init__(self, *args, **kwargs):
-    super(TestRedaction, self).__init__(*args, **kwargs)
-
-    # Parent dir for various file output such as logging. The value is set to a new value
-    # just before each test run.
-    self.tmp_dir = None
 
   @property
   def log_dir(self):
@@ -71,16 +61,17 @@ class TestRedaction(CustomClusterTestSuite, unittest.TestCase):
 
   def setup_method(self, method):
     # Override parent
-    pass
+    # The temporary directory gets removed in teardown_method() after each test.
+    self.tmp_dir = self.make_tmp_dir('redaction')
 
   def teardown_method(self, method):
-    # Parent method would fail, nothing needs to be done. The tests are responsible
-    # for deleting self.tmp_dir after tests pass.
-    pass
+    # Parent method would fail, nothing needs to be done.
+    # Cleanup any temporary dirs.
+    self.clear_tmp_dirs()
 
   def start_cluster_using_rules(self, redaction_rules, log_level=2, vmodule=""):
     '''Start Impala with a custom log dir and redaction rules.'''
-    self.tmp_dir = mkdtemp(prefix="test_redaction_", dir=os.getenv("LOG_DIR"))
+    assert self.tmp_dir
     os.chmod(self.tmp_dir, 0o777)
     LOG.info("tmp_dir is " + self.tmp_dir)
     os.mkdir(self.log_dir)
@@ -175,17 +166,12 @@ class TestRedaction(CustomClusterTestSuite, unittest.TestCase):
     startup_options = dict()
     self.assert_server_fails_to_start('{ "version": 100 }', startup_options,
         'Error parsing redaction rules; only version 1 is supported')
-    # Since the tests passed, the log dir shouldn't be of interest and can be deleted.
-    shutil.rmtree(self.tmp_dir)
 
-  @pytest.mark.execute_serially
-  def test_very_verbose_logging(self):
-    '''Check that the server fails to start if logging is configured at a level that
-       could dump table data. Row logging would be enabled with "-v=3" or could be
-       enabled  with the -vmodule option. In either case the server should not start.
+  def assert_too_verbose_logging(self, start_options):
+    '''Assert that the server fails to start with the specific start_options while
+       using a basic redaction policy to redact emails. This is intended to test
+       cases where logging is configured at a level that could dump table data.
     '''
-    if self.exploration_strategy() != 'exhaustive':
-      pytest.skip('runs only in exhaustive')
     rules = r"""
         {
           "version": 1,
@@ -200,16 +186,29 @@ class TestRedaction(CustomClusterTestSuite, unittest.TestCase):
         }"""
     error_message = "Redaction cannot be used in combination with log level 3 or " \
         "higher or the -vmodule option"
-    self.assert_server_fails_to_start(rules, {"log_level": 3}, error_message)
-    # Since the tests passed, the log dir shouldn't be of interest and can be deleted.
-    shutil.rmtree(self.tmp_dir)
+    self.assert_server_fails_to_start(rules, start_options, error_message)
 
-    self.assert_server_fails_to_start(rules, {"vmodule": "foo"}, error_message)
-    shutil.rmtree(self.tmp_dir)
+  @pytest.mark.execute_serially
+  def test_too_verbose_v3(self):
+    '''Check that the server fails to start when redaction is combined with -v=3.'''
+    if self.exploration_strategy() != 'exhaustive':
+      pytest.skip('runs only in exhaustive')
+    self.assert_too_verbose_logging({"log_level": 3})
 
-    self.assert_server_fails_to_start(
-        rules, {"log_level": 3, "vmodule": "foo"}, error_message)
-    shutil.rmtree(self.tmp_dir)
+  @pytest.mark.execute_serially
+  def test_too_verbose_vmodule(self):
+    '''Check that the server fails to start when redaction is combined with -vmodule'''
+    if self.exploration_strategy() != 'exhaustive':
+      pytest.skip('runs only in exhaustive')
+    self.assert_too_verbose_logging({"vmodule": "foo"})
+
+  @pytest.mark.execute_serially
+  def test_too_verbose_v3_vmodule(self):
+    '''Check that the server fails to start when redaction is combined with -v=3
+       and -vmodule'''
+    if self.exploration_strategy() != 'exhaustive':
+      pytest.skip('runs only in exhaustive')
+    self.assert_too_verbose_logging({"log_level": 3, "vmodule": "foo"})
 
   @pytest.mark.execute_serially
   def test_unredacted(self):
@@ -235,10 +234,6 @@ class TestRedaction(CustomClusterTestSuite, unittest.TestCase):
     assert_file_in_dir_contains(self.audit_dir, email)
     # The profile is encoded so the email won't be found.
     assert_no_files_in_dir_contain(self.profile_dir, email)
-
-    # Since all the tests passed, the log dir shouldn't be of interest and can be
-    # deleted.
-    shutil.rmtree(self.tmp_dir)
 
   @pytest.mark.execute_serially
   def test_redacted(self):
@@ -282,7 +277,7 @@ class TestRedaction(CustomClusterTestSuite, unittest.TestCase):
     self.assert_query_profile_contains(self.find_last_query_id(), user_profile_pattern)
     # Wait for the logs to be written.
     sleep(5)
-    self.assert_log_redaction(email, "\*email\*")
+    self.assert_log_redaction(email, r"\*email\*")
 
     # Even if the query is invalid, redaction should still be applied.
     credit_card = '1234-5678-1234-5678'
@@ -294,13 +289,9 @@ class TestRedaction(CustomClusterTestSuite, unittest.TestCase):
     self.assert_query_profile_contains(self.find_last_query_id(), user_profile_pattern)
     sleep(5)
     # Apparently an invalid query doesn't generate an audit log entry.
-    self.assert_log_redaction(credit_card, "\*credit card\*", expect_audit=False)
+    self.assert_log_redaction(credit_card, r"\*credit card\*", expect_audit=False)
 
     # Assert that the username in the query stmt is redacted but not from the user fields.
     self.execute_query_expect_success(self.client, query_template % current_user)
     self.assert_query_profile_contains(self.find_last_query_id(), user_profile_pattern)
     self.assert_query_profile_contains(self.find_last_query_id(), "redacted user")
-
-    # Since all the tests passed, the log dir shouldn't be of interest and can be
-    # deleted.
-    shutil.rmtree(self.tmp_dir)

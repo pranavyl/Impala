@@ -34,10 +34,10 @@ import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.common.TransactionException;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TQueryCtx;
+import org.apache.impala.util.TUniqueIdUtil;
 import org.apache.log4j.Logger;
 
 import com.google.common.base.Preconditions;
-import com.sun.tools.javac.code.Attribute.Array;
 
 /**
  * Object of this class creates a daemon thread that periodically heartbeats the
@@ -80,7 +80,7 @@ public class TransactionKeepalive {
     }
 
     public String toString() {
-      if (queryCtx != null) return queryCtx.query_id.toString();
+      if (queryCtx != null) return TUniqueIdUtil.PrintId(queryCtx.query_id);
       return cause;
     }
   }

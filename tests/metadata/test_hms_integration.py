@@ -23,17 +23,15 @@
 # TODO: For each test, verify all the metadata available via Hive and
 # Impala, in all the possible ways of validating that metadata.
 
-
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 import random
 import string
-from subprocess import call
 
 from tests.common.environ import HIVE_MAJOR_VERSION
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfHive2, SkipIfHive3,
-                               SkipIfIsilon, SkipIfGCS, SkipIfCOS, SkipIfLocal,
-                               SkipIfCatalogV2)
+from tests.common.skip import SkipIfFS, SkipIfHive2, SkipIfHive3
 from tests.common.test_dimensions import (
     create_single_exec_option_dimension,
     create_uncompressed_text_dimension)
@@ -41,13 +39,7 @@ from tests.util.event_processor_utils import EventProcessorUtils
 from tests.util.hive_utils import HiveDbWrapper, HiveTableWrapper
 
 
-@SkipIfS3.hive
-@SkipIfGCS.hive
-@SkipIfCOS.hive
-@SkipIfABFS.hive
-@SkipIfADLS.hive
-@SkipIfIsilon.hive
-@SkipIfLocal.hive
+@SkipIfFS.hive
 class TestHmsIntegrationSanity(ImpalaTestSuite):
   @classmethod
   def get_workload(self):
@@ -104,13 +96,43 @@ class TestHmsIntegrationSanity(ImpalaTestSuite):
       self.client.execute("invalidate metadata hms_sanity_db.test_tbl")
     assert 'test_tbl' in self.client.execute("show tables in hms_sanity_db").data
 
-@SkipIfS3.hive
-@SkipIfGCS.hive
-@SkipIfCOS.hive
-@SkipIfABFS.hive
-@SkipIfADLS.hive
-@SkipIfIsilon.hive
-@SkipIfLocal.hive
+  def test_desc_json_tbl(self, unique_database):
+    """
+    This function tests if JSON tables created in impala can be
+    described in hive.
+    """
+    self.client.execute("create table {0}.json_tbl (x int) stored as jsonfile"
+                        .format(unique_database))
+    assert "col_name,data_type,comment\nx,int,from deserializer\n"\
+           == self.run_stmt_in_hive("DESCRIBE {0}.json_tbl"
+                                    .format(unique_database))
+
+  def test_desc_json_tbl_hive(self, unique_database):
+    """
+    This function tests if JSON tables created in hive can be
+    described in impala.
+    """
+    self.run_stmt_in_hive("create table {0}.json_tbl (x int) stored as jsonfile"
+                          .format(unique_database))
+    self.client.execute("INVALIDATE METADATA {0}.json_tbl"
+                        .format(unique_database))
+    # If the below query runs without throwing exception, then
+    # JSON tables created in hive can be described in impala.
+    self.client.execute("DESCRIBE {0}.json_tbl"
+                        .format(unique_database))
+
+  def test_invalidate_metadata(self, unique_name):
+    """Verify invalidate metadata on tables under unloaded db won't fail"""
+    db = unique_name + "_db"
+    tbl = db + "." + unique_name + "_tbl"
+    try:
+      self.run_stmt_in_hive("create database " + db)
+      self.run_stmt_in_hive("create table %s (i int)" % tbl)
+      self.client.execute("invalidate metadata %s" % tbl)
+    finally:
+      self.run_stmt_in_hive("drop database %s cascade" % db)
+
+@SkipIfFS.hive
 class TestHmsIntegration(ImpalaTestSuite):
 
   @classmethod
@@ -172,18 +194,12 @@ class TestHmsIntegration(ImpalaTestSuite):
     output = self.client.execute('show table stats %s' % table).get_data()
     output_lines = output.split('\n')
     result = {}
+    headers = ['#rows', '#files', 'size', 'bytes cached', 'cache replication',
+        'format', 'incremental stats', 'location', 'ec policy']
     for line in output_lines:
       parts = line.split('\t')
-      stats = {}
-      stats['location'] = parts[-1]
-      stats['incremental stats'] = parts[-2]
-      stats['format'] = parts[-3]
-      stats['cache replication'] = parts[-4]
-      stats['bytes cached'] = parts[-5]
-      stats['size'] = parts[-6]
-      stats['#files'] = parts[-7]
-      stats['#rows'] = parts[-8]
-      result[tuple(parts[:-8])] = stats
+      id_parts, stat_parts = parts[:-len(headers)], parts[-len(headers):]
+      result[tuple(id_parts)] = dict(zip(headers, stat_parts))
     return result
 
   def impala_all_column_stats(self, table):
@@ -207,7 +223,7 @@ class TestHmsIntegration(ImpalaTestSuite):
     dictionary that holds the parsed attributes."""
     result = {}
     output_lines = output.split('\n')
-    stat_names = map(string.strip, output_lines[0].split(','))
+    stat_names = [s.strip() for s in output_lines[0].split(',')]
     stat_values = output_lines[3].split(',')
     assert len(stat_names) == len(stat_values)
     for i in range(0, len(stat_names)):
@@ -219,7 +235,7 @@ class TestHmsIntegration(ImpalaTestSuite):
     dictionary that holds the parsed attributes."""
     result = {}
     for line in output.split('\n'):
-      line_elements = map(string.strip, line.split(','))
+      line_elements = [s.strip() for s in line.split(',')]
       if len(line_elements) >= 2:
         result[line_elements[0]] = line_elements[1]
     return result
@@ -707,7 +723,7 @@ class TestHmsIntegration(ImpalaTestSuite):
                             '(x int, y int) stored as parquet') as table_name:
         self.client.execute('invalidate metadata')
         self.client.execute('invalidate metadata %s' % table_name)
-        print self.impala_table_stats(table_name)
+        print(self.impala_table_stats(table_name))
         assert 'PARQUET' == self.impala_table_stats(table_name)[()]['format']
         self.run_stmt_in_hive(
             'alter table %s set fileformat avro' % table_name)

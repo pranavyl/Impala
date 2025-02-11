@@ -95,6 +95,10 @@ under the License.
       </li>
 
       <li>
+        <xref href="#string_functions/bytes">BYTES</xref>
+      </li>
+
+      <li>
         <xref href="#string_functions/char_length">CHAR_LENGTH</xref>
       </li>
 
@@ -171,11 +175,15 @@ under the License.
       </li>
 
       <li>
-        <xref href="#string_functions/ltrim">LTRI </xref>
+        <xref href="#string_functions/ltrim">LTRIM</xref>
       </li>
 
       <li>
         <xref href="#string_functions/parse_url">PARSE_URL</xref>
+      </li>
+
+      <li>
+        <xref href="#string_functions/prettyprint_bytes">PRETTYPRINT_BYTES</xref>
       </li>
 
       <li>
@@ -391,6 +399,39 @@ select concat('[',btrim('xyhelxyzlozyzzxx','xyz'),']');
 | [helxyzlo]                                         |
 +----------------------------------------------------+
 </codeblock>
+        </dd>
+
+      </dlentry>
+
+      <dlentry id="bytes">
+        <dt>BYTES</dt>
+        <dd><b>Purpose:</b> Returns the number of bytes contained in the specified byte string. <p>
+            <b>Syntax:</b> BYTES (<i>byte_expression</i>)</p><p>Where:</p><p><i>byte_expression</i>
+            is the byte string for which the number of bytes is to be returned.</p><p
+            conref="../shared/impala_common.xml#common/usage_notes_blurb"/><p>The BYTES function is
+            similar to the LENGTH() function except that it always returns the number of bytes
+            regardless of the status of UTF-8 mode whether it is turned ON or OFF.</p><p>The
+            following is the list of supported string data types to be used in
+              <i>byte_expression</i>:</p><ul>
+            <li>STRING</li>
+            <li>VARCHAR</li>
+            <li>CHAR</li>
+          </ul><note>The BYTES (<i>byte_expression</i>) function counts the trailing zeros because
+            trailing zero bytes are considered bytes. In the case of a fixed <i>length</i> column,
+            the length of the value is always equal to the length defined for the column whereas the
+            length of the value in a <i>variable</i> length column is always equal to the number of
+            bytes, including any trailing zero bytes, contained in that value.</note><p
+            conref="../shared/impala_common.xml#common/example_blurb"/><p>The following example
+            obtains the number of bytes from “cloudera” by applying the BYTES function to the column
+            “cloudera”, which is type
+            VARCHAR.</p><codeblock>SELECT bytes(cast('cloudera' as varchar(20))) FROM xyz;
+            +----------------------------------------+
+            | bytes(cast('cloudera' as varchar(20))) |
+            +----------------------------------------+
+            | 8                                      |
+            +----------------------------------------+
+          </codeblock><note>Use the TRIM function on the <i>byte_expression</i> to
+            exclude the trailing blanks included in the byte count for a data value.</note>
         </dd>
 
       </dlentry>
@@ -1093,6 +1134,36 @@ select instr('foo bar bletch', 'b', 1, 2);
 
       </dlentry>
 
+      <dlentry id="prettyprint_bytes">
+
+        <dt>
+          PRETTYPRINT_BYTES(TINYINT / SMALLINT / INT / BIGINT bytes)
+        </dt>
+
+        <dd>
+          <b>Purpose:</b> Formats numeric bytes in a human readable manner.
+          <p>
+            <b>Return type:</b> <codeph>STRING</codeph>
+          </p>
+
+          <p>
+            <b>Examples:</b>
+          </p>
+
+          <p>
+<codeblock>
+select prettyprint_bytes(1), prettyprint_bytes(12345678), prettyprint_bytes(1234567890), prettyprint_bytes(1234567890123);
+
++-----------------------+------------------------------+--------------------------------+-------------------------------+
+| prettyprint_bytes(1) | prettyprint_bytes(12345678) | prettyprint_bytes(1234567890) | prettyprint_bytes(1234567890123) |
++----------------------+-----------------------------+-------------------------------+----------------------------------+
+| 1.00 B               | 11.77 MB                    | 1.15 GB                       | 1149.78 GB                       |
++----------------------+-----------------------------+-------------------------------+----------------------------------+
+</codeblock>
+          </p>
+        </dd>
+      </dlentry>
+
       <dlentry rev="3.0" id="regexp_escape">
 
         <dt>
@@ -1734,7 +1805,7 @@ select replace('hello world','xyz','abc');
       <dlentry id="trim">
 
         <dt>
-          TRIM(STRING a)
+          TRIM(STRING a), TRIM({{LEADING | TRAILING | BOTH} [STRING chars_to_trim] | STRING chars_to_trim} FROM STRING a)
         </dt>
 
         <dd>
@@ -1746,6 +1817,31 @@ select replace('hello world','xyz','abc');
             cycle, if input values might still have surrounding spaces. For a more
             general-purpose function that can remove other leading and trailing characters
             besides spaces, see <codeph>BTRIM()</codeph>.
+          </p>
+
+          <p>
+            TRIM-FROM syntax is a SQL-standardized wrapper around
+            <codeph>LTRIM</codeph> / <codeph>RTRIM</codeph> / <codeph>BTRIM</codeph>.
+            Depending on the first parameter <codeph>LEADING</codeph> /
+            <codeph>TRAILING</codeph> / <codeph>BOTH</codeph>, wrapper resolves itself to
+            the corresponding underlying function. Default value is <codeph>BOTH</codeph>.
+            If present, the <codeph>chars_to_trim</codeph> parameter is passed forward to
+            the underlying function. Thus, given syntax may come in three different forms:
+          </p>
+
+          <p>
+            Syntax #1: <codeph>TRIM(&lt;where&gt; FROM &lt;string&gt;)</codeph> --&gt;
+            <codeph>{L|R|B}TRIM(string)</codeph>;
+          </p>
+
+          <p>
+            Syntax #2: <codeph>TRIM(&lt;charset&gt; FROM &lt;string&gt;)</codeph>  --&gt;
+            <codeph>BTRIM(string, charset)</codeph>;
+          </p>
+
+          <p>
+            Syntax #3: <codeph>TRIM(&lt;where&gt; &lt;charset&gt; FROM &lt;string&gt;)</codeph>
+            --&gt;<codeph>{L|R|B}TRIM(string, charset)</codeph>.
           </p>
 
           <p>

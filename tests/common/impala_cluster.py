@@ -17,18 +17,20 @@
 #
 # Basic object model of an Impala cluster (set of Impala processes).
 
+from __future__ import absolute_import, division, print_function
+from builtins import map, range
 import json
 import logging
 import os
 import pipes
 import psutil
 import socket
-import sys
 import time
+import requests
 from getpass import getuser
 from random import choice
 from signal import SIGKILL
-from subprocess import check_call
+from subprocess import check_call, check_output
 from time import sleep
 
 import tests.common.environ
@@ -37,11 +39,7 @@ from tests.common.impala_service import (
     CatalogdService,
     ImpaladService,
     StateStoredService)
-from tests.util.shell_util import exec_process, exec_process_async
-
-if sys.version_info >= (2, 7):
-  # We use some functions in the docker code that don't exist in Python 2.6.
-  from subprocess import check_output
+from tests.util.shell_util import exec_process
 
 LOG = logging.getLogger('impala_cluster')
 LOG.setLevel(level=logging.DEBUG)
@@ -56,6 +54,10 @@ DEFAULT_HS2_HTTP_PORT = 28000
 DEFAULT_KRPC_PORT = 27000
 DEFAULT_CATALOG_SERVICE_PORT = 26000
 DEFAULT_STATE_STORE_SUBSCRIBER_PORT = 23000
+DEFAULT_CATALOGD_STATE_STORE_SUBSCRIBER_PORT = 23020
+DEFAULT_STATESTORE_SERVICE_PORT = 24000
+DEFAULT_STATESTORE_HA_SERVICE_PORT = 24020
+DEFAULT_PEER_STATESTORE_HA_SERVICE_PORT = 24021
 DEFAULT_IMPALAD_WEBSERVER_PORT = 25000
 DEFAULT_STATESTORED_WEBSERVER_PORT = 25010
 DEFAULT_CATALOGD_WEBSERVER_PORT = 25020
@@ -67,6 +69,20 @@ DEFAULT_CATALOGD_JVM_DEBUG_PORT = 30030
 # Timeout to use when waiting for a cluster to start up. Set quite high to avoid test
 # flakiness.
 CLUSTER_WAIT_TIMEOUT_IN_SECONDS = 240
+
+# Url format used to set JVM log level.
+SET_JAVA_LOGLEVEL_URL = "http://{0}:{1}/set_java_loglevel"
+
+
+def post_data(url, data):
+  """Helper method to post data to a url."""
+  response = requests.head(url)
+  assert response.status_code == requests.codes.ok, "URL: {0} Resp:{1}".format(
+    url, response.text)
+  response = requests.post(url, data=data)
+  assert response.status_code == requests.codes.ok, "URL: {0} Resp:{1}".format(
+    url, response.text)
+  return response
 
 
 # Represents a set of Impala processes.
@@ -88,24 +104,25 @@ class ImpalaCluster(object):
     the environment."""
     return ImpalaCluster(docker_network=tests.common.environ.docker_network)
 
-  def refresh(self):
+  def refresh(self, silent=False):
     """ Re-loads the impalad/statestored/catalogd processes if they exist.
 
     Helpful to confirm that processes have been killed.
     """
     if self.docker_network is None:
-      self.__impalads, self.__statestoreds, self.__catalogd, self.__admissiond =\
+      self.__impalads, self.__statestoreds, self.__catalogds, self.__admissiond =\
           self.__build_impala_process_lists()
     else:
-      self.__impalads, self.__statestoreds, self.__catalogd, self.__admissiond =\
+      self.__impalads, self.__statestoreds, self.__catalogds, self.__admissiond =\
           self.__find_docker_containers()
     admissiond_str = ""
     if self.use_admission_service:
       admissiond_str = "/%d admissiond" % (1 if self.__admissiond else 0)
 
-    LOG.debug("Found %d impalad/%d statestored/%d catalogd%s process(es)" %
-        (len(self.__impalads), len(self.__statestoreds), 1 if self.__catalogd else 0,
-         admissiond_str))
+    if not silent:
+      LOG.debug("Found %d impalad/%d statestored/%d catalogd%s process(es)" %
+          (len(self.__impalads), len(self.__statestoreds), len(self.__catalogds),
+           admissiond_str))
 
   @property
   def statestored(self):
@@ -118,6 +135,13 @@ class ImpalaCluster(object):
     # If no statestored process exists, return None.
     return self.__statestoreds[0] if len(self.__statestoreds) > 0 else None
 
+  def statestoreds(self):
+    """Returns a list of the known statestored processes"""
+    return self.__statestoreds
+
+  def get_first_statestored(self):
+    return self.statestoreds[0]
+
   @property
   def impalads(self):
     """Returns a list of the known impalad processes"""
@@ -125,8 +149,15 @@ class ImpalaCluster(object):
 
   @property
   def catalogd(self):
-    """Returns the catalogd process, or None if no catalogd process was found"""
-    return self.__catalogd
+    # If no catalogd process exists, return None. Otherwise, return first catalogd
+    return self.__catalogds[0] if len(self.__catalogds) > 0 else None
+
+  def catalogds(self):
+    """Returns a list of the known catalogd processes"""
+    return self.__catalogds
+
+  def get_first_catalogd(self):
+    return self.catalogds[0]
 
   @property
   def admissiond(self):
@@ -158,7 +189,7 @@ class ImpalaCluster(object):
         result = client.execute("select 1")
         assert result.success
         ++n
-      except Exception as e: print e
+      except Exception as e: print(e)
       finally:
         client.close()
     return n
@@ -171,8 +202,10 @@ class ImpalaCluster(object):
           one impalad is up).
         - expected_num_ready_impalads backends are registered with the statestore.
           expected_num_ready_impalads defaults to expected_num_impalads.
+        - Each impalad's debug webserver is ready.
+        - Each coordinator impalad's hs2/beeswax port is open (this happens after catalog
+          cache is ready).
         - All impalads knows about all other ready impalads.
-        - Each coordinator impalad's catalog cache is ready.
       This information is retrieved by querying the statestore debug webpage
       and each individual impalad's metrics webpage.
     """
@@ -185,21 +218,35 @@ class ImpalaCluster(object):
     def check_processes_still_running():
       """Check that the processes we waited for above (i.e. impalads, statestored,
       catalogd) are still running. Throw an exception otherwise."""
-      self.refresh()
+      self.refresh(silent=True)
       # The number of impalad processes may temporarily increase if breakpad forked a
       # process to write a minidump.
       assert len(self.impalads) >= expected_num_impalads
       assert self.statestored is not None
       assert self.catalogd is not None
 
+    sleep_interval = 0.5
+    # Wait for each webserver to be ready.
+    for impalad in self.impalads:
+      impalad.wait_for_webserver(sleep_interval, check_processes_still_running)
 
+    # Wait for coordinators to start.
+    for impalad in self.impalads:
+      if impalad._get_arg_value("is_coordinator", default="true") != "true": continue
+      if impalad._get_arg_value("stress_catalog_init_delay_ms", default=0) != 0: continue
+      impalad.wait_for_coordinator_services(sleep_interval, check_processes_still_running)
+      # Decrease sleep_interval after first coordinator ready as the others are also
+      # likely to be (nearly) ready.
+      sleep_interval = 0.2
+
+    # Restore sleep interval to avoid potential log spew. At this point it is unlikely
+    # that any more sleeps are actually needed.
+    sleep_interval = 0.5
+    # Wait till all impalads consider all backends ready.
     for impalad in self.impalads:
       impalad.service.wait_for_num_known_live_backends(expected_num_ready_impalads,
-          timeout=CLUSTER_WAIT_TIMEOUT_IN_SECONDS, interval=2,
+          timeout=CLUSTER_WAIT_TIMEOUT_IN_SECONDS, interval=sleep_interval,
           early_abort_fn=check_processes_still_running)
-      if (impalad._get_arg_value("is_coordinator", default="true") == "true" and
-         impalad._get_arg_value("stress_catalog_init_delay_ms", default=0) == 0):
-        impalad.wait_for_catalog()
 
   def wait_for_num_impalads(self, num_impalads, retries=10):
     """Checks that at least 'num_impalads' impalad processes are running, along with
@@ -232,8 +279,8 @@ class ImpalaCluster(object):
     environment this would need to enumerate each machine in the cluster.
     """
     impalads = list()
-    statestored = list()
-    catalogd = None
+    statestoreds = list()
+    catalogds = list()
     admissiond = None
     daemons = ['impalad', 'catalogd', 'statestored', 'admissiond']
     for binary, process in find_user_processes(daemons):
@@ -253,14 +300,16 @@ class ImpalaCluster(object):
       if binary == 'impalad':
         impalads.append(ImpaladProcess(cmdline))
       elif binary == 'statestored':
-        statestored.append(StateStoreProcess(cmdline))
+        statestoreds.append(StateStoreProcess(cmdline))
       elif binary == 'catalogd':
-        catalogd = CatalogdProcess(cmdline)
+        catalogds.append(CatalogdProcess(cmdline))
       elif binary == 'admissiond':
         admissiond = AdmissiondProcess(cmdline)
 
     self.__sort_impalads(impalads)
-    return impalads, statestored, catalogd, admissiond
+    self.__sort_statestoreds(statestoreds)
+    self.__sort_catalogds(catalogds)
+    return impalads, statestoreds, catalogds, admissiond
 
   def __find_docker_containers(self):
     """
@@ -268,9 +317,10 @@ class ImpalaCluster(object):
     """
     impalads = []
     statestoreds = []
-    catalogd = None
+    catalogds = []
     admissiond = None
-    output = check_output(["docker", "network", "inspect", self.docker_network])
+    output = check_output(["docker", "network", "inspect", self.docker_network],
+                          universal_newlines=True)
     # Only one network should be present in the top level array.
     for container_id in json.loads(output)[0]["Containers"]:
       container_info = get_container_info(container_id)
@@ -280,7 +330,7 @@ class ImpalaCluster(object):
       args = container_info["Args"]
       executable = os.path.basename(args[0])
       port_map = {}
-      for k, v in container_info["NetworkSettings"]["Ports"].iteritems():
+      for k, v in container_info["NetworkSettings"]["Ports"].items():
         # Key looks like "25000/tcp"..
         port = int(k.split("/")[0])
         # Value looks like { "HostPort": "25002", "HostIp": "" }.
@@ -293,15 +343,16 @@ class ImpalaCluster(object):
         statestoreds.append(StateStoreProcess(args, container_id=container_id,
                                               port_map=port_map))
       elif executable == 'catalogd':
-        assert catalogd is None
-        catalogd = CatalogdProcess(args, container_id=container_id,
-                                   port_map=port_map)
+        catalogds.append(CatalogdProcess(args, container_id=container_id,
+                                         port_map=port_map))
       elif executable == 'admissiond':
         assert admissiond is None
         admissiond = AdmissiondProcess(args, container_id=container_id,
                                        port_map=port_map)
     self.__sort_impalads(impalads)
-    return impalads, statestoreds, catalogd, admissiond
+    self.__sort_statestoreds(statestoreds)
+    self.__sort_catalogds(catalogds)
+    return impalads, statestoreds, catalogds, admissiond
 
   def __sort_impalads(self, impalads):
     """Does an in-place sort of a list of ImpaladProcess objects into a canonical order.
@@ -309,6 +360,20 @@ class ImpalaCluster(object):
     first one. We need to use a port that is exposed and mapped to a host port for
     the containerised cluster."""
     impalads.sort(key=lambda i: i.service.hs2_port)
+
+  def __sort_statestoreds(self, statestoreds):
+    """Does an in-place sort of a list of StateStoredService objects into a canonical
+    order. We order them by their service port, so that get_first_statestored() always
+    returns the first one. We need to use a port that is exposed and mapped to a host
+    port for the containerised cluster."""
+    statestoreds.sort(key=lambda i: i.service.service_port)
+
+  def __sort_catalogds(self, catalogds):
+    """Does an in-place sort of a list of CatalogdProcess objects into a canonical order.
+    We order them by their service port, so that get_first_catalogd() always returns the
+    first one. We need to use a port that is exposed and mapped to a host port for
+    the containerised cluster."""
+    catalogds.sort(key=lambda i: i.service.service_port)
 
 
 # Represents a process running on a machine and common actions that can be performed
@@ -354,7 +419,7 @@ class Process(object):
     """Gets the PIDs of the process. In some circumstances, a process can run multiple
     times, e.g. when it forks in the Breakpad crash handler. Returns an empty list if no
     PIDs can be determined."""
-    pids = self.__get_pids()
+    pids = [proc['pid'] for proc in self.__get_procs()]
     if pids:
       LOG.info("Found PIDs %s for %s" % (", ".join(map(str, pids)), " ".join(self.cmd)))
     else:
@@ -362,37 +427,53 @@ class Process(object):
                " ".join(self.cmd))
     return pids
 
-  def __get_pid(self):
-    pids = self.__get_pids()
-    assert len(pids) < 2, "Expected single pid but found %s" % ", ".join(map(str, pids))
-    return len(pids) == 1 and pids[0] or None
+  def __procs_str(self, procs):
+    return "\n".join([str(proc) for proc in procs])
 
-  def __get_pids(self):
+  def __get_pid(self):
+    procs = self.__get_procs()
+    # Return early for containerized environments
+    if len(procs) == 1:
+      return procs[0]['pid']
+
+    result = None
+    # In some circumstances - notably ubsan tests - child processes can be slow to exit.
+    # Only return the original process, i.e. one who's parent has a different cmd.
+    pids = [proc['pid'] for proc in procs]
+    for process in procs:
+      if process['ppid'] not in pids:
+        assert result is None,\
+            "Multiple non-child processes:\n%s" % self.__procs_str(procs)
+        result = process['pid']
+      else:
+        LOG.info("Child process active:\n%s" % self.__procs_str(procs))
+
+    return result
+
+  def __get_procs(self):
+    """
+    Returns a list of dicts containing {pid, ppid, cmdline} for related processes.
+    """
     if self.container_id is not None:
       container_info = get_container_info(self.container_id)
       if container_info["State"]["Status"] != "running":
         return []
-      return [container_info["State"]["Pid"]]
+      return [{'pid': container_info["State"]["Pid"], 'ppid': 0, 'cmdline': self.cmd}]
 
     # In non-containerised case, search for process based on matching command lines.
-    pids = []
-    for pid in psutil.pids():
-      try:
-        process = psutil.Process(pid)
-        if set(self.cmd) == set(process.cmdline()):
-          pids.append(pid)
-      except psutil.NoSuchProcess:
-        # A process from psutil.pids() no longer exists, continue. We don't log this
-        # error since it can refer to arbitrary processes outside of our testing code.
-        pass
-    return pids
+    procs = []
+    for process in psutil.process_iter(['pid', 'ppid', 'cmdline']):
+      # Use info because it won't throw NoSuchProcess exceptions.
+      if set(self.cmd) == set(process.info['cmdline']):
+        procs.append(process.info)
+    return procs
 
   def kill(self, signal=SIGKILL):
     """
     Kills the given processes.
     """
     if self.container_id is None:
-      pid = self.__get_pid()
+      pid = self.get_pid()
       assert pid is not None, "No processes for %s" % self
       LOG.info('Killing %s with signal %s' % (self, signal))
       exec_process("kill -%d %d" % (signal, pid))
@@ -405,7 +486,7 @@ class Process(object):
     if self.container_id is None:
       binary = os.path.basename(self.cmd[0])
       restart_args = self.cmd[1:]
-      LOG.info("Starting {0} with arguments".format(binary, restart_args))
+      LOG.info("Starting {0} with arguments {1}".format(binary, restart_args))
       run_daemon(binary, restart_args)
     else:
       LOG.info("Starting container: {0}".format(self.container_id))
@@ -429,6 +510,19 @@ class Process(object):
     self.kill(signal)
     self.wait_for_exit()
 
+  def modify_argument(self, argument, new_value):
+    """Modify the 'argument' in start args with new_value.
+    If no 'argument' in start args, add it.
+    If new_value is None, add or remove 'argument'."""
+    for i in range(1, len(self.cmd)):
+      if self.cmd[i].split('=')[0] == argument:
+        if new_value is None:
+          del self.cmd[i]
+        else:
+          self.cmd[i] = (argument + '=' + new_value)
+        return
+    self.cmd.append(argument if new_value is None else (argument + '=' + new_value))
+
 
 # Base class for all Impala processes
 class BaseImpalaProcess(Process):
@@ -440,6 +534,11 @@ class BaseImpalaProcess(Process):
   def get_webserver_port(self):
     """Return the port for the webserver of this process."""
     return int(self._get_port('webserver_port', self._get_default_webserver_port()))
+
+  def set_jvm_log_level(self, class_name, level="info"):
+    """Helper method to set JVM log level for certain class name.
+    Some daemon might not have JVM in it."""
+    raise NotImplementedError()
 
   def _get_default_webserver_port(self):
     """Different daemons have different defaults. Subclasses must override."""
@@ -497,6 +596,11 @@ class ImpaladProcess(BaseImpalaProcess):
   def __get_hs2_http_port(self):
     return int(self._get_port('hs2_http_port', DEFAULT_HS2_HTTP_PORT))
 
+  def is_coordinator(self):
+    """Returns boolean True or False depending on whether or not the current process is
+       a coordinator. Both exclusive and non-exclusive coordinators will return true."""
+    return self._get_arg_value("is_coordinator", "true") == "true"
+
   def start(self, wait_until_ready=True, timeout=30):
     """Starts the impalad and waits until the service is ready to accept connections.
     'timeout' is the amount of time to wait for the Impala server to be in the
@@ -508,32 +612,47 @@ class ImpaladProcess(BaseImpalaProcess):
       self.service.wait_for_metric_value('impala-server.ready',
                                          expected_value=1, timeout=timeout)
 
-  def wait_for_catalog(self):
-    """Waits for a catalog copy to be received by the impalad. When its received,
-       additionally waits for client ports to be opened."""
+  def wait_for_webserver(self, sleep_interval, early_abort_fn):
     start_time = time.time()
-    beeswax_port_is_open = False
-    hs2_port_is_open = False
-    num_dbs = 0
-    num_tbls = 0
-    while ((time.time() - start_time < CLUSTER_WAIT_TIMEOUT_IN_SECONDS) and
-        not (beeswax_port_is_open and hs2_port_is_open)):
-      try:
-        num_dbs, num_tbls = self.service.get_metric_values(
-            ["catalog.num-databases", "catalog.num-tables"])
-        beeswax_port_is_open = self.service.beeswax_port_is_open()
-        hs2_port_is_open = self.service.hs2_port_is_open()
-      except Exception:
-        LOG.exception(("Client services not ready. Waiting for catalog cache: "
-            "({num_dbs} DBs / {num_tbls} tables). Trying again ...").format(
-                num_dbs=num_dbs,
-                num_tbls=num_tbls))
-      sleep(0.5)
+    while time.time() - start_time < CLUSTER_WAIT_TIMEOUT_IN_SECONDS:
+      LOG.info("Waiting for Impalad webserver port %s", self.service.webserver_port)
+      if self.service.webserver_port_is_open(): return
+      early_abort_fn()
+      sleep(sleep_interval)
 
-    if not hs2_port_is_open or not beeswax_port_is_open:
-      raise RuntimeError(
-          "Unable to open client ports within {num_seconds} seconds.".format(
-              num_seconds=CLUSTER_WAIT_TIMEOUT_IN_SECONDS))
+  def wait_for_coordinator_services(self, sleep_interval, early_abort_fn):
+    """Waits for client ports to be opened. Assumes that the webservice ports are open."""
+    start_time = time.time()
+    LOG.info(
+        "Waiting for coordinator client services " +
+        "- hs2 port: %d hs2-http port: %d beeswax port: %d",
+        self.service.hs2_port, self.service.hs2_http_port, self.service.beeswax_port)
+    while time.time() - start_time < CLUSTER_WAIT_TIMEOUT_IN_SECONDS:
+      beeswax_port_is_open = self.service.beeswax_port_is_open()
+      hs2_port_is_open = self.service.hs2_port_is_open()
+      hs2_http_port_is_open = self.service.hs2_http_port_is_open()
+      if beeswax_port_is_open and hs2_port_is_open and hs2_http_port_is_open:
+        return
+      early_abort_fn()
+      # The coordinator is likely to wait for the catalog update. Fetch the number
+      # of catalog objects.
+      num_dbs, num_tbls = self.service.get_metric_values(
+          ["catalog.num-databases", "catalog.num-tables"])
+      LOG.info(("Client services not ready. Waiting for catalog cache: "
+          "({num_dbs} DBs / {num_tbls} tables). Trying again ...").format(
+              num_dbs=num_dbs,
+              num_tbls=num_tbls))
+      sleep(sleep_interval)
+
+    raise RuntimeError(
+        "Unable to open client ports within {num_seconds} seconds.".format(
+            num_seconds=CLUSTER_WAIT_TIMEOUT_IN_SECONDS))
+
+  def set_jvm_log_level(self, class_name, level):
+    """Helper method to set JVM log level for certain class name."""
+    url = SET_JAVA_LOGLEVEL_URL.format(
+      self.webserver_interface, self.get_webserver_port())
+    return post_data(url, {"class": class_name, "level": level})
 
 
 # Represents a statestored process
@@ -541,10 +660,26 @@ class StateStoreProcess(BaseImpalaProcess):
   def __init__(self, cmd, container_id=None, port_map=None):
     super(StateStoreProcess, self).__init__(cmd, container_id, port_map)
     self.service = StateStoredService(self.hostname, self.webserver_interface,
-        self.get_webserver_port(), self._get_webserver_certificate_file())
+        self.get_webserver_port(), self._get_webserver_certificate_file(),
+        self.__get_port())
 
   def _get_default_webserver_port(self):
     return DEFAULT_STATESTORED_WEBSERVER_PORT
+
+  def __get_port(self):
+    return int(self._get_port('state_store_port', DEFAULT_STATESTORE_SERVICE_PORT))
+
+  def start(self, wait_until_ready=True, additional_args=None):
+    """Starts statestored and waits until the service is started and ready to accept
+    connections."""
+    restart_args = self.cmd[1:]
+    if additional_args:
+      restart_args = restart_args + [additional_args]
+    LOG.info("Starting Statestored process: {0}".format(restart_args))
+    run_daemon("statestored", restart_args)
+    if wait_until_ready:
+      self.service.wait_for_metric_value('statestore.service-started',
+                                         expected_value=1, timeout=30)
 
 
 # Represents a catalogd process
@@ -561,14 +696,22 @@ class CatalogdProcess(BaseImpalaProcess):
   def __get_port(self):
     return int(self._get_port('catalog_service_port', DEFAULT_CATALOG_SERVICE_PORT))
 
-  def start(self, wait_until_ready=True):
+  def start(self, wait_until_ready=True, additional_args=None):
     """Starts catalogd and waits until the service is ready to accept connections."""
     restart_args = self.cmd[1:]
+    if additional_args:
+      restart_args = restart_args + [additional_args]
     LOG.info("Starting Catalogd process: {0}".format(restart_args))
     run_daemon("catalogd", restart_args)
     if wait_until_ready:
       self.service.wait_for_metric_value('statestore-subscriber.connected',
                                          expected_value=1, timeout=30)
+
+  def set_jvm_log_level(self, class_name, level):
+    """Helper method to set JVM log level for certain class name."""
+    url = SET_JAVA_LOGLEVEL_URL.format(
+      self.webserver_interface, self.get_webserver_port())
+    return post_data(url, {"class": class_name, "level": level})
 
 
 # Represents an admission control process.
@@ -580,6 +723,7 @@ class AdmissiondProcess(BaseImpalaProcess):
 
   def _get_default_webserver_port(self):
     return DEFAULT_ADMISSIOND_WEBSERVER_PORT
+
 
 def find_user_processes(binaries):
   """Returns an iterator over all processes owned by the current user with a matching
@@ -597,10 +741,10 @@ def find_user_processes(binaries):
       binary_name = os.path.basename(cmdline[0])
       if binary_name in binaries:
         yield binary_name, process
-    except KeyError, e:
+    except KeyError as e:
       if "uid not found" not in str(e):
         raise
-    except psutil.NoSuchProcess, e:
+    except psutil.NoSuchProcess as e:
       # Ignore the case when a process no longer exists.
       pass
 
@@ -624,7 +768,7 @@ def run_daemon(daemon_binary, args, build_type="latest", env_vars={}, output_fil
   # achieve the same thing but it doesn't work on some platforms for some reasons.
   sys_cmd = ("{set_cmds} {cmd} {redirect} &".format(
       set_cmds=''.join(["export {0}={1};".format(k, pipes.quote(v))
-                         for k, v in env_vars.iteritems()]),
+                         for k, v in env_vars.items()]),
       cmd=' '.join([pipes.quote(tok) for tok in cmd]),
       redirect=redirect))
   os.system(sys_cmd)
@@ -632,8 +776,8 @@ def run_daemon(daemon_binary, args, build_type="latest", env_vars={}, output_fil
 
 def get_container_info(container_id):
   """Get the output of "docker container inspect" as a python data structure."""
-  containers = json.loads(
-      check_output(["docker", "container", "inspect", container_id]))
+  containers = json.loads(check_output(["docker", "container", "inspect", container_id],
+                                       universal_newlines=True))
   # Only one container should be present in the top level array.
   assert len(containers) == 1, json.dumps(containers, indent=4)
   return containers[0]

@@ -26,6 +26,7 @@
 #include "runtime/runtime-state.h"
 #include "runtime/descriptors.h"
 #include "runtime/tuple.h"
+#include "util/coding-util.h"
 #include "util/string-parser.h"
 #include "runtime/string-value.h"
 #include "runtime/date-value.h"
@@ -64,9 +65,18 @@ inline bool TextConverter::WriteSlot(const SlotDescriptor* slot_desc, Tuple* tup
 
       bool reuse_data = type.IsVarLenStringType() &&
           !(len != 0 && (copy_string || need_escape));
-      if (type.type == TYPE_CHAR) reuse_data &= (buffer_len <= len);
 
-      StringValue str;
+      bool base64_decode = false;
+      if (type.IsBinaryType()) {
+        base64_decode = true;
+        reuse_data = false;
+        int64_t out_len;
+        if (!Base64DecodeBufLen(data, len, &out_len)) return false;
+        buffer_len = out_len;
+      }
+
+      StringValue::SimpleString str;
+      str.ptr = nullptr;
       str.len = std::min(buffer_len, len);
       if (reuse_data) {
         str.ptr = const_cast<char*>(data);
@@ -82,8 +92,13 @@ inline bool TextConverter::WriteSlot(const SlotDescriptor* slot_desc, Tuple* tup
         str.ptr = type.IsVarLenStringType() ?
             reinterpret_cast<char*>(pool->TryAllocateUnaligned(buffer_len)) :
             reinterpret_cast<char*>(slot);
-        if (UNLIKELY(str.ptr == NULL)) return false;
-        if (need_escape) {
+        if (UNLIKELY(str.ptr == nullptr)) return false;
+        if (base64_decode) {
+          unsigned out_len;
+          if(!Base64Decode(data, len, buffer_len, str.ptr, &out_len)) return false;
+          DCHECK_LE(out_len, buffer_len);
+          str.len = out_len;
+        } else if (need_escape) {
           // Use a temporary variable on the stack to avoid accessing an unaligned
           // pointer.
           int str_len = str.len;
@@ -93,6 +108,7 @@ inline bool TextConverter::WriteSlot(const SlotDescriptor* slot_desc, Tuple* tup
           memcpy(str.ptr, data, str.len);
         }
       }
+      DCHECK_NE(str.ptr, nullptr);
 
       if (type.type == TYPE_CHAR) {
         StringValue::PadWithSpaces(str.ptr, buffer_len, str.len);
@@ -101,7 +117,7 @@ inline bool TextConverter::WriteSlot(const SlotDescriptor* slot_desc, Tuple* tup
       // write back to the slot, if !IsVarLenStringType() we already wrote to the slot
       if (type.IsVarLenStringType()) {
         StringValue* str_slot = reinterpret_cast<StringValue*>(slot);
-        *str_slot = str;
+        str_slot->Assign(str.ptr, str.len);
       }
       break;
     }

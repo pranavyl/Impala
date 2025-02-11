@@ -24,18 +24,17 @@
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <mutex>
 #include <utility>
 
 #include <boost/uuid/random_generator.hpp>
-#include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/callback.h"  // IWYU pragma: keep
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/spinlock.h"
 #include "kudu/gutil/stringprintf.h"
@@ -67,17 +66,19 @@ TAG_FLAG(log_async_buffer_bytes_per_level, hidden);
 // Defined in Impala.
 DECLARE_int32(max_log_files);
 TAG_FLAG(max_log_files, runtime);
-TAG_FLAG(max_log_files, experimental);
+TAG_FLAG(max_log_files, stable);
 
 #define PROJ_NAME "kudu"
 
 bool logging_initialized = false;
 
-using namespace std; // NOLINT(*)
-using namespace boost::uuids; // NOLINT(*)
-
 using base::SpinLock;
 using base::SpinLockHolder;
+using boost::uuids::random_generator;
+using std::string;
+using std::ofstream;
+using std::ostream;
+using std::ostringstream;
 
 namespace kudu {
 
@@ -115,7 +116,7 @@ class SimpleSink : public google::LogSink {
       default:
         LOG(FATAL) << "Unknown glog severity: " << severity;
     }
-    cb_.Run(kudu_severity, full_filename, line, tm_time, message, message_len);
+    cb_(kudu_severity, full_filename, line, tm_time, message, message_len);
   }
 
  private:

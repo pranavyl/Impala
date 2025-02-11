@@ -114,6 +114,9 @@ enum TAlterTableType {
   SET_OWNER = 16
   UNSET_TBL_PROPERTIES = 17
   SET_PARTITION_SPEC = 18
+  EXECUTE = 19
+  SET_VIEW_PROPERTIES = 20
+  UNSET_VIEW_PROPERTIES = 21
 }
 
 // Parameters of CREATE DATABASE commands
@@ -219,7 +222,7 @@ struct TAlterTableOrViewRenameParams {
 // Parameters for ALTER TABLE ADD COLUMNS commands.
 struct TAlterTableAddColsParams {
   // List of columns to add to the table
-  1: required list<CatalogObjects.TColumn> columns
+  1: optional list<CatalogObjects.TColumn> columns
 
   // If true, no error is raised when a column already exists.
   2: required bool if_not_exists
@@ -289,6 +292,9 @@ struct TAlterTableDropPartitionParams {
 
   // If true, underlying data is purged using -skipTrash
   3: required bool purge
+
+  // Summary of partitions to delete for Iceberg tables
+  4: optional CatalogObjects.TIcebergDropPartitionRequest iceberg_drop_partition_request
 }
 
 // Parameters for ALTER TABLE ALTER/CHANGE COLUMN commands
@@ -411,6 +417,38 @@ struct TAlterTableSetPartitionSpecParams {
   1: required CatalogObjects.TIcebergPartitionSpec partition_spec
 }
 
+// Parameters for ALTER TABLE EXECUTE EXPIRE_SNAPSHOTS operations.
+struct TAlterTableExecuteExpireSnapshotsParams {
+  1: required i64 older_than_millis
+}
+
+// ALTER TABLE EXECUTE ROLLBACK can be to a date or snapshot id.
+enum TRollbackType {
+  TIME_ID = 0
+  VERSION_ID = 1
+}
+
+// Parameters for ALTER TABLE EXECUTE ROLLBACK operations.
+struct TAlterTableExecuteRollbackParams {
+  // Is rollback to a date or snapshot id.
+  1: required TRollbackType kind
+
+  // If kind is TIME_ID this is the date to rollback to.
+  2: optional i64 timestamp_millis
+
+  // If kind is VERSION_ID this is the id to rollback to.
+  3: optional i64 snapshot_id
+}
+
+// Parameters for ALTER TABLE EXECUTE ... operations.
+struct TAlterTableExecuteParams {
+  // Parameters for ALTER TABLE EXECUTE EXPIRE_SNAPSHOTS
+  1: optional TAlterTableExecuteExpireSnapshotsParams expire_snapshots_params
+
+  // Parameters for ALTER TABLE EXECUTE ROLLBACK
+  2: optional TAlterTableExecuteRollbackParams execute_rollback_params
+}
+
 // Parameters for all ALTER TABLE commands.
 struct TAlterTableParams {
   1: required TAlterTableType alter_type
@@ -468,6 +506,9 @@ struct TAlterTableParams {
 
   // Parameters for ALTER TABLE SET PARTITION SPEC
   19: optional TAlterTableSetPartitionSpecParams set_partition_spec_params
+
+  // Parameters for ALTER TABLE EXECUTE operations
+  20: optional TAlterTableExecuteParams set_execute_params
 }
 
 // Parameters of CREATE TABLE LIKE commands
@@ -579,6 +620,12 @@ struct TCreateTableParams {
 
   // Just one PartitionSpec when create iceberg table
   21: optional CatalogObjects.TIcebergPartitionSpec partition_spec
+
+  // Bucket desc for created bucketed table
+  22: optional CatalogObjects.TBucketInfo bucket_info
+
+  // Primary key is unique (Kudu-only)
+  23: optional bool is_primary_key_unique
 }
 
 // Parameters of a CREATE VIEW or ALTER VIEW AS SELECT command
@@ -607,6 +654,9 @@ struct TCreateOrAlterViewParams {
   // The server name for security privileges when authorization is enabled.
   // TODO: Need to cleanup:IMPALA-7553
   8: optional string server_name
+
+  // Tblproperties of the view
+  9: optional map<string, string> tblproperties
 }
 
 // Parameters of a COMPUTE STATS command
@@ -687,6 +737,9 @@ struct TGrantRevokePrivParams {
 
   // The type of principal
   5: required CatalogObjects.TPrincipalType principal_type
+
+  // The name of the resource owner.
+  6: optional string owner_name
 }
 
 // Parameters of DROP DATABASE commands
@@ -816,10 +869,31 @@ struct TOperationUsageCounter {
   3: optional i64 op_counter
 }
 
+struct TCatalogOpRecord {
+  1: required i64 thread_id
+  2: required Types.TUniqueId query_id
+  3: required string client_ip
+  4: required string coordinator_hostname
+  5: required string catalog_op_name
+  // Name of the target depends on the operation types, e.g. table name for CreateTable,
+  // db name for CreateDb, function name for CreateFunction, etc.
+  6: required string target_name
+  7: required string user
+  8: required i64 start_time_ms
+  9: required i64 finish_time_ms
+  10: required string status
+  11: required string details
+}
+
 // Response to getOperationUsage request.
 struct TGetOperationUsageResponse {
-  // List of the the number of running catalog operations
+  // List of the number of running catalog operations
   1: required list<TOperationUsageCounter> catalog_op_counters
+  // List of the in-flight catalog operations. Sorted by start time.
+  2: optional list<TCatalogOpRecord> in_flight_catalog_operations;
+  // List of the finished catalog operations. Sorted by finish time descendingly, i.e.
+  // the most recently finished operations is shown first.
+  3: optional list<TCatalogOpRecord> finished_catalog_operations;
 }
 
 struct TColumnName {
@@ -858,26 +932,47 @@ struct TEventProcessorMetrics {
   // Total number of events skipped so far
   3: optional i64 events_skipped
 
-  // Mean time in sec for the fetching metastore events
+  // Time in sec for the fetching metastore events
   4: optional double events_fetch_duration_mean
+  5: optional double events_fetch_duration_p75
+  6: optional double events_fetch_duration_p95
+  7: optional double events_fetch_duration_p99
 
-  // Mean time in sec for processing a given batch of events
-  5: optional double events_process_duration_mean
+  // Duration in sec for fetching the last event batch
+  8: optional double last_events_fetch_duration
+
+  // Time in sec for processing a given batch of events
+  9: optional double events_process_duration_mean
+  10: optional double events_process_duration_p75
+  11: optional double events_process_duration_p95
+  12: optional double events_process_duration_p99
+
+  // Duration in sec for processing the last event batch
+  13: optional double last_events_process_duration
 
   // Average number of events received in 1 min
-  6: optional double events_received_1min_rate
+  14: optional double events_received_1min_rate
 
-  // Average number of events received in 1 min
-  7: optional double events_received_5min_rate
+  // Average number of events received in 5 min
+  15: optional double events_received_5min_rate
 
-  // Average number of events received in 1 min
-  8: optional double events_received_15min_rate
+  // Average number of events received in 15 min
+  16: optional double events_received_15min_rate
 
   // Average number events skipped in a polling interval
-  9: optional double events_skipped_per_poll_mean
+  17: optional double events_skipped_per_poll_mean
 
   // Last metastore event id that the catalog server synced to
-  10: optional i64 last_synced_event_id
+  18: optional i64 last_synced_event_id
+
+  // Event time of the last synced event
+  19: optional i64 last_synced_event_time
+
+  // Latest metastore event id
+  20: optional i64 latest_event_id
+
+  // Event time of the latest metastore event
+  21: optional i64 latest_event_time
 }
 
 struct TCatalogHmsCacheApiMetrics {
@@ -946,6 +1041,23 @@ struct TGetCatalogServerMetricsResponse {
 
   // get the catalogd Hive metastore server metrics, if configured
   3: optional TCatalogdHmsCacheMetrics catalogd_hms_cache_metrics
+
+  // Metrics of table metadata loading
+  4: optional i32 catalog_num_file_metadata_loading_threads
+  5: optional i32 catalog_num_file_metadata_loading_tasks
+  6: optional i32 catalog_num_tables_loading_file_metadata
+  7: optional i32 catalog_num_tables_loading_metadata
+  8: optional i32 catalog_num_tables_async_loading_metadata
+  9: optional i32 catalog_num_tables_waiting_for_async_loading
+
+  // Metrics of the catalog
+  10: optional i32 catalog_num_dbs
+  11: optional i32 catalog_num_tables
+  12: optional i32 catalog_num_functions
+
+  // Metrics of HMS clients
+  13: optional i32 catalog_num_hms_clients_idle
+  14: optional i32 catalog_num_hms_clients_in_use
 }
 
 // Request to copy the generated testcase from a given input path.
@@ -953,8 +1065,35 @@ struct TCopyTestCaseReq {
   1: required string input_path
 }
 
+struct TEventBatchProgressInfo {
+  // Number of original HMS events received in the current batch.
+  1: required i32 num_hms_events
+  // Number of filtered MetastoreEvents generated from the original HMS events.
+  2: required i32 num_filtered_events
+  3: required i32 current_event_index
+  // Number of HMS events represented by this filtered event. For most events this is 1.
+  // In case of BatchPartitionEvent this could be more than 1.
+  4: required i32 current_event_batch_size
+  5: required i64 min_event_id
+  6: required i64 min_event_time_s
+  7: required i64 max_event_id
+  8: required i64 max_event_time_s
+  // Timestamp when we start to process the current event batch
+  9: required i64 current_batch_start_time_ms
+  // Timestamp when we start to process the current event
+  10: required i64 current_event_start_time_ms
+  11: required i64 last_synced_event_id
+  12: required i64 last_synced_event_time_s
+  13: required i64 latest_event_id
+  14: required i64 latest_event_time_s
+  15: optional hive_metastore.NotificationEvent current_event
+}
+
 struct TEventProcessorMetricsSummaryResponse {
   // summary view of the events processor which can include status,
   // metrics and other details
   1: required string summary
+  // Error messages if the events processor goes into ERROR/NEEDS_INVALIDATE states
+  2: optional string error_msg
+  3: optional TEventBatchProgressInfo progress
 }

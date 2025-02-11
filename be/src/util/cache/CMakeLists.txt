@@ -26,14 +26,18 @@ add_library(UtilCache
   lirs-cache.cc
   rl-cache.cc
 )
-add_dependencies(UtilCache gen-deps gen_ir_descriptions)
+add_dependencies(UtilCache gen-deps)
+
+if (BUILD_WITH_NO_TESTS)
+  return()
+endif()
 
 add_library(UtilCacheTests STATIC
   cache-test.cc
   lirs-cache-test.cc
   rl-cache-test.cc
 )
-add_dependencies(UtilCacheTests gen-deps gen_ir_descriptions)
+add_dependencies(UtilCacheTests gen-deps)
 
 add_executable(cache-bench cache-bench.cc)
 target_link_libraries(cache-bench ${IMPALA_TEST_LINK_LIBS})

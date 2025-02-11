@@ -24,6 +24,7 @@ import java.lang.StringBuilder;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.HashMap;
+import java.util.Optional;
 import java.util.Random;
 import java.util.Date;
 
@@ -41,7 +42,8 @@ import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 public class RandomNestedDataGenerator {
 
   public static Random rand;
-  public static int numListItems;
+  public static int maxNormalStrLen;
+  public static int maxNumListItems;
   public static int numElementsGenerated = 0;
   public static ArrayList<Double> doubleCache;
   public static ArrayList<Float> floatCache;
@@ -54,9 +56,10 @@ public class RandomNestedDataGenerator {
   public static final Double CHANCE_UNIQUE = 0.02;
 
   private static void generateDataToFile(
-      String schemaFile, int targetNumElements, String outputFile) throws IOException {
+      String schemaFile, int targetNumElements, String outputFile, Optional<Long> seed)
+      throws IOException {
     buildCache();
-    rand = new Random();
+    rand = seed.isPresent() ? new Random(seed.get()) : new Random();
     Schema schema = new Schema.Parser().parse(new File(schemaFile));
     Configuration conf = new Configuration();
     conf.set("parquet.avro.write-old-list-structure", "false");
@@ -124,7 +127,7 @@ public class RandomNestedDataGenerator {
     stringCache = new ArrayList<String>();
     for (int i = 0; i < NUM_ELEMENTS; i++) {
       StringBuilder sb = new StringBuilder();
-      int len = rand.nextInt(10);
+      int len = rand.nextInt(maxNormalStrLen);
       for (int j = 0; j < len; j++) {
         sb.append(alphabet.charAt(rand.nextInt(alphabet.length())));
       }
@@ -142,7 +145,7 @@ public class RandomNestedDataGenerator {
 
   private static int generateListLength(int depth) {
     if (rand.nextDouble() < 0.1) return 0; // empty list
-    return rand.nextInt(numListItems);
+    return rand.nextInt(maxNumListItems);
   }
 
   private static Schema getNonNullSchema(Schema schema) {
@@ -237,11 +240,11 @@ public class RandomNestedDataGenerator {
         }
         return m;
       }
-      case BOOLEAN: return new Boolean(getRandomBoolean());
-      case DOUBLE: return new Double(getRandomDouble());
-      case FLOAT: return new Float(getRandomFloat());
-      case INT: return new Integer(getRandomInt());
-      case LONG: return new Long(getRandomLong());
+      case BOOLEAN: return Boolean.valueOf(getRandomBoolean());
+      case DOUBLE: return Double.valueOf(getRandomDouble());
+      case FLOAT: return Float.valueOf(getRandomFloat());
+      case INT: return Integer.valueOf(getRandomInt());
+      case LONG: return Long.valueOf(getRandomLong());
       case STRING: return getRandomString();
       // TODO: Decimal
       // TODO: Timestamp
@@ -251,15 +254,26 @@ public class RandomNestedDataGenerator {
   }
 
   public static void main(String[] args) throws Exception {
-    if (args.length != 4) {
-      System.err.println("Arguments: schema_file num_elements list_len output_file");
+    final int num_args = args.length;
+    if (num_args < 5 || num_args > 6) {
+      System.err.println(
+          "Arguments: schema_file num_elements max_normal_str_len max_list_len " +
+          "output_file [random_seed]");
       System.exit(1);
     }
     String schemaFile = args[0];
-    int numElements = new Integer(args[1]);
-    numListItems = new Integer(args[2]);
-    String outputFile = args[3];
+    int numElements = Integer.valueOf(args[1]);
+    maxNormalStrLen = Integer.valueOf(args[2]);
+    maxNumListItems = Integer.valueOf(args[3]);
+    String outputFile = args[4];
 
-    generateDataToFile(schemaFile, numElements, outputFile);
+    Optional<Long> seed;
+    if (num_args > 5) {
+      seed = Optional.of(Long.valueOf(args[5]));
+    } else {
+      seed = Optional.empty();
+    }
+
+    generateDataToFile(schemaFile, numElements, outputFile, seed);
   }
 }

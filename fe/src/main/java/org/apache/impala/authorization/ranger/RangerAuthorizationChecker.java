@@ -20,7 +20,7 @@ package org.apache.impala.authorization.ranger;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
 import org.apache.impala.authorization.Authorizable;
@@ -102,6 +102,11 @@ public class RangerAuthorizationChecker extends BaseAuthorizationChecker {
         resources.add(new RangerImpalaResourceBuilder()
             .database("*").function("*").build());
         resources.add(new RangerImpalaResourceBuilder().uri("*").build());
+        if (privilege == Privilege.ALL || privilege == Privilege.OWNER ||
+            privilege == Privilege.RWSTORAGE) {
+          resources.add(new RangerImpalaResourceBuilder()
+              .storageType("*").storageUri("*").build());
+        }
         break;
       case DB:
         resources.add(new RangerImpalaResourceBuilder()
@@ -153,6 +158,12 @@ public class RangerAuthorizationChecker extends BaseAuthorizationChecker {
             .uri(authorizable.getName())
             .build());
         break;
+      case STORAGEHANDLER_URI:
+        resources.add(new RangerImpalaResourceBuilder()
+            .storageType(authorizable.getStorageType())
+            .storageUri(authorizable.getStorageUri())
+            .build());
+        break;
       default:
         throw new IllegalArgumentException(String.format("Invalid authorizable type: %s",
             authorizable.getType()));
@@ -177,17 +188,36 @@ public class RangerAuthorizationChecker extends BaseAuthorizationChecker {
   }
 
   @Override
-  public void postAuthorize(AuthorizationContext authzCtx, boolean authzOk) {
+  public void postAuthorize(AuthorizationContext authzCtx, boolean authzOk,
+      boolean analysisOk) {
     Preconditions.checkArgument(authzCtx instanceof RangerAuthorizationContext);
-    super.postAuthorize(authzCtx, authzOk);
-    // Apply the deduplicated column masking events to update the List of all
-    // AuthzAuditEvent's only if the authorization is successful.
+    super.postAuthorize(authzCtx, authzOk, analysisOk);
+    // Consolidate the audit log entries and apply the deduplicated column masking events
+    // to update the List of all AuthzAuditEvent's only if the authorization is
+    // successful.
     if (authzOk) {
+      // We consolidate the audit log entries before invoking
+      // applyDeduplicatedAuthzEvents() where we add the deduplicated table
+      // masking-related log entries to 'auditHandler' because currently a Ranger column
+      // masking policy can be applied to only one single column in a table. Thus, we do
+      // not need to combine log entries produced due to column masking policies.
+      ((RangerAuthorizationContext) authzCtx).consolidateAuthzEvents();
       ((RangerAuthorizationContext) authzCtx).applyDeduplicatedAuthzEvents();
     }
     RangerBufferAuditHandler auditHandler =
         ((RangerAuthorizationContext) authzCtx).getAuditHandler();
-    auditHandler.flush();
+    if (authzOk && !analysisOk) {
+      // When the query was authorized, we do not send any audit log entry to the Ranger
+      // server if there was an AnalysisException during query analysis.
+      // We still have to call clear() to remove audit log entries in this case because
+      // the current test framework checks the contents in auditHandler.getAuthzEvents()
+      // to determine whether the correct audit events are collected.
+      auditHandler.getAuthzEvents().clear();
+    } else {
+      // We send audit log entries to the Ranger server only if authorization failed or
+      // analysis succeeded.
+      auditHandler.flush();
+    }
   }
 
   @Override
@@ -248,34 +278,49 @@ public class RangerAuthorizationChecker extends BaseAuthorizationChecker {
       throws AuthorizationException, InternalException {
     RangerAuthorizationContext originalCtx = (RangerAuthorizationContext) authzCtx;
     RangerBufferAuditHandler originalAuditHandler = originalCtx.getAuditHandler();
-    // case 1: table (select) OK --> add the table event
+    // case 1: table (select) OK, columns (select) OK --> add the table event,
+    //                                                    add the column events
     // case 2: table (non-select) ERROR --> add the table event
     // case 3: table (select) ERROR, columns (select) OK -> only add the column events
-    // case 4: table (select) ERROR, columns (select) ERROR --> only add the first column
-    //                                                          event
+    // case 4: table (select) ERROR, columns (select) ERROR --> add the table event
+    // case 5: table (select) ERROR --> add the table event
+    //         This could happen when the select request for a non-existing table fails
+    //         the authorization.
+    // case 6: table (select) OK, columns (select) ERROR --> add the first column event
+    //         This could happen when the requesting user is granted the select privilege
+    //         on the table but is denied access to a column in the same table in Ranger.
     RangerAuthorizationContext tmpCtx = new RangerAuthorizationContext(
         originalCtx.getSessionState(), originalCtx.getTimeline());
     tmpCtx.setAuditHandler(new RangerBufferAuditHandler(originalAuditHandler));
+    AuthorizationException authorizationException = null;
     try {
       super.authorizeTableAccess(tmpCtx, analysisResult, catalog, requests);
     } catch (AuthorizationException e) {
+      authorizationException = e;
       tmpCtx.getAuditHandler().getAuthzEvents().stream()
           .filter(evt ->
               // case 2: get the first failing non-select table
               (!"select".equalsIgnoreCase(evt.getAccessType()) &&
                   "@table".equals(evt.getResourceType())) ||
-              // case 4: get the first failing column
-              ("@column".equals(evt.getResourceType()) && evt.getAccessResult() == 0))
+              // case 4 & 5 & 6: get the table or a column event
+              (("@table".equals(evt.getResourceType()) ||
+                  "@column".equals(evt.getResourceType())) &&
+                  evt.getAccessResult() == 0))
           .findFirst()
           .ifPresent(evt -> originalCtx.getAuditHandler().getAuthzEvents().add(evt));
       throw e;
     } finally {
-      // case 1 & 4: we only add the successful events. The first table-level access
-      // check is only for the short-circuit, we don't want to add an event for that.
-      List<AuthzAuditEvent> events = tmpCtx.getAuditHandler().getAuthzEvents().stream()
-          .filter(evt -> evt.getAccessResult() != 0)
-          .collect(Collectors.toList());
-      originalCtx.getAuditHandler().getAuthzEvents().addAll(events);
+      // We should not add successful events when there was an AuthorizationException.
+      // Specifically, we should not add the successful table event in case 6.
+      if (authorizationException == null) {
+        // case 1 & 3: we only add the successful events.
+        // TODO(IMPALA-11381): Consider whether we should keep the table-level event which
+        // corresponds to a check only for short-circuiting authorization.
+        List<AuthzAuditEvent> events = tmpCtx.getAuditHandler().getAuthzEvents().stream()
+            .filter(evt -> evt.getAccessResult() != 0)
+            .collect(Collectors.toList());
+        originalCtx.getAuditHandler().getAuthzEvents().addAll(events);
+      }
     }
   }
 
@@ -451,8 +496,11 @@ public class RangerAuthorizationChecker extends BaseAuthorizationChecker {
         .table(tableName)
         .column(columnName)
         .build();
-    RangerAccessRequest req = new RangerAccessRequestImpl(resource,
-        SELECT_ACCESS_TYPE, user.getShortName(), getUserGroups(user));
+    RangerAccessRequestImpl req = new RangerAccessRequestImpl();
+    req.setResource(resource);
+    req.setAccessType(SELECT_ACCESS_TYPE);
+    req.setUser(user.getShortName());
+    req.setUserGroups(getUserGroups(user));
     // The method evalDataMaskPolicies() only checks whether there is a corresponding
     // column masking policy on the Ranger server and thus does not check whether the
     // requesting user/group is granted the necessary privilege on the specified
@@ -472,8 +520,11 @@ public class RangerAuthorizationChecker extends BaseAuthorizationChecker {
         .database(dbName)
         .table(tableName)
         .build();
-    RangerAccessRequest req = new RangerAccessRequestImpl(resource,
-        SELECT_ACCESS_TYPE, user.getShortName(), getUserGroups(user));
+    RangerAccessRequestImpl req = new RangerAccessRequestImpl();
+    req.setResource(resource);
+    req.setAccessType(SELECT_ACCESS_TYPE);
+    req.setUser(user.getShortName());
+    req.setUserGroups(getUserGroups(user));
     return plugin_.evalRowFilterPolicies(req, auditHandler);
   }
 
@@ -560,9 +611,16 @@ public class RangerAuthorizationChecker extends BaseAuthorizationChecker {
     }
     // 'tmpAuditHandler' could be null if 'originalAuditHandler' is null or
     // authzCtx.getRetainAudits() is false.
+    // Moreover, when 'resource' is associated with a storage handler URI, we pass
+    // Privilege.RWSTORAGE to updateAuditEvents() since RWSTORAGE is the only valid
+    // access type on a storage handler URI. Otherwise, we may update
+    // 'originalAuditHandler' incorrectly since the audit log entries produced by Ranger
+    // corresponding to a command like REFRESH/INVALIDATE METADATA has a entry with
+    // access type being RWSTORAGE instead of REFRESH.
     if (originalAuditHandler != null && tmpAuditHandler != null) {
       updateAuditEvents(tmpAuditHandler, originalAuditHandler, false /*not any*/,
-          privilege);
+          resource.getKeys().contains(RangerImpalaResourceBuilder.STORAGE_TYPE) ?
+          Privilege.RWSTORAGE : privilege);
     }
     return authorized;
   }
@@ -599,16 +657,26 @@ public class RangerAuthorizationChecker extends BaseAuthorizationChecker {
       RangerAccessResourceImpl resource, Authorizable authorizable, Privilege privilege,
       RangerBufferAuditHandler auditHandler) throws InternalException {
     String accessType;
-    if (privilege == Privilege.ANY) {
-      accessType = RangerPolicyEngine.ANY_ACCESS;
-    } else if (privilege == Privilege.INSERT) {
-      // Ranger plugin for Hive considers INSERT to be UPDATE.
-      accessType = UPDATE_ACCESS_TYPE;
+    // If 'resource' is associated with a storage handler URI, then 'accessType' can only
+    // be RWSTORAGE since RWSTORAGE is the only valid privilege that could be applied on
+    // a storage handler URI.
+    if (resource.getKeys().contains(RangerImpalaResourceBuilder.STORAGE_TYPE)) {
+      accessType = Privilege.RWSTORAGE.name().toLowerCase();
     } else {
-      accessType = privilege.name().toLowerCase();
+      if (privilege == Privilege.ANY) {
+        accessType = RangerPolicyEngine.ANY_ACCESS;
+      } else if (privilege == Privilege.INSERT) {
+        // Ranger plugin for Hive considers INSERT to be UPDATE.
+        accessType = UPDATE_ACCESS_TYPE;
+      } else {
+        accessType = privilege.name().toLowerCase();
+      }
     }
-    RangerAccessRequestImpl request = new RangerAccessRequestImpl(resource,
-        accessType, user.getShortName(), getUserGroups(user));
+    RangerAccessRequestImpl request = new RangerAccessRequestImpl();
+    request.setResource(resource);
+    request.setAccessType(accessType);
+    request.setUser(user.getShortName());
+    request.setUserGroups(getUserGroups(user));
     request.setClusterName(plugin_.getClusterName());
     if (authzCtx.getSessionState() != null) {
       request.setClientIPAddress(
@@ -695,4 +763,9 @@ public class RangerAuthorizationChecker extends BaseAuthorizationChecker {
 
   @VisibleForTesting
   public RangerImpalaPlugin getRangerImpalaPlugin() { return plugin_; }
+
+  @Override
+  public boolean roleExists(String roleName) {
+    return RangerUtil.roleExists(plugin_, roleName);
+  }
 }

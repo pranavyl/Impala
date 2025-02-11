@@ -25,12 +25,11 @@
 #include <rapidjson/rapidjson.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
-#include <rapidjson/error/en.h>
 
 #include "catalog/catalog-service-client-wrapper.h"
 #include "common/status.h"
-#include "exec/kudu-util.h"
 #include "exprs/timezone_db.h"
+#include "gen-cpp/Types_types.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "rpc/rpc-mgr.inline.h"
 #include "runtime/coordinator.h"
@@ -42,6 +41,7 @@
 #include "runtime/timestamp-value.h"
 #include "runtime/timestamp-value.inline.h"
 #include "scheduling/admission-control-client.h"
+#include "scheduling/cluster-membership-mgr.h"
 #include "scheduling/scheduler.h"
 #include "service/frontend.h"
 #include "service/impala-server.h"
@@ -51,15 +51,12 @@
 #include "util/debug-util.h"
 #include "util/impalad-metrics.h"
 #include "util/lineage-util.h"
-#include "util/metrics.h"
 #include "util/pretty-printer.h"
-#include "util/promise.h"
 #include "util/redactor.h"
 #include "util/runtime-profile-counters.h"
 #include "util/time.h"
 #include "util/uid-util.h"
 
-#include "gen-cpp/CatalogService.h"
 #include "gen-cpp/CatalogService_types.h"
 #include "gen-cpp/control_service.pb.h"
 #include "gen-cpp/control_service.proxy.h"
@@ -81,12 +78,15 @@ using namespace strings;
 DECLARE_bool(abort_on_failed_audit_event);
 DECLARE_bool(abort_on_failed_lineage_event);
 DECLARE_int32(krpc_port);
-DECLARE_int32(catalog_service_port);
-DECLARE_string(catalog_service_host);
 DECLARE_int64(max_result_cache_size);
 DECLARE_bool(use_local_catalog);
 
 namespace impala {
+
+PROFILE_DEFINE_TIMER(ClientFetchLockWaitTimer, UNSTABLE,
+    "Cumulative time client fetch requests waiting for locks.");
+PROFILE_DEFINE_SUMMARY_STATS_TIMER(GetInFlightProfileTimeStats, UNSTABLE,
+    "Summary stats of the time dumping profiles when the query is still in-flight.");
 
 // Keys into the info string map of the runtime profile referring to specific
 // items used by CM for monitoring purposes.
@@ -98,25 +98,36 @@ static const string TABLES_WITH_MISSING_DISK_IDS_KEY = "Tables With Missing Disk
 static const string QUERY_STATUS_KEY = "Query Status";
 static const string RETRY_STATUS_KEY = "Retry Status";
 
+const TExecRequest ClientRequestState::unknown_exec_request_;
+
 ClientRequestState::ClientRequestState(const TQueryCtx& query_ctx, Frontend* frontend,
     ImpalaServer* server, shared_ptr<ImpalaServer::SessionState> session,
-    TExecRequest* exec_request, QueryDriver* query_driver)
+    QueryDriver* query_driver)
   : query_ctx_(query_ctx),
     last_active_time_ms_(numeric_limits<int64_t>::max()),
     child_query_executor_(new ChildQueryExecutor),
-    session_(session),
+    session_(move(session)),
     coord_exec_called_(false),
     // Profile is assigned name w/ id after planning
-    profile_(RuntimeProfile::Create(&profile_pool_, "Query")),
-    frontend_profile_(RuntimeProfile::Create(&profile_pool_, "Frontend")),
-    server_profile_(RuntimeProfile::Create(&profile_pool_, "ImpalaServer")),
-    summary_profile_(RuntimeProfile::Create(&profile_pool_, "Summary")),
-    exec_request_(exec_request),
+    profile_(RuntimeProfile::Create(&profile_pool_, "Query", false)),
+    frontend_profile_(RuntimeProfile::Create(&profile_pool_, "Frontend", false)),
+    server_profile_(RuntimeProfile::Create(&profile_pool_, "ImpalaServer", false)),
+    summary_profile_(RuntimeProfile::Create(&profile_pool_, "Summary", false)),
     frontend_(frontend),
     parent_server_(server),
     start_time_us_(UnixMicros()),
     fetch_rows_timeout_us_(MICROS_PER_MILLI * query_options().fetch_rows_timeout_ms),
     parent_driver_(query_driver) {
+  bool is_external_fe = session_type() == TSessionType::EXTERNAL_FRONTEND;
+  // "Impala Backend Timeline" was specifically chosen to exploit the lexicographical
+  // ordering defined by the underlying std::map holding the timelines displayed in
+  // the web UI. This helps ensure that "Frontend Timeline" is displayed before
+  // "Impala Backend Timeline".
+  query_events_ = summary_profile_->AddEventSequence(
+      is_external_fe ? "Impala Backend Timeline" : "Query Timeline");
+  query_events_->Start();
+  profile_->AddChild(summary_profile_);
+
 #ifndef NDEBUG
   profile_->AddInfoString("DEBUG MODE WARNING", "Query profile created while running a "
       "DEBUG build of Impala. Use RELEASE builds to measure query performance.");
@@ -130,31 +141,32 @@ ClientRequestState::ClientRequestState(const TQueryCtx& query_ctx, Frontend* fro
   num_rows_fetched_from_cache_counter_ =
       ADD_COUNTER(server_profile_, "NumRowsFetchedFromCache", TUnit::UNIT);
   client_wait_timer_ = ADD_TIMER(server_profile_, "ClientFetchWaitTimer");
-  bool is_external_fe = session_type() == TSessionType::EXTERNAL_FRONTEND;
-  // "Impala Backend Timeline" was specifically chosen to exploit the lexicographical
-  // ordering defined by the underlying std::map holding the timelines displayed in
-  // the web UI. This helps ensure that "Frontend Timeline" is displayed before
-  // "Impala Backend Timeline".
-  query_events_ = summary_profile_->AddEventSequence(
-      is_external_fe ? "Impala Backend Timeline" : "Query Timeline");
-  query_events_->Start();
-  profile_->AddChild(summary_profile_);
+  client_wait_time_stats_ =
+      ADD_SUMMARY_STATS_TIMER(server_profile_, "ClientFetchWaitTimeStats");
+  rpc_read_timer_ = ADD_TIMER(server_profile_, "RPCReadTimer");
+  rpc_write_timer_ = ADD_TIMER(server_profile_, "RPCWriteTimer");
+  rpc_count_ = ADD_COUNTER(server_profile_, "RPCCount", TUnit::UNIT);
+  get_inflight_profile_time_stats_ =
+      PROFILE_GetInFlightProfileTimeStats.Instantiate(server_profile_);
+  client_fetch_lock_wait_timer_ =
+      PROFILE_ClientFetchLockWaitTimer.Instantiate(server_profile_);
 
   profile_->set_name("Query (id=" + PrintId(query_id()) + ")");
   summary_profile_->AddInfoString("Session ID", PrintId(session_id()));
-  summary_profile_->AddInfoString("Session Type", PrintThriftEnum(session_type()));
+  summary_profile_->AddInfoString("Session Type", PrintValue(session_type()));
   if (session_type() == TSessionType::HIVESERVER2 ||
       session_type() == TSessionType::EXTERNAL_FRONTEND) {
-    summary_profile_->AddInfoString("HiveServer2 Protocol Version",
-        Substitute("V$0", 1 + session->hs2_version));
+    summary_profile_->AddInfoString(
+        "HiveServer2 Protocol Version", Substitute("V$0", 1 + session_->hs2_version));
   }
   // Certain API clients expect Start Time and End Time to be date-time strings
   // of nanosecond precision, so we explicitly specify the precision here.
   summary_profile_->AddInfoString("Start Time", ToStringFromUnixMicros(start_time_us(),
       TimePrecision::Nanosecond));
   summary_profile_->AddInfoString("End Time", "");
+  summary_profile_->AddInfoString("Duration", "");
   summary_profile_->AddInfoString("Query Type", "N/A");
-  summary_profile_->AddInfoString("Query State", PrintThriftEnum(BeeswaxQueryState()));
+  summary_profile_->AddInfoString("Query State", PrintValue(BeeswaxQueryState()));
   summary_profile_->AddInfoString(
       "Impala Query State", ExecStateToString(exec_state()));
   summary_profile_->AddInfoString("Query Status", "OK");
@@ -164,6 +176,11 @@ ClientRequestState::ClientRequestState(const TQueryCtx& query_ctx, Frontend* fro
   summary_profile_->AddInfoString("Delegated User", do_as_user());
   summary_profile_->AddInfoString("Network Address",
       TNetworkAddressToString(session_->network_address));
+  if (!session_->http_origin.empty()) {
+    /// If using hs2-http protocol, this is the origin of the session
+    /// as recorded in the X-Forwarded-For http message header.
+    summary_profile_->AddInfoString("Http Origin", session_->http_origin);
+  }
   summary_profile_->AddInfoString("Default Db", default_db());
   summary_profile_->AddInfoStringRedacted(
       "Sql Statement", query_ctx_.client_request.stmt);
@@ -176,7 +193,10 @@ ClientRequestState::ClientRequestState(const TQueryCtx& query_ctx, Frontend* fro
 }
 
 ClientRequestState::~ClientRequestState() {
-  DCHECK(wait_thread_.get() == NULL) << "BlockOnWait() needs to be called!";
+  DCHECK(wait_thread_.get() == NULL) << "Finalize() needs to be called!";
+  DCHECK(!track_rpcs_);  // Should get set to false in Finalize()
+  DCHECK(pending_rpcs_.empty()); // Should get cleared in Finalize()
+  UnRegisterRemainingRPCs(); // Avoid memory leaks if Finalize() didn't get called
 }
 
 Status ClientRequestState::SetResultCache(QueryResultSet* cache,
@@ -194,14 +214,24 @@ Status ClientRequestState::SetResultCache(QueryResultSet* cache,
 }
 
 void ClientRequestState::SetRemoteSubmitTime(int64_t remote_submit_time) {
-  query_events_->Start(remote_submit_time);
+  int64_t ack_submit_time = min(MonotonicStopWatch::Now(), remote_submit_time);
+  if (ack_submit_time < remote_submit_time) {
+    VLOG_QUERY << "Ignoring remote_submit_time (" << remote_submit_time
+               << " ns) that is more than coordinator time (" << ack_submit_time
+               << " ns) for query id=" << PrintId(query_id());
+  }
+  query_events_->Start(ack_submit_time);
 }
 
-void ClientRequestState::SetFrontendProfile(TRuntimeProfileNode profile) {
+void ClientRequestState::SetFrontendProfile(const TExecRequest& exec_request) {
   // Should we defer creating and adding the child until here? probably.
   TRuntimeProfileTree prof_tree;
-  prof_tree.nodes.emplace_back(std::move(profile));
-  frontend_profile_->Update(prof_tree);
+  prof_tree.nodes.emplace_back(std::move(exec_request.profile));
+  for (auto& child : exec_request.profile_children) {
+    prof_tree.nodes.emplace_back(std::move(child));
+  }
+  prof_tree.nodes.at(0).num_children = prof_tree.nodes.size() - 1;
+  frontend_profile_->Update(prof_tree, false);
 }
 
 void ClientRequestState::AddBlacklistedExecutorAddress(const NetworkAddressPB& addr) {
@@ -221,12 +251,33 @@ void ClientRequestState::SetBlacklistedExecutorAddresses(
 Status ClientRequestState::Exec() {
   MarkActive();
 
+  const TExecRequest& exec_req = exec_request();
   profile_->AddChild(server_profile_);
-  summary_profile_->AddInfoString("Query Type", PrintThriftEnum(stmt_type()));
+  summary_profile_->AddInfoString("Query Type", PrintValue(stmt_type()));
   summary_profile_->AddInfoString("Query Options (set by configuration)",
       DebugQueryOptions(query_ctx_.client_request.query_options));
   summary_profile_->AddInfoString("Query Options (set by configuration and planner)",
-      DebugQueryOptions(exec_request_->query_options));
+      DebugQueryOptions(exec_req.query_options));
+  if (!exec_req.tables.empty()) {
+    summary_profile_->AddInfoString("Tables Queried", PrintTableList(exec_req.tables));
+  }
+  if (!exec_req.select_columns.empty()) {
+    summary_profile_->AddInfoString("Select Columns", join(exec_req.select_columns, ","));
+  }
+  if (!exec_req.where_columns.empty()) {
+    summary_profile_->AddInfoString("Where Columns", join(exec_req.where_columns, ","));
+  }
+  if (!exec_req.join_columns.empty()) {
+    summary_profile_->AddInfoString("Join Columns", join(exec_req.join_columns, ","));
+  }
+  if (!exec_req.aggregate_columns.empty()) {
+    summary_profile_->AddInfoString(
+        "Aggregate Columns", join(exec_req.aggregate_columns, ","));
+  }
+  if (!exec_req.orderby_columns.empty()) {
+    summary_profile_->AddInfoString(
+        "OrderBy Columns", join(exec_req.orderby_columns, ","));
+  }
   if (query_ctx_.__isset.overridden_mt_dop_value) {
     DCHECK(query_ctx_.client_request.query_options.__isset.mt_dop);
     summary_profile_->AddInfoString("MT_DOP limited by admission control",
@@ -235,41 +286,41 @@ Status ClientRequestState::Exec() {
             query_ctx_.client_request.query_options.mt_dop));
   }
 
-  switch (exec_request_->stmt_type) {
+  switch (exec_req.stmt_type) {
     case TStmtType::QUERY:
     case TStmtType::DML:
-      DCHECK(exec_request_->__isset.query_exec_request);
+      DCHECK(exec_req.__isset.query_exec_request);
       RETURN_IF_ERROR(
-          ExecQueryOrDmlRequest(exec_request_->query_exec_request, true /*async*/));
+          ExecQueryOrDmlRequest(exec_req.query_exec_request, true /*async*/));
       break;
     case TStmtType::EXPLAIN: {
       request_result_set_.reset(new vector<TResultRow>(
-          exec_request_->explain_result.results));
+          exec_req.explain_result.results));
       break;
     }
     case TStmtType::TESTCASE: {
-      DCHECK(exec_request_->__isset.testcase_data_path);
-      SetResultSet(vector<string>(1, exec_request_->testcase_data_path));
+      DCHECK(exec_req.__isset.testcase_data_path);
+      SetResultSet(vector<string>(1, exec_req.testcase_data_path));
       break;
     }
     case TStmtType::DDL: {
-      DCHECK(exec_request_->__isset.catalog_op_request);
+      DCHECK(exec_req.__isset.catalog_op_request);
       LOG_AND_RETURN_IF_ERROR(ExecDdlRequest());
       break;
     }
     case TStmtType::LOAD: {
-      DCHECK(exec_request_->__isset.load_data_request);
+      DCHECK(exec_req.__isset.load_data_request);
       LOG_AND_RETURN_IF_ERROR(ExecLoadDataRequest());
       break;
     }
     case TStmtType::SET: {
-      DCHECK(exec_request_->__isset.set_query_option_request);
+      DCHECK(exec_req.__isset.set_query_option_request);
       lock_guard<mutex> l(session_->lock);
-      if (exec_request_->set_query_option_request.__isset.key) {
+      if (exec_req.set_query_option_request.__isset.key) {
         // "SET key=value" updates the session query options.
-        DCHECK(exec_request_->set_query_option_request.__isset.value);
-        const auto& key = exec_request_->set_query_option_request.key;
-        const auto& value = exec_request_->set_query_option_request.value;
+        DCHECK(exec_req.set_query_option_request.__isset.value);
+        const auto& key = exec_req.set_query_option_request.key;
+        const auto& value = exec_req.set_query_option_request.value;
         RETURN_IF_ERROR(SetQueryOption(key, value, &session_->set_query_options,
               &session_->set_query_options_mask));
         SetResultSet({}, {}, {});
@@ -280,22 +331,45 @@ Status ClientRequestState::Exec() {
           VLOG_QUERY << "ClientRequestState::Exec() SET: idle_session_timeout="
                      << PrettyPrinter::Print(session_->session_timeout, TUnit::TIME_S);
         }
+      } else if (exec_req.set_query_option_request.__isset.query_option_type
+          && exec_req.set_query_option_request.query_option_type
+              == TQueryOptionType::UNSET_ALL) {
+        // "UNSET ALL"
+        RETURN_IF_ERROR(ResetAllQueryOptions(
+            &session_->set_query_options, &session_->set_query_options_mask));
+        SetResultSet({}, {}, {});
       } else {
         // "SET" or "SET ALL"
-        bool is_set_all = exec_request_->set_query_option_request.__isset.is_set_all &&
-            exec_request_->set_query_option_request.is_set_all;
+        bool is_set_all =
+            exec_req.set_query_option_request.__isset.query_option_type
+            && exec_req.set_query_option_request.query_option_type
+                == TQueryOptionType::SET_ALL;
         PopulateResultForSet(is_set_all);
       }
       break;
     }
     case TStmtType::ADMIN_FN:
-      DCHECK(exec_request_->admin_request.type == TAdminRequestType::SHUTDOWN);
-      RETURN_IF_ERROR(ExecShutdownRequest());
+      if (exec_req.admin_request.type == TAdminRequestType::SHUTDOWN) {
+        RETURN_IF_ERROR(ExecShutdownRequest());
+      } else if (exec_req.admin_request.type == TAdminRequestType::EVENT_PROCESSOR) {
+        RETURN_IF_ERROR(ExecEventProcessorCmd());
+      } else {
+        DCHECK(false);
+      }
+      break;
+    case TStmtType::CONVERT:
+      DCHECK(exec_req.__isset.convert_table_request);
+      LOG_AND_RETURN_IF_ERROR(ExecMigrateRequest());
+      break;
+    case TStmtType::UNKNOWN:
+      DCHECK(false);
+      return Status("Exec request uninitialized during execution");
+    case TStmtType::KILL:
+      DCHECK(exec_req.__isset.kill_query_request);
+      LOG_AND_RETURN_IF_ERROR(ExecKillQueryRequest());
       break;
     default:
-      stringstream errmsg;
-      errmsg << "Unknown exec request stmt type: " << exec_request_->stmt_type;
-      return Status(errmsg.str());
+      return Status(Substitute("Unknown exec request stmt type: $0", exec_req.stmt_type));
   }
 
   if (async_exec_thread_.get() == nullptr) {
@@ -331,19 +405,36 @@ Status ClientRequestState::ExecLocalCatalogOp(
   switch (catalog_op.op_type) {
     case TCatalogOpType::USE: {
       lock_guard<mutex> l(session_->lock);
-      session_->database = exec_request_->catalog_op_request.use_db_params.db;
+      session_->database = exec_request().catalog_op_request.use_db_params.db;
       return Status::OK();
     }
-    case TCatalogOpType::SHOW_TABLES: {
+    case TCatalogOpType::SHOW_TABLES:
+    case TCatalogOpType::SHOW_VIEWS: {
       const TShowTablesParams* params = &catalog_op.show_tables_params;
-      // A NULL pattern means match all tables. However, Thrift string types can't
-      // be NULL in C++, so we have to test if it's set rather than just blindly
-      // using the value.
-      const string* table_name =
-          params->__isset.show_pattern ? &(params->show_pattern) : NULL;
+      // A NULL pattern means match all tables of the specified table types. However,
+      // Thrift string types can't be NULL in C++, so we have to test if it's set rather
+      // than just blindly using the value.
+      const string* table_name_pattern =
+          params->__isset.show_pattern ? &(params->show_pattern) : nullptr;
       TGetTablesResult table_names;
-      RETURN_IF_ERROR(frontend_->GetTableNames(params->db, table_name,
-          &query_ctx_.session, &table_names));
+      const set<TImpalaTableType::type>& table_types = params->table_types;
+      RETURN_IF_ERROR(frontend_->GetTableNames(params->db, table_name_pattern,
+          &query_ctx_.session, table_types, &table_names));
+      SetResultSet(table_names.tables);
+      return Status::OK();
+    }
+    case TCatalogOpType::SHOW_METADATA_TABLES: {
+      const TShowTablesParams* params = &catalog_op.show_tables_params;
+      // A NULL pattern means match all tables of the specified table types. However,
+      // Thrift string types can't be NULL in C++, so we have to test if it's set rather
+      // than just blindly using the value.
+      const string* metadata_table_name_pattern =
+          params->__isset.show_pattern ? &(params->show_pattern) : nullptr;
+      DCHECK(params->__isset.tbl);
+      const string& table_name = params->tbl;
+      TGetTablesResult table_names;
+      RETURN_IF_ERROR(frontend_->GetMetadataTableNames(params->db, table_name,
+          metadata_table_name_pattern, &query_ctx_.session, &table_names));
       SetResultSet(table_names.tables);
       return Status::OK();
     }
@@ -508,38 +599,21 @@ Status ClientRequestState::ExecQueryOrDmlRequest(
   if (!query_exec_request.query_ctx.__isset.parent_query_id &&
       query_exec_request.query_ctx.__isset.tables_missing_stats &&
       !query_exec_request.query_ctx.tables_missing_stats.empty()) {
-    stringstream ss;
-    const vector<TTableName>& tbls = query_exec_request.query_ctx.tables_missing_stats;
-    for (int i = 0; i < tbls.size(); ++i) {
-      if (i != 0) ss << ",";
-      ss << tbls[i].db_name << "." << tbls[i].table_name;
-    }
-    summary_profile_->AddInfoString(TABLES_MISSING_STATS_KEY, ss.str());
+    summary_profile_->AddInfoString(TABLES_MISSING_STATS_KEY,
+        PrintTableList(query_exec_request.query_ctx.tables_missing_stats));
   }
 
   if (!query_exec_request.query_ctx.__isset.parent_query_id &&
       query_exec_request.query_ctx.__isset.tables_with_corrupt_stats &&
       !query_exec_request.query_ctx.tables_with_corrupt_stats.empty()) {
-    stringstream ss;
-    const vector<TTableName>& tbls =
-        query_exec_request.query_ctx.tables_with_corrupt_stats;
-    for (int i = 0; i < tbls.size(); ++i) {
-      if (i != 0) ss << ",";
-      ss << tbls[i].db_name << "." << tbls[i].table_name;
-    }
-    summary_profile_->AddInfoString(TABLES_WITH_CORRUPT_STATS_KEY, ss.str());
+    summary_profile_->AddInfoString(TABLES_WITH_CORRUPT_STATS_KEY,
+        PrintTableList(query_exec_request.query_ctx.tables_with_corrupt_stats));
   }
 
   if (query_exec_request.query_ctx.__isset.tables_missing_diskids &&
       !query_exec_request.query_ctx.tables_missing_diskids.empty()) {
-    stringstream ss;
-    const vector<TTableName>& tbls =
-        query_exec_request.query_ctx.tables_missing_diskids;
-    for (int i = 0; i < tbls.size(); ++i) {
-      if (i != 0) ss << ",";
-      ss << tbls[i].db_name << "." << tbls[i].table_name;
-    }
-    summary_profile_->AddInfoString(TABLES_WITH_MISSING_DISK_IDS_KEY, ss.str());
+    summary_profile_->AddInfoString(TABLES_WITH_MISSING_DISK_IDS_KEY,
+        PrintTableList(query_exec_request.query_ctx.tables_missing_diskids));
   }
 
   {
@@ -563,14 +637,15 @@ Status ClientRequestState::ExecQueryOrDmlRequest(
 }
 
 void ClientRequestState::FinishExecQueryOrDmlRequest() {
-  DCHECK(exec_request_->__isset.query_exec_request);
+  const TExecRequest& exec_req = exec_request();
+  DCHECK(exec_req.__isset.query_exec_request);
   UniqueIdPB query_id_pb;
   TUniqueIdToUniqueIdPB(query_id(), &query_id_pb);
   Status admit_status = admission_control_client_->SubmitForAdmission(
       {query_id_pb, ExecEnv::GetInstance()->backend_id(),
-          exec_request_->query_exec_request, exec_request_->query_options,
+          exec_req.query_exec_request, exec_req.query_options,
           summary_profile_, blacklisted_executor_addresses_},
-      query_events_, &schedule_);
+      query_events_, &schedule_, &wait_start_time_ms_, &wait_end_time_ms_);
   {
     lock_guard<mutex> l(lock_);
     if (!UpdateQueryStatus(admit_status).ok()) return;
@@ -580,15 +655,15 @@ void ClientRequestState::FinishExecQueryOrDmlRequest() {
   // startup. The query was not cancelled right before being admitted and the window here
   // is small enough to not require special handling. Instead we start the query and then
   // cancel it through the check below if necessary.
-  DebugActionNoFail(exec_request_->query_options, "CRS_BEFORE_COORD_STARTS");
+  DebugActionNoFail(exec_req.query_options, "CRS_BEFORE_COORD_STARTS");
   // Register the query with the server to support cancellation. This happens after
   // admission because now the set of executors is fixed and an executor failure will
   // cause a query failure.
   parent_server_->RegisterQueryLocations(schedule_->backend_exec_params(), query_id());
-  coord_.reset(new Coordinator(this, *exec_request_, *schedule_.get(), query_events_));
+  coord_.reset(new Coordinator(this, exec_req, *schedule_.get(), query_events_));
   Status exec_status = coord_->Exec();
 
-  DebugActionNoFail(exec_request_->query_options, "CRS_AFTER_COORD_STARTS");
+  DebugActionNoFail(exec_req.query_options, "CRS_AFTER_COORD_STARTS");
 
   // Make coordinator profile visible, even upon failure.
   if (coord_->query_profile() != nullptr) profile_->AddChild(coord_->query_profile());
@@ -624,14 +699,14 @@ Status ClientRequestState::ExecDdlRequestImplSync() {
 
   if (catalog_op_type() != TCatalogOpType::DDL &&
       catalog_op_type() != TCatalogOpType::RESET_METADATA) {
-    Status status = ExecLocalCatalogOp(exec_request_->catalog_op_request);
+    Status status = ExecLocalCatalogOp(exec_request().catalog_op_request);
     lock_guard<mutex> l(lock_);
     return UpdateQueryStatus(status);
   }
 
   if (ddl_type() == TDdlType::COMPUTE_STATS) {
-    TComputeStatsParams& compute_stats_params =
-        exec_request_->catalog_op_request.ddl_params.compute_stats_params;
+    const TComputeStatsParams& compute_stats_params =
+        exec_request().catalog_op_request.ddl_params.compute_stats_params;
     RuntimeProfile* child_profile =
         RuntimeProfile::Create(&profile_pool_, "Child Queries");
     profile_->AddChild(child_profile);
@@ -667,12 +742,14 @@ Status ClientRequestState::ExecDdlRequestImplSync() {
 void ClientRequestState::ExecDdlRequestImpl(bool exec_in_worker_thread) {
   bool is_CTAS = (catalog_op_type() == TCatalogOpType::DDL
       && ddl_type() == TDdlType::CREATE_TABLE_AS_SELECT);
+  const TExecRequest& exec_req = exec_request();
 
   catalog_op_executor_.reset(
       new CatalogOpExecutor(ExecEnv::GetInstance(), frontend_, server_profile_));
 
   // Indirectly check if running in thread async_exec_thread_.
   if (exec_in_worker_thread) {
+    VLOG_QUERY << "Running in worker thread";
     DCHECK(exec_state() == ExecState::PENDING);
 
     // 1. For any non-CTAS DDLs, transition to RUNNING
@@ -682,12 +759,14 @@ void ClientRequestState::ExecDdlRequestImpl(bool exec_in_worker_thread) {
   }
 
   // Optionally wait with a debug action before Exec() below.
-  DebugActionNoFail(exec_request_->query_options, "CRS_DELAY_BEFORE_CATALOG_OP_EXEC");
+  DebugActionNoFail(exec_req.query_options, "CRS_DELAY_BEFORE_CATALOG_OP_EXEC");
 
-  Status status = catalog_op_executor_->Exec(exec_request_->catalog_op_request);
+  Status status = catalog_op_executor_->Exec(exec_req.catalog_op_request);
+  query_events_->MarkEvent("CatalogDdlRequest finished");
+  AddCatalogTimeline();
   {
     lock_guard<mutex> l(lock_);
-    RETURN_VOID_IF_ERROR(UpdateQueryStatus(status));
+    RETURN_VOID_IF_ERROR(UpdateQueryStatus(status, exec_in_worker_thread));
   }
 
   // If this is a CTAS request, there will usually be more work to do
@@ -697,7 +776,7 @@ void ClientRequestState::ExecDdlRequestImpl(bool exec_in_worker_thread) {
   if (catalog_op_type() == TCatalogOpType::DDL &&
       ddl_type() == TDdlType::CREATE_TABLE_AS_SELECT &&
       !catalog_op_executor_->ddl_exec_response()->new_table_created) {
-    DCHECK(exec_request_->catalog_op_request.
+    DCHECK(exec_req.catalog_op_request.
         ddl_params.create_table_params.if_not_exists);
     return;
   }
@@ -705,10 +784,10 @@ void ClientRequestState::ExecDdlRequestImpl(bool exec_in_worker_thread) {
   // Add newly created table to catalog cache.
   status = parent_server_->ProcessCatalogUpdateResult(
       *catalog_op_executor_->update_catalog_result(),
-      exec_request_->query_options.sync_ddl);
+      exec_req.query_options.sync_ddl, query_options(), query_events_);
   {
     lock_guard<mutex> l(lock_);
-    RETURN_VOID_IF_ERROR(UpdateQueryStatus(status));
+    RETURN_VOID_IF_ERROR(UpdateQueryStatus(status, exec_in_worker_thread));
   }
 
   if (is_CTAS) {
@@ -716,13 +795,17 @@ void ClientRequestState::ExecDdlRequestImpl(bool exec_in_worker_thread) {
     // like a normal DML request. As with other DML requests, it will
     // wait for another catalog update if any partitions were altered as a result
     // of the operation.
-    DCHECK(exec_request_->__isset.query_exec_request);
+    DCHECK(exec_req.__isset.query_exec_request);
     RETURN_VOID_IF_ERROR(
-        ExecQueryOrDmlRequest(exec_request_->query_exec_request, !exec_in_worker_thread));
+        ExecQueryOrDmlRequest(exec_req.query_exec_request, !exec_in_worker_thread));
   }
 
-  // Set the results to be reported to the client.
-  SetResultSet(catalog_op_executor_->ddl_exec_response());
+  // Set the results to be reported to the client. Do this under lock to avoid races
+  // with ImpalaServer::GetResultSetMetadata().
+  {
+    lock_guard<mutex> l(lock_);
+    SetResultSet(catalog_op_executor_->ddl_exec_response());
+  }
 }
 
 bool ClientRequestState::ShouldRunExecDdlAsync() {
@@ -740,9 +823,9 @@ bool ClientRequestState::ShouldRunExecDdlAsync() {
 
 Status ClientRequestState::ExecDdlRequest() {
   string op_type = catalog_op_type() == TCatalogOpType::DDL ?
-      PrintThriftEnum(ddl_type()) : PrintThriftEnum(catalog_op_type());
+      PrintValue(ddl_type()) : PrintValue(catalog_op_type());
   bool async_ddl = ShouldRunExecDdlAsync();
-  bool async_ddl_enabled = exec_request_->query_options.enable_async_ddl_execution;
+  bool async_ddl_enabled = exec_request().query_options.enable_async_ddl_execution;
   string exec_mode = (async_ddl && async_ddl_enabled) ? "asynchronous" : "synchronous";
 
   summary_profile_->AddInfoString("DDL Type", op_type);
@@ -766,61 +849,146 @@ Status ClientRequestState::ExecDdlRequest() {
 }
 
 void ClientRequestState::ExecLoadDataRequestImpl(bool exec_in_worker_thread) {
+  const TExecRequest& exec_req = exec_request();
   if (exec_in_worker_thread) {
+    VLOG_QUERY << "Running in worker thread";
     DCHECK(exec_state() == ExecState::PENDING);
     UpdateNonErrorExecState(ExecState::RUNNING);
   }
   DebugActionNoFail(
-      exec_request_->query_options, "CRS_DELAY_BEFORE_LOAD_DATA");
+      exec_req.query_options, "CRS_DELAY_BEFORE_LOAD_DATA");
 
   TLoadDataResp response;
-  Status status = frontend_->LoadData(exec_request_->load_data_request, &response);
+  Status status = frontend_->LoadData(exec_req.load_data_request, &response);
+  if (exec_req.load_data_request.iceberg_tbl) {
+    ExecLoadIcebergDataRequestImpl(response);
+  }
   {
     lock_guard<mutex> l(lock_);
-    RETURN_VOID_IF_ERROR(UpdateQueryStatus(status));
+    RETURN_VOID_IF_ERROR(UpdateQueryStatus(status, exec_in_worker_thread));
   }
 
   request_result_set_.reset(new vector<TResultRow>);
   request_result_set_->push_back(response.load_summary);
 
-  // Now refresh the table metadata.
-  TCatalogOpRequest reset_req;
-  reset_req.__set_sync_ddl(exec_request_->query_options.sync_ddl);
-  reset_req.__set_op_type(TCatalogOpType::RESET_METADATA);
-  reset_req.__set_reset_metadata_params(TResetMetadataRequest());
-  reset_req.reset_metadata_params.__set_header(TCatalogServiceRequestHeader());
-  reset_req.reset_metadata_params.header.__set_want_minimal_response(
-      FLAGS_use_local_catalog);
-  reset_req.reset_metadata_params.__set_is_refresh(true);
-  reset_req.reset_metadata_params.__set_table_name(
-      exec_request_->load_data_request.table_name);
-  if (exec_request_->load_data_request.__isset.partition_spec) {
-    reset_req.reset_metadata_params.__set_partition_spec(
-        exec_request_->load_data_request.partition_spec);
-  }
-  reset_req.reset_metadata_params.__set_sync_ddl(
-      exec_request_->query_options.sync_ddl);
-  catalog_op_executor_.reset(
-      new CatalogOpExecutor(ExecEnv::GetInstance(), frontend_, server_profile_));
+  // We use TUpdateCatalogRequest to refresh the table metadata so that it will
+  // fire an insert event just like an insert statement.
+  TUpdatedPartition updatedPartition;
+  updatedPartition.files.insert(updatedPartition.files.end(),
+    response.loaded_files.begin(), response.loaded_files.end());
+  TUpdateCatalogRequest catalog_update;
+  // The partition_name is an empty string for unpartitioned tables.
+  catalog_update.updated_partitions[response.partition_name] = updatedPartition;
 
-  status = catalog_op_executor_->Exec(reset_req);
+  catalog_update.__set_sync_ddl(exec_req.query_options.sync_ddl);
+  catalog_update.__set_header(GetCatalogServiceRequestHeader());
+  catalog_update.target_table = exec_req.load_data_request.table_name.table_name;
+  catalog_update.db_name = exec_req.load_data_request.table_name.db_name;
+  catalog_update.is_overwrite = exec_req.load_data_request.overwrite;
+
+  CatalogServiceConnection client(ExecEnv::GetInstance()->catalogd_client_cache(),
+      *ExecEnv::GetInstance()->GetCatalogdAddress().get(), &status);
   {
     lock_guard<mutex> l(lock_);
-    RETURN_VOID_IF_ERROR(UpdateQueryStatus(status));
+    RETURN_VOID_IF_ERROR(UpdateQueryStatus(status, exec_in_worker_thread));
+  }
+
+  TUpdateCatalogResponse resp;
+  status = client.DoRpc(
+      &CatalogServiceClientWrapper::UpdateCatalog, catalog_update, &resp);
+  query_events_->MarkEvent("UpdateCatalog finished");
+  if (resp.__isset.profile) {
+    for (const TEventSequence& catalog_timeline : resp.profile.event_sequences) {
+      summary_profile_->AddEventSequence(catalog_timeline.name, catalog_timeline);
+    }
+  }
+  {
+    lock_guard<mutex> l(lock_);
+    RETURN_VOID_IF_ERROR(UpdateQueryStatus(status, exec_in_worker_thread));
   }
 
   status = parent_server_->ProcessCatalogUpdateResult(
-      *catalog_op_executor_->update_catalog_result(),
-      exec_request_->query_options.sync_ddl);
+      resp.result,
+      exec_req.query_options.sync_ddl, query_options(), query_events_);
   {
     lock_guard<mutex> l(lock_);
-    RETURN_VOID_IF_ERROR(UpdateQueryStatus(status));
+    RETURN_VOID_IF_ERROR(UpdateQueryStatus(status, exec_in_worker_thread));
+  }
+}
+
+void ClientRequestState::ExecLoadIcebergDataRequestImpl(TLoadDataResp response) {
+  TLoadDataReq load_data_req = exec_request().load_data_request;
+  RuntimeProfile* child_profile =
+      RuntimeProfile::Create(&profile_pool_, "Child Queries");
+  profile_->AddChild(child_profile);
+  // Add child queries for computing table and column stats.
+  vector<ChildQuery> child_queries;
+  // Prepare CREATE
+  RuntimeProfile* create_profile =
+      RuntimeProfile::Create(&profile_pool_, "Create table query");
+  child_profile->AddChild(create_profile);
+  child_queries.emplace_back(response.create_tmp_tbl_query, this, parent_server_,
+      create_profile, &profile_pool_);
+  // Prepare INSERT
+  RuntimeProfile* insert_profile =
+      RuntimeProfile::Create(&profile_pool_, "Insert query");
+  child_profile->AddChild(insert_profile);
+  child_queries.emplace_back(load_data_req.insert_into_dst_tbl_query, this,
+      parent_server_, insert_profile, &profile_pool_);
+  // Prepare DROP
+  RuntimeProfile* drop_profile =
+      RuntimeProfile::Create(&profile_pool_, "Drop table query");
+  child_profile->AddChild(drop_profile);
+  child_queries.emplace_back(load_data_req.drop_tmp_tbl_query, this,
+      parent_server_, drop_profile, &profile_pool_);
+  // Execute queries
+  RETURN_VOID_IF_ERROR(child_query_executor_->ExecAsync(move(child_queries)));
+  vector<ChildQuery*>* completed_queries = new vector<ChildQuery*>();
+  Status query_status = child_query_executor_->WaitForAll(completed_queries);
+  if (query_status.ok()) {
+    const char* path = response.create_location.c_str();
+    string delete_err = "Load was succesful, but failed to remove staging data under '"
+        + response.create_location + "', HDFS error: ";
+    hdfsFS hdfs_conn;
+    Status hdfs_ret = HdfsFsCache::instance()->GetConnection(path, &hdfs_conn);
+    if (!hdfs_ret.ok()) {
+      lock_guard<mutex> l(lock_);
+      RETURN_VOID_IF_ERROR(UpdateQueryStatus(Status(delete_err + hdfs_ret.GetDetail())));
+    }
+    if (hdfsDelete(hdfs_conn, path, 1)) {
+      lock_guard<mutex> l(lock_);
+      RETURN_VOID_IF_ERROR(UpdateQueryStatus(Status(delete_err + strerror(errno))));
+    }
+  } else {
+    const char* dst_path = load_data_req.source_path.c_str();
+    hdfsFS hdfs_dst_conn;
+    string revert_err = "Failed to load data and failed to revert data movement, "
+        "please check source and staging directory under '" + response.create_location
+        + "', Query error: " + query_status.GetDetail() + " HDFS error: ";
+    Status hdfs_ret = HdfsFsCache::instance()->GetConnection(dst_path, &hdfs_dst_conn);
+    if (!hdfs_ret.ok()) {
+      lock_guard<mutex> l(lock_);
+      RETURN_VOID_IF_ERROR(UpdateQueryStatus(Status(revert_err + hdfs_ret.GetDetail())));
+    }
+    for (const string& src_path : response.loaded_files) {
+      hdfsFS hdfs_src_conn;
+      hdfs_ret = HdfsFsCache::instance()->GetConnection(dst_path, &hdfs_src_conn);
+      if (!hdfs_ret.ok()) {
+        lock_guard<mutex> l(lock_);
+        RETURN_VOID_IF_ERROR(UpdateQueryStatus(Status(revert_err
+            + hdfs_ret.GetDetail())));
+      }
+      if (hdfsMove(hdfs_src_conn, src_path.c_str(), hdfs_dst_conn, dst_path)) {
+        lock_guard<mutex> l(lock_);
+        RETURN_VOID_IF_ERROR(UpdateQueryStatus(Status(revert_err + strerror(errno))));
+      }
+    }
   }
 }
 
 
 Status ClientRequestState::ExecLoadDataRequest() {
-  if (exec_request_->query_options.enable_async_load_data_execution) {
+  if (exec_request().query_options.enable_async_load_data_execution) {
     // Transition the exec state out of INITIALIZED to PENDING to make available the
     // runtime profile for the DDL.
     UpdateNonErrorExecState(ExecState::PENDING);
@@ -834,7 +1002,7 @@ Status ClientRequestState::ExecLoadDataRequest() {
 }
 
 Status ClientRequestState::ExecShutdownRequest() {
-  const TShutdownParams& request = exec_request_->admin_request.shutdown_params;
+  const TShutdownParams& request = exec_request().admin_request.shutdown_params;
   bool backend_port_specified = request.__isset.backend && request.backend.port != 0;
   int port = backend_port_specified ? request.backend.port : FLAGS_krpc_port;
   // Use the local shutdown code path if the host is unspecified or if it exactly matches
@@ -857,21 +1025,47 @@ Status ClientRequestState::ExecShutdownRequest() {
             << " to ip address, error: " << ip_status.GetDetail();
     return ip_status;
   }
-  TNetworkAddress krpc_addr = MakeNetworkAddress(ip_address, port);
-
+  // Find BackendId for the given remote ip address and port from cluster membership.
+  // The searching is not efficient, but Shutdown Requests are not called frequently.
+  // The BackendId is used to generate UDS address for Unix domain socket. Leave the
+  // Id value as 0 if it's not found in cluster membership.
+  // Note that UDS is only used when FLAGS_rpc_use_unix_domain_socket is set as true.
+  UniqueIdPB backend_id;
+  backend_id.set_hi(0);
+  backend_id.set_lo(0);
+  if (ExecEnv::GetInstance()->rpc_mgr()->IsKrpcUsingUDS()) {
+    if (ExecEnv::GetInstance()->rpc_mgr()->GetUdsAddressUniqueId()
+        == UdsAddressUniqueIdPB::BACKEND_ID) {
+      ClusterMembershipMgr::SnapshotPtr membership_snapshot =
+          ExecEnv::GetInstance()->cluster_membership_mgr()->GetSnapshot();
+      DCHECK(membership_snapshot.get() != nullptr);
+      for (const auto& it : membership_snapshot->current_backends) {
+        // Compare resolved IP addresses and ports.
+        if (it.second.ip_address() == ip_address && it.second.address().port() == port) {
+          DCHECK(it.second.has_backend_id());
+          backend_id = it.second.backend_id();
+          break;
+        }
+      }
+    }
+  }
+  string krpc_error = "RemoteShutdown() RPC failed: Network error";
+  string krpc_error2 = "RemoteShutdown() RPC failed: Timed out";
+  NetworkAddressPB krpc_addr = MakeNetworkAddressPB(ip_address, port, backend_id,
+      ExecEnv::GetInstance()->rpc_mgr()->GetUdsAddressUniqueId());
   std::unique_ptr<ControlServiceProxy> proxy;
   Status get_proxy_status =
       ControlService::GetProxy(krpc_addr, request.backend.hostname, &proxy);
   if (!get_proxy_status.ok()) {
     return Status(
         Substitute("Could not get Proxy to ControlService at $0 with error: $1.",
-            TNetworkAddressToString(krpc_addr), get_proxy_status.msg().msg()));
+            NetworkAddressPBToString(krpc_addr), get_proxy_status.msg().msg()));
   }
 
   RemoteShutdownParamsPB params;
   if (request.__isset.deadline_s) params.set_deadline_s(request.deadline_s);
   RemoteShutdownResultPB resp;
-  VLOG_QUERY << "Sending Shutdown RPC to " << TNetworkAddressToString(krpc_addr);
+  VLOG_QUERY << "Sending Shutdown RPC to " << NetworkAddressPBToString(krpc_addr);
 
   const int num_retries = 3;
   const int64_t timeout_ms = 10 * MILLIS_PER_SEC;
@@ -883,14 +1077,14 @@ Status ClientRequestState::ExecShutdownRequest() {
   if (!rpc_status.ok()) {
     const string& msg = rpc_status.msg().msg();
     VLOG_QUERY << "RemoteShutdown query_id= " << PrintId(query_id())
-               << " failed to send RPC to " << TNetworkAddressToString(krpc_addr) << " :"
+               << " failed to send RPC to " << NetworkAddressPBToString(krpc_addr) << " :"
                << msg;
     string err_string = Substitute(
-        "Rpc to $0 failed with error '$1'", TNetworkAddressToString(krpc_addr), msg);
+        "Rpc to $0 failed with error '$1'", NetworkAddressPBToString(krpc_addr), msg);
     // Attempt to detect if the the failure is because of not using a KRPC port.
-    if (backend_port_specified
-        && msg.find("RemoteShutdown() RPC failed: Timed out: connection negotiation to")
-            != string::npos) {
+    if (backend_port_specified &&
+           (msg.find(krpc_error) != string::npos ||
+            msg.find(krpc_error2) != string::npos)) {
       // Prior to IMPALA-7985 :shutdown() used the backend port.
       err_string.append(" This may be because the port specified is wrong. You may have"
                         " specified the backend (thrift) port which :shutdown() can no"
@@ -905,8 +1099,27 @@ Status ClientRequestState::ExecShutdownRequest() {
   return Status::OK();
 }
 
-Status ClientRequestState::Finalize(bool check_inflight, const Status* cause) {
-  RETURN_IF_ERROR(Cancel(check_inflight, cause, /*wait_until_finalized=*/true));
+Status ClientRequestState::ExecEventProcessorCmd() {
+  catalog_op_executor_.reset(
+      new CatalogOpExecutor(ExecEnv::GetInstance(), frontend_, server_profile_));
+  const TEventProcessorCmdParams& params =
+      exec_request().admin_request.event_processor_cmd_params;
+  TSetEventProcessorStatusRequest request;
+  TSetEventProcessorStatusResponse response;
+  request.__set_params(params);
+  request.__set_header(GetCatalogServiceRequestHeader());
+  Status rpc_status = catalog_op_executor_->SetEventProcessorStatus(request, &response);
+  if (!rpc_status.ok()) {
+    VLOG_QUERY << "SetEventProcessorStatus failed: " << rpc_status.msg().msg();
+    return rpc_status;
+  }
+  SetResultSet({response.info});
+  return Status::OK();
+}
+
+void ClientRequestState::Finalize(const Status* cause) {
+  UnRegisterCompletedRPCs();
+  Cancel(cause, /*wait_until_finalized=*/true);
   MarkActive();
   // Make sure we join on wait_thread_ before we finish (and especially before this object
   // is destroyed).
@@ -959,13 +1172,13 @@ Status ClientRequestState::Finalize(bool check_inflight, const Status* cause) {
 
   // Update the timeline here so that all of the above work is captured in the timeline.
   query_events_->MarkEvent("Unregister query");
-  return Status::OK();
+  UnRegisterRemainingRPCs();
 }
 
 Status ClientRequestState::Exec(const TMetadataOpRequest& exec_request) {
   TResultSet metadata_op_result;
   // Like the other Exec(), fill out as much profile information as we're able to.
-  summary_profile_->AddInfoString("Query Type", PrintThriftEnum(TStmtType::DDL));
+  summary_profile_->AddInfoString("Query Type", PrintValue(TStmtType::DDL));
   RETURN_IF_ERROR(frontend_->ExecHiveServer2MetadataOp(exec_request,
       &metadata_op_result));
   result_metadata_ = metadata_op_result.schema;
@@ -1008,12 +1221,17 @@ bool ClientRequestState::BlockOnWait(int64_t timeout_us, int64_t* block_on_wait_
 void ClientRequestState::Wait() {
   // block until results are ready
   Status status = WaitInternal();
+  // Rows are available now (for SELECT statement), so start the 'wait' timer that tracks
+  // how long Impala waits for the client to fetch rows. For other statements, track the
+  // time until a Close() is received.
+  MarkInactive();
   {
     lock_guard<mutex> l(lock_);
     if (returns_result_set()) {
       query_events()->MarkEvent("Rows available");
     } else {
       query_events()->MarkEvent("Request finished");
+      UpdateEndTime();
     }
     discard_result(UpdateQueryStatus(status));
   }
@@ -1042,8 +1260,7 @@ void ClientRequestState::Wait() {
 
 Status ClientRequestState::WaitInternal() {
   // Explain requests have already populated the result set. Nothing to do here.
-  if (exec_request_->stmt_type == TStmtType::EXPLAIN) {
-    MarkInactive();
+  if (exec_request().stmt_type == TStmtType::EXPLAIN) {
     return Status::OK();
   }
 
@@ -1092,10 +1309,6 @@ Status ClientRequestState::WaitInternal() {
   } else if (isCTAS) {
     SetCreateTableAsSelectResultSet();
   }
-  // Rows are available now (for SELECT statement), so start the 'wait' timer that tracks
-  // how long Impala waits for the client to fetch rows. For other statements, track the
-  // time until a Close() is received.
-  MarkInactive();
   return Status::OK();
 }
 
@@ -1192,12 +1405,13 @@ void ClientRequestState::MarkAsRetrying(const Status& status) {
   summary_profile_->AddInfoStringRedacted("Retry Cause", query_status_.GetDetail());
 }
 
-Status ClientRequestState::UpdateQueryStatus(const Status& status) {
+Status ClientRequestState::UpdateQueryStatus(const Status& status, bool log_error) {
   // Preserve the first non-ok status
   if (!status.ok() && query_status_.ok()) {
     UpdateExecState(ExecState::ERROR);
     query_status_ = status;
     summary_profile_->AddInfoStringRedacted(QUERY_STATUS_KEY, query_status_.GetDetail());
+    if (log_error) VLOG_QUERY << status.GetDetail();
   }
 
   return status;
@@ -1333,19 +1547,7 @@ Status ClientRequestState::FetchRowsInternal(const int32_t max_rows,
   return Status::OK();
 }
 
-Status ClientRequestState::Cancel(
-    bool check_inflight, const Status* cause, bool wait_until_finalized) {
-  if (check_inflight) {
-    // If the query is in 'inflight_queries' it means that the query has actually started
-    // executing. It is ok if the query is removed from 'inflight_queries' during
-    // cancellation, so we can release the session lock before starting the cancellation
-    // work.
-    lock_guard<mutex> session_lock(session_->lock);
-    if (session_->inflight_queries.find(query_id()) == session_->inflight_queries.end()) {
-      return Status("Query not yet running");
-    }
-  }
-
+void ClientRequestState::Cancel(const Status* cause, bool wait_until_finalized) {
   {
     lock_guard<mutex> lock(lock_);
     // If the query has reached a terminal state, no need to update the state.
@@ -1358,8 +1560,12 @@ Status ClientRequestState::Cancel(
           || retry_state() == RetryState::RETRYING);
     }
 
-    admission_control_client_->CancelAdmission();
-    is_cancelled_ = true;
+    // To avoid recalling RemoteAdmissionControlClient::CancelAdmission() since it will
+    // send extra RPC.
+    if (!is_cancelled_) {
+      admission_control_client_->CancelAdmission();
+      is_cancelled_ = true;
+    }
   } // Release lock_ before doing cancellation work.
 
   // Cancel and close child queries before cancelling parent. 'lock_' should not be held
@@ -1371,32 +1577,29 @@ Status ClientRequestState::Cancel(
   // started, cancellation is handled by the 'async-exec-thread' thread). 'lock_' should
   // not be held because cancellation involves RPCs and can block for a long time.
   if (GetCoordinator() != nullptr) GetCoordinator()->Cancel(wait_until_finalized);
-  return Status::OK();
 }
 
 Status ClientRequestState::UpdateCatalog() {
-  if (!exec_request_->__isset.query_exec_request ||
-      exec_request_->query_exec_request.stmt_type != TStmtType::DML) {
+  const TExecRequest& exec_req = exec_request();
+  if (!exec_req.__isset.query_exec_request ||
+      exec_req.query_exec_request.stmt_type != TStmtType::DML) {
     return Status::OK();
   }
 
   query_events_->MarkEvent("DML data written");
   SCOPED_TIMER(ADD_TIMER(server_profile_, "MetastoreUpdateTimer"));
 
-  TQueryExecRequest query_exec_request = exec_request_->query_exec_request;
+  const TQueryExecRequest& query_exec_request = exec_req.query_exec_request;
   if (query_exec_request.__isset.finalize_params) {
     const TFinalizeParams& finalize_params = query_exec_request.finalize_params;
     TUpdateCatalogRequest catalog_update;
-    catalog_update.__set_sync_ddl(exec_request_->query_options.sync_ddl);
-    catalog_update.__set_header(TCatalogServiceRequestHeader());
-    catalog_update.header.__set_requesting_user(effective_user());
-    catalog_update.header.__set_client_ip(session()->network_address.hostname);
-    catalog_update.header.__set_want_minimal_response(FLAGS_use_local_catalog);
-    catalog_update.header.__set_redacted_sql_stmt(
-        query_ctx_.client_request.__isset.redacted_stmt ?
-            query_ctx_.client_request.redacted_stmt : query_ctx_.client_request.stmt);
+    catalog_update.__set_sync_ddl(exec_req.query_options.sync_ddl);
+    catalog_update.__set_header(GetCatalogServiceRequestHeader());
+    if (exec_req.query_options.__isset.debug_action) {
+      catalog_update.__set_debug_action(exec_req.query_options.debug_action);
+    }
     DmlExecState* dml_exec_state = GetCoordinator()->dml_exec_state();
-    if (!dml_exec_state->PrepareCatalogUpdate(&catalog_update)) {
+    if (!dml_exec_state->PrepareCatalogUpdate(&catalog_update, finalize_params)) {
       VLOG_QUERY << "No partitions altered, not updating metastore (query id: "
                  << PrintId(query_id()) << ")";
     } else {
@@ -1419,20 +1622,19 @@ Status ClientRequestState::UpdateCatalog() {
         catalog_update.__set_transaction_id(finalize_params.transaction_id);
         catalog_update.__set_write_id(finalize_params.write_id);
       }
-      if (finalize_params.__isset.spec_id) {
+      if (finalize_params.__isset.iceberg_params) {
+        TIcebergOperationParam& cat_ice_op = catalog_update.iceberg_operation;
         catalog_update.__isset.iceberg_operation = true;
-        TIcebergOperationParam& ice_op = catalog_update.iceberg_operation;
-        ice_op.__set_spec_id(finalize_params.spec_id);
-        ice_op.__set_iceberg_data_files_fb(
-            dml_exec_state->CreateIcebergDataFilesVector());
-        ice_op.__set_is_overwrite(finalize_params.is_overwrite);
+        if (!CreateIcebergCatalogOps(finalize_params, &cat_ice_op)) {
+          VLOG_QUERY << "No Iceberg partitions altered, not updating metastore "
+                     << "(query id: " << PrintId(query_id()) << ")";
+          return Status::OK();
+        }
       }
 
       Status cnxn_status;
-      const TNetworkAddress& address =
-          MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
-      CatalogServiceConnection client(
-          ExecEnv::GetInstance()->catalogd_client_cache(), address, &cnxn_status);
+      CatalogServiceConnection client(ExecEnv::GetInstance()->catalogd_client_cache(),
+          *ExecEnv::GetInstance()->GetCatalogdAddress().get(), &cnxn_status);
       RETURN_IF_ERROR(cnxn_status);
 
       VLOG_QUERY << "Executing FinalizeDml() using CatalogService";
@@ -1441,6 +1643,18 @@ Status ClientRequestState::UpdateCatalog() {
       if (status.ok()) {
         status = client.DoRpc(
             &CatalogServiceClientWrapper::UpdateCatalog, catalog_update, &resp);
+        query_events_->MarkEvent("UpdateCatalog finished");
+      }
+      if (resp.__isset.profile) {
+        for (const TEventSequence& catalog_timeline : resp.profile.event_sequences) {
+          string timeline_name = catalog_timeline.name;
+          // For CTAS, we already have a timeline for the CreateTable execution.
+          // Use another name for the INSERT timeline.
+          if (summary_profile_->GetEventSequence(timeline_name) != nullptr) {
+            timeline_name += " 2";
+          }
+          summary_profile_->AddEventSequence(timeline_name, catalog_timeline);
+        }
       }
       if (status.ok()) status = Status(resp.result.status);
       if (!status.ok()) {
@@ -1458,7 +1672,7 @@ Status ClientRequestState::UpdateCatalog() {
         query_events_->MarkEvent("Transaction committed");
       }
       RETURN_IF_ERROR(parent_server_->ProcessCatalogUpdateResult(resp.result,
-          exec_request_->query_options.sync_ddl));
+          exec_req.query_options.sync_ddl, query_options(), query_events_));
     }
   } else if (InKuduTransaction()) {
     // Commit the Kudu transaction. Clear transaction state if it's successful.
@@ -1474,6 +1688,68 @@ Status ClientRequestState::UpdateCatalog() {
   }
   query_events_->MarkEvent("DML Metastore update finished");
   return Status::OK();
+}
+
+bool ClientRequestState::CreateIcebergCatalogOps(
+    const TFinalizeParams& finalize_params, TIcebergOperationParam* cat_ice_op) {
+  DCHECK(cat_ice_op != nullptr);
+  const TIcebergDmlFinalizeParams& ice_finalize_params = finalize_params.iceberg_params;
+  DmlExecState* dml_exec_state = GetCoordinator()->dml_exec_state();
+  bool update_catalog = true;
+  cat_ice_op->__set_operation(ice_finalize_params.operation);
+  cat_ice_op->__set_initial_snapshot_id(
+      ice_finalize_params.initial_snapshot_id);
+  cat_ice_op->__set_spec_id(ice_finalize_params.spec_id);
+  if (ice_finalize_params.operation == TIcebergOperation::INSERT) {
+    cat_ice_op->__set_iceberg_data_files_fb(
+        dml_exec_state->CreateIcebergDataFilesVector());
+    cat_ice_op->__set_is_overwrite(finalize_params.is_overwrite);
+    if (cat_ice_op->iceberg_data_files_fb.empty()) update_catalog = false;
+  } else if (ice_finalize_params.operation == TIcebergOperation::DELETE) {
+    cat_ice_op->__set_iceberg_delete_files_fb(
+        dml_exec_state->CreateIcebergDeleteFilesVector());
+    cat_ice_op->__set_data_files_referenced_by_position_deletes(
+        dml_exec_state->DataFilesReferencedByPositionDeletes());
+    if (cat_ice_op->iceberg_delete_files_fb.empty()) update_catalog = false;
+  } else if (ice_finalize_params.operation == TIcebergOperation::UPDATE) {
+    cat_ice_op->__set_iceberg_data_files_fb(
+        dml_exec_state->CreateIcebergDataFilesVector());
+    cat_ice_op->__set_iceberg_delete_files_fb(
+        dml_exec_state->CreateIcebergDeleteFilesVector());
+    cat_ice_op->__set_data_files_referenced_by_position_deletes(
+        dml_exec_state->DataFilesReferencedByPositionDeletes());
+    if (cat_ice_op->iceberg_delete_files_fb.empty()) {
+      DCHECK(cat_ice_op->iceberg_data_files_fb.empty());
+      update_catalog = false;
+    }
+  } else if (ice_finalize_params.operation == TIcebergOperation::OPTIMIZE) {
+    DCHECK(ice_finalize_params.__isset.optimize_params);
+    const TIcebergOptimizeParams& optimize_params = ice_finalize_params.optimize_params;
+    if (optimize_params.mode == TIcebergOptimizationMode::NOOP) {
+      update_catalog = false;
+    } else {
+      cat_ice_op->__set_iceberg_data_files_fb(
+          dml_exec_state->CreateIcebergDataFilesVector());
+      if (optimize_params.mode == TIcebergOptimizationMode::PARTIAL) {
+        DCHECK(optimize_params.__isset.selected_data_files_without_deletes);
+        cat_ice_op->__set_replaced_data_files_without_deletes(
+            optimize_params.selected_data_files_without_deletes);
+      }
+    }
+  } else if (ice_finalize_params.operation == TIcebergOperation::MERGE) {
+    cat_ice_op->__set_iceberg_data_files_fb(
+        dml_exec_state->CreateIcebergDataFilesVector());
+    cat_ice_op->__set_iceberg_delete_files_fb(
+        dml_exec_state->CreateIcebergDeleteFilesVector());
+    cat_ice_op->__set_data_files_referenced_by_position_deletes(
+        dml_exec_state->DataFilesReferencedByPositionDeletes());
+    if (cat_ice_op->iceberg_delete_files_fb.empty()
+        && cat_ice_op->iceberg_data_files_fb.empty()) {
+      update_catalog = false;
+    }
+  }
+  if (!update_catalog) query_events_->MarkEvent("No-op Iceberg DML statement");
+  return update_catalog;
 }
 
 void ClientRequestState::SetResultSet(const TDdlExecResponse* ddl_resp) {
@@ -1567,7 +1843,24 @@ void ClientRequestState::MarkInactive() {
 void ClientRequestState::MarkActive() {
   client_wait_sw_.Stop();
   int64_t elapsed_time = client_wait_sw_.ElapsedTime();
-  client_wait_timer_->Set(elapsed_time);
+  // If we have reached eos, then the query is already complete,
+  // and we should not accumulate more client wait time. This mostly
+  // impacts the finalization step, where the client is closing the
+  // query and does not need any more rows. Fetching may have already
+  // completed prior to this point, so finalization time should not
+  // count in that case. If the fetch was incomplete, then the client
+  // time should be counted for finalization as well.
+  if (!eos()) {
+    client_wait_timer_->Set(elapsed_time);
+    // The first call is before any MarkInactive() call has run and produces
+    // a zero-length sample. Skip this zero-length sample (but not any later
+    // zero-length samples).
+    if (elapsed_time != 0 || last_client_wait_time_ != 0) {
+      int64_t current_wait_time = elapsed_time - last_client_wait_time_;
+      client_wait_time_stats_->UpdateCounter(current_wait_time);
+    }
+    last_client_wait_time_ = elapsed_time;
+  }
   lock_guard<mutex> l(expiration_data_lock_);
   last_active_time_ms_ = UnixMillis();
   ++ref_count_;
@@ -1589,19 +1882,22 @@ Status ClientRequestState::UpdateTableAndColumnStats(
     col_stats_data = child_queries[1]->result_data();
   }
 
+  const TExecRequest& exec_req = exec_request();
   Status status = catalog_op_executor_->ExecComputeStats(
-      exec_request_->catalog_op_request,
+      GetCatalogServiceRequestHeader(),
+      exec_req.catalog_op_request,
       child_queries[0]->result_schema(),
       child_queries[0]->result_data(),
       col_stats_schema,
       col_stats_data);
+  AddCatalogTimeline();
   {
     lock_guard<mutex> l(lock_);
     RETURN_IF_ERROR(UpdateQueryStatus(status));
   }
   RETURN_IF_ERROR(parent_server_->ProcessCatalogUpdateResult(
       *catalog_op_executor_->update_catalog_result(),
-      exec_request_->query_options.sync_ddl));
+      exec_req.query_options.sync_ddl, query_options(), query_events_));
 
   // Set the results to be reported to the client.
   SetResultSet(catalog_op_executor_->ddl_exec_response());
@@ -1624,9 +1920,28 @@ void ClientRequestState::ClearResultCache() {
 }
 
 void ClientRequestState::UpdateExecState(ExecState exec_state) {
-  exec_state_.Store(exec_state);
-  summary_profile_->AddInfoString("Query State", PrintThriftEnum(BeeswaxQueryState()));
-  summary_profile_->AddInfoString("Impala Query State", ExecStateToString(exec_state));
+  {
+    lock_guard<mutex> l(exec_state_lock_);
+    exec_state_.Store(exec_state);
+    summary_profile_->AddInfoString("Query State", PrintValue(BeeswaxQueryState()));
+    summary_profile_->AddInfoString("Impala Query State", ExecStateToString(exec_state));
+  }
+  // Drop exec_state_lock_ before signalling
+  exec_state_cv_.NotifyAll();
+}
+
+void ClientRequestState::WaitForCompletionExecState() {
+  if (query_options().long_polling_time_ms <= 0) return;
+  int64_t timeout_us = query_options().long_polling_time_ms * MICROS_PER_MILLI;
+  unique_lock<mutex> l(exec_state_lock_);
+  timespec deadline;
+  TimeFromNowMicros(timeout_us, &deadline);
+  bool timed_out = false;
+  while (exec_state() != ExecState::FINISHED &&
+         exec_state() != ExecState::ERROR &&
+         !timed_out) {
+    timed_out = !exec_state_cv_.WaitUntil(l, deadline);
+  }
 }
 
 TOperationState::type ClientRequestState::TOperationState() const {
@@ -1721,16 +2036,19 @@ void ClientRequestState::UpdateEndTime() {
     // of nanosecond precision, so we explicitly specify the precision here.
     summary_profile_->AddInfoString(
         "End Time", ToStringFromUnixMicros(end_time_us(), TimePrecision::Nanosecond));
+    int64_t duration = end_time_us() - start_time_us();
+    summary_profile_->AddInfoString("Duration", Substitute("$0 ($1 us)",
+        PrettyPrinter::Print(duration, TUnit::TIME_US), duration));
   }
 }
 
 int64_t ClientRequestState::GetTransactionId() const {
   DCHECK(InTransaction());
-  return exec_request_->query_exec_request.finalize_params.transaction_id;
+  return exec_request().query_exec_request.finalize_params.transaction_id;
 }
 
 bool ClientRequestState::InTransaction() const {
-  return exec_request_->query_exec_request.finalize_params.__isset.transaction_id &&
+  return exec_request().query_exec_request.finalize_params.__isset.transaction_id &&
       !transaction_closed_;
 }
 
@@ -1752,8 +2070,7 @@ void ClientRequestState::ClearTransactionState() {
 bool ClientRequestState::InKuduTransaction() const {
   // If Kudu transaction is opened, TQueryExecRequest.query_ctx.is_kudu_transactional
   // is set as true by Frontend.doCreateExecRequest().
-  DCHECK(exec_request_ != nullptr);
-  return (exec_request_->query_exec_request.query_ctx.is_kudu_transactional
+  return (exec_request().query_exec_request.query_ctx.is_kudu_transactional
       && !transaction_closed_);
 }
 
@@ -1770,7 +2087,17 @@ void ClientRequestState::AbortKuduTransaction() {
 
 Status ClientRequestState::CommitKuduTransaction() {
   DCHECK(InKuduTransaction());
-  Status status = frontend_->CommitKuduTransaction(query_ctx_.query_id);
+  // Skip calling Commit() for Kudu Transaction with a debug action so that test code
+  // could explicitly control over calling Commit().
+  Status status = DebugAction(exec_request().query_options, "CRS_NOT_COMMIT_KUDU_TXN");
+  if (UNLIKELY(!status.ok())) {
+    VLOG(1) << Substitute("Skip to commit Kudu transaction with query-id: $0",
+        PrintId(query_ctx_.query_id));
+    transaction_closed_ = true;
+    return Status::OK();
+  }
+
+  status = frontend_->CommitKuduTransaction(query_ctx_.query_id);
   if (status.ok()) {
     query_events_->MarkEvent("Kudu transaction committed");
     transaction_closed_ = true;
@@ -1795,6 +2122,7 @@ void ClientRequestState::LogQueryEvents() {
     case TStmtType::QUERY:
     case TStmtType::DML:
     case TStmtType::DDL:
+    case TStmtType::UNKNOWN:
       log_events = status.ok();
       break;
     case TStmtType::EXPLAIN:
@@ -1853,13 +2181,12 @@ Status ClientRequestState::LogAuditRecord(const Status& query_status) {
   writer.String("statement_type");
   if (request.stmt_type == TStmtType::DDL) {
     if (request.catalog_op_request.op_type == TCatalogOpType::DDL) {
-      writer.String(
-          PrintThriftEnum(request.catalog_op_request.ddl_params.ddl_type).c_str());
+      writer.String(PrintValue(request.catalog_op_request.ddl_params.ddl_type).c_str());
     } else {
-      writer.String(PrintThriftEnum(request.catalog_op_request.op_type).c_str());
+      writer.String(PrintValue(request.catalog_op_request.op_type).c_str());
     }
   } else {
-    writer.String(PrintThriftEnum(request.stmt_type).c_str());
+    writer.String(PrintValue(request.stmt_type).c_str());
   }
   writer.String("network_address");
   writer.String(TNetworkAddressToString(
@@ -1876,7 +2203,7 @@ Status ClientRequestState::LogAuditRecord(const Status& query_status) {
     writer.String("name");
     writer.String(event.name.c_str());
     writer.String("object_type");
-    writer.String(PrintThriftEnum(event.object_type).c_str());
+    writer.String(PrintValue(event.object_type).c_str());
     writer.String("privilege");
     writer.String(event.privilege.c_str());
     writer.EndObject();
@@ -1990,4 +2317,326 @@ string ClientRequestState::RetryStateToString(RetryState state) {
           {ClientRequestState::RetryState::RETRIED, "RETRIED"}};
   return retry_state_strings.at(state);
 }
+
+TCatalogServiceRequestHeader ClientRequestState::GetCatalogServiceRequestHeader() {
+  TCatalogServiceRequestHeader header = TCatalogServiceRequestHeader();
+  header.__set_requesting_user(effective_user());
+  header.__set_client_ip(session()->network_address.hostname);
+  header.__set_want_minimal_response(FLAGS_use_local_catalog);
+  header.__set_redacted_sql_stmt(
+      query_ctx_.client_request.__isset.redacted_stmt ?
+          query_ctx_.client_request.redacted_stmt : query_ctx_.client_request.stmt);
+  header.__set_query_id(query_ctx_.query_id);
+  header.__set_coordinator_hostname(FLAGS_hostname);
+  return header;
+}
+
+void ClientRequestState::RegisterRPC() {
+  RpcEventHandler::InvocationContext* rpc_context =
+      RpcEventHandler::GetThreadRPCContext();
+  // The existence of rpc_context means that this is called from an RPC
+  if (rpc_context) {
+    lock_guard<mutex> l(lock_);
+    if (track_rpcs_ && pending_rpcs_.find(rpc_context) == pending_rpcs_.end()) {
+      rpc_context->Register();
+      pending_rpcs_.insert(rpc_context);
+      rpc_count_->Add(1);
+    }
+  }
+}
+
+void ClientRequestState::UnRegisterCompletedRPCs() {
+  lock_guard<mutex> l(lock_);
+  for (auto iter = pending_rpcs_.begin(); iter != pending_rpcs_.end();) {
+    RpcEventHandler::InvocationContext* rpc_context = *iter;
+    uint64_t read_ns = 0, write_ns = 0;
+    if (rpc_context->UnRegisterCompleted(read_ns, write_ns)) {
+      rpc_read_timer_->Add(read_ns);
+      rpc_write_timer_->Add(write_ns);
+      iter = pending_rpcs_.erase(iter);
+    } else {
+      ++iter;
+    }
+  }
+}
+
+void ClientRequestState::UnRegisterRemainingRPCs() {
+  lock_guard<mutex> l(lock_);
+  for (auto rpc_context: pending_rpcs_) {
+    rpc_context->UnRegister();
+  }
+  track_rpcs_ = false;
+  pending_rpcs_.clear();
+}
+
+void ClientRequestState::CopyRPCs(ClientRequestState& from_request) {
+  lock_guard<mutex> l_to(lock_);
+  lock_guard<mutex> l_from(from_request.lock_);
+  rpc_read_timer_->Add(from_request.rpc_read_timer_->value());
+  rpc_write_timer_->Add(from_request.rpc_write_timer_->value());
+  rpc_count_->Add(from_request.rpc_count_->value());
+  for (auto rpc_context: from_request.pending_rpcs_) {
+    rpc_context->Register();
+    pending_rpcs_.insert(rpc_context);
+  }
+}
+
+Status ClientRequestState::ExecMigrateRequest() {
+  ExecMigrateRequestImpl();
+  SetResultSet({"Table has been migrated."});
+  return query_status_;
+}
+
+void ClientRequestState::ExecMigrateRequestImpl() {
+  // A convert table request holds the query strings for the sub-queries. These are
+  // populated by ConvertTableToIcebergStmt in the Frontend during analysis.
+  const TConvertTableRequest& params = exec_request().convert_table_request;
+  {
+    RuntimeProfile* child_profile =
+        RuntimeProfile::Create(&profile_pool_, "Child Queries 1");
+    profile_->AddChild(child_profile);
+    vector<ChildQuery> child_queries;
+
+    // Prepare: SET some table properties for the original table.
+    RuntimeProfile* set_hdfs_table_profile = RuntimeProfile::Create(
+        &profile_pool_, "Set properties for HDFS table query");
+    child_profile->AddChild(set_hdfs_table_profile);
+    child_queries.emplace_back(params.set_hdfs_table_properties_query, this,
+        parent_server_, set_hdfs_table_profile, &profile_pool_);
+
+    // Prepare: RENAME the HDFS table to a temporary HDFS table.
+    RuntimeProfile* rename_hdfs_table_profile = RuntimeProfile::Create(
+        &profile_pool_, "Rename HDFS table query");
+    child_profile->AddChild(rename_hdfs_table_profile);
+    child_queries.emplace_back(params.rename_hdfs_table_to_temporary_query,
+        this, parent_server_, rename_hdfs_table_profile, &profile_pool_);
+
+    // Prepare: REFRESH the temporary HDFS table.
+    RuntimeProfile* refresh_hdfs_table_profile = RuntimeProfile::Create(
+        &profile_pool_, "Refresh temporary HDFS table query");
+    child_profile->AddChild(refresh_hdfs_table_profile);
+    child_queries.emplace_back(params.refresh_temporary_hdfs_table_query, this,
+        parent_server_, refresh_hdfs_table_profile, &profile_pool_);
+
+    // Execute child queries
+    unique_ptr<ChildQueryExecutor> query_executor(new ChildQueryExecutor());
+    RETURN_VOID_IF_ERROR(query_executor->ExecAsync(move(child_queries)));
+    vector<ChildQuery*>* completed_queries = new vector<ChildQuery*>();
+    Status query_status = query_executor->WaitForAll(completed_queries);
+    if (!query_status.ok()) AddTableResetHints(params, &query_status);
+    {
+      lock_guard<mutex> l(lock_);
+      RETURN_VOID_IF_ERROR(UpdateQueryStatus(query_status));
+    }
+  }
+  // Create an external Iceberg table using the data of the HDFS table.
+  Status status = frontend_->Convert(exec_request());
+  if (!status.ok()) AddTableResetHints(params, &status);
+  {
+    lock_guard<mutex> l(lock_);
+    RETURN_VOID_IF_ERROR(UpdateQueryStatus(status));
+  }
+  {
+    RuntimeProfile* child_profile =
+        RuntimeProfile::Create(&profile_pool_, "Child Queries 2");
+    profile_->AddChild(child_profile);
+    vector<ChildQuery> child_queries;
+
+    if (params.__isset.create_iceberg_table_query) {
+      // Prepare: CREATE the Iceberg table that inherits HDFS table location.
+      RuntimeProfile* create_iceberg_table_profile = RuntimeProfile::Create(
+          &profile_pool_, "Create Iceberg table query");
+      child_profile->AddChild(create_iceberg_table_profile);
+      child_queries.emplace_back(params.create_iceberg_table_query, this,
+          parent_server_, create_iceberg_table_profile, &profile_pool_);
+    } else {
+      // Prepare: Invalidate metadata for tables in Hive catalog to guarantee that it is
+      // propagated instantly to all coordinators.
+      RuntimeProfile* invalidate_metadata_profile = RuntimeProfile::Create(
+          &profile_pool_, "Invalidate metadata Iceberg table query");
+      child_profile->AddChild(invalidate_metadata_profile);
+      child_queries.emplace_back(params.invalidate_metadata_query, this,
+          parent_server_, invalidate_metadata_profile, &profile_pool_);
+    }
+
+    if (params.__isset.post_create_alter_table_query) {
+      // Prepare: ALTER TABLE query after creating the Iceberg table.
+      RuntimeProfile* post_create_alter_table_profile = RuntimeProfile::Create(
+          &profile_pool_, "ALTER TABLE after create Iceberg table query");
+      child_profile->AddChild(post_create_alter_table_profile);
+      child_queries.emplace_back(params.post_create_alter_table_query, this,
+          parent_server_, post_create_alter_table_profile, &profile_pool_);
+    }
+
+    // Prepare: DROP the temporary HDFS table.
+    RuntimeProfile* drop_tmp_hdfs_table_profile = RuntimeProfile::Create(
+        &profile_pool_, "Drop temporary HDFS table query");
+    child_profile->AddChild(drop_tmp_hdfs_table_profile);
+    child_queries.emplace_back(params.drop_temporary_hdfs_table_query, this,
+        parent_server_, drop_tmp_hdfs_table_profile, &profile_pool_);
+
+    // Execute queries
+    unique_ptr<ChildQueryExecutor> query_executor(new ChildQueryExecutor());
+    RETURN_VOID_IF_ERROR(query_executor->ExecAsync(move(child_queries)));
+    vector<ChildQuery*>* completed_queries = new vector<ChildQuery*>();
+    Status query_status = query_executor->WaitForAll(completed_queries);
+    {
+      lock_guard<mutex> l(lock_);
+      RETURN_VOID_IF_ERROR(UpdateQueryStatus(query_status));
+    }
+  }
+}
+
+Status ClientRequestState::TryKillQueryLocally(
+    const TUniqueId& query_id, const string& requesting_user, bool is_admin) {
+  Status status = ExecEnv::GetInstance()->impala_server()->KillQuery(
+      query_id, requesting_user, is_admin);
+  if (status.ok()) {
+    SetResultSet({Substitute("Query $0 is killed.", PrintId(query_id))});
+    return query_status_;
+  }
+  return status;
+}
+
+Status ClientRequestState::TryKillQueryRemotely(
+    const TUniqueId& query_id, const KillQueryRequestPB& request) {
+  // The initial status should be INVALID_QUERY_HANDLE so that if there is no other
+  // coordinator in the cluster, it will be the status to return.
+  Status status = Status::Expected(TErrorCode::INVALID_QUERY_HANDLE, PrintId(query_id));
+  ExecutorGroup all_coordinators =
+      ExecEnv::GetInstance()->cluster_membership_mgr()->GetSnapshot()->GetCoordinators();
+  // Skipping the current impalad.
+  unique_ptr<ExecutorGroup> other_coordinators{ExecutorGroup::GetFilteredExecutorGroup(
+      &all_coordinators, {ExecEnv::GetInstance()->krpc_address()})};
+  // If we get an RPC error, instead of returning immediately, we record it and move
+  // on to the next coordinator.
+  Status rpc_errors = Status::OK();
+  for (const auto& backend : other_coordinators->GetAllExecutorDescriptors()) {
+    // The logic here is similar to ExecShutdownRequest()
+    NetworkAddressPB krpc_addr = MakeNetworkAddressPB(backend.ip_address(),
+        backend.address().port(), backend.backend_id(),
+        ExecEnv::GetInstance()->rpc_mgr()->GetUdsAddressUniqueId());
+    VLOG_QUERY << "Sending KillQuery() RPC to " << NetworkAddressPBToString(krpc_addr);
+    unique_ptr<ControlServiceProxy> proxy;
+    Status get_proxy_status =
+        ControlService::GetProxy(krpc_addr, backend.address().hostname(), &proxy);
+    if (!get_proxy_status.ok()) {
+      Status get_proxy_status_to_report{Substitute(
+          "KillQuery: Could not get Proxy to ControlService at $0 with error: $1.",
+          NetworkAddressPBToString(krpc_addr), get_proxy_status.msg().msg())};
+      rpc_errors.MergeStatus(get_proxy_status_to_report);
+      LOG(ERROR) << get_proxy_status_to_report.GetDetail();
+      continue;
+    }
+    KillQueryResponsePB response;
+    const int num_retries = 3;
+    const int64_t timeout_ms = 10 * MILLIS_PER_SEC;
+    const int64_t backoff_time_ms = 3 * MILLIS_PER_SEC;
+    // Currently, a KILL QUERY statement is not interruptible.
+    Status rpc_status = RpcMgr::DoRpcWithRetry(proxy, &ControlServiceProxy::KillQuery,
+        request, &response, query_ctx_, "KillQuery() RPC failed", num_retries, timeout_ms,
+        backoff_time_ms, "CRS_KILL_QUERY_RPC");
+    if (!rpc_status.ok()) {
+      LOG(ERROR) << rpc_status.GetDetail();
+      rpc_errors.MergeStatus(rpc_status);
+      continue;
+    }
+    // Currently, we only support killing one query in one KILL QUERY statement.
+    DCHECK_EQ(response.statuses_size(), 1);
+    status = Status(response.statuses(0));
+    if (status.ok()) {
+      // Kill succeeded.
+      VLOG_QUERY << "KillQuery: Found the coordinator at "
+                 << NetworkAddressPBToString(krpc_addr);
+      SetResultSet({Substitute("Query $0 is killed.", PrintId(query_id))});
+      return query_status_;
+    } else if (status.code() != TErrorCode::INVALID_QUERY_HANDLE) {
+      LOG(ERROR) << "KillQuery: Found the coordinator at "
+                 << NetworkAddressPBToString(krpc_addr)
+                 << " but failed to kill the query: "
+                 << status.GetDetail();
+      // Kill failed, but we found the coordinator of the query.
+      return status;
+    }
+  }
+  // We did't find the coordinator of the query after trying all other coordinators.
+  // If there is any RPC error, return it.
+  if (!rpc_errors.ok()) {
+    return rpc_errors;
+  }
+  // If there is no RPC error, return INVALID_QUERY_HANDLE.
+  return status;
+}
+
+Status ClientRequestState::ExecKillQueryRequest() {
+  TUniqueId query_id = exec_request().kill_query_request.query_id;
+  string requesting_user = exec_request().kill_query_request.requesting_user;
+  bool is_admin = exec_request().kill_query_request.is_admin;
+
+  VLOG_QUERY << "Exec KillQuery: query_id=" << PrintId(query_id)
+             << ", requesting_user=" << requesting_user << ", is_admin=" << is_admin;
+
+  // First try cancelling the query locally.
+  Status status = TryKillQueryLocally(query_id, requesting_user, is_admin);
+  if (status.code() != TErrorCode::INVALID_QUERY_HANDLE) {
+    return status;
+  }
+
+  // The current impalad is NOT the coordinator of the query. Now we have to broadcast
+  // the kill request to all other coordinators.
+  UniqueIdPB query_id_pb;
+  TUniqueIdToUniqueIdPB(query_id, &query_id_pb);
+  KillQueryRequestPB request;
+  *request.add_query_ids() = query_id_pb;
+  *request.mutable_requesting_user() = requesting_user;
+  request.set_is_admin(is_admin);
+  status = TryKillQueryRemotely(query_id, request);
+  if (status.code() != TErrorCode::INVALID_QUERY_HANDLE) {
+    return status;
+  }
+  // All the error messages are "Invalid or unknown query handle".
+  return Status("Could not find query on any coordinator.");
+}
+
+void ClientRequestState::AddTableResetHints(const TConvertTableRequest& params,
+      Status* status) const {
+  string table_reset_hint("Your table might have been renamed. To reset the name "
+      "try running:\n" + params.reset_table_name_query + ";");
+  status->MergeStatus(Status(table_reset_hint));
+}
+
+int64_t ClientRequestState::num_rows_fetched_counter() const {
+  if (LIKELY(num_rows_fetched_counter_ != nullptr)) {
+    return num_rows_fetched_counter_->value();
+  }
+
+  return 0;
+}
+
+int64_t ClientRequestState::row_materialization_rate() const {
+  if (LIKELY(row_materialization_rate_ != nullptr)) {
+    return row_materialization_rate_->value();
+  }
+
+  return 0;
+}
+
+int64_t ClientRequestState::row_materialization_timer() const {
+  if (LIKELY(row_materialization_timer_ != nullptr)) {
+    return row_materialization_timer_->value();
+  }
+
+  return 0;
+}
+
+void ClientRequestState::AddCatalogTimeline() {
+  if (catalog_op_executor_ != nullptr
+      && catalog_op_executor_->catalog_profile() != nullptr) {
+    for (const TEventSequence& catalog_timeline :
+        catalog_op_executor_->catalog_profile()->event_sequences) {
+      summary_profile_->AddEventSequence(catalog_timeline.name, catalog_timeline);
+    }
+  }
+}
+
 }

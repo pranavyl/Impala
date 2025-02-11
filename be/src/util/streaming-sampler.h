@@ -37,12 +37,23 @@ template<typename T, int MAX_SAMPLES>
 class StreamingSampler {
   static_assert(std::is_arithmetic<T>::value, "Numerical type required");
  public:
-  StreamingSampler(int initial_period = 500)
+  StreamingSampler(int initial_period)
     : samples_collected_(0) ,
       period_(initial_period),
+      initial_period_(initial_period),
       current_sample_sum_(0),
       current_sample_count_(0),
       current_sample_total_time_(0) {
+  }
+
+  /// Resets everything back to the state when this instance was just created.
+  void Reset() {
+    samples_collected_ = 0;
+    current_sample_sum_ = 0;
+    current_sample_count_ = 0;
+    current_sample_total_time_ = 0;
+    // Reset 'period_' to the value got from the constructor.
+    period_ = initial_period_;
   }
 
   /// Add a sample to the sampler. 'ms' is the time elapsed since the last time this
@@ -93,6 +104,8 @@ class StreamingSampler {
 
   /// Storage period in ms.
   int period_;
+  /// Keeps the initial period got from the constructor. Used to reset 'period_'.
+  int initial_period_;
 
   /// The sum of input samples that makes up the next stored sample.
   T current_sample_sum_;

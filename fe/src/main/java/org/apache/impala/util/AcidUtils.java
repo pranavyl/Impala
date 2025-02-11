@@ -19,60 +19,44 @@ package org.apache.impala.util;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Stopwatch;
-import com.google.common.collect.Iterables;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Range;
 import com.google.errorprone.annotations.Immutable;
 
 import java.io.IOException;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hive.common.ValidTxnList;
-import org.apache.hadoop.hive.common.ValidWriteIdList;
-import org.apache.hadoop.hive.common.ValidWriteIdList.RangeResponse;
-import org.apache.hadoop.hive.metastore.api.CompactionInfoStruct;
-import org.apache.hadoop.hive.metastore.api.GetLatestCommittedCompactionInfoRequest;
-import org.apache.hadoop.hive.metastore.api.GetLatestCommittedCompactionInfoResponse;
-import org.apache.hadoop.hive.metastore.api.MetaException;
-import org.apache.impala.catalog.CatalogException;
-import org.apache.impala.catalog.CatalogServiceCatalog;
-import org.apache.impala.catalog.Column;
-import org.apache.impala.catalog.CompactionInfoLoader;
-import org.apache.impala.catalog.FileMetadataLoader.LoadStats;
-import org.apache.impala.catalog.HdfsPartition;
-import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
-import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.MetaStoreClientPool;
-import org.apache.impala.catalog.ScalarType;
-import org.apache.impala.catalog.StructField;
-import org.apache.impala.catalog.StructType;
-import org.apache.impala.common.FileSystemUtil;
-import org.apache.impala.common.Pair;
-import org.apache.impala.common.PrintUtils;
-import org.apache.impala.common.Reference;
-import org.apache.impala.thrift.THdfsFileDesc;
-import org.apache.impala.thrift.TPartialPartitionInfo;
-import org.apache.impala.thrift.TTransactionalType;
-import org.apache.thrift.TException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-
 import javax.annotation.Nullable;
+
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hive.common.ValidTxnList;
+import org.apache.hadoop.hive.common.ValidWriteIdList;
+import org.apache.hadoop.hive.common.ValidWriteIdList.RangeResponse;
+import org.apache.impala.catalog.CatalogException;
+import org.apache.impala.catalog.CatalogServiceCatalog;
+import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.FileMetadataLoader.LoadStats;
+import org.apache.impala.catalog.HdfsPartition;
+import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.catalog.HdfsTable;
+import org.apache.impala.catalog.ScalarType;
+import org.apache.impala.catalog.StructField;
+import org.apache.impala.catalog.StructType;
+import org.apache.impala.common.FileSystemUtil;
+import org.apache.impala.common.Pair;
+import org.apache.impala.common.PrintUtils;
+import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.thrift.TTransactionalType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Contains utility functions for working with Acid tables.
@@ -425,7 +409,7 @@ public class AcidUtils {
    * Returns true if 'fd' refers to a delete delta file.
    */
   public static boolean isDeleteDeltaFd(FileDescriptor fd) {
-    return fd.getRelativePath().startsWith("delete_delta_");
+    return fd.getPath().startsWith("delete_delta_");
   }
 
   /**
@@ -453,7 +437,7 @@ public class AcidUtils {
     Iterator<FileDescriptor> it = fds.iterator();
     int numRemoved = 0;
     while (it.hasNext()) {
-      if (!writeListBasedPredicate.check(it.next().getRelativePath())) {
+      if (!writeListBasedPredicate.check(it.next().getPath())) {
         it.remove();
         numRemoved++;
       }
@@ -710,7 +694,7 @@ public class AcidUtils {
     // if the provided table id does not match with what CatalogService has we return
     // -1 indicating that cached table is stale.
     if (tableId != CatalogServiceCatalog.TABLE_ID_UNAVAILABLE
-        && tbl.getMetaStoreTable().getId() != tableId) {
+        && MetastoreShim.getTableId(tbl.getMetaStoreTable()) != tableId) {
       return -1;
     }
     return compare(tbl.getValidWriteIds(), validWriteIdList);
@@ -789,57 +773,9 @@ public class AcidUtils {
       CatalogServiceCatalog catalog, HdfsTable hdfsTable) throws CatalogException {
     Stopwatch sw = Stopwatch.createStarted();
     Preconditions.checkState(hdfsTable.isReadLockedByCurrentThread());
-    List<HdfsPartition.Builder> partBuilders = new ArrayList<>();
-    List<HdfsPartition> hdfsPartitions = hdfsTable.getPartitions()
-                                             .stream()
-                                             .map(p -> (HdfsPartition) p)
-                                             .collect(Collectors.toList());
-    // fetch the latest compaction info from HMS
-    GetLatestCommittedCompactionInfoRequest request =
-        new GetLatestCommittedCompactionInfoRequest(
-            hdfsTable.getDb().getName(), hdfsTable.getName());
-    if (hdfsTable.isPartitioned()) {
-      List<String> partNames = hdfsPartitions.stream()
-                                   .map(HdfsPartition::getPartitionName)
-                                   .collect(Collectors.toList());
-      request.setPartitionnames(partNames);
-    }
 
-    GetLatestCommittedCompactionInfoResponse response;
-    try (MetaStoreClientPool.MetaStoreClient client = catalog.getMetaStoreClient()) {
-      response = CompactionInfoLoader.getLatestCompactionInfo(client, request);
-    } catch (Exception e) {
-      throw new CatalogException("Error getting latest compaction info for "
-          + hdfsTable.getFullName(), e);
-    }
-
-    Map<String, Long> partNameToCompactionId = new HashMap<>();
-    if (hdfsTable.isPartitioned()) {
-      for (CompactionInfoStruct ci : response.getCompactions()) {
-        partNameToCompactionId.put(
-            Preconditions.checkNotNull(ci.getPartitionname()), ci.getId());
-      }
-    } else {
-      CompactionInfoStruct ci = Iterables.getOnlyElement(response.getCompactions(), null);
-      if (ci != null) {
-        partNameToCompactionId.put(HdfsTable.DEFAULT_PARTITION_NAME, ci.getId());
-      }
-    }
-
-    for (HdfsPartition partition : hdfsPartitions) {
-      long latestCompactionId =
-          partNameToCompactionId.getOrDefault(partition.getPartitionName(), -1L);
-      if (partition.getLastCompactionId() >= latestCompactionId) {
-        continue;
-      }
-      HdfsPartition.Builder builder = new HdfsPartition.Builder(partition);
-      LOG.debug(
-          "Cached compaction id for {} partition {}: {} but the latest compaction id: {}",
-          hdfsTable.getFullName(), partition.getPartitionName(),
-          partition.getLastCompactionId(), latestCompactionId);
-      builder.setLastCompactionId(latestCompactionId);
-      partBuilders.add(builder);
-    }
+    List<HdfsPartition.Builder> partBuilders = MetastoreShim
+        .getPartitionsForRefreshingFileMetadata(catalog, hdfsTable);
     LOG.debug("Checked the latest compaction id for {}. Time taken: {}",
         hdfsTable.getFullName(),
         PrintUtils.printTimeMs(sw.stop().elapsed(TimeUnit.MILLISECONDS)));

@@ -1524,7 +1524,20 @@ alter table partitioned_data set tblproperties ('numRows'='1030000', 'STATS_GENE
         <xref href="https://asciinema.org/a/1rv7qippo0fe7h5k1b6k4nexk" scope="external" format="html">this
           animated demo</xref>.
       </p>
-      
+
+      <p id="comma_separated_values_blurb">
+        Impala backend expects comma separated values to be in quotes when executing the
+        <codeph>SET</codeph> statement.
+        This is usually the case when running SET statement like
+        <codeph>SET ENABLED_RUNTIME_FILTER_TYPES="value1,value2"</codeph> using a JDBC
+        driver. When using Impala-shell client, the <codeph>SET</codeph> statement is not
+        executed immediately but query options are updated in the client and applied as
+        part of the following statement, so no quotes are required for Impala-shell. That
+        is, we use SET statement like
+        <codeph>SET ENABLED_RUNTIME_FILTER_TYPES=value1,value2</codeph> when
+        submitting the query to Impala backend via Impala-shell client.
+      </p>
+
       <p rev="2.5.0" id="runtime_filter_mode_blurb">
         Because the runtime filtering feature is
         enabled by default only for local processing, the other filtering-related query options have
@@ -2466,6 +2479,10 @@ PROFILE;
         <b>Type:</b> integer
       </p>
 
+      <p id="type_double">
+        <b>Type:</b> double
+      </p>
+
       <p id="default_blurb">
         <b>Default:</b>
       </p>
@@ -3348,6 +3365,17 @@ flight_num:           INT32 SNAPPY DO:83456393 FPO:83488603 SZ:10216514/11474301
 <codeblock>isi hdfs settings modify --default-block-size=256MB</codeblock>
       </p>
 
+      <p id="ozone_blurb" rev="4.2.0">
+        <b>Ozone considerations:</b>
+      </p>
+
+      <p id="ozone_block_size_caveat" rev="4.2.0">
+        Because Apache Ozone storage buckets use a global value for the block size rather than
+        a configurable value for each file, the <codeph>PARQUET_FILE_SIZE</codeph> query option
+        has no effect when Impala inserts data into a table or partition residing on Ozone
+        storage.
+      </p>
+
       <p id="hbase_blurb">
         <b>HBase considerations:</b>
       </p>
@@ -3362,6 +3390,15 @@ flight_num:           INT32 SNAPPY DO:83456393 FPO:83488603 SZ:10216514/11474301
 
       <p id="hbase_no">
         <b>HBase considerations:</b> This data type cannot be used with HBase tables.
+      </p>
+
+      <p id="iceberg_blurb">
+        <b>Iceberg considerations:</b>
+      </p>
+
+      <p id="iceberg_load_data">
+        See <xref href="../topics/impala_iceberg.xml#iceberg_load"/> for details about
+        <codeph>LOAD DATA</codeph> with Iceberg.
       </p>
 
       <p id="internals_blurb">
@@ -3397,6 +3434,14 @@ flight_num:           INT32 SNAPPY DO:83456393 FPO:83488603 SZ:10216514/11474301
       <p id="internals_min_bytes">
         <b>Internal details:</b> Represented in memory as a byte array with the minimum size
         needed to represent each value.
+      </p>
+
+      <p rev="4.4.0" id="added_in_440">
+        <b>Added in:</b> <keyword keyref="impala44"/>
+      </p>
+
+      <p rev="4.0.0" id="added_in_400">
+        <b>Added in:</b> <keyword keyref="impala40"/>
       </p>
 
       <p rev="3.0" id="added_in_30">

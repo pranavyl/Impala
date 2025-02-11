@@ -31,11 +31,19 @@ can do so through the environment variables and scripts listed below.
 | CDP_COMPONENTS_HOME | "${IMPALA_HOME}/toolchain/cdp_components-${CDP_BUILD_NUMBER}" | Location of the CDP components within the toolchain. |
 | CDH_MAJOR_VERSION | "7" | Identifier used to uniqueify paths for potentially incompatible component builds. |
 | IMPALA_CONFIG_SOURCED | "1" |  Set by ${IMPALA_HOME}/bin/impala-config.sh (internal use) |
-| JAVA_HOME | "/usr/lib/jvm/${JAVA_VERSION}" | Used to locate Java |
-| JAVA_VERSION | "java-7-oracle-amd64" | Can override to set a local Java version. |
+| IMPALA_JAVA_HOME_OVERRIDE | | Specify a non-system Java version. Overrides IMPALA_JDK_VERSION behavior. |
+| IMPALA_JDK_VERSION | "system" | Set to 8 or 11 to select a system Java version. Default will set JAVA_HOME based on the javac symlink in PATH. |
 | JAVA | "${JAVA_HOME}/bin/java" | Java binary location. |
 | CLASSPATH | | See bin/set-classpath.sh for details. |
-| PYTHONPATH |  Will be changed to include: "${IMPALA_HOME}/shell/gen-py" "${IMPALA_HOME}/testdata" "${THRIFT_HOME}/python/lib/python2.7/site-packages" "${HIVE_HOME}/lib/py" |
+| PYTHONPATH | | See bin/set-pythonpath.sh for details. |
+| USE_APACHE_COMPONENTS | false | Use Apache components for Hadoop, HBase, Hive, Tez, Ranger. It will set USE_APACHE_{HADOOP,HBASE,HIVE,TEZ,RANGER} variable as true if not set. |
+| USE_APACHE_HADOOP | false | Use Apache Hadoop |
+| USE_APACHE_HBASE | false | Use Apache HBase |
+| USE_APACHE_HIVE | false | Use Apache Hive |
+| USE_APACHE_TEZ | false | Use Apache Tez |
+| USE_APACHE_RANGER | false | Use Apache Ranger |
+| DOWNLOAD_CDH_COMPONENTS | true | Download CDH components |
+| DOWNLOAD_APACHE_COMPONENTS | true | Download Apache components |
 
 ## Source Directories for Impala
 
@@ -64,7 +72,9 @@ can do so through the environment variables and scripts listed below.
 | HADOOP_LIB_DIR       | "${HADOOP_HOME}/lib" | For 'libhdfs.a' or 'libhdfs.so' |
 | HIVE_HOME            | "${CDP_COMPONENTS_HOME}/{hive-${IMPALA_HIVE_VERSION}/" | |
 | HBASE_HOME           | "${CDP_COMPONENTS_HOME}/hbase-${IMPALA_HBASE_VERSION}/" | |
-| THRIFT_HOME          | "${IMPALA_TOOLCHAIN}/thrift-${IMPALA_THRIFT_VERSION}" | |
+| THRIFT_CPP_HOME      | "${IMPALA_TOOLCHAIN}/thrift-${IMPALA_THRIFT_CPP_VERSION}" | |
+| THRIFT_JAVA_HOME     | "${IMPALA_TOOLCHAIN}/thrift-${IMPALA_THRIFT_JAVA_VERSION}" | |
+| THRIFT_PY_HOME       | "${IMPALA_TOOLCHAIN}/thrift-${IMPALA_THRIFT_PY_VERSION}" | |
 
 ## Hive Dependency Overrides
 Typically used together to specify a local build of Apache Hive. Care should be taken
@@ -73,7 +83,18 @@ impala-config.sh, they may cause confusion when switching between branches or ve
 Apache Impala.
 
 | Environment variable | Description |
+|----------------------|-------------|
 | HIVE_VERSION_OVERRIDE | Used to specify different Hive version from default |
 | HIVE_STORAGE_API_VERSION_OVERRIDE | Used to specify different Hive Storage API version from default |
 | HIVE_METASTORE_THRIFT_DIR_OVERRIDE | Used to specify location of metastore thrift files to use during Thrift compilation |
 | HIVE_HOME_OVERRIDE | Used to specify location of Hive |
+
+## Ranger Dependency Overrides
+Typically used together to specify a local build of Apache Ranger. Care should be taken
+while using these variables since they take precedence over the defaults in
+impala-config.sh.
+
+| Environment variable | Description |
+|----------------------|-------------|
+| RANGER_VERSION_OVERRIDE | Used to specify different Ranger version from default |
+| RANGER_HOME_OVERRIDE | Used to specify location of Ranger |

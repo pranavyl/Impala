@@ -33,10 +33,21 @@ public class EventSequence {
 
   private final long startTime_;
   private final String name_;
+  private long lastTime_;
 
   public EventSequence(String name) {
     name_ = name;
     startTime_ = System.nanoTime();
+    lastTime_ = startTime_;
+  }
+
+  /**
+   * Returns a new EventSequence instance that won't be used. Some code paths
+   * (e.g. event-processor) don't have catalog profiles so don't provide a timeline to
+   * update. Use this to avoid passing in a null value.
+   */
+  public static EventSequence getUnusedTimeline() {
+    return NoOpEventSequence.INSTANCE;
   }
 
   /**
@@ -45,8 +56,10 @@ public class EventSequence {
    */
   public long markEvent(String label) {
     // Timestamps should be in ns resolution
-    long durationNs = System.nanoTime() - startTime_;
-    timestamps_.add(durationNs);
+    long currentTime = System.nanoTime();
+    long durationNs = currentTime - lastTime_;
+    lastTime_ = currentTime;
+    timestamps_.add(currentTime - startTime_);
     labels_.add(label);
     return durationNs;
   }

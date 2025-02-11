@@ -22,6 +22,7 @@
 #include "codegen/impala-ir.h"
 #include "common/logging.h"
 #include "gutil/macros.h"
+#include "runtime/collection-value.h"
 #include "runtime/descriptors.h"
 #include "runtime/mem-pool.h"
 #include "util/ubsan.h"
@@ -35,7 +36,7 @@ namespace impala {
 
 struct CollectionValue;
 class RuntimeState;
-struct StringValue;
+class StringValue;
 class ScalarExpr;
 class ScalarExprEvaluator;
 class TupleDescriptor;
@@ -117,31 +118,47 @@ class Tuple {
 
   /// The total size of all data represented in this tuple (tuple data and referenced
   /// string and collection data).
-  int64_t TotalByteSize(const TupleDescriptor& desc) const;
+  /// If 'assume_smallify' is true, calculates with smallified string sizes even for not
+  /// (yet) smallified strings.
+  int64_t TotalByteSize(const TupleDescriptor& desc, bool assume_smallify) const;
 
-  /// The size of all referenced string and collection data.
-  int64_t VarlenByteSize(const TupleDescriptor& desc) const;
+  /// The size of all referenced string and collection data. Smallified strings aren't
+  /// counted here as they don't need extra storage space.
+  /// If 'assume_smallify' is true, calculates with smallified string sizes even for not
+  /// (yet) smallified strings.
+  int64_t VarlenByteSize(const TupleDescriptor& desc, bool assume_smallify) const;
 
   /// Create a copy of 'this', including all of its referenced variable-length data
   /// (i.e. strings and collections), using pool to allocate memory. Returns the copy.
-  Tuple* DeepCopy(const TupleDescriptor& desc, MemPool* pool);
+  /// Also smallifies the copied strings when possible.
+  Tuple* DeepCopy(const TupleDescriptor& desc, MemPool* pool) const;
 
   /// Create a copy of 'this', including all its referenced variable-length data
   /// (i.e. strings and collections), using pool to allocate memory. This version does
   /// not allocate a tuple, instead copying to 'dst'. 'dst' must already be allocated to
-  /// the correct size (i.e. TotalByteSize()).
-  void DeepCopy(Tuple* dst, const TupleDescriptor& desc, MemPool* pool);
+  /// the correct size (i.e. TotalByteSize()). Also smallifies the copied strings when
+  /// possible - to get the exact size needed TotalByteSize() has to be called with
+  /// 'assume_smallify'=true.
+  void DeepCopy(Tuple* dst, const TupleDescriptor& desc, MemPool* pool) const;
 
   /// Create a copy of 'this', including all referenced variable-length data (i.e. strings
   /// and collections), into 'data'. The tuple is written first, followed by any
   /// variable-length data. 'data' and 'offset' will be incremented by the total number of
   /// bytes written. 'data' must already be allocated to the correct size
-  /// (i.e. TotalByteSize()).
+  /// (i.e. TotalByteSize()). Also smallifies the copied strings when possible - to get
+  /// the exact size needed TotalByteSize() has to be called with 'assume_smallify'=true.
   /// If 'convert_ptrs' is true, rewrites pointers that are part of the tuple as offsets
   /// into 'data'. Otherwise they will remain pointers directly into data. The offsets are
   /// determined by 'offset', where '*offset' corresponds to address '*data'.
   void DeepCopy(const TupleDescriptor& desc, char** data, int* offset,
-                bool convert_ptrs = false);
+                bool convert_ptrs = false) const;
+
+  /// Similar to DeepCopy() above, but returns false if the buffer is not large enough
+  /// ('*data' would pass 'data_end') instead of assuming that the tuple fits to buffer.
+  /// If it fails, 'data' will be the same as before the call, but the buffer
+  /// can be modified (between before '*data' and 'data_end').
+  bool TryDeepCopy(uint8_t** data, const uint8_t* data_end, int* offset,
+      const TupleDescriptor& desc, bool convert_ptrs) const;
 
   /// This function should only be called on tuples created by DeepCopy() with
   /// 'convert_ptrs' = true. It takes all pointers contained in this tuple (i.e. in
@@ -163,35 +180,56 @@ class Tuple {
   /// Callers of CodegenMaterializeExprs must set 'use_mem_pool' to true to generate the
   /// IR function for the case 'pool' is non-NULL and false for the NULL pool case.
   ///
-  /// If 'COLLECT_STRING_VALS' is true, the materialized non-NULL string value slots and
-  /// the total length of the string slots are returned in 'non_null_string_values' and
-  /// 'total_string_lengths'. 'non_null_string_values' and 'total_string_lengths' must be
-  /// non-NULL in this case. 'non_null_string_values' does not need to be empty; its
-  /// original contents will be overwritten.
-  /// TODO: this function does not collect other var-len types such as collections.
-  template <bool COLLECT_STRING_VALS, bool NULL_POOL>
+  /// If 'COLLECT_VAR_LEN_VALS' is true
+  ///  - the materialized non-NULL non-smallified string value slots are returned in
+  ///    'non_null_string_values' - smallified strings (see Small
+  ///    String Optimization, IMPALA-12373) are not collected;
+  ///  - the materialized non-NULL collection value slots, along with their byte sizes,
+  ///    are returned in 'non_null_collection_values' and
+  ///  - the total length of the string and collection slots is returned in
+  ///    'total_varlen_lengths'.
+  /// 'non_null_string_values', 'non_null_collection_values' and 'total_varlen_lengths'
+  /// must be non-NULL in this case. Their contents will be overwritten. The var-len
+  /// values are collected recursively. This means that if there are no collections with
+  /// variable length types in the tuple, the length of 'non_null_string_values' will be
+  /// 'desc.string_slots().size()' and the length of 'non_null_collection_values' will be
+  /// 'desc.collection_slots().size()'; if there are collections with variable length
+  /// types, the lengths of these vectors will be more.
+  ///
+  /// Children are placed before their parents in the vectors (post-order traversal). The
+  /// order matters in case of serialisation. When a child is serialised, the pointer of
+  /// the parent needs to be updated. If the parent itself also needs to be serialised
+  /// (because it is also a var-len child of a 'CollectionValue'), it should be serialised
+  /// after its child so that its pointer is already updated at that time. For the same
+  /// reason, the 'StringValue's must be serialised before the 'CollectionValue's -
+  /// strings can be children of collections but not the other way around. For more see
+  /// Sorter::Run::CollectNonNullVarSlots().
+  template <bool COLLECT_VAR_LEN_VALS, bool NULL_POOL>
   inline void IR_ALWAYS_INLINE MaterializeExprs(TupleRow* row,
       const TupleDescriptor& desc, const std::vector<ScalarExprEvaluator*>& evals,
-      MemPool* pool, std::vector<StringValue*>* non_null_string_values = NULL,
-      int* total_string_lengths = NULL) {
-    DCHECK_EQ(NULL_POOL, pool == NULL);
+      MemPool* pool, std::vector<StringValue*>* non_null_string_values = nullptr,
+      std::vector<std::pair<CollectionValue*, int64_t>>*
+         non_null_collection_values = nullptr,
+      int* total_varlen_lengths = nullptr) {
+    DCHECK_EQ(NULL_POOL, pool == nullptr);
     DCHECK_EQ(evals.size(), desc.slots().size());
-    StringValue** non_null_string_values_array = NULL;
+
     int num_non_null_string_values = 0;
-    if (COLLECT_STRING_VALS) {
-      DCHECK(non_null_string_values != NULL);
-      DCHECK(total_string_lengths != NULL);
-      // string::resize() will zero-initialize any new values, so we resize to the largest
-      // possible size here, then truncate the vector below once we know the actual size
-      // (which preserves already-written values).
-      non_null_string_values->resize(desc.string_slots().size());
-      non_null_string_values_array = non_null_string_values->data();
-      *total_string_lengths = 0;
+    int num_non_null_collection_values = 0;
+    if (COLLECT_VAR_LEN_VALS) {
+      DCHECK(non_null_string_values != nullptr);
+      DCHECK(non_null_collection_values != nullptr);
+      DCHECK(total_varlen_lengths != nullptr);
+
+      non_null_string_values->clear();
+      non_null_collection_values->clear();
+      *total_varlen_lengths = 0;
     }
-    MaterializeExprs<COLLECT_STRING_VALS, NULL_POOL>(row, desc,
-        evals.data(), pool, non_null_string_values_array,
-        total_string_lengths, &num_non_null_string_values);
-    if (COLLECT_STRING_VALS) non_null_string_values->resize(num_non_null_string_values);
+
+    MaterializeExprs<COLLECT_VAR_LEN_VALS, NULL_POOL>(row, desc,
+        evals.data(), pool, non_null_string_values, non_null_collection_values,
+        total_varlen_lengths, &num_non_null_string_values,
+        &num_non_null_collection_values);
   }
 
   /// Copy the var-len string data in this tuple into the provided memory pool and update
@@ -211,7 +249,7 @@ class Tuple {
   static const char* MATERIALIZE_EXPRS_NULL_POOL_SYMBOL;
 
   /// Generates an IR version of MaterializeExprs(), returned in 'fn'. Currently only
-  /// 'collect_string_vals' = false is implemented and some arguments passed to the IR
+  /// 'collect_varlen_vals' = false is implemented and some arguments passed to the IR
   /// function are unused.
   ///
   /// If 'use_mem_pool' is true, any varlen data will be copied into the MemPool specified
@@ -219,7 +257,7 @@ class Tuple {
   /// be copied. There are two different MaterializeExprs symbols to differentiate between
   /// these cases when we replace the function calls during codegen. Please see comment
   /// of MaterializeExprs() for details.
-  static Status CodegenMaterializeExprs(LlvmCodeGen* codegen, bool collect_string_vals,
+  static Status CodegenMaterializeExprs(LlvmCodeGen* codegen, bool collect_varlen_vals,
       const TupleDescriptor& desc, const vector<ScalarExpr*>& slot_materialize_exprs,
       bool use_mem_pool, llvm::Function** fn);
 
@@ -313,21 +351,52 @@ class Tuple {
 
   /// Copy all referenced string and collection data by allocating memory from pool,
   /// copying data, then updating pointers in tuple to reference copied data.
+  /// Also smallifies the copied strings when possible.
   void DeepCopyVarlenData(const TupleDescriptor& desc, MemPool* pool);
 
   /// Copies all referenced string and collection data into 'data'. Increments 'data' and
   /// 'offset' by the number of bytes written. Recursively writes collection tuple data
   /// and referenced collection and string data.
+  /// Also smallifies the copied strings when possible.
   void DeepCopyVarlenData(const TupleDescriptor& desc, char** data, int* offset,
       bool convert_ptrs);
 
-  /// Implementation of MaterializedExprs(). This function is replaced during
-  /// codegen. 'num_non_null_string_values' must be initialized by the caller.
-  template <bool COLLECT_STRING_VALS, bool NULL_POOL>
+  bool TryDeepCopyStrings(uint8_t** data, const uint8_t* data_end, int* offset,
+      const TupleDescriptor& desc, bool convert_ptrs);
+  bool TryDeepCopyCollections(uint8_t** data, const uint8_t* data_end, int* offset,
+      const TupleDescriptor& desc, bool convert_ptrs);
+
+  /// During the construction of hand-crafted codegen'd functions, types cannot generally
+  /// be looked up by name. In our own types we use the static 'LLVM_CLASS_NAME' member to
+  /// facilitate this, but it cannot be used with other types, for example standard
+  /// containers. This struct contains members with types that we'd like to use - struct
+  /// members can be retrieved by their index in LLVM.
+  struct CodegenTypes {
+    // Use type aliases to ensure that we use the same types in codegen and the
+    // corresponding normal code.
+    using StringValuePtrVecType = std::vector<StringValue*>;
+    using CollValuePtrAndSizeVecType = std::vector<std::pair<CollectionValue*, int64_t>>;
+
+    StringValuePtrVecType string_value_vec;
+    CollValuePtrAndSizeVecType coll_size_andvalue_vec;
+
+    static llvm::Type* getStringValuePtrVecType(LlvmCodeGen* codegen);
+    static llvm::Type* getCollValuePtrAndSizeVecType(LlvmCodeGen* codegen);
+
+    /// For C++/IR interop, we need to be able to look up types by name.
+    static const char* LLVM_CLASS_NAME;
+  };
+
+  /// Implementation of MaterializedExprs(). This function is replaced during codegen.
+  /// 'num_non_null_string_values' and 'num_non_null_collection_values' must be
+  /// initialized by the caller.
+  template <bool COLLECT_VAR_LEN_VALS, bool NULL_POOL>
   void IR_NO_INLINE MaterializeExprs(TupleRow* row, const TupleDescriptor& desc,
       ScalarExprEvaluator* const* evals, MemPool* pool,
-      StringValue** non_null_string_values, int* total_string_lengths,
-      int* num_non_null_string_values);
+      CodegenTypes::StringValuePtrVecType* non_null_string_values,
+      CodegenTypes::CollValuePtrAndSizeVecType* non_null_collection_values,
+      int* total_varlen_lengths, int* num_non_null_string_values,
+      int* num_non_null_collection_values) noexcept;
 
   /// Helper for CopyStrings() to allocate 'bytes' of memory. Returns a pointer to the
   /// allocated buffer on success. Otherwise an error was encountered, in which case NULL
@@ -336,6 +405,8 @@ class Tuple {
   char* AllocateStrings(const char* err_ctx, RuntimeState* state, int64_t bytes,
       MemPool* pool, Status* status) noexcept;
 
+  // Defined in tuple-ir.cc to force the compilation of the CodegenTypes struct.
+  void dummy(Tuple::CodegenTypes*);
 };
 
 }

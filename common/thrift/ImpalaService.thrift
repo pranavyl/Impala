@@ -209,6 +209,7 @@ enum TImpalaQueryOptions {
   // If true, the planner will not generate plans with streaming preaggregations.
   DISABLE_STREAMING_PREAGGREGATIONS = 35
 
+  // Select between off, local, or global runtime filters.
   RUNTIME_FILTER_MODE = 36
 
   // Size (in bytes) of a runtime Bloom Filter. Will be rounded up to nearest power of
@@ -472,7 +473,7 @@ enum TImpalaQueryOptions {
   // The maximum amount of time, in milliseconds, a fetch rows request (TFetchResultsReq)
   // from the client should spend fetching results (including waiting for results to
   // become available and materialize). When result spooling is enabled, a fetch request
-  // to may read multiple RowBatches, in which case, the timeout controls how long the
+  // may read multiple RowBatches, in which case, the timeout controls how long the
   // client waits for all returned RowBatches to be produced. If the timeout is hit, the
   // client returns whatever rows it has already read. Defaults to 10000 milliseconds. A
   // value of 0 causes fetch requests to wait indefinitely.
@@ -512,7 +513,7 @@ enum TImpalaQueryOptions {
   PREAGG_BYTES_LIMIT = 98
 
   // Indicates whether the FE should rewrite disjunctive predicates to conjunctive
-  // normal form (CNF) for optimization purposes. Default is False.
+  // normal form (CNF) for optimization purposes. Default is true.
   ENABLE_CNF_REWRITES = 99
 
   // The max number of conjunctive normal form (CNF) exprs to create when converting
@@ -532,11 +533,19 @@ enum TImpalaQueryOptions {
   RETRY_FAILED_QUERIES = 102
 
   // Enabled runtime filter types to be applied to scanner.
-  // This option only apply to Kudu now, will apply to HDFS once we support
-  // min-max filter for HDFS.
+  // This option only apply to Hdfs scan node and Kudu scan node.
+  // Specify the enabled types by a comma-separated list or enable all types by "ALL".
   //     BLOOM   - apply bloom filter only,
   //     MIN_MAX - apply min-max filter only.
-  //     ALL     - apply both bloom filter and min-max filter (default).
+  //     IN_LIST - apply in-list filter only.
+  //     ALL     - apply all types of runtime filters.
+  // Default is [BLOOM, MIN_MAX].
+  // Depending on the scan node type, Planner can schedule compatible runtime filter type
+  // as follows:
+  // Kudu scan: BLOOM, MIN_MAX
+  // Hdfs scan on Parquet file: BLOOM, MIN_MAX
+  // Hdfs scan on ORC file: BLOOM, IN_LIST
+  // Hdfs scan on other kind of file: BLOOM
   ENABLED_RUNTIME_FILTER_TYPES = 103
 
   // Enable asynchronous codegen.
@@ -714,6 +723,260 @@ enum TImpalaQueryOptions {
   // enable runtime filtering on the row group. For example, 2 means that runtime filter
   // will be evaluated when the dictionary size is smaller or equal to 2.
   PARQUET_DICTIONARY_RUNTIME_FILTER_ENTRY_LIMIT = 139;
+
+  // Abort the Java UDF if an exception is thrown. Default is that only a
+  // warning will be logged if the Java UDF throws an exception.
+  ABORT_JAVA_UDF_ON_EXCEPTION = 140;
+
+  // Indicates whether to use ORC's async read.
+  ORC_ASYNC_READ = 141
+
+  // Maximum number of distinct entries in a runtime in-list filter.
+  RUNTIME_IN_LIST_FILTER_ENTRY_LIMIT = 142;
+
+  // If true, replanning is enabled.
+  ENABLE_REPLAN = 143;
+
+  // If true, test replan by imposing artificial two executor groups in FE and always
+  // compute ProcessingCost. The degree of parallelism adjustment, however, still require
+  // COMPUTE_PROCESSING_COST option set to true.
+  TEST_REPLAN = 144;
+
+  // Maximum wait time on HMS ACID lock in seconds.
+  LOCK_MAX_WAIT_TIME_S = 145
+
+  // Determines how to resolve ORC files' schemas. Valid values are "position" and "name".
+  ORC_SCHEMA_RESOLUTION = 146;
+
+  // Expands complex types in star queries
+  EXPAND_COMPLEX_TYPES = 147;
+
+  // Specify the database name which stores global udf
+  FALLBACK_DB_FOR_FUNCTIONS = 148;
+
+  // Specify whether to use codegen cache.
+  DISABLE_CODEGEN_CACHE = 149;
+
+  // Specify how the entry stores to the codegen cache, would affect the entry size.
+  // Possible values are NORMAL, OPTIMAL, NORMAL_DEBUG and OPTIMAL_DEBUG.
+  // The normal mode will use a full key for the cache, while the optimal mode uses
+  // a hashcode of 128 bits for the key to save the memory consumption.
+  // The debug mode of each of them allows more logs, would be helpful to target
+  // an issue.
+  // Only valid if DISABLE_CODEGEN_CACHE is set to false.
+  CODEGEN_CACHE_MODE = 150;
+
+  // Convert non-string map keys to string to produce valid JSON.
+  STRINGIFY_MAP_KEYS = 151
+
+  // Enable immediate admission for trivial queries.
+  ENABLE_TRIVIAL_QUERY_FOR_ADMISSION = 152
+
+  // Control whether to consider CPU processing cost during query planning.
+  COMPUTE_PROCESSING_COST = 153;
+
+  // Minimum number of threads of a query fragment per node in processing
+  // cost algorithm. It is recommend to not set it with value more than number of
+  // physical cores in executor node. Valid values are in [1, 128]. Default to 1.
+  PROCESSING_COST_MIN_THREADS = 154;
+
+  // When calculating estimated join cardinality of 2 or more conjuncts
+  // e.g t1.a1 = t2.a2 AND t1.b1 = t2.b2, this selectivity correlation factor
+  // provides more control over the join cardinality estimation. The range is a
+  // double value between 0 to 1 inclusive. The default value of 0 preserves the
+  // existing behavior of using the minimum cardinality of the conjucts. Setting
+  // this to a value between 0 to 1 computes the combined selectivity by
+  // taking the product of the selectivities and dividing by this factor.
+  JOIN_SELECTIVITY_CORRELATION_FACTOR = 155;
+
+  // Maximum number of threads of a query fragment per node in processing
+  // cost algorithm. It is recommend to not set it with value more than number of
+  // physical cores in executor node. This query option may be ignored if selected
+  // executor group has lower max-query-cpu-core-per-node-limit configuration or
+  // PROCESSING_COST_MIN_THREADS option has higher value.
+  // Valid values are in [1, 128]. Default to 128.
+  MAX_FRAGMENT_INSTANCES_PER_NODE = 156
+
+  // Configures the in-memory sort algorithm used in the sorter. Determines the maximum
+  // number of pages in an initial in-memory run (fixed + variable length).
+  // Maximizing the sort run size can help mitigate back-pressure in the sorter. It
+  // creates multiple miniruns and merges them in-memory. The run size must be at least 2,
+  // but 10 or more are recommended to avoid high fragmentation of variable length data.
+  // Setting 0 or a negative value disables the run size limitation.
+  // Defaults to 0 (disabled).
+  MAX_SORT_RUN_SIZE = 157;
+
+  // Allowing implicit casts with loss of precision, adds the capability to use
+  // implicit casts between numeric and string types in set operations and insert
+  // statements.
+  ALLOW_UNSAFE_CASTS = 158;
+
+  // The maximum number of threads Impala can use for migrating a table to a different
+  // type. E.g. from Hive table to Iceberg table.
+  NUM_THREADS_FOR_TABLE_MIGRATION = 159;
+
+  // Turns off optimized Iceberg V2 reads, falls back to Hash Join
+  DISABLE_OPTIMIZED_ICEBERG_V2_READ = 160;
+
+  // In VALUES clauses, if all values in a column are CHARs but they have different
+  // lengths, choose the VARCHAR type of the longest length instead of the corresponding
+  // CHAR type as the common type. This avoids padding and thereby loss of information.
+  // See IMPALA-10753.
+  VALUES_STMT_AVOID_LOSSY_CHAR_PADDING = 161;
+
+  // Threshold in bytes to determine whether an aggregation node's memory estimate is
+  // deemed large. If an aggregation node's memory estimate is large, an alternative
+  // estimation is used to lower the memory usage estimation for that aggregation node.
+  // The new memory estimate will not be lower than the specified
+  // LARGE_AGG_MEM_THRESHOLD. Unlike PREAGG_BYTES_LIMIT, LARGE_AGG_MEM_THRESHOLD is
+  // evaluated on both preagg and merge agg, and does not cap max memory reservation of
+  // the aggregation node (it may still increase memory allocation beyond the threshold
+  // if it is available). However, if a plan node is a streaming preaggregation node and
+  // PREAGG_BYTES_LIMIT is set, then PREAGG_BYTES_LIMIT will override the value of
+  // LARGE_AGG_MEM_THRESHOLD as a threshold. 0 or -1 means this option has no effect.
+  LARGE_AGG_MEM_THRESHOLD = 162
+
+  // Correlation factor that will be used to calculate a lower memory estimation of
+  // aggregation node when the default memory estimation exceeds
+  // LARGE_AGG_MEM_THRESHOLD. The reduction is achieved by calculating a memScale
+  // multiplier (a fraction between 0.0 and 1.0). Given N as number of non-literal
+  // grouping expressions:
+  //
+  //   memScale = (1.0 - AGG_MEM_CORRELATION_FACTOR) ^ max(0, N - 1)
+  //
+  // Valid values are in [0.0, 1.0]. Note that high value of AGG_MEM_CORRELATION_FACTOR
+  // value means there is high correlation between grouping expressions / columns, while
+  // low value means there is low correlation between them. High correlation means
+  // aggregation node can be scheduled with lower memory estimation (lower memScale).
+  // Setting value 0.0 will result in an equal memory estimate as the default estimation
+  // (no change). Defaults to 0.5.
+  AGG_MEM_CORRELATION_FACTOR = 163
+
+  // A per coordinator approximate limit on the memory consumption
+  // of this query. Only applied if MEM_LIMIT is not specified.
+  // Unspecified or a limit of 0 or negative value means no limit;
+  // Otherwise specified either as:
+  // a) an int (= number of bytes);
+  // b) a float followed by "M" (MB) or "G" (GB)
+  MEM_LIMIT_COORDINATORS = 164
+
+  // Enables predicate subsetting for Iceberg plan nodes. If enabled, expressions
+  // evaluated by Iceberg are not pushed down the scanner node.
+  ICEBERG_PREDICATE_PUSHDOWN_SUBSETTING = 165;
+
+  // Amount of memory that we approximate a scanner thread will use not including I/O
+  // buffers. The memory used does not vary considerably between file formats (just a
+  // couple of MBs). This amount of memory is not reserved by the planner and only
+  // considered in the old multi-threaded scanner mode (non-MT_DOP) for 2nd and
+  // subsequent additional scanner threads. If this option is not set to a positive
+  // value, the value of flag hdfs_scanner_thread_max_estimated_bytes will be used
+  // (which defaults to 32MB). The default value of this option is -1 (not set).
+  HDFS_SCANNER_NON_RESERVED_BYTES = 166
+
+  // Select codegen optimization level from O0, O1, Os, O2, or O3. Higher levels will
+  // overwrite existing codegen cache entries.
+  CODEGEN_OPT_LEVEL = 167
+
+  // The reservation time (in seconds) for deleted impala-managed Kudu tables.
+  // During this time deleted Kudu tables can be recovered by Kudu's 'recall table' API.
+  // See KUDU-3326 for details.
+  KUDU_TABLE_RESERVE_SECONDS = 168
+
+  // When true, UNIXTIME_MICRO columns read from Kudu will be interpreted as UTC and
+  // and UTC->local timezone conversion is applied when converting to Impala TIMESTAMP.
+  // Writes are unaffected (see WRITE_KUDU_UTC_TIMESTAMPS).
+  CONVERT_KUDU_UTC_TIMESTAMPS = 169
+
+  // This only makes sense when 'CONVERT_KUDU_UTC_TIMESTAMPS' is true. When true, it
+  // disables the bloom filter for Kudu's timestamp type, because using local timestamp in
+  // Kudu bloom filter may cause missing rows.
+  // Local timestamp convert to UTC could be ambiguous in the case of DST change.
+  // We can only put one of the two possible UTC timestamps in the bloom filter
+  // for now, which may cause missing rows that have the other UTC timestamp.
+  // For those regions that do not observe DST, could set this flag to false
+  // to re-enable kudu local timestamp bloom filter.
+  DISABLE_KUDU_LOCAL_TIMESTAMP_BLOOM_FILTER = 170
+
+  // A range of [0.0..1.0] that controls the cardinality reduction scale from runtime
+  // filter analysis. This is a linear scale with 0.0 meaning no cardinality estimate
+  // reduction should be applied and 1.0 meaning maximum cardinality estimate reduction
+  // should be applied. For example, if a table has 1M rows and runtime filters are
+  // estimated to reduce cardinality to 500K, setting value 0.25 will result in an 875K
+  // cardinality estimate. Default to 1.0.
+  RUNTIME_FILTER_CARDINALITY_REDUCTION_SCALE = 171
+
+  // Maximum number of backend executor that can send bloom runtime filter updates to
+  // one intermediate aggregator. Given N as number of backend executor excluding
+  // coordinator, the selected number of designated intermediate aggregator is
+  // ceil(N / MAX_NUM_FILTERS_AGGREGATED_PER_HOST). Setting 1, 0, or negative value
+  // will disable the intermediate aggregator feature. Default to -1 (disabled).
+  MAX_NUM_FILTERS_AGGREGATED_PER_HOST = 172
+
+  // Divide the CPU requirement of a query to fit the total available CPU in
+  // the executor group. For example, setting value 2 will fit the query with CPU
+  // requirement 2X to an executor group with total available CPU X. Note that setting
+  // with a fractional value less than 1 effectively multiplies the query CPU
+  // requirement. A valid value is > 0.0.
+  // If this query option is not set, value of backend flag --query_cpu_count_divisor
+  // (default to 1.0) will be picked up instead.
+  QUERY_CPU_COUNT_DIVISOR = 173
+
+  // Enables intermediate result caching. The frontend will determine eligibility and
+  // potentially insert tuple cache nodes into the plan. This can only be set if the
+  // allow_tuple_caching feature startup flag is set to true.
+  ENABLE_TUPLE_CACHE = 174
+
+  // Disables statistic-based count(*)-optimization for Iceberg tables.
+  ICEBERG_DISABLE_COUNT_STAR_OPTIMIZATION = 175
+
+  // List of runtime filter id to skip if it exists in query plan.
+  // If using JDBC client, use double quote to wrap multiple ids, like:
+  //   RUNTIME_FILTER_IDS_TO_SKIP="1,2,3"
+  // If using impala-shell client, double quote is not required.
+  RUNTIME_FILTER_IDS_TO_SKIP = 176
+
+  // Decide what strategy to use to compute number of slot per node to run a query.
+  // Default to number of instances of largest query fragment (LARGEST_FRAGMENT).
+  // See TSlotCountStrategy in Query.thrift for documentation of its possible values.
+  SLOT_COUNT_STRATEGY = 177
+
+  // Indicate if external JDBC table handler should clean DBCP DataSource object from
+  // cache when its reference count equals 0. By caching DBCP DataSource objects, we can
+  // avoid to reload JDBC driver.
+  CLEAN_DBCP_DS_CACHE = 178
+
+  // Enables cache for isTrueWithNullSlots, which can be expensive when evaluating lots
+  // of expressions. The cache helps with generated expressions, which often contain lots
+  // of repeated patterns.
+  USE_NULL_SLOTS_CACHE = 179
+
+  // When true, Impala TIMESTAMPs are converted from local timezone to UTC before being
+  // written to Kudu as UNIXTIME_MICRO.
+  // Reads are unaffected (see CONVERT_KUDU_UTC_TIMESTAMPS).
+  WRITE_KUDU_UTC_TIMESTAMPS = 180
+
+  // Turns off optimized JSON count star (zero slots) scan, falls back to rapidjson parse.
+  DISABLE_OPTIMIZED_JSON_COUNT_STAR = 181
+
+  // How long to wait for statement completion for ExecuteStatement/executeAndWait and
+  // GetOperationStatus/get_state RPCs. Waiting on the server side allows for immediate
+  // notification when the query completes and avoid added latency from waiting on the
+  // client side. This defaults to off (0ms).
+  LONG_POLLING_TIME_MS = 182
+
+  // Enables the verification process for intermediate result caching.
+  // Tuple cache verification is performed only when the startup flag
+  // tuple_cache_debug_dump_dir is specified and enable_tuple_cache_verification is set
+  // to true.
+  ENABLE_TUPLE_CACHE_VERIFICATION = 183
+
+  // If True, enable tuple analysis for both preaggregation and final aggregation node.
+  // Enabling this feature can lower cardinality estimate of multi-column grouping.
+  ENABLE_TUPLE_ANALYSIS_IN_AGGREGATE = 184
+
+  // If True, account for probability of having duplicate grouping key exist in multiple
+  // nodes during preaggreation.
+  ESTIMATE_DUPLICATE_IN_PREAGG = 185
 }
 
 // The summary of a DML statement.
@@ -722,6 +985,7 @@ struct TDmlResult {
   // The keys represent partitions to create, coded as k1=v1/k2=v2/k3=v3..., with
   // the root in an unpartitioned table being the empty string.
   1: required map<string, i64> rows_modified
+  3: optional map<string, i64> rows_deleted
 
   // Number of row operations attempted but not completed due to non-fatal errors
   // reported by the storage engine that Impala treats as warnings. Only applies to Kudu

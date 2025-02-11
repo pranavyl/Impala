@@ -19,12 +19,14 @@
 # programatically interact with the services and perform operations such as querying
 # the debug webpage, getting metric values, or creating client connections.
 
+from __future__ import absolute_import, division, print_function
 from collections import defaultdict
 import json
 import logging
 import os
 import re
 import requests
+import socket
 import subprocess
 from datetime import datetime
 from time import sleep, time
@@ -120,7 +122,7 @@ class BaseImpalaService(object):
       value = None
       try:
         value = self.get_metric_value(metric_name)
-      except Exception, e:
+      except Exception as e:
         LOG.error(e)
 
       # if allow_greater is True we wait until the metric value becomes >= the expected
@@ -138,9 +140,9 @@ class BaseImpalaService(object):
       LOG.info("Sleeping %ds before next retry." % interval)
       sleep(interval)
 
-    LOG.info("Metric {0} did not reach value {1} in {2}s. Failing...".format(metric_name,
-        expected_value, timeout))
-    self.__metric_timeout_assert(metric_name, expected_value, timeout)
+    LOG.info("Metric {0} did not reach value {1} in {2}s. Actual value was '{3}'. "
+        "Failing...".format(metric_name, expected_value, timeout, value))
+    self.__metric_timeout_assert(metric_name, expected_value, timeout, value)
 
   def __request_minidump(self, pid):
     """
@@ -153,7 +155,7 @@ class BaseImpalaService(object):
     cmd = ["kill", "-SIGUSR1", pid]
     subprocess.check_output(cmd)
 
-  def __metric_timeout_assert(self, metric_name, expected_value, timeout):
+  def __metric_timeout_assert(self, metric_name, expected_value, timeout, actual_value):
     """
     Helper function to dump diagnostic information for debugging a metric timeout and
     then assert.
@@ -184,8 +186,10 @@ class BaseImpalaService(object):
     # Requests a minidump for each running impalad/catalogd. The minidump will be
     # written to the processes's minidump_path. For simplicity, we leave it there,
     # as it will be preserved along with everything else in the log directory.
-    impalad_pids = subprocess.check_output(["pgrep", "impalad"]).split("\n")[:-1]
-    catalogd_pids = subprocess.check_output(["pgrep", "-f", "catalogd"]).split("\n")[:-1]
+    impalad_pids = subprocess.check_output(["pgrep", "impalad"],
+        universal_newlines=True).split("\n")[:-1]
+    catalogd_pids = subprocess.check_output(["pgrep", "catalogd"],
+        universal_newlines=True).split("\n")[:-1]
     minidump_diag_string = "Dumping minidumps for impalads/catalogds...\n"
     for pid in impalad_pids:
       self.__request_minidump(pid)
@@ -203,8 +207,8 @@ class BaseImpalaService(object):
     # This is in the logs directory, so it should be packed up along with everything
     # else for automated jobs.
     assert_string = \
-        "Metric {0} did not reach value {1} in {2}s.\n".format(metric_name,
-            expected_value, timeout)
+        "Metric {0} did not reach value {1} in {2}s. Actual value was '{3}'.\n" \
+        .format(metric_name, expected_value, timeout, actual_value)
     assert_string += json_diag_string
     assert_string += minidump_diag_string
     assert 0, assert_string
@@ -359,7 +363,7 @@ class ImpaladService(BaseImpalaService):
       try:
         value = self.get_num_known_live_backends(timeout=1, interval=interval,
             include_shutting_down=include_shutting_down)
-      except Exception, e:
+      except Exception as e:
         LOG.error(e)
       if value == expected_value:
         LOG.info("num_known_live_backends has reached value: %s" % value)
@@ -367,7 +371,7 @@ class ImpaladService(BaseImpalaService):
       else:
         LOG.info("Waiting for num_known_live_backends=%s. Current value: %s" %
             (expected_value, value))
-      sleep(1)
+      sleep(interval)
     assert 0, 'num_known_live_backends did not reach expected value in time'
 
   def read_query_profile_page(self, query_id, timeout=10, interval=1):
@@ -422,6 +426,17 @@ class ImpaladService(BaseImpalaService):
       sleep(interval)
     return False
 
+  def is_port_open(self, port):
+    try:
+      sock = socket.create_connection((self.hostname, port), timeout=1)
+      sock.close()
+      return True
+    except Exception:
+      return False
+
+  def webserver_port_is_open(self):
+    return self.is_port_open(self.webserver_port)
+
   def create_beeswax_client(self, use_kerberos=False):
     """Creates a new beeswax client connection to the impalad"""
     client = create_connection('%s:%d' % (self.hostname, self.beeswax_port),
@@ -431,12 +446,16 @@ class ImpaladService(BaseImpalaService):
 
   def beeswax_port_is_open(self):
     """Test if the beeswax port is open. Does not need to authenticate."""
+    # Check if the port is open first to avoid chatty logging of Thrift connection.
+    if not self.is_port_open(self.beeswax_port): return False
+
     try:
       # The beeswax client will connect successfully even if not authenticated.
       client = self.create_beeswax_client()
       client.close()
       return True
-    except Exception:
+    except Exception as e:
+      LOG.info(e)
       return False
 
   def create_ldap_beeswax_client(self, user, password, use_ssl=False):
@@ -453,30 +472,40 @@ class ImpaladService(BaseImpalaService):
 
   def hs2_port_is_open(self):
     """Test if the HS2 port is open. Does not need to authenticate."""
+    # Check if the port is open first to avoid chatty logging of Thrift connection.
+    if not self.is_port_open(self.hs2_port): return False
+
     # Impyla will try to authenticate as part of connecting, so preserve previous logic
     # that uses the HS2 thrift code directly.
     try:
-      socket = TSocket(self.hostname, self.hs2_port)
-      transport = TBufferedTransport(socket)
+      sock = TSocket(self.hostname, self.hs2_port)
+      transport = TBufferedTransport(sock)
       transport.open()
       transport.close()
       return True
-    except Exception, e:
+    except Exception as e:
       LOG.info(e)
       return False
 
+  def hs2_http_port_is_open(self):
+    # Only check if the port is open, do not create Thrift transport.
+    return self.is_port_open(self.hs2_http_port)
 
 # Allows for interacting with the StateStore service to perform operations such as
 # accessing the debug webpage.
 class StateStoredService(BaseImpalaService):
   def __init__(self, hostname, webserver_interface, webserver_port,
-      webserver_certificate_file):
+      webserver_certificate_file, service_port):
     super(StateStoredService, self).__init__(
         hostname, webserver_interface, webserver_port, webserver_certificate_file)
+    self.service_port = service_port
 
   def wait_for_live_subscribers(self, num_subscribers, timeout=15, interval=1):
     self.wait_for_metric_value('statestore.live-backends', num_subscribers,
                                timeout=timeout, interval=interval)
+
+  def get_statestore_service_port(self):
+    return self.service_port
 
 
 # Allows for interacting with the Catalog service to perform operations such as
@@ -501,6 +530,9 @@ class CatalogdService(BaseImpalaService):
         LOG.info('Catalogd version not yet available.')
       sleep(interval)
     assert False, 'Catalog version not ready in expected time.'
+
+  def get_catalog_service_port(self):
+    return self.service_port
 
 
 class AdmissiondService(BaseImpalaService):

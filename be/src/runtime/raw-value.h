@@ -21,13 +21,14 @@
 #include <string>
 
 #include "codegen/impala-ir.h"
+#include "runtime/collection-value.h"
 #include "runtime/types.h"
 
 namespace impala {
 
 class MemPool;
 class SlotDescriptor;
-struct StringValue;
+class StringValue;
 class Tuple;
 
 /// Useful utility functions for runtime values (which are passed around as void*).
@@ -47,11 +48,13 @@ class RawValue {
 
   /// Convert 'value' into ascii and write to 'stream'. NULL turns into "NULL". 'scale'
   /// determines how many digits after the decimal are printed for floating point numbers,
-  /// -1 indicates to use the stream's current formatting.
+  /// -1 indicates to use the stream's current formatting. Doesn't support complex types.
+  /// If 'quote_val' is true, write STRING, VARCHAR, CHAR, DATE, TIMESTAMP values in
+  /// quoted form surrounded by double quotes.
   /// TODO: for string types, we just print the result regardless of whether or not it
   /// ascii. This could be undesirable.
   static void PrintValue(const void* value, const ColumnType& type, int scale,
-                         std::stringstream* stream);
+                         std::stringstream* stream, bool quote_val=false);
 
   /// Write ascii value to string instead of stringstream.
   static void PrintValue(const void* value, const ColumnType& type, int scale,
@@ -63,7 +66,6 @@ class RawValue {
     PrintValue(value, type, scale, &str);
     return str;
   }
-
 
   /// Writes the byte representation of a value to a stringstream character-by-character
   static void PrintValueAsBytes(const void* value, const ColumnType& type,
@@ -115,23 +117,32 @@ class RawValue {
   static int IR_ALWAYS_INLINE Compare(
       const void* v1, const void* v2, const ColumnType& type) noexcept;
 
-  /// Writes the bytes of a given value into the slot of a tuple.
-  /// For string values, the string data is copied into memory allocated from 'pool'
-  /// only if pool is non-NULL.
+  /// Writes the bytes of a given value into the slot of a tuple. Supports primitive and
+  /// complex types. 'value' is allowed to be NULL. For string and collection values, the
+  /// data is deep-copied into memory allocated from 'pool' if pool is non-NULL, otherwise
+  /// the data is not copied.
+  ///
+  /// If COLLECT_VAR_LEN_VALS is true, gathers the non-NULL non-smallified string slots of
+  /// the slot tree into 'string_values' and the non-NULL collection slots along with
+  /// their byte sizes into 'collection_values' recursively. Smallified strings (see Small
+  /// String Optimization, IMPALA-12373) are not collected. Children are placed before
+  /// their parents in the vectors (post-order traversal) - see Tuple::MaterializeExprs()
+  /// and Sorter::Run::CollectNonNullVarSlots() for the reason. If COLLECT_VAR_LEN_VALS is
+  /// true, 'string_values' and 'collection_values' must be non-NULL.
+  template <bool COLLECT_VAR_LEN_VALS>
   static void Write(const void* value, Tuple* tuple, const SlotDescriptor* slot_desc,
-                    MemPool* pool);
+      MemPool* pool, std::vector<StringValue*>* string_values,
+      std::vector<std::pair<CollectionValue*, int64_t>>* collection_values);
 
-  /// Writes 'src' into 'dst' for type.
-  /// For string values, the string data is copied into 'pool' if pool is non-NULL.
-  /// src must be non-NULL.
-  static void Write(const void* src, void* dst, const ColumnType& type, MemPool* pool);
+  /// Convenience wrapper for the templated version with COLLECT_VAR_LEN_VALS=false.
+  static void Write(const void* value, Tuple* tuple, const SlotDescriptor* slot_desc,
+      MemPool* pool);
 
-  /// Wrapper function for Write() to handle struct slots and its children. Additionally,
-  /// gathers the string slots of the slot tree into 'string_values'.
-  template <bool COLLECT_STRING_VALS>
-  static void Write(const void* value, Tuple* tuple,
-      const SlotDescriptor* slot_desc, MemPool* pool,
-    std::vector<StringValue*>* string_values);
+  /// Writes 'src' into 'dst' for the given primitive type. Does not support complex
+  /// types. 'src' must be non-NULL. For string values, the string data is copied into
+  /// 'pool' if pool is non-NULL.
+  static void WriteNonNullPrimitive(const void* src, void* dst, const ColumnType& type,
+      MemPool* pool);
 
   /// Returns true if v1 == v2.
   /// This is more performant than Compare() == 0 for string equality, mostly because of
@@ -155,18 +166,49 @@ class RawValue {
   // Returns positive zero for floating point types.
   static inline const void* PositiveFloatingZero(const ColumnType& type);
 
+  // Top level null values are printed as "NULL"; collections and structs are printed in
+  // JSON format, which requires "null".
+  static constexpr const char* NullLiteral(bool top_level) {
+    return top_level ? "NULL" : "null";
+  }
+
 private:
+  /// Like Write() but 'value' must be non-NULL.
+  template <bool COLLECT_VAR_LEN_VALS>
+  static void WriteNonNull(const void* value, Tuple* tuple,
+      const SlotDescriptor* slot_desc, MemPool* pool,
+      std::vector<StringValue*>* string_values,
+      std::vector<std::pair<CollectionValue*, int64_t>>* collection_values);
+
   /// Recursive helper function for Write() to handle struct slots.
-  template <bool COLLECT_STRING_VALS>
+  template <bool COLLECT_VAR_LEN_VALS>
   static void WriteStruct(const void* value, Tuple* tuple,
       const SlotDescriptor* slot_desc, MemPool* pool,
-      std::vector<StringValue*>* string_values);
+      std::vector<StringValue*>* string_values,
+      std::vector<std::pair<CollectionValue*, int64_t>>* collection_values);
 
-  /// Gets the destination slot from 'tuple' and 'slot_desc', writes value to this slot
-  /// using Write(). Collects pointer of the string slots to 'string_values'. 'slot_desc'
-  /// has to be primitive type.
-  template <bool COLLECT_STRING_VALS>
-  static void WritePrimitive(const void* value, Tuple* tuple,
+  /// Recursive helper function for Write() to handle collection slots.
+  template <bool COLLECT_VAR_LEN_VALS>
+  static void WriteCollection(const void* value, Tuple* tuple,
+      const SlotDescriptor* slot_desc, MemPool* pool, vector<StringValue*>* string_values,
+      vector<pair<CollectionValue*, int64_t>>* collection_values);
+
+  template <bool COLLECT_VAR_LEN_VALS>
+  static void WriteCollectionChildren(const CollectionValue& dest,
+      const CollectionValue& src, const SlotDescriptor& collection_slot_desc,
+      MemPool* pool, vector<StringValue*>* string_values,
+      vector<pair<CollectionValue*, int64_t>>* collection_values);
+
+  template <bool COLLECT_VAR_LEN_VALS>
+  static void WriteCollectionVarlenChild(Tuple* child_dest_tuple, Tuple* child_src_tuple,
+      const SlotDescriptor* slot_desc, MemPool* pool, vector<StringValue*>* string_values,
+      vector<pair<CollectionValue*, int64_t>>* collection_values );
+
+  /// Gets the destination slot from 'tuple' and 'slot_desc' and writes 'value' to this
+  /// slot. 'value' must be primitive and non-NULL. If COLLECT_VAR_LEN_VALS is true,
+  /// collects the pointers of string slots to 'string_values'.
+  template <bool COLLECT_VAR_LEN_VALS>
+  static void WritePrimitiveCollectVarlen(const void* value, Tuple* tuple,
       const SlotDescriptor* slot_desc, MemPool* pool,
       std::vector<StringValue*>* string_values);
 };

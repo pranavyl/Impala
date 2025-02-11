@@ -75,6 +75,111 @@ select * from functional.alltypestiny t
 INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT
 ====
 ---- QUERY
+# Test on star select item with other columns
+select int_col, * from functional.alltypestiny
+---- RESULTS
+0,0,NULL,0,0,0,0,0,0,'01/01/09','0aaa',2009-01-01 00:00:00,2009,1
+1,100,NULL,1,1,1,10,1.100000023841858,10.1,'01/01/09','1aaa',2009-01-01 00:01:00,2009,1
+0,200,NULL,0,0,0,0,0,0,'02/01/09','0aaa',2009-02-01 00:00:00,2009,2
+1,300,NULL,1,1,1,10,1.100000023841858,10.1,'02/01/09','1aaa',2009-02-01 00:01:00,2009,2
+0,400,NULL,0,0,0,0,0,0,'03/01/09','0aaa',2009-03-01 00:00:00,2009,3
+1,500,NULL,1,1,1,10,1.100000023841858,10.1,'03/01/09','1aaa',2009-03-01 00:01:00,2009,3
+0,600,NULL,0,0,0,0,0,0,'04/01/09','0aaa',2009-04-01 00:00:00,2009,4
+1,700,NULL,1,1,1,10,1.100000023841858,10.1,'04/01/09','1aaa',2009-04-01 00:01:00,2009,4
+---- TYPES
+INT,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT
+====
+---- QUERY
+# Test on star select item with other columns
+select string_col, * from functional.alltypestiny
+---- RESULTS
+'0aaa',0,NULL,0,0,0,0,0,0,'01/01/09','0aaa',2009-01-01 00:00:00,2009,1
+'1aaa',100,NULL,1,1,1,10,1.100000023841858,10.1,'01/01/09','1aaa',2009-01-01 00:01:00,2009,1
+'0aaa',200,NULL,0,0,0,0,0,0,'02/01/09','0aaa',2009-02-01 00:00:00,2009,2
+'1aaa',300,NULL,1,1,1,10,1.100000023841858,10.1,'02/01/09','1aaa',2009-02-01 00:01:00,2009,2
+'0aaa',400,NULL,0,0,0,0,0,0,'03/01/09','0aaa',2009-03-01 00:00:00,2009,3
+'1aaa',500,NULL,1,1,1,10,1.100000023841858,10.1,'03/01/09','1aaa',2009-03-01 00:01:00,2009,3
+'0aaa',600,NULL,0,0,0,0,0,0,'04/01/09','0aaa',2009-04-01 00:00:00,2009,4
+'1aaa',700,NULL,1,1,1,10,1.100000023841858,10.1,'04/01/09','1aaa',2009-04-01 00:01:00,2009,4
+---- TYPES
+STRING,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT
+====
+---- QUERY
+# Test on star select item with other columns
+select string_col, month, * from functional.alltypestiny
+---- RESULTS
+'0aaa',1,0,NULL,0,0,0,0,0,0,'01/01/09','0aaa',2009-01-01 00:00:00,2009,1
+'1aaa',1,100,NULL,1,1,1,10,1.100000023841858,10.1,'01/01/09','1aaa',2009-01-01 00:01:00,2009,1
+'0aaa',2,200,NULL,0,0,0,0,0,0,'02/01/09','0aaa',2009-02-01 00:00:00,2009,2
+'1aaa',2,300,NULL,1,1,1,10,1.100000023841858,10.1,'02/01/09','1aaa',2009-02-01 00:01:00,2009,2
+'0aaa',3,400,NULL,0,0,0,0,0,0,'03/01/09','0aaa',2009-03-01 00:00:00,2009,3
+'1aaa',3,500,NULL,1,1,1,10,1.100000023841858,10.1,'03/01/09','1aaa',2009-03-01 00:01:00,2009,3
+'0aaa',4,600,NULL,0,0,0,0,0,0,'04/01/09','0aaa',2009-04-01 00:00:00,2009,4
+'1aaa',4,700,NULL,1,1,1,10,1.100000023841858,10.1,'04/01/09','1aaa',2009-04-01 00:01:00,2009,4
+---- TYPES
+STRING,INT,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT
+====
+---- QUERY
+# Test on star select item with other columns
+select *, int_col from functional.alltypestiny
+---- RESULTS
+0,NULL,0,0,0,0,0,0,'01/01/09','0aaa',2009-01-01 00:00:00,2009,1,0
+100,NULL,1,1,1,10,1.100000023841858,10.1,'01/01/09','1aaa',2009-01-01 00:01:00,2009,1,1
+200,NULL,0,0,0,0,0,0,'02/01/09','0aaa',2009-02-01 00:00:00,2009,2,0
+300,NULL,1,1,1,10,1.100000023841858,10.1,'02/01/09','1aaa',2009-02-01 00:01:00,2009,2,1
+400,NULL,0,0,0,0,0,0,'03/01/09','0aaa',2009-03-01 00:00:00,2009,3,0
+500,NULL,1,1,1,10,1.100000023841858,10.1,'03/01/09','1aaa',2009-03-01 00:01:00,2009,3,1
+600,NULL,0,0,0,0,0,0,'04/01/09','0aaa',2009-04-01 00:00:00,2009,4,0
+700,NULL,1,1,1,10,1.100000023841858,10.1,'04/01/09','1aaa',2009-04-01 00:01:00,2009,4,1
+---- TYPES
+INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT,INT
+====
+---- QUERY
+# Test on star select item with other columns
+select *, string_col from functional.alltypestiny
+---- RESULTS
+0,NULL,0,0,0,0,0,0,'01/01/09','0aaa',2009-01-01 00:00:00,2009,1,'0aaa'
+100,NULL,1,1,1,10,1.100000023841858,10.1,'01/01/09','1aaa',2009-01-01 00:01:00,2009,1,'1aaa'
+200,NULL,0,0,0,0,0,0,'02/01/09','0aaa',2009-02-01 00:00:00,2009,2,'0aaa'
+300,NULL,1,1,1,10,1.100000023841858,10.1,'02/01/09','1aaa',2009-02-01 00:01:00,2009,2,'1aaa'
+400,NULL,0,0,0,0,0,0,'03/01/09','0aaa',2009-03-01 00:00:00,2009,3,'0aaa'
+500,NULL,1,1,1,10,1.100000023841858,10.1,'03/01/09','1aaa',2009-03-01 00:01:00,2009,3,'1aaa'
+600,NULL,0,0,0,0,0,0,'04/01/09','0aaa',2009-04-01 00:00:00,2009,4,'0aaa'
+700,NULL,1,1,1,10,1.100000023841858,10.1,'04/01/09','1aaa',2009-04-01 00:01:00,2009,4,'1aaa'
+---- TYPES
+INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT,STRING
+====
+---- QUERY
+# Test on star select item with other columns
+select string_col, *, int_col from functional.alltypestiny
+---- RESULTS
+'0aaa',0,NULL,0,0,0,0,0,0,'01/01/09','0aaa',2009-01-01 00:00:00,2009,1,0
+'1aaa',100,NULL,1,1,1,10,1.100000023841858,10.1,'01/01/09','1aaa',2009-01-01 00:01:00,2009,1,1
+'0aaa',200,NULL,0,0,0,0,0,0,'02/01/09','0aaa',2009-02-01 00:00:00,2009,2,0
+'1aaa',300,NULL,1,1,1,10,1.100000023841858,10.1,'02/01/09','1aaa',2009-02-01 00:01:00,2009,2,1
+'0aaa',400,NULL,0,0,0,0,0,0,'03/01/09','0aaa',2009-03-01 00:00:00,2009,3,0
+'1aaa',500,NULL,1,1,1,10,1.100000023841858,10.1,'03/01/09','1aaa',2009-03-01 00:01:00,2009,3,1
+'0aaa',600,NULL,0,0,0,0,0,0,'04/01/09','0aaa',2009-04-01 00:00:00,2009,4,0
+'1aaa',700,NULL,1,1,1,10,1.100000023841858,10.1,'04/01/09','1aaa',2009-04-01 00:01:00,2009,4,1
+---- TYPES
+STRING,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT,INT
+====
+---- QUERY
+# Test on star select item with other columns
+select string_col, *, month, *, int_col from functional.alltypestiny
+---- RESULTS
+'0aaa',0,NULL,0,0,0,0,0,0,'01/01/09','0aaa',2009-01-01 00:00:00,2009,1,1,0,NULL,0,0,0,0,0,0,'01/01/09','0aaa',2009-01-01 00:00:00,2009,1,0
+'1aaa',100,NULL,1,1,1,10,1.100000023841858,10.1,'01/01/09','1aaa',2009-01-01 00:01:00,2009,1,1,100,NULL,1,1,1,10,1.100000023841858,10.1,'01/01/09','1aaa',2009-01-01 00:01:00,2009,1,1
+'0aaa',200,NULL,0,0,0,0,0,0,'02/01/09','0aaa',2009-02-01 00:00:00,2009,2,2,200,NULL,0,0,0,0,0,0,'02/01/09','0aaa',2009-02-01 00:00:00,2009,2,0
+'1aaa',300,NULL,1,1,1,10,1.100000023841858,10.1,'02/01/09','1aaa',2009-02-01 00:01:00,2009,2,2,300,NULL,1,1,1,10,1.100000023841858,10.1,'02/01/09','1aaa',2009-02-01 00:01:00,2009,2,1
+'0aaa',400,NULL,0,0,0,0,0,0,'03/01/09','0aaa',2009-03-01 00:00:00,2009,3,3,400,NULL,0,0,0,0,0,0,'03/01/09','0aaa',2009-03-01 00:00:00,2009,3,0
+'1aaa',500,NULL,1,1,1,10,1.100000023841858,10.1,'03/01/09','1aaa',2009-03-01 00:01:00,2009,3,3,500,NULL,1,1,1,10,1.100000023841858,10.1,'03/01/09','1aaa',2009-03-01 00:01:00,2009,3,1
+'0aaa',600,NULL,0,0,0,0,0,0,'04/01/09','0aaa',2009-04-01 00:00:00,2009,4,4,600,NULL,0,0,0,0,0,0,'04/01/09','0aaa',2009-04-01 00:00:00,2009,4,0
+'1aaa',700,NULL,1,1,1,10,1.100000023841858,10.1,'04/01/09','1aaa',2009-04-01 00:01:00,2009,4,4,700,NULL,1,1,1,10,1.100000023841858,10.1,'04/01/09','1aaa',2009-04-01 00:01:00,2009,4,1
+---- TYPES
+STRING,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT,INT,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT,INT
+====
+---- QUERY
 # Test on predicate. Should evaluate on masked values.
 select * from functional.alltypestiny where id = 1
 ---- RESULTS
@@ -213,6 +318,178 @@ order by id limit 10
 900,false,9,'vvv9ttt'
 ---- TYPES
 INT,BOOLEAN,INT,STRING
+====
+---- QUERY
+# Test on star select item with other columns on view
+select int_col, * from functional.alltypes_view
+order by id limit 10
+---- RESULTS
+0,0,true,0,0,0,0,0.0,0.0,'01/01/09','vvv0ttt',2009-01-01 00:00:00,2009,1
+1,100,false,1,1,1,10,1.10000002384,10.1,'01/01/09','vvv1ttt',2009-01-01 00:01:00,2009,1
+2,200,true,2,2,2,20,2.20000004768,20.2,'01/01/09','vvv2ttt',2009-01-01 00:02:00.100000000,2009,1
+3,300,false,3,3,3,30,3.29999995232,30.3,'01/01/09','vvv3ttt',2009-01-01 00:03:00.300000000,2009,1
+4,400,true,4,4,4,40,4.40000009537,40.4,'01/01/09','vvv4ttt',2009-01-01 00:04:00.600000000,2009,1
+5,500,false,5,5,5,50,5.5,50.5,'01/01/09','vvv5ttt',2009-01-01 00:05:00.100000000,2009,1
+6,600,true,6,6,6,60,6.59999990463,60.6,'01/01/09','vvv6ttt',2009-01-01 00:06:00.150000000,2009,1
+7,700,false,7,7,7,70,7.69999980927,70.7,'01/01/09','vvv7ttt',2009-01-01 00:07:00.210000000,2009,1
+8,800,true,8,8,8,80,8.80000019073,80.8,'01/01/09','vvv8ttt',2009-01-01 00:08:00.280000000,2009,1
+9,900,false,9,9,9,90,9.89999961853,90.9,'01/01/09','vvv9ttt',2009-01-01 00:09:00.360000000,2009,1
+---- TYPES
+INT,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT
+====
+---- QUERY
+# Test on star select item with other columns on view
+select string_col, * from functional.alltypes_view
+order by id limit 10
+---- RESULTS
+'vvv0ttt',0,true,0,0,0,0,0.0,0.0,'01/01/09','vvv0ttt',2009-01-01 00:00:00,2009,1
+'vvv1ttt',100,false,1,1,1,10,1.10000002384,10.1,'01/01/09','vvv1ttt',2009-01-01 00:01:00,2009,1
+'vvv2ttt',200,true,2,2,2,20,2.20000004768,20.2,'01/01/09','vvv2ttt',2009-01-01 00:02:00.100000000,2009,1
+'vvv3ttt',300,false,3,3,3,30,3.29999995232,30.3,'01/01/09','vvv3ttt',2009-01-01 00:03:00.300000000,2009,1
+'vvv4ttt',400,true,4,4,4,40,4.40000009537,40.4,'01/01/09','vvv4ttt',2009-01-01 00:04:00.600000000,2009,1
+'vvv5ttt',500,false,5,5,5,50,5.5,50.5,'01/01/09','vvv5ttt',2009-01-01 00:05:00.100000000,2009,1
+'vvv6ttt',600,true,6,6,6,60,6.59999990463,60.6,'01/01/09','vvv6ttt',2009-01-01 00:06:00.150000000,2009,1
+'vvv7ttt',700,false,7,7,7,70,7.69999980927,70.7,'01/01/09','vvv7ttt',2009-01-01 00:07:00.210000000,2009,1
+'vvv8ttt',800,true,8,8,8,80,8.80000019073,80.8,'01/01/09','vvv8ttt',2009-01-01 00:08:00.280000000,2009,1
+'vvv9ttt',900,false,9,9,9,90,9.89999961853,90.9,'01/01/09','vvv9ttt',2009-01-01 00:09:00.360000000,2009,1
+---- TYPES
+STRING,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT
+====
+---- QUERY
+# Test on star select item with other columns on view
+select string_col, month, * from functional.alltypes_view
+order by id limit 10
+---- RESULTS
+'vvv0ttt',1,0,true,0,0,0,0,0.0,0.0,'01/01/09','vvv0ttt',2009-01-01 00:00:00,2009,1
+'vvv1ttt',1,100,false,1,1,1,10,1.10000002384,10.1,'01/01/09','vvv1ttt',2009-01-01 00:01:00,2009,1
+'vvv2ttt',1,200,true,2,2,2,20,2.20000004768,20.2,'01/01/09','vvv2ttt',2009-01-01 00:02:00.100000000,2009,1
+'vvv3ttt',1,300,false,3,3,3,30,3.29999995232,30.3,'01/01/09','vvv3ttt',2009-01-01 00:03:00.300000000,2009,1
+'vvv4ttt',1,400,true,4,4,4,40,4.40000009537,40.4,'01/01/09','vvv4ttt',2009-01-01 00:04:00.600000000,2009,1
+'vvv5ttt',1,500,false,5,5,5,50,5.5,50.5,'01/01/09','vvv5ttt',2009-01-01 00:05:00.100000000,2009,1
+'vvv6ttt',1,600,true,6,6,6,60,6.59999990463,60.6,'01/01/09','vvv6ttt',2009-01-01 00:06:00.150000000,2009,1
+'vvv7ttt',1,700,false,7,7,7,70,7.69999980927,70.7,'01/01/09','vvv7ttt',2009-01-01 00:07:00.210000000,2009,1
+'vvv8ttt',1,800,true,8,8,8,80,8.80000019073,80.8,'01/01/09','vvv8ttt',2009-01-01 00:08:00.280000000,2009,1
+'vvv9ttt',1,900,false,9,9,9,90,9.89999961853,90.9,'01/01/09','vvv9ttt',2009-01-01 00:09:00.360000000,2009,1
+---- TYPES
+STRING,INT,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT
+====
+---- QUERY
+# Test on star select item with other columns on view
+select *, int_col from functional.alltypes_view
+order by id limit 10
+---- RESULTS
+0,true,0,0,0,0,0.0,0.0,'01/01/09','vvv0ttt',2009-01-01 00:00:00,2009,1,0
+100,false,1,1,1,10,1.10000002384,10.1,'01/01/09','vvv1ttt',2009-01-01 00:01:00,2009,1,1
+200,true,2,2,2,20,2.20000004768,20.2,'01/01/09','vvv2ttt',2009-01-01 00:02:00.100000000,2009,1,2
+300,false,3,3,3,30,3.29999995232,30.3,'01/01/09','vvv3ttt',2009-01-01 00:03:00.300000000,2009,1,3
+400,true,4,4,4,40,4.40000009537,40.4,'01/01/09','vvv4ttt',2009-01-01 00:04:00.600000000,2009,1,4
+500,false,5,5,5,50,5.5,50.5,'01/01/09','vvv5ttt',2009-01-01 00:05:00.100000000,2009,1,5
+600,true,6,6,6,60,6.59999990463,60.6,'01/01/09','vvv6ttt',2009-01-01 00:06:00.150000000,2009,1,6
+700,false,7,7,7,70,7.69999980927,70.7,'01/01/09','vvv7ttt',2009-01-01 00:07:00.210000000,2009,1,7
+800,true,8,8,8,80,8.80000019073,80.8,'01/01/09','vvv8ttt',2009-01-01 00:08:00.280000000,2009,1,8
+900,false,9,9,9,90,9.89999961853,90.9,'01/01/09','vvv9ttt',2009-01-01 00:09:00.360000000,2009,1,9
+---- TYPES
+INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT,INT
+====
+---- QUERY
+# Test on star select item with other columns on view
+select *, string_col from functional.alltypes_view
+order by id limit 10
+---- RESULTS
+0,true,0,0,0,0,0.0,0.0,'01/01/09','vvv0ttt',2009-01-01 00:00:00,2009,1,'vvv0ttt'
+100,false,1,1,1,10,1.10000002384,10.1,'01/01/09','vvv1ttt',2009-01-01 00:01:00,2009,1,'vvv1ttt'
+200,true,2,2,2,20,2.20000004768,20.2,'01/01/09','vvv2ttt',2009-01-01 00:02:00.100000000,2009,1,'vvv2ttt'
+300,false,3,3,3,30,3.29999995232,30.3,'01/01/09','vvv3ttt',2009-01-01 00:03:00.300000000,2009,1,'vvv3ttt'
+400,true,4,4,4,40,4.40000009537,40.4,'01/01/09','vvv4ttt',2009-01-01 00:04:00.600000000,2009,1,'vvv4ttt'
+500,false,5,5,5,50,5.5,50.5,'01/01/09','vvv5ttt',2009-01-01 00:05:00.100000000,2009,1,'vvv5ttt'
+600,true,6,6,6,60,6.59999990463,60.6,'01/01/09','vvv6ttt',2009-01-01 00:06:00.150000000,2009,1,'vvv6ttt'
+700,false,7,7,7,70,7.69999980927,70.7,'01/01/09','vvv7ttt',2009-01-01 00:07:00.210000000,2009,1,'vvv7ttt'
+800,true,8,8,8,80,8.80000019073,80.8,'01/01/09','vvv8ttt',2009-01-01 00:08:00.280000000,2009,1,'vvv8ttt'
+900,false,9,9,9,90,9.89999961853,90.9,'01/01/09','vvv9ttt',2009-01-01 00:09:00.360000000,2009,1,'vvv9ttt'
+---- TYPES
+INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT,STRING
+====
+---- QUERY
+# Test on star select item with other columns on view
+select string_col, *, int_col from functional.alltypes_view
+order by id limit 10
+---- RESULTS
+'vvv0ttt',0,true,0,0,0,0,0.0,0.0,'01/01/09','vvv0ttt',2009-01-01 00:00:00,2009,1,0
+'vvv1ttt',100,false,1,1,1,10,1.10000002384,10.1,'01/01/09','vvv1ttt',2009-01-01 00:01:00,2009,1,1
+'vvv2ttt',200,true,2,2,2,20,2.20000004768,20.2,'01/01/09','vvv2ttt',2009-01-01 00:02:00.100000000,2009,1,2
+'vvv3ttt',300,false,3,3,3,30,3.29999995232,30.3,'01/01/09','vvv3ttt',2009-01-01 00:03:00.300000000,2009,1,3
+'vvv4ttt',400,true,4,4,4,40,4.40000009537,40.4,'01/01/09','vvv4ttt',2009-01-01 00:04:00.600000000,2009,1,4
+'vvv5ttt',500,false,5,5,5,50,5.5,50.5,'01/01/09','vvv5ttt',2009-01-01 00:05:00.100000000,2009,1,5
+'vvv6ttt',600,true,6,6,6,60,6.59999990463,60.6,'01/01/09','vvv6ttt',2009-01-01 00:06:00.150000000,2009,1,6
+'vvv7ttt',700,false,7,7,7,70,7.69999980927,70.7,'01/01/09','vvv7ttt',2009-01-01 00:07:00.210000000,2009,1,7
+'vvv8ttt',800,true,8,8,8,80,8.80000019073,80.8,'01/01/09','vvv8ttt',2009-01-01 00:08:00.280000000,2009,1,8
+'vvv9ttt',900,false,9,9,9,90,9.89999961853,90.9,'01/01/09','vvv9ttt',2009-01-01 00:09:00.360000000,2009,1,9
+---- TYPES
+STRING,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT,INT
+====
+---- QUERY
+# Test on star select item with other columns on view
+select string_col, *, month, *, int_col from functional.alltypes_view
+order by id limit 10
+---- RESULTS
+'vvv0ttt',0,true,0,0,0,0,0.0,0.0,'01/01/09','vvv0ttt',2009-01-01 00:00:00,2009,1,1,0,true,0,0,0,0,0.0,0.0,'01/01/09','vvv0ttt',2009-01-01 00:00:00,2009,1,0
+'vvv1ttt',100,false,1,1,1,10,1.10000002384,10.1,'01/01/09','vvv1ttt',2009-01-01 00:01:00,2009,1,1,100,false,1,1,1,10,1.10000002384,10.1,'01/01/09','vvv1ttt',2009-01-01 00:01:00,2009,1,1
+'vvv2ttt',200,true,2,2,2,20,2.20000004768,20.2,'01/01/09','vvv2ttt',2009-01-01 00:02:00.100000000,2009,1,1,200,true,2,2,2,20,2.20000004768,20.2,'01/01/09','vvv2ttt',2009-01-01 00:02:00.100000000,2009,1,2
+'vvv3ttt',300,false,3,3,3,30,3.29999995232,30.3,'01/01/09','vvv3ttt',2009-01-01 00:03:00.300000000,2009,1,1,300,false,3,3,3,30,3.29999995232,30.3,'01/01/09','vvv3ttt',2009-01-01 00:03:00.300000000,2009,1,3
+'vvv4ttt',400,true,4,4,4,40,4.40000009537,40.4,'01/01/09','vvv4ttt',2009-01-01 00:04:00.600000000,2009,1,1,400,true,4,4,4,40,4.40000009537,40.4,'01/01/09','vvv4ttt',2009-01-01 00:04:00.600000000,2009,1,4
+'vvv5ttt',500,false,5,5,5,50,5.5,50.5,'01/01/09','vvv5ttt',2009-01-01 00:05:00.100000000,2009,1,1,500,false,5,5,5,50,5.5,50.5,'01/01/09','vvv5ttt',2009-01-01 00:05:00.100000000,2009,1,5
+'vvv6ttt',600,true,6,6,6,60,6.59999990463,60.6,'01/01/09','vvv6ttt',2009-01-01 00:06:00.150000000,2009,1,1,600,true,6,6,6,60,6.59999990463,60.6,'01/01/09','vvv6ttt',2009-01-01 00:06:00.150000000,2009,1,6
+'vvv7ttt',700,false,7,7,7,70,7.69999980927,70.7,'01/01/09','vvv7ttt',2009-01-01 00:07:00.210000000,2009,1,1,700,false,7,7,7,70,7.69999980927,70.7,'01/01/09','vvv7ttt',2009-01-01 00:07:00.210000000,2009,1,7
+'vvv8ttt',800,true,8,8,8,80,8.80000019073,80.8,'01/01/09','vvv8ttt',2009-01-01 00:08:00.280000000,2009,1,1,800,true,8,8,8,80,8.80000019073,80.8,'01/01/09','vvv8ttt',2009-01-01 00:08:00.280000000,2009,1,8
+'vvv9ttt',900,false,9,9,9,90,9.89999961853,90.9,'01/01/09','vvv9ttt',2009-01-01 00:09:00.360000000,2009,1,1,900,false,9,9,9,90,9.89999961853,90.9,'01/01/09','vvv9ttt',2009-01-01 00:09:00.360000000,2009,1,9
+---- TYPES
+STRING,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT,INT,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT,INT
+====
+---- QUERY
+# Test on star select with table ref
+select v.* from functional.alltypes_view v
+order by id limit 10
+---- RESULTS
+0,true,0,0,0,0,0.0,0.0,'01/01/09','vvv0ttt',2009-01-01 00:00:00,2009,1
+100,false,1,1,1,10,1.10000002384,10.1,'01/01/09','vvv1ttt',2009-01-01 00:01:00,2009,1
+200,true,2,2,2,20,2.20000004768,20.2,'01/01/09','vvv2ttt',2009-01-01 00:02:00.100000000,2009,1
+300,false,3,3,3,30,3.29999995232,30.3,'01/01/09','vvv3ttt',2009-01-01 00:03:00.300000000,2009,1
+400,true,4,4,4,40,4.40000009537,40.4,'01/01/09','vvv4ttt',2009-01-01 00:04:00.600000000,2009,1
+500,false,5,5,5,50,5.5,50.5,'01/01/09','vvv5ttt',2009-01-01 00:05:00.100000000,2009,1
+600,true,6,6,6,60,6.59999990463,60.6,'01/01/09','vvv6ttt',2009-01-01 00:06:00.150000000,2009,1
+700,false,7,7,7,70,7.69999980927,70.7,'01/01/09','vvv7ttt',2009-01-01 00:07:00.210000000,2009,1
+800,true,8,8,8,80,8.80000019073,80.8,'01/01/09','vvv8ttt',2009-01-01 00:08:00.280000000,2009,1
+900,false,9,9,9,90,9.89999961853,90.9,'01/01/09','vvv9ttt',2009-01-01 00:09:00.360000000,2009,1
+---- TYPES
+INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT
+====
+---- QUERY
+select v.* from functional.alltypes_view v, functional.alltypestiny t where v.id = t.id
+---- RESULTS
+0,true,0,0,0,0,0.0,0.0,'01/01/09','vvv0ttt',2009-01-01 00:00:00,2009,1
+100,false,1,1,1,10,1.10000002384,10.1,'01/01/09','vvv1ttt',2009-01-01 00:01:00,2009,1
+200,true,2,2,2,20,2.20000004768,20.2,'01/01/09','vvv2ttt',2009-01-01 00:02:00.100000000,2009,1
+300,false,3,3,3,30,3.29999995232,30.3,'01/01/09','vvv3ttt',2009-01-01 00:03:00.300000000,2009,1
+400,true,4,4,4,40,4.40000009537,40.4,'01/01/09','vvv4ttt',2009-01-01 00:04:00.600000000,2009,1
+500,false,5,5,5,50,5.5,50.5,'01/01/09','vvv5ttt',2009-01-01 00:05:00.100000000,2009,1
+600,true,6,6,6,60,6.59999990463,60.6,'01/01/09','vvv6ttt',2009-01-01 00:06:00.150000000,2009,1
+700,false,7,7,7,70,7.69999980927,70.7,'01/01/09','vvv7ttt',2009-01-01 00:07:00.210000000,2009,1
+---- TYPES
+INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT
+====
+---- QUERY
+select v.id, v.*, t.id from functional.alltypes_view v, functional.alltypestiny t where v.id = t.id
+---- RESULTS
+0,0,true,0,0,0,0,0.0,0.0,'01/01/09','vvv0ttt',2009-01-01 00:00:00,2009,1,0
+100,100,false,1,1,1,10,1.10000002384,10.1,'01/01/09','vvv1ttt',2009-01-01 00:01:00,2009,1,100
+200,200,true,2,2,2,20,2.20000004768,20.2,'01/01/09','vvv2ttt',2009-01-01 00:02:00.100000000,2009,1,200
+300,300,false,3,3,3,30,3.29999995232,30.3,'01/01/09','vvv3ttt',2009-01-01 00:03:00.300000000,2009,1,300
+400,400,true,4,4,4,40,4.40000009537,40.4,'01/01/09','vvv4ttt',2009-01-01 00:04:00.600000000,2009,1,400
+500,500,false,5,5,5,50,5.5,50.5,'01/01/09','vvv5ttt',2009-01-01 00:05:00.100000000,2009,1,500
+600,600,true,6,6,6,60,6.59999990463,60.6,'01/01/09','vvv6ttt',2009-01-01 00:06:00.150000000,2009,1,600
+700,700,false,7,7,7,70,7.69999980927,70.7,'01/01/09','vvv7ttt',2009-01-01 00:07:00.210000000,2009,1,700
+---- TYPES
+INT,INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT,INT
 ====
 ---- QUERY
 # Test on local view (CTE). Correctly ignore masking on local view names so the result
@@ -385,6 +662,75 @@ select * from $UNIQUE_DB.masked_tbl;
 INT,BOOLEAN,TINYINT,SMALLINT,INT,BIGINT,FLOAT,DOUBLE,STRING,STRING,TIMESTAMP,INT,INT
 ====
 ---- QUERY
+# Test UPDATE stmt for Kudu target when source is a masked table.
+create table $UNIQUE_DB.masked_kudu (id int primary key, string_col string) stored as kudu;
+insert into $UNIQUE_DB.masked_kudu select id, string_col from alltypestiny;
+insert into $UNIQUE_DB.masked_kudu values (1, NULL), (3, NULL), (5, NULL);
+update k set k.string_col=a.string_col
+from $UNIQUE_DB.masked_kudu k JOIN alltypestiny a ON (k.id=a.id);
+select * from $UNIQUE_DB.masked_kudu;
+---- RESULTS
+0,'0aaa'
+1,'NULL'
+3,'NULL'
+5,'NULL'
+100,'1aaa'
+200,'0aaa'
+300,'1aaa'
+400,'0aaa'
+500,'1aaa'
+600,'0aaa'
+700,'1aaa'
+---- TYPES
+INT, STRING
+====
+---- QUERY
+# Test UPDATE stmt for Iceberg target when source is a masked table.
+create table $UNIQUE_DB.masked_iceberg (id int, string_col string)
+stored as iceberg tblproperties ('format-version'='2');
+insert into $UNIQUE_DB.masked_iceberg select id, string_col from alltypestiny;
+insert into $UNIQUE_DB.masked_iceberg values (1, NULL), (3, NULL), (5, NULL);
+update k set k.string_col=a.string_col
+from $UNIQUE_DB.masked_iceberg k JOIN alltypestiny a ON (k.id=a.id);
+select * from $UNIQUE_DB.masked_iceberg;
+---- RESULTS
+0,'0aaa'
+1,'NULL'
+3,'NULL'
+5,'NULL'
+100,'1aaa'
+200,'0aaa'
+300,'1aaa'
+400,'0aaa'
+500,'1aaa'
+600,'0aaa'
+700,'1aaa'
+---- TYPES
+INT, STRING
+====
+---- QUERY
+# Test MERGE stmt for Iceberg target when source is a masked table.
+merge into $UNIQUE_DB.masked_iceberg target using alltypestiny source on target.id = cast(source.id + 100 as int)
+when matched then update set target.string_col = source.string_col
+when not matched then insert values (cast(source.id + 100 as int), "string");
+select * from $UNIQUE_DB.masked_iceberg;
+---- RESULTS
+0,'0aaa'
+1,'NULL'
+3,'NULL'
+5,'NULL'
+100,'0aaa'
+200,'1aaa'
+300,'0aaa'
+400,'1aaa'
+500,'0aaa'
+600,'1aaa'
+700,'0aaa'
+800,'string'
+---- TYPES
+INT, STRING
+====
+---- QUERY
 # Test on CreateView. Should not mask the columns when used in sql generations.
 create view $UNIQUE_DB.masked_view as select * from alltypestiny;
 show create view $UNIQUE_DB.masked_view;
@@ -414,6 +760,15 @@ select id, bigint_col from functional.alltypesagg order by id limit 10
 ---- TYPES
 INT,BIGINT
 ====
+---- IS_HDFS_ONLY
+---- QUERY
+select * from functional_parquet.iceberg_v2_delete_positional;
+---- RESULTS
+1,'NULL'
+3,'NULL'
+---- TYPES
+BIGINT,STRING
+====
 ---- QUERY
 # IMPALA-10554: Updates on masked tables should be blocked.
 insert into functional.alltypestiny partition(year, month) select * from functional.alltypes
@@ -431,4 +786,209 @@ AuthorizationException: User '$USER' does not have privileges to execute 'INSERT
 compute stats functional.alltypestiny
 ---- CATCH
 AuthorizationException: User '$USER' does not have privileges to execute 'ALTER' on: functional.alltypestiny
+====
+---- QUERY
+# Optimize statement on masked tables should be blocked, because reading and inserting masked data would result in data loss.
+optimize table functional_parquet.iceberg_partitioned
+---- CATCH
+AuthorizationException: User '$USER' does not have privileges to access: functional_parquet.iceberg_partitioned
+====
+---- QUERY
+# Deletes on masked tables should be blocked.
+delete from functional_parquet.iceberg_v2_delete_positional where id = 2;
+---- CATCH
+AuthorizationException: User '$USER' does not have privileges to access: functional_parquet.iceberg_v2_delete_positional
+====
+---- QUERY
+# Updates on masked tables should be blocked.
+update functional_parquet.iceberg_v2_delete_positional set `data` = concat(`data`, 'a');
+---- CATCH
+AuthorizationException: User '$USER' does not have privileges to access: functional_parquet.iceberg_v2_delete_positional
+====
+---- QUERY
+# Merges on masked tables should be blocked.
+merge into functional_parquet.iceberg_v2_delete_positional target using functional_parquet.iceberg_v2_delete_positional source
+on target.id = source.id when matched then update set `data` = concat(source.`data`, 'a');
+---- CATCH
+AuthorizationException: User '$USER' does not have privileges to access: functional_parquet.iceberg_v2_delete_positional
+====
+---- QUERY
+# Select masked INPUT_FILE__NAME plus all cols
+select input__file__name, * from alltypestiny order by id;
+---- RESULTS
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',0,NULL,0,0,0,0,0,0,'01/01/09','0aaa',2009-01-01 00:00:00,2009,1
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',100,NULL,1,1,1,10,1.100000023841858,10.1,'01/01/09','1aaa',2009-01-01 00:01:00,2009,1
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',200,NULL,0,0,0,0,0,0,'02/01/09','0aaa',2009-02-01 00:00:00,2009,2
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',300,NULL,1,1,1,10,1.100000023841858,10.1,'02/01/09','1aaa',2009-02-01 00:01:00,2009,2
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',400,NULL,0,0,0,0,0,0,'03/01/09','0aaa',2009-03-01 00:00:00,2009,3
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',500,NULL,1,1,1,10,1.100000023841858,10.1,'03/01/09','1aaa',2009-03-01 00:01:00,2009,3
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',600,NULL,0,0,0,0,0,0,'04/01/09','0aaa',2009-04-01 00:00:00,2009,4
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',700,NULL,1,1,1,10,1.100000023841858,10.1,'04/01/09','1aaa',2009-04-01 00:01:00,2009,4
+---- TYPES
+STRING, INT, BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT, DOUBLE, STRING, STRING, TIMESTAMP, INT, INT
+====
+---- QUERY
+# Select masked INPUT_FILE__NAME plus all cols
+select int_col, input__file__name, * from alltypestiny order by id;
+---- RESULTS
+0,regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',0,NULL,0,0,0,0,0,0,'01/01/09','0aaa',2009-01-01 00:00:00,2009,1
+1,regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',100,NULL,1,1,1,10,1.100000023841858,10.1,'01/01/09','1aaa',2009-01-01 00:01:00,2009,1
+0,regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',200,NULL,0,0,0,0,0,0,'02/01/09','0aaa',2009-02-01 00:00:00,2009,2
+1,regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',300,NULL,1,1,1,10,1.100000023841858,10.1,'02/01/09','1aaa',2009-02-01 00:01:00,2009,2
+0,regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',400,NULL,0,0,0,0,0,0,'03/01/09','0aaa',2009-03-01 00:00:00,2009,3
+1,regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',500,NULL,1,1,1,10,1.100000023841858,10.1,'03/01/09','1aaa',2009-03-01 00:01:00,2009,3
+0,regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',600,NULL,0,0,0,0,0,0,'04/01/09','0aaa',2009-04-01 00:00:00,2009,4
+1,regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',700,NULL,1,1,1,10,1.100000023841858,10.1,'04/01/09','1aaa',2009-04-01 00:01:00,2009,4
+---- TYPES
+INT, STRING, INT, BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT, DOUBLE, STRING, STRING, TIMESTAMP, INT, INT
+====
+---- QUERY
+# Select masked INPUT_FILE__NAME plus a few cols
+select input__file__name, id, bool_col from alltypestiny order by id;
+---- RESULTS
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',0,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',100,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',200,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',300,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',400,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',500,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',600,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',700,NULL
+---- TYPES
+STRING, INT, BOOLEAN
+====
+---- QUERY
+# Select masked INPUT_FILE__NAME from a VIEW
+select input__file__name, id, bool_col from (
+    select input__file__name, * from alltypestiny) v
+order by id;
+---- RESULTS
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',0,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',100,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',200,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',300,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',400,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',500,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',600,NULL
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',700,NULL
+---- TYPES
+STRING, INT, BOOLEAN
+====
+---- QUERY
+# Select masked INPUT_FILE__NAME and * from a VIEW.
+# This doubles input__file__name in the output, as the outer '*' includes v.input__file__name.
+select input__file__name, * from (select input__file__name, * from alltypestiny) v order by id;
+---- RESULTS
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',0,NULL,0,0,0,0,0,0,'01/01/09','0aaa',2009-01-01 00:00:00,2009,1
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',100,NULL,1,1,1,10,1.100000023841858,10.1,'01/01/09','1aaa',2009-01-01 00:01:00,2009,1
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',200,NULL,0,0,0,0,0,0,'02/01/09','0aaa',2009-02-01 00:00:00,2009,2
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',300,NULL,1,1,1,10,1.100000023841858,10.1,'02/01/09','1aaa',2009-02-01 00:01:00,2009,2
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',400,NULL,0,0,0,0,0,0,'03/01/09','0aaa',2009-03-01 00:00:00,2009,3
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',500,NULL,1,1,1,10,1.100000023841858,10.1,'03/01/09','1aaa',2009-03-01 00:01:00,2009,3
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',600,NULL,0,0,0,0,0,0,'04/01/09','0aaa',2009-04-01 00:00:00,2009,4
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',700,NULL,1,1,1,10,1.100000023841858,10.1,'04/01/09','1aaa',2009-04-01 00:01:00,2009,4
+---- TYPES
+STRING, STRING, INT, BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT, DOUBLE, STRING, STRING, TIMESTAMP, INT, INT
+====
+---- QUERY
+# Select unmasked INPUT__FILE__NAME and masked table cols
+select input__file__name, id, string_col from alltypes
+order by id
+limit 10;
+---- RESULTS
+'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt',0,'0ttt'
+'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt',100,'1ttt'
+'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt',200,'2ttt'
+'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt',300,'3ttt'
+'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt',400,'4ttt'
+'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt',500,'5ttt'
+'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt',600,'6ttt'
+'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt',700,'7ttt'
+'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt',800,'8ttt'
+'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt',900,'9ttt'
+---- TYPES
+STRING, INT, STRING
+====
+---- QUERY
+# Select unmasked INPUT__FILE__NAME and all table cols
+select *, input__file__name from alltypes
+order by id
+limit 10;
+---- RESULTS
+0,true,0,0,0,0,0,0,'01/01/09','0ttt',2009-01-01 00:00:00,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+100,false,1,1,1,10,1.100000023841858,10.1,'01/01/09','1ttt',2009-01-01 00:01:00,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+200,true,2,2,2,20,2.200000047683716,20.2,'01/01/09','2ttt',2009-01-01 00:02:00.100000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+300,false,3,3,3,30,3.299999952316284,30.3,'01/01/09','3ttt',2009-01-01 00:03:00.300000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+400,true,4,4,4,40,4.400000095367432,40.4,'01/01/09','4ttt',2009-01-01 00:04:00.600000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+500,false,5,5,5,50,5.5,50.5,'01/01/09','5ttt',2009-01-01 00:05:00.100000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+600,true,6,6,6,60,6.599999904632568,60.59999999999999,'01/01/09','6ttt',2009-01-01 00:06:00.150000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+700,false,7,7,7,70,7.699999809265137,70.7,'01/01/09','7ttt',2009-01-01 00:07:00.210000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+800,true,8,8,8,80,8.800000190734863,80.8,'01/01/09','8ttt',2009-01-01 00:08:00.280000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+900,false,9,9,9,90,9.899999618530273,90.89999999999999,'01/01/09','9ttt',2009-01-01 00:09:00.360000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+---- TYPES
+INT, BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT, DOUBLE, STRING, STRING, TIMESTAMP, INT, INT, STRING
+====
+---- QUERY
+# Select unmasked INPUT__FILE__NAME and all table cols from a VIEW
+# The outer '*' must include input__file__name in this case.
+select * from (select *, input__file__name from alltypes) v
+order by id
+limit 10;
+---- RESULTS
+0,true,0,0,0,0,0,0,'01/01/09','0ttt',2009-01-01 00:00:00,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+100,false,1,1,1,10,1.100000023841858,10.1,'01/01/09','1ttt',2009-01-01 00:01:00,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+200,true,2,2,2,20,2.200000047683716,20.2,'01/01/09','2ttt',2009-01-01 00:02:00.100000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+300,false,3,3,3,30,3.299999952316284,30.3,'01/01/09','3ttt',2009-01-01 00:03:00.300000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+400,true,4,4,4,40,4.400000095367432,40.4,'01/01/09','4ttt',2009-01-01 00:04:00.600000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+500,false,5,5,5,50,5.5,50.5,'01/01/09','5ttt',2009-01-01 00:05:00.100000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+600,true,6,6,6,60,6.599999904632568,60.59999999999999,'01/01/09','6ttt',2009-01-01 00:06:00.150000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+700,false,7,7,7,70,7.699999809265137,70.7,'01/01/09','7ttt',2009-01-01 00:07:00.210000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+800,true,8,8,8,80,8.800000190734863,80.8,'01/01/09','8ttt',2009-01-01 00:08:00.280000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+900,false,9,9,9,90,9.899999618530273,90.89999999999999,'01/01/09','9ttt',2009-01-01 00:09:00.360000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+---- TYPES
+INT, BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT, DOUBLE, STRING, STRING, TIMESTAMP, INT, INT, STRING
+====
+---- QUERY
+# Do a join between masked tables
+select att.input__file__name, aty.input__file__name from alltypestiny att, alltypes aty
+where att.id=aty.id;
+---- RESULTS
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt','$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt','$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt','$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt','$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt','$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt','$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt','$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt','$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+---- TYPES
+STRING, STRING
+====
+---- QUERY
+# Do a join between masked tables, and select every with *.
+select att.input__file__name, *, aty.input__file__name from alltypestiny att, alltypes aty
+where att.id=aty.id;
+---- RESULTS
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',0,NULL,0,0,0,0,0,0,'01/01/09','0aaa',2009-01-01 00:00:00,2009,1,0,true,0,0,0,0,0,0,'01/01/09','0ttt',2009-01-01 00:00:00,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090101.txt',100,NULL,1,1,1,10,1.100000023841858,10.1,'01/01/09','1aaa',2009-01-01 00:01:00,2009,1,100,false,1,1,1,10,1.100000023841858,10.1,'01/01/09','1ttt',2009-01-01 00:01:00,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',200,NULL,0,0,0,0,0,0,'02/01/09','0aaa',2009-02-01 00:00:00,2009,2,200,true,2,2,2,20,2.200000047683716,20.2,'01/01/09','2ttt',2009-01-01 00:02:00.100000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090201.txt',300,NULL,1,1,1,10,1.100000023841858,10.1,'02/01/09','1aaa',2009-02-01 00:01:00,2009,2,300,false,3,3,3,30,3.299999952316284,30.3,'01/01/09','3ttt',2009-01-01 00:03:00.300000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',400,NULL,0,0,0,0,0,0,'03/01/09','0aaa',2009-03-01 00:00:00,2009,3,400,true,4,4,4,40,4.400000095367432,40.4,'01/01/09','4ttt',2009-01-01 00:04:00.600000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090301.txt',500,NULL,1,1,1,10,1.100000023841858,10.1,'03/01/09','1aaa',2009-03-01 00:01:00,2009,3,500,false,5,5,5,50,5.5,50.5,'01/01/09','5ttt',2009-01-01 00:05:00.100000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',600,NULL,0,0,0,0,0,0,'04/01/09','0aaa',2009-04-01 00:00:00,2009,4,600,true,6,6,6,60,6.599999904632568,60.59999999999999,'01/01/09','6ttt',2009-01-01 00:06:00.150000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+regex:'.*/xxxx-xxxxxxxxx/xxxxxxxxxxxx/xxxx=xxxx/xxxxx=x/090401.txt',700,NULL,1,1,1,10,1.100000023841858,10.1,'04/01/09','1aaa',2009-04-01 00:01:00,2009,4,700,false,7,7,7,70,7.699999809265137,70.7,'01/01/09','7ttt',2009-01-01 00:07:00.210000000,2009,1,'$NAMENODE/test-warehouse/alltypes/year=2009/month=1/090101.txt'
+---- TYPES
+STRING, INT, BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT, DOUBLE, STRING, STRING, TIMESTAMP, INT, INT, INT, BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT, DOUBLE, STRING, STRING, TIMESTAMP, INT, INT, STRING
+====
+---- QUERY
+# Query table with invalid masking function
+SELECT * FROM functional_parquet.alltypessmall;
+---- CATCH
+AnalysisException: An error occurred after query rewrite: Could not resolve column/field reference: 'invalid_col'
+====
+---- QUERY
+# CTAS statement with invalid masking function
+CREATE TABLE $UNIQUE_DB.invalid_masked_tbl AS SELECT * FROM functional_parquet.alltypessmall;
+---- CATCH
+AnalysisException: An error occurred after query rewrite: Could not resolve column/field reference: 'invalid_col'
 ====

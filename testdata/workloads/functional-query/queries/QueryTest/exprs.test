@@ -1399,6 +1399,77 @@ and cast('2010-01-01 01:40:00' as timestamp)
 bigint
 ====
 ---- QUERY
+# Regression tests for IMPALA-8054
+select count(*) from functional.alltypes where 10 between float_col and bigint_col;
+---- RESULTS
+6570
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where !(10 between null and bigint_col);
+---- RESULTS
+730
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where !(5 between float_col and null);
+---- RESULTS
+3650
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where 10 between null and null;
+---- RESULTS
+0
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where null between null and null;
+---- RESULTS
+0
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where 10 not between float_col and bigint_col;
+---- RESULTS
+730
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where 10 not between null and bigint_col;
+---- RESULTS
+730
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where 5 not between float_col and null;
+---- RESULTS
+3650
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where 10 not between null and null;
+---- RESULTS
+0
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from functional.alltypes where null not between null and null;
+---- RESULTS
+0
+---- TYPES
+bigint
+====
+---- QUERY
 # Test pid() function, this should only return one pid. If pid() were not implemented
 # correctly via the global state variable, this could return multiple pids.
 select pid() p from functional.alltypes
@@ -2973,12 +3044,12 @@ timestamp
 ---- QUERY
 select to_timestamp('01:01:01', 'HH:mm:ss');
 ---- CATCH
-Query aborted:Bad date/time conversion format: HH:mm:ss
+Bad date/time conversion format: HH:mm:ss
 ====
 ---- QUERY
 select to_timestamp('01:01:01.123', 'HH:mm:ss.SSS');
 ---- CATCH
-Query aborted:Bad date/time conversion format: HH:mm:ss
+Bad date/time conversion format: HH:mm:ss
 ====
 ---- QUERY
 select from_unixtime(1382337792,"HH:mm:ss.SSSSSSSSS");
@@ -3200,4 +3271,111 @@ select 'escape' like 'escap_'
 true
 ---- TYPES
 BOOLEAN
+====
+---- QUERY: IMPALA-955
+# Returns number of bytes in a byte string.
+select bytes(string_col), bytes(date_string_col) from functional.alltypestiny;
+---- RESULTS
+1,8
+1,8
+1,8
+1,8
+1,8
+1,8
+1,8
+1,8
+---- TYPES
+INT, INT
+====
+---- QUERY
+# Test for IMPALA-12565 (UDF)
+select pmod(0, 0), pmod(0, 0.0);
+---- RESULTS
+NULL,NULL
+---- TYPES
+BIGINT, DOUBLE
+====
+---- QUERY: IMPALA-12562
+# Convert double to string
+select cast(round(cast(1.33 as double), 2) as string);
+---- RESULTS
+'1.33'
+---- TYPES
+string
+====
+---- QUERY: IMPALA-12562
+# Convert double to string
+select cast(round(cast(1.33 as double), 1) as string);
+---- RESULTS
+'1.3'
+---- TYPES
+string
+====
+---- QUERY: IMPALA-12562
+# Convert double to string
+select cast(round(cast(1.33 as double), 7) as string);
+---- RESULTS
+'1.33'
+---- TYPES
+string
+====
+---- QUERY: IMPALA-12562
+# Convert float to string
+select cast(round(cast(1.33 as float), 2) as string);
+---- RESULTS
+'1.33'
+---- TYPES
+string
+====
+---- QUERY: IMPALA-12562
+# Convert float to string
+select cast(round(cast(1.33 as float), 1) as string);
+---- RESULTS
+'1.3'
+---- TYPES
+string
+====
+---- QUERY: IMPALA-12562
+# Convert float to string
+select cast(round(cast(1.33 as float), 7) as string);
+---- RESULTS
+'1.33'
+---- TYPES
+string
+====
+---- QUERY: IMPALA-12562
+select cast(round(sum(double_col)/count(1),2) as string) from alltypes;
+---- RESULTS
+'45.45'
+---- TYPES
+string
+====
+---- QUERY: IMPALA-12562
+select cast(round(1/3, 0) as string);
+---- RESULTS
+'0'
+---- TYPES
+string
+====
+---- QUERY: IMPALA-12562
+select cast(round(1/3, 1) as string);
+---- RESULTS
+'0.3'
+---- TYPES
+string
+====
+---- QUERY: IMPALA-12562
+select cast(round(1/3, 17) as string);
+---- RESULTS
+'0.33333333333333331'
+---- TYPES
+string
+====
+---- QUERY: IMPALA-12562
+# Doubles have up to 17 digits of precision
+select cast(round(1/3, 20) as string);
+---- RESULTS
+'0.33333333333333331'
+---- TYPES
+string
 ====

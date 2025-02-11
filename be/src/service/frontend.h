@@ -21,6 +21,7 @@
 #include <jni.h>
 
 #include "common/status.h"
+#include "gen-cpp/CatalogService_types.h"
 #include "gen-cpp/Frontend_types.h"
 #include "gen-cpp/ImpalaHiveServer2Service.h"
 #include "gen-cpp/ImpalaService.h"
@@ -59,8 +60,16 @@ class Frontend {
   /// Get the metrics from the catalog used by this frontend.
   Status GetCatalogMetrics(TGetCatalogMetricsResult* resp);
 
-  /// Returns all matching table names, per Hive's "SHOW TABLES <pattern>". Each
-  /// table name returned is unqualified.
+  /// Returns all matching table names, per Hive's "SHOW TABLES <pattern>" regardless of
+  /// the table type.
+  Status GetTableNames(const std::string& db, const std::string* pattern,
+      const TSessionState* session, TGetTablesResult* table_names);
+
+  /// Returns all matching table names, per Hive's "SHOW TABLES <pattern>" such that each
+  /// corresponds to a table whose type is in table_types for a non-empty table_types.
+  /// Each table name returned is unqualified. If table_types is empty, then all types of
+  /// tables will be considered when their table names are matched against the pattern.
+  ///
   /// If pattern is NULL, match all tables otherwise match only those tables that
   /// match the pattern string. Patterns are "p1|p2|p3" where | denotes choice,
   /// and each pN may contain wildcards denoted by '*' which match all strings.
@@ -70,7 +79,15 @@ class Frontend {
   /// the session should be set to NULL which will skip privilege checks returning all
   /// results.
   Status GetTableNames(const std::string& db, const std::string* pattern,
-      const TSessionState* session, TGetTablesResult* table_names);
+      const TSessionState* session, const std::set<TImpalaTableType::type>& table_types,
+      TGetTablesResult* table_names);
+
+  /// Returns the list of metadata tables for the given table that match the pattern.
+  /// 'pattern' and 'session' are used as in GetTableNames(). Currently only Iceberg
+  /// metadata tables are supported.
+  Status GetMetadataTableNames(const string& db, const string& table_name,
+      const string* pattern, const TSessionState* session,
+      TGetTablesResult* metadata_table_names);
 
   /// Return all databases matching the optional argument 'pattern'.
   /// If pattern is NULL, match all databases otherwise match only those databases that
@@ -118,6 +135,10 @@ class Frontend {
   /// Returns OK if the operation was successful, otherwise a Status object with
   /// information on the error will be returned.
   Status GetCatalogObject(const TCatalogObject& request, TCatalogObject* response);
+
+  /// Gets the Java object of a Catalog table object. It can be used to call Java methods
+  /// of the Catalog Table object.
+  Status GetCatalogTable(const TTableName& table_name, jobject *result);
 
   /// Call FE to get the roles.
   Status ShowRoles(const TShowRolesParams& params, TShowRolesResult* result);
@@ -222,7 +243,14 @@ class Frontend {
   /// Commits Kudu transaction with the given query id.
   Status CommitKuduTransaction(const TUniqueId& query_id);
 
+  /// Convert external Hdfs tables to Iceberg tables
+  Status Convert(const TExecRequest& request);
+
+  /// Get secret from jceks key store for the input secret_key.
+  Status GetSecretFromKeyStore(const string& secret_key, string* secret);
+
  private:
+  jclass fe_class_; // org.apache.impala.service.JniFrontend class
   jobject fe_;  // instance of org.apache.impala.service.JniFrontend
   jmethodID create_exec_request_id_;  // JniFrontend.createExecRequest()
   jmethodID get_explain_plan_id_;  // JniFrontend.getExplainPlan()
@@ -231,9 +259,10 @@ class Frontend {
   jmethodID get_hadoop_groups_id_;  // JniFrontend.getHadoopGroups()
   jmethodID check_config_id_; // JniFrontend.checkConfiguration()
   jmethodID update_catalog_cache_id_; // JniFrontend.updateCatalogCache(byte[][])
-  jmethodID update_membership_id_; // JniFrontend.updateMembership()
+  jmethodID update_membership_id_; // JniFrontend.updateExecutorMembership()
   jmethodID get_catalog_metrics_id_; // JniFrontend.getCatalogMetrics()
   jmethodID get_table_names_id_; // JniFrontend.getTableNames
+  jmethodID get_metadata_table_names_id_; // JniFrontend.getMetadataTableNames
   jmethodID describe_db_id_; // JniFrontend.describeDb
   jmethodID describe_table_id_; // JniFrontend.describeTable
   jmethodID show_create_table_id_; // JniFrontend.showCreateTable
@@ -243,6 +272,7 @@ class Frontend {
   jmethodID get_functions_id_; // JniFrontend.getFunctions
   jmethodID get_table_history_id_; // JniFrontend.getTableHistory
   jmethodID get_catalog_object_id_; // JniFrontend.getCatalogObject
+  jmethodID get_catalog_table_id_; // JniFrontend.getCatalogTable
   jmethodID show_roles_id_; // JniFrontend.getRoles
   jmethodID get_principal_privileges_id_; // JniFrontend.getPrincipalPrivileges
   jmethodID exec_hs2_metadata_op_id_; // JniFrontend.execHiveServer2MetadataOp
@@ -260,6 +290,8 @@ class Frontend {
   jmethodID validate_saml2_bearer_id_; // JniFrontend.validateSaml2Bearer()
   jmethodID abort_kudu_txn_; // JniFrontend.abortKuduTransaction()
   jmethodID commit_kudu_txn_; // JniFrontend.commitKuduTransaction()
+  jmethodID convertTable; // JniFrontend.convertTable
+  jmethodID get_secret_from_key_store_; // JniFrontend.getSecretFromKeyStore()
 
   // Only used for testing.
   jmethodID build_test_descriptor_table_id_; // JniFrontend.buildTestDescriptorTable()

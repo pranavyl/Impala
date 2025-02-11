@@ -68,6 +68,7 @@ import org.apache.impala.thrift.TPrivilege;
 import org.apache.impala.thrift.TPrivilegeLevel;
 import org.apache.impala.thrift.TPrivilegeScope;
 import org.apache.impala.thrift.TTableName;
+import org.apache.impala.util.NoOpEventSequence;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
@@ -154,6 +155,7 @@ public class CatalogTest {
     assertNotNull(catalog_.getOrLoadTable("functional", "uservisitssmall", "test", null));
     assertNotNull(catalog_.getOrLoadTable("functional", "view_view", "test", null));
     assertNotNull(catalog_.getOrLoadTable("functional", "date_tbl", "test", null));
+    assertNotNull(catalog_.getOrLoadTable("functional", "binary_tbl", "test", null));
     // IMP-163 - table with string partition column does not load if there are partitions
     assertNotNull(
         catalog_.getOrLoadTable("functional", "StringPartitionKey", "test", null));
@@ -331,6 +333,10 @@ public class CatalogTest {
         new String[] {"date_part", "id_col", "date_col"},
         new Type[] {Type.DATE, Type.INT, Type.DATE});
 
+    checkTableCols(functionalDb, "binary_tbl", 0,
+        new String[] {"id", "string_col", "binary_col"},
+        new Type[] {Type.INT, Type.STRING, Type.BINARY});
+
     // case-insensitive lookup
     assertEquals(catalog_.getOrLoadTable("functional", "alltypes", "test", null),
         catalog_.getOrLoadTable("functional", "AllTypes", "test", null));
@@ -359,7 +365,7 @@ public class CatalogTest {
     stats.reset();
     catalog_.invalidateTable(new TTableName("functional", "alltypes"),
         /*tblWasRemoved=*/new Reference<Boolean>(),
-        /*dbWasAdded=*/new Reference<Boolean>());
+        /*dbWasAdded=*/new Reference<Boolean>(), NoOpEventSequence.INSTANCE);
 
     HdfsTable table = (HdfsTable)catalog_.getOrLoadTable("functional", "AllTypes",
         "test", null);
@@ -385,7 +391,7 @@ public class CatalogTest {
 
     // Now test REFRESH on the table...
     stats.reset();
-    catalog_.reloadTable(table, "test");
+    catalog_.reloadTable(table, "test", NoOpEventSequence.INSTANCE);
 
     // Again, we expect only one getFileStatus call, for the top-level directory.
     assertEquals(1L, (long)opsCounts.getLong(GET_FILE_STATUS));
@@ -404,7 +410,7 @@ public class CatalogTest {
         new TPartitionKeyValue("year", "2010"),
         new TPartitionKeyValue("month", "10"));
     catalog_.reloadPartition(table, partitionSpec, new Reference<>(false),
-        CatalogObject.ThriftObjectType.NONE, "test");
+        CatalogObject.ThriftObjectType.NONE, "test", NoOpEventSequence.INSTANCE);
     assertEquals(0L, (long)opsCounts.getLong(GET_FILE_BLOCK_LOCS));
 
     // Loading or reloading an unpartitioned table with some files in it should not make
@@ -414,7 +420,7 @@ public class CatalogTest {
         "functional", "alltypesaggmultifilesnopart", "test", null);
     assertEquals(0L, (long)opsCounts.getLong(GET_FILE_BLOCK_LOCS));
     stats.reset();
-    catalog_.reloadTable(unpartTable, "test");
+    catalog_.reloadTable(unpartTable, "test", NoOpEventSequence.INSTANCE);
     assertEquals(0L, (long)opsCounts.getLong(GET_FILE_BLOCK_LOCS));
 
     // Simulate an empty partition, which will trigger the full
@@ -427,7 +433,7 @@ public class CatalogTest {
     table.updatePartition(partBuilder);
     stats.reset();
     catalog_.reloadPartition(table, partitionSpec, new Reference<>(false),
-        CatalogObject.ThriftObjectType.NONE, "test");
+        CatalogObject.ThriftObjectType.NONE, "test", NoOpEventSequence.INSTANCE);
 
     // Should not scan the directory file-by-file, should use a single
     // listLocatedStatus() to get the whole directory (partition)
@@ -605,6 +611,27 @@ public class CatalogTest {
     assertTrue(stringCol.getStats().getAvgSerializedSize() > 0);
     assertTrue(stringCol.getStats().getMaxSize() > 0);
     assertFalse(stringCol.getStats().hasNulls());
+
+    // DATE and BINARY types are missing from alltypesagg, so date_tbl and binary_tbl
+    // are also checked.
+    HdfsTable dateTable = (HdfsTable) catalog_.getOrLoadTable("functional", "date_tbl",
+        "test", null);
+
+    Column dateCol = dateTable.getColumn("date_col");
+    assertEquals(dateCol.getStats().getAvgSerializedSize(),
+        PrimitiveType.DATE.getSlotSize(), 0.0001);
+    assertEquals(dateCol.getStats().getMaxSize(), PrimitiveType.DATE.getSlotSize());
+    assertTrue(dateCol.getStats().hasNulls());
+
+    HdfsTable binaryTable = (HdfsTable) catalog_.getOrLoadTable("functional",
+         "binary_tbl", "test", null);
+
+    Column binaryCol = binaryTable.getColumn("binary_col");
+    assertTrue(binaryCol.getStats().getAvgSerializedSize() > 0);
+    assertTrue(binaryCol.getStats().getMaxSize() > 0);
+    assertTrue(binaryCol.getStats().hasNulls());
+    // NDV is not calculated for BINARY columns
+    assertFalse(binaryCol.getStats().hasNumDistinctValues());
   }
 
   /**
@@ -710,8 +737,8 @@ public class CatalogTest {
     // Partitioned table with stats. Invalidate the table prior to fetching.
     Reference<Boolean> tblWasRemoved = new Reference<Boolean>();
     Reference<Boolean> dbWasAdded = new Reference<Boolean>();
-    catalog_.invalidateTable(
-        new TTableName("functional", "alltypesagg"), tblWasRemoved, dbWasAdded);
+    catalog_.invalidateTable(new TTableName("functional", "alltypesagg"),
+        tblWasRemoved, dbWasAdded, NoOpEventSequence.INSTANCE);
     expectStatistics("functional", "alltypesagg", 11);
 
     // Unpartitioned table with no stats.

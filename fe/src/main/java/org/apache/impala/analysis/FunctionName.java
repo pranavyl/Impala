@@ -18,9 +18,13 @@
 package org.apache.impala.analysis;
 
 import java.util.List;
+import java.util.Objects;
 
+import org.apache.commons.lang3.StringUtils;
+import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FeDb;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TFunctionName;
 
@@ -71,8 +75,15 @@ public class FunctionName {
     return fn_.equalsIgnoreCase(o.fn_);
   }
 
+  @Override
+  public int hashCode() {
+    return Objects.hash(getClass(), db_.toLowerCase(), fn_.toLowerCase());
+  }
+
   public String getDb() { return db_; }
+  public void setDb(String db) { db_ = db; }
   public String getFunction() { return fn_; }
+  public void setFunction(String fn) { fn_ = fn; }
   public boolean isFullyQualified() { return db_ != null; }
   public boolean isBuiltin() { return isBuiltin_; }
   public List<String> getFnNamePath() { return fnNamePath_; }
@@ -99,8 +110,13 @@ public class FunctionName {
    * - When preferBuiltinsDb is true:
    *   - If the function name specified has the same name as a built-in function,
    *     set the database name to _impala_builtins.
+   *   - Else if the query option of 'FALLBACK_DB_FOR_FUNCTIONS' being set and the
+   *     function exists in fallback database, set the database name to fallback
+   *     database.
    *   - Else, set the database name to the current session DB name.
    * - When preferBuiltinsDb is false: set the database name to current session DB name.
+   *   For CREATE/DROP FUNCTION and GRANT/REVOKE <privilege> ON USER_DEFINED_FN
+   *   statements, preferBuiltinsDb is false.
    */
   public void analyze(Analyzer analyzer, boolean preferBuiltinsDb)
       throws AnalysisException {
@@ -123,6 +139,8 @@ public class FunctionName {
     if (!isFullyQualified()) {
       if (preferBuiltinsDb && builtinDb.containsFunction(fn_)) {
         db_ = BuiltinsDb.NAME;
+      } else if (preferBuiltinsDb && fallbackDbContainsFn(analyzer)) {
+        db_ = analyzer.getFallbackDbForFunctions();
       } else {
         db_ = analyzer.getDefaultDb();
       }
@@ -131,6 +149,20 @@ public class FunctionName {
     isBuiltin_ = db_.equals(BuiltinsDb.NAME) &&
         builtinDb.containsFunction(fn_);
     isAnalyzed_ = true;
+  }
+
+  private boolean fallbackDbContainsFn(Analyzer analyzer) throws AnalysisException {
+    String dbName = analyzer.getFallbackDbForFunctions();
+    if (StringUtils.isEmpty(dbName)) {
+      return false;
+    }
+    // Execute a UDF of the fallback database in a SELECT statement, the requesting user
+    // has be to granted a) the SELECT privilege on the UDF, and b) any one of the
+    // INSERT, REFRESH, SELECT privileges on the fallback database.
+    analyzer.registerPrivReq(builder ->
+        builder.allOf(Privilege.SELECT).onFunction(dbName, getFunction()).build());
+    FeDb feDb = analyzer.getDb(dbName, Privilege.VIEW_METADATA, false);
+    return feDb != null && feDb.containsFunction(fn_);
   }
 
   private void analyzeFnNamePath() throws AnalysisException {
@@ -160,5 +192,9 @@ public class FunctionName {
 
   public static FunctionName fromThrift(TFunctionName fnName) {
     return new FunctionName(fnName.getDb_name(), fnName.getFunction_name());
+  }
+
+  public static String thriftToString(TFunctionName fnName) {
+    return fromThrift(fnName).toString();
   }
 }

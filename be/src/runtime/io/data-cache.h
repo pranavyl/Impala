@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <gtest/gtest_prod.h>
+#include <boost/thread/pthread/shared_mutex.hpp>
 
 #include "common/status.h"
 #include "util/cache/cache.h"
@@ -123,10 +124,10 @@ class DataCache {
   /// an optimized mode that skips all file operations and only does the metadata
   /// operations. This is used to replay the access trace and compare different cache
   /// configurations. See data-cache-trace.h
-  explicit DataCache(const std::string config, bool trace_replay = false)
-    : config_(config), trace_replay_(trace_replay) { }
+  explicit DataCache(
+      std::string config, int32_t num_async_write_threads = 0, bool trace_replay = false);
 
-  ~DataCache() { ReleaseResources(); }
+  ~DataCache();
 
   /// Parses the configuration string, initializes all partitions in the cache by
   /// checking for storage space available and creates a backing file for caching.
@@ -190,14 +191,32 @@ class DataCache {
   /// partitions before verifying their sizes. Used by test only.
   Status CloseFilesAndVerifySizes();
 
+  /// Set the data cache to read-only. After this function is called, all Store() calls
+  /// return false immediately, and for ongoing Store(), this function blocks until they
+  /// are complete.
+  /// Return current number of writes after read-only set for testing.
+  int64_t SetDataCacheReadOnly();
+
+  /// Revoke the data cache read-only.
+  /// Return current number of writes after read-only revoked for testing.
+  int64_t RevokeDataCacheReadOnly();
+
+  /// Dump the metadata of each cache partition to the same directory on disk as the cache
+  /// files, and the dump file can be reloaded back when data cache init. Note that the
+  /// data cache will set to read-only mode before the data is dumped.
+  Status Dump();
+
  private:
   friend class DataCacheBaseTest;
   friend class DataCacheTest;
-  FRIEND_TEST(DataCacheTest, TestAccessTrace);
+  FRIEND_TEST(DataCacheTest, RotationalDisk);
+  FRIEND_TEST(DataCacheTest, NonRotationalDisk);
+  FRIEND_TEST(DataCacheTest, InvalidDisk);
 
   class CacheFile;
   struct CacheKey;
   class CacheEntry;
+  class StoreTask;
 
   /// An implementation of a cache partition. Each partition maintains its own set of
   /// cache keys in a LRU cache.
@@ -217,7 +236,7 @@ class DataCache {
     /// - removes any stale backing file in this partition
     /// - checks if there is enough storage space
     /// - checks if the filesystem supports hole punching
-    /// - creates an empty backing file.
+    /// - try to load dump file or creates an empty backing file.
     ///
     /// Returns error if there is any of the above steps fails. Returns OK otherwise.
     Status Init();
@@ -261,10 +280,23 @@ class DataCache {
     /// --data_cache_max_opened_files.
     void DeleteOldFiles();
 
+    /// Set all cache files of this partition to read-only.
+    void SetCacheFilesReadOnly();
+
+    /// Revoke all cache files of this partition read-only.
+    void RevokeCacheFilesReadOnly();
+
+    /// Dump the 'meta_cache_' and 'cache_files_' of this partition as dump file.
+    Status Dump();
+
    private:
     friend class DataCacheBaseTest;
     friend class DataCacheTest;
-    FRIEND_TEST(DataCacheTest, TestAccessTrace);
+    FRIEND_TEST(DataCacheTest, RotationalDisk);
+    FRIEND_TEST(DataCacheTest, NonRotationalDisk);
+    FRIEND_TEST(DataCacheTest, InvalidDisk);
+
+    class DumpData;
 
     /// Index of this partition. This is used for naming metrics or other items that
     /// need separate values for each partition. It does not impact cache behavior.
@@ -279,6 +311,9 @@ class DataCache {
     /// Maximum number of opened files allowed in a partition.
     const int max_opened_files_;
 
+    /// Device-specific write concurrency
+    int32_t data_cache_write_concurrency_ = 1;
+
     /// Whether this is only a trace replay. For trace replay, this is only
     /// performing the metadata operations to determine the hit/miss rate.
     /// There is no need to perform any filesystem operations.
@@ -291,8 +326,15 @@ class DataCache {
     /// The prefix of the names of the cache backing files.
     static const char* CACHE_FILE_PREFIX;
 
+    /// The file name of the data cache dump file.
+    static const char* DUMP_FILE_NAME;
+
     /// Protects the following fields.
     SpinLock lock_;
+
+    /// If it is true, no file deletion should take place. Set before the files are set to
+    /// read only.
+    bool files_readonly_ = false;
 
     /// Index into 'cache_files_' of the oldest opened file.
     int oldest_opened_file_ = -1;
@@ -336,9 +378,10 @@ class DataCache {
     /// error on failure.
     Status CreateCacheFile();
 
-    /// Utility function to delete cache files left over from previous runs of Impala.
+    /// Utility function to delete cache files that are not tracked by cache_files_ and
+    /// may have been left over from previous runs of Impala.
     /// Returns error on failure.
-    Status DeleteExistingFiles() const;
+    Status DeleteUntrackedFiles() const;
 
     /// Utility function for computing the checksum of 'buffer' with length 'buffer_len'.
     static uint64_t Checksum(const uint8_t* buffer, int64_t buffer_len);
@@ -376,6 +419,21 @@ class DataCache {
     static bool VerifyChecksum(const std::string& ops_name, const CacheEntry& entry,
         const uint8_t* buffer, int64_t buffer_len);
 
+    /// Load the 'cache_files_' and 'meta_cache_' of this partition from dump file.
+    Status Load();
+
+    /// Dump the 'cache_files_' of this partition into 'dump_data'.
+    Status DumpCacheFiles(DumpData& dump_data);
+
+    /// Load the 'cache_files_' for this partition from 'dump_data'.
+    Status LoadCacheFiles(const DumpData& dump_data);
+
+    /// Dump the 'meta_cache_' of this partition into 'dump_data'.
+    Status DumpMetaCache(DumpData& dump_data);
+
+    /// Load the 'meta_cache_' for this partition from 'dump_data'.
+    Status LoadMetaCache(const DumpData& dump_data);
+
     void Trace(const trace::EventType& status, const DataCache::CacheKey& key,
         int64_t lookup_len, int64_t entry_len);
   };
@@ -383,9 +441,18 @@ class DataCache {
   /// The configuration string for the data cache.
   const std::string config_;
 
+  /// The capacity in bytes of one partition.
+  int64_t per_partition_capacity_;
+
   /// Set to true if this is only doing trace replay. Trace replay does only metadata
   /// operations, and no filesystem operations are required.
   bool trace_replay_;
+
+  /// This lock keep SetDataCacheReadOnly() blocked until all ongoing Store() complete.
+  boost::shared_mutex readonly_lock_;
+
+  /// Store() will return false immediately if this is true.
+  AtomicBool readonly_{false};
 
   /// The set of all cache partitions.
   std::vector<std::unique_ptr<Partition>> partitions_;
@@ -398,6 +465,35 @@ class DataCache {
   /// Thread function called by threads in 'file_deleter_pool_' for deleting old files
   /// in partitions_[partition_idx].
   void DeleteOldFiles(uint32_t thread_id, int partition_idx);
+
+  /// Create a new store task and copy the data to a temporary buffer, then submit it to
+  /// the asynchronous write thread pool for handling. May abort due to buffer size limit.
+  /// Return true if success.
+  bool SubmitStoreTask(const std::string& filename, int64_t mtime, int64_t offset,
+      const uint8_t* buffer, int64_t buffer_len);
+
+  /// Called by StoreTask's d'tor, decrease the current_buffer_size_ by task's buffer_len.
+  void CompleteStoreTask(const StoreTask& task);
+
+  /// Thread pool for storing cache asynchronously, it is initialized only if
+  /// 'data_cache_num_async_write_threads' has been set above 0, and creates a
+  /// corresponding number of worker threads.
+  int32_t num_async_write_threads_;
+  using StoreTaskHandle = std::unique_ptr<const StoreTask>;
+  std::unique_ptr<ThreadPool<StoreTaskHandle>> storer_pool_;
+
+  /// Thread function called by threads in 'storer_pool_' for handling store task.
+  void HandleStoreTask(uint32_t thread_id, const StoreTaskHandle& task);
+
+  /// Limit of the total buffer size used by asynchronous store tasks, when the current
+  /// buffer size reaches the limit, the subsequent store task will be abandoned.
+  int64_t store_buffer_capacity_;
+
+  /// Total buffer size currently used by all asynchronous store tasks.
+  AtomicInt64 current_buffer_size_{0};
+
+  /// Call the corresponding cache partition for storing.
+  bool StoreInternal(const CacheKey& key, const uint8_t* buffer, int64_t buffer_len);
 
 };
 

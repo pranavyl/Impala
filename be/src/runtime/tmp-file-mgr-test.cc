@@ -58,6 +58,9 @@ DECLARE_int32(stress_scratch_write_delay_ms);
 #endif
 DECLARE_string(remote_tmp_file_size);
 DECLARE_int32(wait_for_spill_buffer_timeout_s);
+DECLARE_bool(remote_batch_read);
+DECLARE_string(remote_read_memory_buffer_size);
+DECLARE_bool(remote_scratch_cleanup_on_startup);
 
 namespace impala {
 
@@ -69,9 +72,11 @@ static const int64_t GIGABYTE = 1024L * MEGABYTE;
 static const int64_t TERABYTE = 1024L * GIGABYTE;
 
 /// For testing spill to remote.
-static const string HDFS_LOCAL_URL = "hdfs://localhost:20500/tmp";
-static const string REMOTE_URL = HDFS_LOCAL_URL;
 static const string LOCAL_BUFFER_PATH = "/tmp/tmp-file-mgr-test-buffer";
+
+/// Read buffer sizes for TestBatchReadingSetMaxBytes().
+static const int64_t READ_BUFFER_SMALL_SIZE_BYTES = 1 << 20; // 1MB
+static const int64_t READ_BUFFER_EXTREMELY_BIG_SIZE_BYTES = 100ll << 30; // 100GB
 
 class TmpFileMgrTest : public ::testing::Test {
  public:
@@ -85,12 +90,15 @@ class TmpFileMgrTest : public ::testing::Test {
     FLAGS_stress_scratch_write_delay_ms = 0;
 #endif
     FLAGS_remote_tmp_file_size = "8MB";
+    FLAGS_remote_read_memory_buffer_size = "1GB";
+    FLAGS_remote_batch_read = false;
 
     metrics_.reset(new MetricGroup("tmp-file-mgr-test"));
     profile_ = RuntimeProfile::Create(&obj_pool_, "tmp-file-mgr-test");
     test_env_.reset(new TestEnv);
     ASSERT_OK(test_env_->Init());
     cb_counter_ = 0;
+    remote_url_ = test_env_->GetDefaultFsPath("/tmp");
   }
 
   virtual void TearDown() {
@@ -147,6 +155,14 @@ class TmpFileMgrTest : public ::testing::Test {
     ASSERT_EQ(hwm_value->GetValue(), exp_hwm_value);
   }
 
+  /// Check the current scratch space read buffer HWM higher than zero.
+  void checkHWMReadBuffMetrics() {
+    AtomicHighWaterMarkGauge* hwm_value =
+        metrics_->FindMetricForTesting<AtomicHighWaterMarkGauge>(
+            "tmp-file-mgr.scratch-read-memory-buffer-used-high-water-mark");
+    ASSERT_TRUE(hwm_value->GetValue() > 0);
+  }
+
   void RemoveAndCreateDirs(const vector<string>& dirs) {
     for (const string& dir: dirs) {
       ASSERT_OK(FileSystemUtil::RemoveAndCreateDirectory(dir));
@@ -155,6 +171,40 @@ class TmpFileMgrTest : public ::testing::Test {
 
   void RemoveDirs(const vector<string>& dirs) {
     ASSERT_OK(FileSystemUtil::RemovePaths(dirs));
+  }
+
+  int64_t GetReadBufferMaxAllowedBytes(TmpFileMgr* mgr) {
+    return mgr->tmp_dirs_remote_ctrl_.CalcMaxReadBufferBytes();
+  }
+
+  int64_t GetReadBufferCurrentMaxBytes(TmpFileMgr* mgr) {
+    return mgr->tmp_dirs_remote_ctrl_.max_read_buffer_size_;
+  }
+
+  void CreateAndGetGeneralRemoteTmpDir(vector<string>* tmp_dirs) {
+    FLAGS_remote_tmp_file_size = "1K";
+    vector<string> tmp_create_dirs{{LOCAL_BUFFER_PATH}};
+    RemoveAndCreateDirs(tmp_create_dirs);
+    tmp_dirs->push_back(Substitute(LOCAL_BUFFER_PATH + ":$0", 4096));
+    tmp_dirs->push_back(remote_url_);
+  }
+
+  // Helper for TestBatchReadingSetMaxBytes() to set the read buffer size and check
+  // whether we should expect the system to use the max allowed bytes instead of the
+  // specified buffer size in the testcase.
+  void SetReadBufferSizeHelper(int64_t buffer_size, bool* expect_max_allowed_bytes) {
+    ASSERT_TRUE(expect_max_allowed_bytes != nullptr);
+    if (buffer_size == READ_BUFFER_SMALL_SIZE_BYTES) {
+      FLAGS_remote_read_memory_buffer_size = "1MB";
+      *expect_max_allowed_bytes = false;
+    } else if (buffer_size == READ_BUFFER_EXTREMELY_BIG_SIZE_BYTES) {
+      FLAGS_remote_read_memory_buffer_size = "100GB";
+      // If buffer size is too large for the system, we expect the actual capacity of
+      // the read buffer to be changed to the max allowed bytes in the testcase.
+      *expect_max_allowed_bytes = true;
+    } else {
+      ASSERT_TRUE(false) << "Unexpected buffer size " << buffer_size;
+    }
   }
 
   /// Helper to call the private CreateFiles() method and return
@@ -262,6 +312,30 @@ class TmpFileMgrTest : public ::testing::Test {
     EXPECT_EQ(end, search->second.end);
   }
 
+  /// Helper to wait for the disk file changing to specific status. Will timeout after 20
+  /// seconds.
+  static bool WaitForDiskFileStatus(DiskFile* file, DiskFileStatus status) {
+    DCHECK(file != nullptr);
+    int wait_times = 20;
+    while (wait_times-- > 0) {
+      if (file->GetFileStatus() == status) {
+        return true;
+      }
+      usleep(1000 * 1000); // sleep 1s each round.
+    }
+    return false;
+  }
+
+  /// Helper to get the remote temporary file from the temporary file group.
+  static TmpFileRemote* GetRemoteTmpFileByFileGroup(TmpFileGroup& file_group, int idx) {
+    return static_cast<TmpFileRemote*>(file_group.tmp_files_remote_[idx].get());
+  }
+
+  /// Helper to get the number of remote temporary files from the temporary file group.
+  static int GetRemoteTmpFileNum(TmpFileGroup& file_group) {
+    return file_group.tmp_files_remote_.size();
+  }
+
   /// Helpers to call WriteHandle methods.
   void Cancel(TmpWriteHandle* handle) { handle->Cancel(); }
   void WaitForWrite(TmpWriteHandle* handle) {
@@ -269,7 +343,7 @@ class TmpFileMgrTest : public ::testing::Test {
   }
 
   // Write callback, which signals 'cb_cv_' and increments 'cb_counter_'.
-  void SignalCallback(Status write_status) {
+  void SignalCallback(const Status& write_status) {
     {
       lock_guard<mutex> lock(cb_cv_lock_);
       ++cb_counter_;
@@ -319,6 +393,9 @@ class TmpFileMgrTest : public ::testing::Test {
   mutex cb_cv_lock_;
   ConditionVariable cb_cv_;
   int64_t cb_counter_;
+
+  /// URL for remote spilling.
+  string remote_url_;
 };
 
 /// Regression test for IMPALA-2160. Verify that temporary file manager allocates blocks
@@ -980,7 +1057,7 @@ TEST_F(TmpFileMgrTest, TestDirectoryLimitParsing) {
   // directories.
   auto& dirs2 = GetTmpDirs(
       CreateTmpFileMgr("/tmp/tmp-file-mgr-test1:foo,/tmp/tmp-file-mgr-test2:?,"
-                       "/tmp/tmp-file-mgr-test3:1.2.3.4,/tmp/tmp-file-mgr-test4: ,"
+                       "/tmp/tmp-file-mgr-test3:1.2.3.4,/tmp/tmp-file-mgr-test4:a,"
                        "/tmp/tmp-file-mgr-test5:5pb,/tmp/tmp-file-mgr-test6:10%,"
                        "/tmp/tmp-file-mgr-test1:100"));
   EXPECT_EQ(1, dirs2.size());
@@ -1014,10 +1091,11 @@ TEST_F(TmpFileMgrTest, TestDirectoryLimitParsingRemotePath) {
   RemoveAndCreateDirs({"/tmp/local-buffer-dir", "/tmp/local-buffer-dir1",
       "/tmp/local-buffer-dir2", "/tmp/local-buffer-dir3"});
 
-  // Successful cases for HDFS paths.
+  // Successful cases for FS paths.
   // Two types of paths, one with directory, one without.
-  vector<string> hdfs_paths{"hdfs://localhost:20500", "hdfs://localhost:20500/tmp"};
-  for (string hdfs_path : hdfs_paths) {
+  vector<string> hdfs_paths{
+      test_env_->GetDefaultFsPath(""), test_env_->GetDefaultFsPath("/tmp")};
+  for (const string& hdfs_path : hdfs_paths) {
     string full_hdfs_path = hdfs_path + "/impala-scratch";
     auto& dirs1 = GetTmpRemoteDir(CreateTmpFileMgr(hdfs_path + ",/tmp/local-buffer-dir"));
     EXPECT_NE(nullptr, dirs1);
@@ -1034,10 +1112,10 @@ TEST_F(TmpFileMgrTest, TestDirectoryLimitParsingRemotePath) {
     EXPECT_EQ(full_hdfs_path, dirs3->path());
     EXPECT_EQ(1024, dirs3->bytes_limit());
 
-    // Multiple local paths with one remote path.
+    // Multiple local paths with one remote path. Trims spaces.
     auto tmp_mgr_4 = CreateTmpFileMgr(hdfs_path
-        + ",/tmp/local-buffer-dir1,"
-          "/tmp/local-buffer-dir2,/tmp/local-buffer-dir3");
+        + " , /tmp/local-buffer-dir1, "
+          "/tmp/local-buffer-dir2 ,/tmp/local-buffer-dir3");
     auto& dirs4_local = GetTmpDirs(tmp_mgr_4);
     auto& dirs4_remote = GetTmpRemoteDir(tmp_mgr_4);
     EXPECT_NE(nullptr, dirs4_remote);
@@ -1046,8 +1124,8 @@ TEST_F(TmpFileMgrTest, TestDirectoryLimitParsingRemotePath) {
     EXPECT_EQ("/tmp/local-buffer-dir2/impala-scratch", dirs4_local[0]->path());
     EXPECT_EQ("/tmp/local-buffer-dir3/impala-scratch", dirs4_local[1]->path());
 
-    // Fails the parsing due to no port number for the HDFS path.
-    auto tmp_mgr_5 = CreateTmpFileMgr("hdfs://localhost/tmp,/tmp/local-buffer-dir");
+    // Fails to parse HDFS URI due to no path element.
+    auto tmp_mgr_5 = CreateTmpFileMgr("hdfs://localhost,/tmp/local-buffer-dir");
     auto& dirs5_local = GetTmpDirs(tmp_mgr_5);
     auto& dirs5_remote = GetTmpRemoteDir(tmp_mgr_5);
     EXPECT_EQ(1, dirs5_local.size());
@@ -1059,44 +1137,38 @@ TEST_F(TmpFileMgrTest, TestDirectoryLimitParsingRemotePath) {
 
     // Parse successfully, but the parsed HDFS path is unable to connect.
     // These cases would fail the initialization of TmpFileMgr.
-    auto& dirs7 = GetTmpRemoteDir(
-        CreateTmpFileMgr("hdfs://localhost:1/tmp::1,/tmp/local-buffer-dir", false));
-    EXPECT_EQ(nullptr, dirs7);
-
-    auto& dirs8 = GetTmpRemoteDir(
-        CreateTmpFileMgr("hdfs://localhost:/tmp::,/tmp/local-buffer-dir", false));
-    EXPECT_EQ(nullptr, dirs8);
-
-    auto& dirs9 = GetTmpRemoteDir(
-        CreateTmpFileMgr("hdfs://localhost/tmp::1,/tmp/local-buffer-dir", false));
-    EXPECT_EQ(nullptr, dirs9);
-
-    auto& dirs10 = GetTmpRemoteDir(
-        CreateTmpFileMgr("hdfs://localhost/tmp:1,/tmp/local-buffer-dir", false));
-    EXPECT_EQ(nullptr, dirs10);
+    for (const string& unreachable_path : {
+      "hdfs://localhost:1/tmp::1", "hdfs://localhost:/tmp::", "hdfs://localhost/tmp::1",
+      "hdfs://localhost/tmp:1", "hdfs://localhost/tmp", "hdfs://localhost/:1",
+      "hdfs://localhost:1 ", "hdfs://localhost/ "
+    }) {
+      auto& dirs = GetTmpRemoteDir(
+          CreateTmpFileMgr(unreachable_path + ",/tmp/local-buffer-dir", false));
+      EXPECT_EQ(nullptr, dirs) << unreachable_path;
+    }
 
     // Multiple remote paths, should support only one.
-    auto& dirs11 = GetTmpRemoteDir(CreateTmpFileMgr(hdfs_path
-        + ",hdfs://localhost:20501/tmp,"
-          "/tmp/local-buffer-dir"));
-    EXPECT_NE(nullptr, dirs11);
-    EXPECT_EQ(full_hdfs_path, dirs11->path());
+    auto& dirs6 = GetTmpRemoteDir(CreateTmpFileMgr(Substitute(
+        "$0,hdfs://localhost:20501/tmp,/tmp/local-buffer-dir", hdfs_path)));
+    EXPECT_NE(nullptr, dirs6);
+    EXPECT_EQ(full_hdfs_path, dirs6->path());
 
     // The order of the buffer and the remote dir should not affect the result.
-    auto& dirs12 = GetTmpRemoteDir(CreateTmpFileMgr(
-        "/tmp/local-buffer-dir, " + hdfs_path + ",hdfs://localhost:20501/tmp"));
-    EXPECT_NE(nullptr, dirs12);
-    EXPECT_EQ(full_hdfs_path, dirs12->path());
+    auto& dirs7 = GetTmpRemoteDir(CreateTmpFileMgr(Substitute(
+        "/tmp/local-buffer-dir,$0,hdfs://localhost:20501/tmp", hdfs_path)));
+    EXPECT_NE(nullptr, dirs7);
+    EXPECT_EQ(full_hdfs_path, dirs7->path());
   }
 
   // Successful cases for parsing S3 paths.
   // Create a fake s3 connection in order to pass the connection verification.
   HdfsFsCache::HdfsFsMap fake_hdfs_conn_map;
   hdfsFS fake_conn = reinterpret_cast<hdfsFS>(1);
+  FLAGS_remote_scratch_cleanup_on_startup = false;
   fake_hdfs_conn_map.insert(make_pair("s3a://fake_host/", fake_conn));
   // Two types of paths, one with directory, one without.
   vector<string> s3_paths{"s3a://fake_host", "s3a://fake_host/dir"};
-  for (string s3_path : s3_paths) {
+  for (const string& s3_path : s3_paths) {
     string full_s3_path = s3_path + "/impala-scratch";
     auto& dirs13 = GetTmpRemoteDir(
         CreateTmpFileMgr("/tmp/local-buffer-dir, " + s3_path, true, &fake_hdfs_conn_map));
@@ -1184,8 +1256,8 @@ void TmpFileMgrTest::TestCompressBufferManagement(
   TmpFileMgr tmp_file_mgr;
   if (spill_to_remote) {
     RemoveAndCreateDirs(vector<string>{LOCAL_BUFFER_PATH});
-    ASSERT_OK(tmp_file_mgr.InitCustom(vector<string>{REMOTE_URL, LOCAL_BUFFER_PATH}, true,
-        "lz4", true, metrics_.get()));
+    ASSERT_OK(tmp_file_mgr.InitCustom(vector<string>{remote_url_, LOCAL_BUFFER_PATH},
+        true, "lz4", true, metrics_.get()));
   } else {
     ASSERT_OK(tmp_file_mgr.InitCustom(
         vector<string>{"/tmp/tmp-file-mgr-test.1"}, true, "lz4", true, metrics_.get()));
@@ -1230,16 +1302,12 @@ void TmpFileMgrTest::TestCompressBufferManagement(
     EXPECT_NE(compressed_handle->file_, uncompressed_handle->file_);
     auto wait_upload_func = [&](TmpFile* tmp_file) {
       // Wait until the file has been uploaded to remote dir.
-      // Should be finished in 2 seconds.
-      int wait_times = 10;
-      while (wait_times-- > 0) {
-        if (tmp_file->DiskFile()->GetFileStatus() == io::DiskFileStatus::PERSISTED) break;
-        usleep(200 * 1000);
-      }
-      EXPECT_EQ(tmp_file->DiskFile()->GetFileStatus(), io::DiskFileStatus::PERSISTED);
+      EXPECT_TRUE(WaitForDiskFileStatus(tmp_file->DiskFile(),
+          io::DiskFileStatus::PERSISTED));
       // Remove the local buffer to enforce reading from the remote file.
-      tmp_file->GetWriteFile()->SetStatus(io::DiskFileStatus::DELETED);
-      EXPECT_OK(FileSystemUtil::RemovePaths({tmp_file->GetWriteFile()->path()}));
+      unique_lock<shared_mutex> buffer_file_lock(
+          *(tmp_file->GetWriteFile()->GetFileLock()));
+      EXPECT_OK(tmp_file->GetWriteFile()->Delete(buffer_file_lock));
     };
     wait_upload_func(compressed_handle->file_);
     wait_upload_func(uncompressed_handle->file_);
@@ -1309,7 +1377,7 @@ TEST_F(TmpFileMgrTest, TestDirectoryPriorityParsing) {
   // directories.
   auto& dirs2 = GetTmpDirs(
       CreateTmpFileMgr("/tmp/tmp-file-mgr-test1::foo,/tmp/tmp-file-mgr-test2::?,"
-                       "/tmp/tmp-file-mgr-test3::1.2.3.4,/tmp/tmp-file-mgr-test4:: ,"
+                       "/tmp/tmp-file-mgr-test3::1.2.3.4,/tmp/tmp-file-mgr-test4::a,"
                        "/tmp/tmp-file-mgr-test5::p0,/tmp/tmp-file-mgr-test6::10%,"
                        "/tmp/tmp-file-mgr-test1:100:-1"));
   EXPECT_EQ(1, dirs2.size());
@@ -1438,7 +1506,7 @@ TEST_F(TmpFileMgrTest, TestRemoteOneDir) {
   vector<string> tmp_dirs({LOCAL_BUFFER_PATH});
   TmpFileMgr tmp_file_mgr;
   RemoveAndCreateDirs(tmp_dirs);
-  tmp_dirs.push_back(REMOTE_URL);
+  tmp_dirs.push_back(remote_url_);
   ASSERT_OK(tmp_file_mgr.InitCustom(tmp_dirs, true, "", false, metrics_.get()));
   TUniqueId id;
   TmpFileGroup file_group(&tmp_file_mgr, io_mgr(), profile_, id);
@@ -1467,7 +1535,7 @@ TEST_F(TmpFileMgrTest, TestRemoteDirReportError) {
   vector<string> tmp_dirs({LOCAL_BUFFER_PATH});
   TmpFileMgr tmp_file_mgr;
   RemoveAndCreateDirs(tmp_dirs);
-  tmp_dirs.push_back(REMOTE_URL);
+  tmp_dirs.push_back(remote_url_);
   ASSERT_OK(tmp_file_mgr.InitCustom(tmp_dirs, false, "", false, metrics_.get()));
   TUniqueId id;
   TmpFileGroup file_group(&tmp_file_mgr, io_mgr(), profile_, id);
@@ -1522,7 +1590,7 @@ TEST_F(TmpFileMgrTest, TestRemoteAllocateNonWritable) {
   vector<string> tmp_dirs({LOCAL_BUFFER_PATH});
   TmpFileMgr tmp_file_mgr;
   RemoveAndCreateDirs(tmp_dirs);
-  tmp_dirs.push_back(REMOTE_URL);
+  tmp_dirs.push_back(remote_url_);
   ASSERT_OK(tmp_file_mgr.InitCustom(tmp_dirs, true, "", false, metrics_.get()));
   TUniqueId id;
   TmpFileGroup file_group(&tmp_file_mgr, io_mgr(), profile_, id);
@@ -1555,7 +1623,7 @@ TEST_F(TmpFileMgrTest, TestRemoteScratchLimit) {
   vector<string> tmp_dirs({LOCAL_BUFFER_PATH});
   TmpFileMgr tmp_file_mgr;
   RemoveAndCreateDirs(tmp_dirs);
-  tmp_dirs.push_back(REMOTE_URL);
+  tmp_dirs.push_back(remote_url_);
 
   ASSERT_OK(tmp_file_mgr.InitCustom(tmp_dirs, true, "", false, metrics_.get()));
   TUniqueId id;
@@ -1597,7 +1665,7 @@ TEST_F(TmpFileMgrTest, TestRemoteWriteRange) {
   vector<string> tmp_dirs({LOCAL_BUFFER_PATH});
   TmpFileMgr tmp_file_mgr;
   RemoveAndCreateDirs(tmp_dirs);
-  tmp_dirs.push_back(REMOTE_URL);
+  tmp_dirs.push_back(remote_url_);
 
   ASSERT_OK(tmp_file_mgr.InitCustom(tmp_dirs, true, "", false, metrics_.get()));
   TUniqueId id;
@@ -1632,7 +1700,7 @@ TEST_F(TmpFileMgrTest, TestRemoteBlockVerification) {
   vector<string> tmp_dirs({LOCAL_BUFFER_PATH});
   TmpFileMgr tmp_file_mgr;
   RemoveAndCreateDirs(tmp_dirs);
-  tmp_dirs.push_back(REMOTE_URL);
+  tmp_dirs.push_back(remote_url_);
 
   ASSERT_OK(tmp_file_mgr.InitCustom(tmp_dirs, true, "", false, metrics_.get()));
   TUniqueId id;
@@ -1681,7 +1749,7 @@ TEST_F(TmpFileMgrTest, TestRemoteDirectoryLimits) {
   vector<string> tmp_dirs{{LOCAL_BUFFER_PATH}};
   TmpFileMgr tmp_file_mgr;
   RemoveAndCreateDirs(tmp_dirs);
-  tmp_dirs.push_back(REMOTE_URL);
+  tmp_dirs.push_back(remote_url_);
   int64_t alloc_size = 1024;
   int64_t file_size = 1024;
   FLAGS_remote_tmp_file_size = "1K";
@@ -1731,7 +1799,7 @@ TEST_F(TmpFileMgrTest, TestMixDirectoryLimits) {
   vector<string> tmp_dirs{{LOCAL_BUFFER_PATH, "/tmp/tmp-file-mgr-test-local:1024"}};
   TmpFileMgr tmp_file_mgr;
   RemoveAndCreateDirs(tmp_create_dirs);
-  tmp_dirs.push_back(REMOTE_URL);
+  tmp_dirs.push_back(remote_url_);
   int64_t alloc_size = 1024;
   int64_t file_size = 1024;
   FLAGS_remote_tmp_file_size = "1K";
@@ -1794,9 +1862,9 @@ TEST_F(TmpFileMgrTest, TestMixTmpFileLimits) {
   vector<string> tmp_dirs{{LOCAL_BUFFER_PATH}};
   TmpFileMgr tmp_file_mgr;
   RemoveAndCreateDirs(tmp_create_dirs);
-  tmp_dirs.push_back(REMOTE_URL);
+  tmp_dirs.push_back(remote_url_);
   int64_t alloc_size = 1024;
-  int64_t file_size = 256 * 1024 * 1024;
+  int64_t file_size = 512 * 1024 * 1024;
   int64_t offset;
   TmpFile* alloc_file;
   FLAGS_remote_tmp_file_size = "512MB";
@@ -1822,7 +1890,7 @@ void TmpFileMgrTest::TestTmpFileBufferPoolHelper(TmpFileMgr& tmp_file_mgr,
   vector<string> tmp_create_dirs{{LOCAL_BUFFER_PATH}};
   vector<string> tmp_dirs{{Substitute(LOCAL_BUFFER_PATH + ":$0", 2048)}};
   RemoveAndCreateDirs(tmp_create_dirs);
-  tmp_dirs.push_back(REMOTE_URL);
+  tmp_dirs.push_back(remote_url_);
   int64_t alloc_size = 1024;
   int64_t file_size = 1024;
   FLAGS_remote_tmp_file_size = "1KB";
@@ -1961,7 +2029,7 @@ TEST_F(TmpFileMgrTest, TestRemoteRemoveBuffer) {
   vector<string> tmp_dirs({LOCAL_BUFFER_PATH});
   TmpFileMgr tmp_file_mgr;
   RemoveAndCreateDirs(tmp_dirs);
-  tmp_dirs.push_back(REMOTE_URL);
+  tmp_dirs.push_back(remote_url_);
 
   ASSERT_OK(tmp_file_mgr.InitCustom(tmp_dirs, true, "", false, metrics_.get()));
   TUniqueId id;
@@ -2017,7 +2085,7 @@ TEST_F(TmpFileMgrTest, TestRemoteUploadFailed) {
   vector<string> tmp_create_dirs{{LOCAL_BUFFER_PATH}};
   vector<string> tmp_dirs{{Substitute(LOCAL_BUFFER_PATH + ":$0", buffer_limit)}};
   RemoveAndCreateDirs(tmp_create_dirs);
-  tmp_dirs.push_back(HDFS_LOCAL_URL);
+  tmp_dirs.push_back(remote_url_);
 
   ASSERT_OK(tmp_file_mgr.InitCustom(tmp_dirs, true, "", false, metrics_.get()));
   TUniqueId id;
@@ -2059,6 +2127,127 @@ TEST_F(TmpFileMgrTest, TestRemoteUploadFailed) {
 
   file_group.Close();
   test_env_->TearDownQueries();
+}
+
+/// Test using batch reading while reading the remote spilled data.
+TEST_F(TmpFileMgrTest, TestBatchReadingFromRemote) {
+  TmpFileMgr tmp_file_mgr;
+  vector<string> tmp_dirs;
+  CreateAndGetGeneralRemoteTmpDir(&tmp_dirs);
+  FLAGS_remote_read_memory_buffer_size = "1MB";
+  FLAGS_remote_batch_read = true;
+  int64_t page_size_big = 512;
+  int64_t page_size_small = 256;
+  // There should be two files,
+  // file 1. page_big + page_big = 1024B
+  // file 2. page_big + page_small + page_big = 1280B
+  // So that we can test two cases, a file with a default size and one with a little over
+  // size.
+  int64_t file_size_1 = 2 * page_size_big;
+  int64_t file_size_2 = 2 * page_size_big + page_size_small;
+  ASSERT_OK(tmp_file_mgr.InitCustom(tmp_dirs, true, "", false, metrics_.get()));
+  TUniqueId id;
+  TmpFileGroup file_group(&tmp_file_mgr, io_mgr(), profile_, id);
+
+  vector<unique_ptr<MemRange>> mem_ranges;
+  vector<unique_ptr<TmpWriteHandle>> handles;
+  WriteRange::WriteDoneCallback callback =
+      bind(mem_fn(&TmpFileMgrTest::SignalCallback), this, _1);
+  const int PAGE_NUM = 5;
+  vector<vector<uint8_t>> data(PAGE_NUM);
+  for (int i = 0; i < PAGE_NUM; i++) {
+    int64_t page_size = page_size_big;
+    if (i == 3) {
+      page_size = page_size_small;
+    }
+    data[i].resize(page_size);
+    std::iota(data[i].begin(), data[i].end(), i);
+    mem_ranges.emplace_back(make_unique<MemRange>(data[i].data(), page_size));
+    unique_ptr<TmpWriteHandle> handle;
+    ASSERT_OK(file_group.Write(*(mem_ranges[i].get()), callback, &handle));
+    WaitForWrite(handle.get());
+    handles.emplace_back(move(handle));
+  }
+  WaitForCallbacks(PAGE_NUM);
+
+  // There should be two files in the TmpFileMgr.
+  ASSERT_EQ(GetRemoteTmpFileNum(file_group), 2);
+  auto file1 = GetRemoteTmpFileByFileGroup(file_group, 0);
+  auto file2 = GetRemoteTmpFileByFileGroup(file_group, 1);
+  EXPECT_TRUE(WaitForDiskFileStatus(file1->DiskFile(), DiskFileStatus::PERSISTED));
+  EXPECT_TRUE(WaitForDiskFileStatus(file1->DiskBufferFile(), DiskFileStatus::PERSISTED));
+  EXPECT_TRUE(WaitForDiskFileStatus(file2->DiskFile(), DiskFileStatus::PERSISTED));
+  EXPECT_TRUE(WaitForDiskFileStatus(file2->DiskBufferFile(), DiskFileStatus::PERSISTED));
+
+  // Check Actual Size is as expected.
+  ASSERT_EQ(file1->DiskBufferFile()->actual_file_size(), file_size_1);
+  ASSERT_EQ(file2->DiskBufferFile()->actual_file_size(), file_size_2);
+
+  // Remove the local buffers in order to read from the remote fs.
+  ASSERT_OK(tmp_file_mgr.TryEvictFile(file1));
+  ASSERT_OK(tmp_file_mgr.TryEvictFile(file2));
+
+  // Read the data.
+  for (int i = 0; i < PAGE_NUM; i++) {
+    vector<uint8_t> tmp;
+    tmp.resize(mem_ranges[i]->len());
+    ASSERT_OK(file_group.Read(handles[i].get(), MemRange(tmp.data(), tmp.size())));
+    EXPECT_EQ(0, memcmp(tmp.data(), mem_ranges[i]->data(), tmp.size()));
+    file_group.DestroyWriteHandle(move(handles[i]));
+  }
+
+  // Check the metrics that we did use the read buffer for reading.
+  checkHWMReadBuffMetrics();
+
+  file_group.Close();
+  test_env_->TearDownQueries();
+}
+
+// Test to set different capacities of the read buffer for remote spilling.
+TEST_F(TmpFileMgrTest, TestBatchReadingSetMaxBytes) {
+  vector<int64_t> buffer_sizes(
+      {READ_BUFFER_SMALL_SIZE_BYTES, READ_BUFFER_EXTREMELY_BIG_SIZE_BYTES});
+  FLAGS_remote_batch_read = true;
+  for (int64_t buffer_size : buffer_sizes) {
+    TmpFileMgr tmp_file_mgr;
+    vector<string> tmp_dirs;
+    bool expect_max_allowed_bytes = false;
+    CreateAndGetGeneralRemoteTmpDir(&tmp_dirs);
+    SetReadBufferSizeHelper(buffer_size, &expect_max_allowed_bytes);
+    ASSERT_OK(tmp_file_mgr.InitCustom(tmp_dirs, true, "", false, metrics_.get()));
+    int64_t max_allowed_bytes = GetReadBufferMaxAllowedBytes(&tmp_file_mgr);
+    int64_t cur_max_bytes = GetReadBufferCurrentMaxBytes(&tmp_file_mgr);
+    // If the buffer size is too large, then the current max bytes of the read buffer
+    // should be set to the system max allowed bytes instead of the buffer size.
+    if (expect_max_allowed_bytes) {
+      EXPECT_EQ(cur_max_bytes, max_allowed_bytes);
+    } else {
+      EXPECT_EQ(cur_max_bytes, buffer_size);
+    }
+    metrics_.reset(new MetricGroup("tmp-file-mgr-test"));
+  }
+}
+
+TEST_F(TmpFileMgrTest, TestHdfsScratchParsing) {
+  struct parsed { string path; int64_t bytes_limit; int priority; };
+  constexpr int64_t dbytes = numeric_limits<int64_t>::max();
+  constexpr int dpriority = numeric_limits<int>::max();
+  for (auto& valid : map<string, parsed>{
+    { "hdfs://10.0.0.1:8020", parsed{"hdfs://10.0.0.1:8020", dbytes, dpriority} },
+    { "hdfs://10.0.0.1:8020:1024:", parsed{"hdfs://10.0.0.1:8020", 1024, dpriority} },
+    { "hdfs://10.0.0.1/", parsed{"hdfs://10.0.0.1", dbytes, dpriority} },
+    { "hdfs://10.0.0.1/:1k", parsed{"hdfs://10.0.0.1", 1024, dpriority} },
+    { "hdfs://localhost/tmp::", parsed{"hdfs://localhost/tmp", dbytes, dpriority} },
+    { "hdfs://localhost/tmp/:10k:1", parsed{"hdfs://localhost/tmp", 10240, 1} },
+    { "ofs://ozone1/tmp:10k:1", parsed{"ofs://ozone1/tmp", 10240, 1} },
+    { "ofs://ozone1/tmp::1", parsed{"ofs://ozone1/tmp", dbytes, 1} },
+  }) {
+    TmpDirHdfs fs(valid.first);
+    EXPECT_OK(fs.Parse());
+    EXPECT_EQ(path(valid.second.path) / "impala-scratch", fs.path());
+    EXPECT_EQ(valid.second.bytes_limit, fs.bytes_limit());
+    EXPECT_EQ(valid.second.priority, fs.priority());
+  }
 }
 
 } // namespace impala

@@ -14,14 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
 #pragma once
 
+#include <functional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
-
-#include <boost/function.hpp>
 
 #include "kudu/util/easy_json.h"
 
@@ -29,6 +27,7 @@ namespace kudu {
 
 enum class HttpStatusCode {
   Ok, // 200
+  TemporaryRedirect, //307
   BadRequest, // 400
   AuthenticationRequired, // 401
   NotFound, // 404
@@ -67,9 +66,11 @@ class WebCallbackRegistry {
     std::string post_data;
 
     // The socket address of the requester, <host>:<port>.
+    // Define this variable for IMPALA-9182.
     std::string source_socket;
 
     // Authenticated user, or 'anonymous' if no auth used
+    // Define this variable for IMPALA-10779.
     std::string source_user = "anonymous";
   };
 
@@ -99,12 +100,12 @@ class WebCallbackRegistry {
 
   // A function that handles an HTTP request where the response body will be rendered
   // with a mustache template from the JSON object held by 'resp'.
-  typedef boost::function<void (const WebRequest& args, WebResponse* resp)>
+  typedef std::function<void (const WebRequest& args, WebResponse* resp)>
       PathHandlerCallback;
 
   // A function that handles an HTTP request, where the response body is the contents
   // of the 'output' member of 'resp'.
-  typedef boost::function<void (const WebRequest& args, PrerenderedWebResponse* resp)>
+  typedef std::function<void (const WebRequest& args, PrerenderedWebResponse* resp)>
       PrerenderedPathHandlerCallback;
 
   virtual ~WebCallbackRegistry() {}

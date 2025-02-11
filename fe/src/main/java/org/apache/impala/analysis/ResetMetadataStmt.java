@@ -21,7 +21,6 @@ import java.util.List;
 
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.authorization.PrivilegeRequestBuilder;
 import org.apache.impala.authorization.User;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.FeTable;
@@ -32,6 +31,7 @@ import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TCatalogServiceRequestHeader;
 import org.apache.impala.thrift.TResetMetadataRequest;
 import org.apache.impala.thrift.TTableName;
+import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.util.AcidUtils;
 
 import com.google.common.base.Preconditions;
@@ -80,6 +80,12 @@ public class ResetMetadataStmt extends StatementBase {
   // Set during analysis.
   private User requestingUser_;
 
+  // Set during analysis.
+  private TUniqueId queryId_;
+
+  // Set during analysis.
+  private String clientIp_;
+
   private ResetMetadataStmt(Action action, String db, TableName tableName,
       PartitionSpec partitionSpec) {
     Preconditions.checkNotNull(action);
@@ -123,8 +129,15 @@ public class ResetMetadataStmt extends StatementBase {
 
   public TableName getTableName() { return tableName_; }
 
+  public PartitionSpec getPartitionSpec() { return partitionSpec_; }
+
   @VisibleForTesting
   protected Action getAction() { return action_; }
+
+  @VisibleForTesting
+  public void setRequestingUser(User user) {
+    requestingUser_ = user;
+  }
 
   @Override
   public void collectTableRefs(List<TableRef> tblRefs) {
@@ -136,6 +149,8 @@ public class ResetMetadataStmt extends StatementBase {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     requestingUser_ = analyzer.getUser();
+    queryId_ = analyzer.getQueryCtx().getQuery_id();
+    clientIp_ = analyzer.getQueryCtx().getSession().getNetwork_address().getHostname();
     switch (action_) {
       case INVALIDATE_METADATA_TABLE:
       case REFRESH_TABLE:
@@ -178,19 +193,9 @@ public class ResetMetadataStmt extends StatementBase {
                 builder.onTableUnknownOwner(
                   dbName, tableName_.getTbl()).allOf(Privilege.REFRESH).build());
           } else {
-            // Notice that in isViewCreatedWithoutAuthz() we assume that 'tbl' is not a
-            // view whose creation was not authorized if we cannot find it currently
-            // cached in the local Catalog, i.e., when 'tbl' is null.
-            // TODO(IMPALA-10122): Remove the need for computing
-            // 'isViewCreatedWithoutAuthz' once we can properly process a
-            // PrivilegeRequest for a view whose creation was not authorized.
-            boolean isViewCreatedWithoutAuthz =
-                PrivilegeRequestBuilder.isViewCreatedWithoutAuthz(tbl);
             analyzer.registerPrivReq(
                 builder -> builder.onTable(dbName, tableName_.getTbl(),
-                    tbl.getOwnerUser(), isViewCreatedWithoutAuthz)
-                    .allOf(Privilege.REFRESH)
-                    .build());
+                    tbl.getOwnerUser()).allOf(Privilege.REFRESH).build());
           }
         }
         break;
@@ -256,6 +261,9 @@ public class ResetMetadataStmt extends StatementBase {
     TResetMetadataRequest params = new TResetMetadataRequest();
     params.setHeader(new TCatalogServiceRequestHeader());
     params.header.setRequesting_user(requestingUser_.getShortName());
+    params.header.setQuery_id(queryId_);
+    params.header.setCoordinator_hostname(BackendConfig.INSTANCE.getHostname());
+    params.header.setClient_ip(clientIp_);
     params.setIs_refresh(action_.isRefresh());
     if (tableName_ != null) {
       params.setTable_name(new TTableName(tableName_.getDb(), tableName_.getTbl()));

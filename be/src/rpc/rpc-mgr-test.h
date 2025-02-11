@@ -19,12 +19,13 @@
 #define IMPALA_RPC_RPC_MGR_TEST_H
 
 #include "common/init.h"
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/rpc_sidecar.h"
+#include "kudu/security/security_flags.h"
 #include "kudu/util/status.h"
 #include "rpc/rpc-mgr.inline.h"
 #include "runtime/exec-env.h"
@@ -51,6 +52,7 @@ using kudu::Slice;
 
 using namespace std;
 
+DECLARE_bool(rpc_use_unix_domain_socket);
 DECLARE_int32(num_reactor_threads);
 DECLARE_int32(num_acceptor_threads);
 DECLARE_string(hostname);
@@ -60,6 +62,8 @@ DECLARE_string(ssl_server_certificate);
 DECLARE_string(ssl_private_key);
 DECLARE_string(ssl_private_key_password_cmd);
 DECLARE_string(ssl_cipher_list);
+DECLARE_string(ssl_minimum_version);
+DECLARE_string(tls_ciphersuites);
 
 // The path of the current executable file that is required for passing into the SASL
 // library as the 'application name'.
@@ -85,12 +89,17 @@ const string& PASSWORD_PROTECTED_PRIVATE_KEY =
 class ScopedSetTlsFlags {
  public:
   ScopedSetTlsFlags(const string& cert, const string& pkey, const string& ca_cert,
-      const string& pkey_passwd = "", const string& ciphers = "") {
+      const string& pkey_passwd = "", const string& ciphers = "",
+      const string& tls_ciphersuites =
+          kudu::security::SecurityDefaults::kDefaultTlsCipherSuites,
+      const string& ssl_minimum_version = "tlsv1.2") {
     FLAGS_ssl_server_certificate = cert;
     FLAGS_ssl_private_key = pkey;
     FLAGS_ssl_client_ca_certificate = ca_cert;
     FLAGS_ssl_private_key_password_cmd = pkey_passwd;
     FLAGS_ssl_cipher_list = ciphers;
+    FLAGS_tls_ciphersuites = tls_ciphersuites;
+    FLAGS_ssl_minimum_version = ssl_minimum_version;
   }
 
   ~ScopedSetTlsFlags() {
@@ -99,6 +108,8 @@ class ScopedSetTlsFlags {
     FLAGS_ssl_client_ca_certificate = "";
     FLAGS_ssl_private_key_password_cmd = "";
     FLAGS_ssl_cipher_list = "";
+    FLAGS_tls_ciphersuites = kudu::security::SecurityDefaults::kDefaultTlsCipherSuites;
+    FLAGS_ssl_minimum_version = "tlsv1.2";
   }
 };
 
@@ -107,9 +118,12 @@ class ScopedSetTlsFlags {
 const string TLS1_0_COMPATIBLE_CIPHER = "AES128-SHA";
 const string TLS1_0_COMPATIBLE_CIPHER_2 = "AES256-SHA";
 
+const string TLS1_3_CIPHERSUITE = "TLS_AES_256_GCM_SHA384";
+const string TLS1_3_CIPHERSUITE_2 = "TLS_CHACHA20_POLY1305_SHA256";
+
 #define PAYLOAD_SIZE (4096)
 
-class RpcMgrTest : public testing::Test {
+class RpcMgrTest : public testing::TestWithParam<bool> {
  public:
   // Utility function to initialize the parameter for ScanMem RPC.
   // Picks a random value and fills 'payload_' with it. Adds 'payload_' as a sidecar
@@ -126,16 +140,18 @@ class RpcMgrTest : public testing::Test {
   }
 
   // Utility function which alternately makes requests to PingService and ScanMemService.
-  Status RunMultipleServicesTest(RpcMgr* rpc_mgr, const TNetworkAddress& krpc_address);
+  Status RunMultipleServicesTest(RpcMgr* rpc_mgr, const NetworkAddressPB& krpc_address);
 
  protected:
-  TNetworkAddress krpc_address_;
+  NetworkAddressPB krpc_address_;
   RpcMgr rpc_mgr_;
 
   virtual void SetUp() {
+    FLAGS_rpc_use_unix_domain_socket = GetParam();
     IpAddr ip;
     ASSERT_OK(HostnameToIpAddr(FLAGS_hostname, &ip));
-    krpc_address_ = MakeNetworkAddress(ip, FindUnusedEphemeralPort());
+    krpc_address_ = MakeNetworkAddressPB(
+        ip, FindUnusedEphemeralPort(), rpc_mgr_.GetUdsAddressUniqueId());
     exec_env_.reset(new ExecEnv());
     ASSERT_OK(rpc_mgr_.Init(krpc_address_));
   }
@@ -166,14 +182,14 @@ typedef std::function<void(RpcContext*)> ServiceCB;
 class PingServiceImpl : public PingServiceIf {
  public:
   // 'cb' is a callback used by tests to inject custom behaviour into the RPC handler.
-  PingServiceImpl(RpcMgr* rpc_mgr,
-      ServiceCB cb = [](RpcContext* ctx) { ctx->RespondSuccess(); })
+  PingServiceImpl(
+      RpcMgr* rpc_mgr, ServiceCB cb = [](RpcContext* ctx) { ctx->RespondSuccess(); })
     : PingServiceIf(rpc_mgr->metric_entity(), rpc_mgr->result_tracker()),
       rpc_mgr_(rpc_mgr),
       mem_tracker_(-1, "Ping Service"),
-      cb_(cb) {}
+      cb_(std::move(cb)) {}
 
-  Status GetProxy(const TNetworkAddress& address, const std::string& hostname,
+  Status GetProxy(const NetworkAddressPB& address, const std::string& hostname,
       std::unique_ptr<PingServiceProxy>* proxy) {
     return rpc_mgr_->GetProxy(address, hostname, proxy);
   }
@@ -219,7 +235,7 @@ class ScanMemServiceImpl : public ScanMemServiceIf {
       mem_tracker_(-1, "ScanMem Service") {
   }
 
-  Status GetProxy(const TNetworkAddress& address, const std::string& hostname,
+  Status GetProxy(const NetworkAddressPB& address, const std::string& hostname,
       std::unique_ptr<ScanMemServiceProxy>* proxy) {
     return rpc_mgr_->GetProxy(address, hostname, proxy);
   }
@@ -284,7 +300,7 @@ class FailingPingServiceProxy {
 };
 
 Status RpcMgrTest::RunMultipleServicesTest(
-    RpcMgr* rpc_mgr, const TNetworkAddress& krpc_address) {
+    RpcMgr* rpc_mgr, const NetworkAddressPB& krpc_address) {
   // Test that a service can be started, and will respond to requests.
   GeneratedServiceIf* ping_impl = TakeOverService(
       make_unique<PingServiceImpl>(rpc_mgr));

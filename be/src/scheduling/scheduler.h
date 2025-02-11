@@ -60,12 +60,15 @@ class SchedulerWrapper;
 ///           configuration.
 class Scheduler {
  public:
+  static const std::string PROFILE_INFO_KEY_PER_HOST_MIN_MEMORY_RESERVATION;
+
   Scheduler(MetricGroup* metrics, RequestPoolService* request_pool_service);
 
   /// Current snapshot of executors to be used for scheduling a scan.
   struct ExecutorConfig {
     const ExecutorGroup& group;
     const BackendDescriptorPB& coord_desc;
+    const ExecutorGroup& all_coords;
   };
 
   /// Populates given query schedule and assigns fragments to hosts based on scan
@@ -82,6 +85,11 @@ class Scheduler {
   /// that host (needed for setups with multiple executors on a single host)
   typedef boost::unordered_map<IpAddr, ExecutorGroup::Executors::const_iterator>
       NextExecutorPerHost;
+
+  /// Map from file paths to hosts where those files are scheduled, grouped by scan node
+  /// ID.
+  typedef std::unordered_map<int, std::unordered_map<
+      std::string, std::unordered_set<NetworkAddressPB>>> ByNodeFilepathToHosts;
 
   /// Internal structure to track scan range assignments for an executor host. This struct
   /// is used as the heap element in and maintained by AddressableAssignmentHeap.
@@ -346,13 +354,15 @@ class Scheduler {
   /// query_options:           Query options for the current query.
   /// timer:                   Tracks execution time of ComputeScanRangeAssignment.
   /// rng:                     Random number generated used for any random decisions
+  /// summary_profile:         Summary profile for any scheduler warnings.
   /// assignment:              Output parameter, to which new assignments will be added.
   Status ComputeScanRangeAssignment(const ExecutorConfig& executor_config,
       PlanNodeId node_id, const TReplicaPreference::type* node_replica_preference,
       bool node_random_replica, const std::vector<TScanRangeLocationList>& locations,
       const std::vector<TNetworkAddress>& host_list, bool exec_at_coord,
       const TQueryOptions& query_options, RuntimeProfile::Counter* timer,
-      std::mt19937* rng, FragmentScanRangeAssignment* assignment);
+      std::mt19937* rng, RuntimeProfile* summary_profile,
+      FragmentScanRangeAssignment* assignment);
 
   /// Computes execution parameters for all backends assigned in the query and always one
   /// for the coordinator backend since it participates in execution regardless. Must be
@@ -365,15 +375,21 @@ class Scheduler {
   /// This includes the routing information (destinations, per_exch_num_senders,
   /// sender_id)
   /// 'executor_config' is the executor configuration to use for scheduling.
-  void ComputeFragmentExecParams(
+  Status ComputeFragmentExecParams(
       const ExecutorConfig& executor_config, ScheduleState* state);
 
   /// Recursively create FInstanceScheduleState and set per_node_scan_ranges for
   /// fragment_state and its input fragments via a depth-first traversal.
   /// All fragments are part of plan_exec_info.
-  void ComputeFragmentExecParams(const ExecutorConfig& executor_config,
+  Status ComputeFragmentExecParams(const ExecutorConfig& executor_config,
       const TPlanExecInfo& plan_exec_info, FragmentScheduleState* fragment_state,
       ScheduleState* state);
+
+  /// For a given 'src_state' and 'num_filters_per_host', select few backend as
+  /// intermediate filter aggregator before final aggregation in coordinator.
+  /// Do nothing if 'num_filters_per_host' <= 1.
+  void ComputeRandomKrpcForAggregation(const ExecutorConfig& executor_config,
+      ScheduleState* state, FragmentScheduleState* src_state, int num_filters_per_host);
 
   /// Create instances of the fragment corresponding to fragment_state, which contains
   /// either a Union node, one or more scan nodes, or both.
@@ -383,7 +399,8 @@ class Scheduler {
   /// joins or grouping aggregates as children runs on at least as many hosts as the
   /// input to those children).
   ///
-  /// The maximum number of instances per host is the value of query option mt_dop.
+  /// The maximum number of instances per host is the value of query option mt_dop,
+  /// or fragment's effective_instance_count if compute_processing_cost=true.
   /// For HDFS, this load balances among instances within a host using
   /// AssignRangesToInstances().
   void CreateCollocatedAndScanInstances(const ExecutorConfig& executor_config,
@@ -393,8 +410,11 @@ class Scheduler {
   /// to at most 'max_num_instances' fragment instances running on the same host.
   /// 'max_num_ranges' must be positive. Only returns non-empty vectors: if there are not
   /// enough ranges to create 'max_num_instances', fewer instances are assigned ranges.
+  /// 'use_lpt' determines whether this assigns scan ranges via the Longest Processing
+  /// Time algorithm. If false, this uses round-robin (which is cheaper).
   static std::vector<std::vector<ScanRangeParamsPB>> AssignRangesToInstances(
-      int max_num_instances, std::vector<ScanRangeParamsPB>& ranges);
+      int max_num_instances, std::vector<ScanRangeParamsPB>* ranges,
+      bool use_lpt = false);
 
   /// For each instance of fragment_state's input fragment, create a collocated
   /// instance for fragment_state's fragment.
@@ -413,6 +433,14 @@ class Scheduler {
   void CreateCollocatedJoinBuildInstances(
       FragmentScheduleState* fragment_state, ScheduleState* state);
 
+  /// This is called during the execution of Schedule() and populates
+  /// 'ScheduleState::query_schedule_pb_::by_node_filepath_to_hosts' mapping with the
+  /// information of what files are scheduled to what hosts grouped by scan node.
+  /// 'duplicate_check' keeps track of the previously added items and used for preventing
+  /// duplicates being added.
+  void PopulateFilepathToHostsMapping(const FInstanceScheduleState& finst,
+      ScheduleState* state, ByNodeFilepathToHosts* duplicate_check);
+
   /// Add all hosts that the scans identified by 'scan_ids' are executed on to
   /// 'scan_hosts'.
   void GetScanHosts(const std::vector<TPlanNodeId>& scan_ids,
@@ -420,13 +448,17 @@ class Scheduler {
       std::vector<NetworkAddressPB>* scan_hosts);
 
   /// Return true if 'plan' contains a node of the given type.
-  bool ContainsNode(const TPlan& plan, TPlanNodeType::type type);
+  static bool ContainsNode(const TPlan& plan, TPlanNodeType::type type);
 
   /// Return true if 'plan' contains a node of one of the given types.
-  bool ContainsNode(const TPlan& plan, const std::vector<TPlanNodeType::type>& types);
+  static bool ContainsNode(
+      const TPlan& plan, const std::vector<TPlanNodeType::type>& types);
 
   /// Return true if 'plan' contains a scan node.
-  bool ContainsScanNode(const TPlan& plan);
+  static bool ContainsScanNode(const TPlan& plan);
+
+  /// Return true if 'plan' contains a union node.
+  static bool ContainsUnionNode(const TPlan& plan);
 
   /// Return all ids of nodes in 'plan' of any of the given types.
   std::vector<TPlanNodeId> FindNodes(
@@ -435,12 +467,39 @@ class Scheduler {
   /// Return all ids of all scan nodes in 'plan'.
   std::vector<TPlanNodeId> FindScanNodes(const TPlan& plan);
 
+  /// If TPlanFragment.effective_instance_count is positive, verify that resulting
+  /// instance_states size match with effective_instance_count. Fragment with UnionNode or
+  /// ScanNode or one where IsExceedMaxFsWriters equals true is not checked.
+  static Status CheckEffectiveInstanceCount(
+      const FragmentScheduleState* fragment_state, ScheduleState* state);
+
+  /// Check if sink_fragment_state has hdfs_table_sink AND ref_fragment_state scheduled
+  /// to exceed max_fs_writers query option.
+  static inline bool IsExceedMaxFsWriters(
+      const FragmentScheduleState* sink_fragment_state,
+      const FragmentScheduleState* ref_fragment_state, const ScheduleState* state) {
+    return (sink_fragment_state->fragment.output_sink.__isset.table_sink
+        && sink_fragment_state->fragment.output_sink.table_sink.__isset.hdfs_table_sink
+        && state->query_options().max_fs_writers > 0
+        && ref_fragment_state->instance_states.size()
+            > state->query_options().max_fs_writers);
+  }
+
+  /// Comparator to order scan ranges for scheduling. This uses ScanRangeWeight(), but it
+  /// also compares other fields so that it is deterministic for scan ranges with the
+  /// same weight. This comparator only works when both scan ranges have the same storage
+  /// type: HDFS vs HDFS, Kudu vs Kudu, HBase vs HBase. Otherwise, it asserts.
+  static bool ScanRangeComparator(const ScanRangeParamsPB& a,
+      const ScanRangeParamsPB& b);
+
   friend class impala::test::SchedulerWrapper;
   FRIEND_TEST(SimpleAssignmentTest, ComputeAssignmentDeterministicNonCached);
   FRIEND_TEST(SimpleAssignmentTest, ComputeAssignmentRandomNonCached);
   FRIEND_TEST(SimpleAssignmentTest, ComputeAssignmentRandomDiskLocal);
   FRIEND_TEST(SimpleAssignmentTest, ComputeAssignmentRandomRemote);
   FRIEND_TEST(SchedulerTest, TestMultipleFinstances);
+  FRIEND_TEST(SchedulerTest, TestMultipleFinstancesLPT);
+  FRIEND_TEST(SchedulerTest, TestScanRangeComparator);
 };
 
 }

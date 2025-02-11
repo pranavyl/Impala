@@ -19,8 +19,10 @@
 
 #include <cerrno>
 #include <iomanip>
+#include <list>
 #include <sstream>
 #include <unordered_set>
+#include <utility>
 
 #include <thrift/protocol/TDebugProtocol.h>
 #include <boost/algorithm/string/join.hpp>
@@ -58,6 +60,7 @@
 #include "util/hdfs-util.h"
 #include "util/histogram-metric.h"
 #include "util/kudu-status-util.h"
+#include "util/in-list-filter.h"
 #include "util/min-max-filter.h"
 #include "util/pretty-printer.h"
 #include "util/table-printer.h"
@@ -118,6 +121,8 @@ PROFILE_DEFINE_COUNTER(NumCompletedBackends, STABLE_HIGH, TUnit::UNIT,"The numbe
 PROFILE_DEFINE_TIMER(FinalizationTimer, STABLE_LOW,
     "Total time spent in finalization (typically 0 except for INSERT into hdfs tables).");
 
+const string Coordinator::PROFILE_EVENT_LABEL_FIRST_ROW_FETCHED = "First row fetched";
+
 // Maximum number of fragment instances that can publish each broadcast filter.
 static const int MAX_BROADCAST_FILTER_PRODUCERS = 3;
 
@@ -151,19 +156,19 @@ Status Coordinator::Exec() {
              << " stmt=" << request.query_ctx.client_request.stmt;
   stmt_type_ = request.stmt_type;
 
-  query_profile_ =
-      RuntimeProfile::Create(obj_pool(), "Execution Profile " + PrintId(query_id()));
+  query_profile_ = RuntimeProfile::Create(
+      obj_pool(), "Execution Profile " + PrintId(query_id()), false);
   finalization_timer_ = PROFILE_FinalizationTimer.Instantiate(query_profile_);
   filter_updates_received_ = PROFILE_FiltersReceived.Instantiate(query_profile_);
 
-  host_profiles_ = RuntimeProfile::Create(obj_pool(), "Per Node Profiles");
+  host_profiles_ = RuntimeProfile::Create(obj_pool(), "Per Node Profiles", false);
   query_profile_->AddChild(host_profiles_);
 
   SCOPED_TIMER(query_profile_->total_time_counter());
 
   // initialize progress updater
   const string& str = Substitute("Query $0", PrintId(query_id()));
-  progress_.Init(str, exec_params_.query_schedule().num_scan_ranges());
+  scan_progress_.Init(str, exec_params_.query_schedule().num_scan_ranges());
 
   query_state_ = ExecEnv::GetInstance()->query_exec_mgr()->CreateQueryState(
       query_ctx(), exec_params_.query_schedule().coord_backend_mem_limit());
@@ -175,6 +180,14 @@ Status Coordinator::Exec() {
   // the latter in the FragmentStats' root profile
   InitBackendStates();
   exec_summary_.Init(exec_params_);
+
+  int64_t total_finstances = 0;
+  for (BackendState* backend_state : backend_states_) {
+    total_finstances += backend_state->exec_params().instance_params().size();
+  }
+  const string& query_progress_str =
+      Substitute("Query $0 progress", PrintId(query_id()));
+  query_progress_.Init(query_progress_str, total_finstances);
 
   if (filter_mode_ != TRuntimeFilterMode::OFF) {
     // Populate the runtime filter routing table. This should happen before starting the
@@ -414,13 +427,6 @@ void Coordinator::AddFilterSource(const FragmentExecParamsPB& src_fragment_param
     int num_instances, int num_backends, const TRuntimeFilterDesc& filter,
     int join_node_id) {
   FilterState* f = filter_routing_table_->GetOrCreateFilterState(filter);
-  // Set the 'pending_count_' to zero to indicate that for a filter with
-  // local-only targets the coordinator does not expect to receive any filter
-  // updates. We expect to receive a single aggregated filter from each backend
-  // for partitioned joins.
-  int pending_count = filter.is_broadcast_join
-      ? (filter.has_remote_targets ? 1 : 0) : num_backends;
-  f->set_pending_count(pending_count);
 
   // Determine which instances will produce the filters.
   // TODO: IMPALA-9333: having a shared RuntimeFilterBank between all fragments on
@@ -448,10 +454,60 @@ void Coordinator::AddFilterSource(const FragmentExecParamsPB& src_fragment_param
     random_shuffle(src_idxs.begin(), src_idxs.end());
     src_idxs.resize(MAX_BROADCAST_FILTER_PRODUCERS);
   }
-  for (int src_idx : src_idxs) {
+
+  bool has_intermediate_aggregator = src_fragment_params.has_filter_agg_info()
+      && !filter.has_local_targets && !filter.is_broadcast_join
+      && filter.type == TRuntimeFilterType::BLOOM;
+
+  if (has_intermediate_aggregator) {
+    const RuntimeFilterAggregatorInfoPB& agg_info = src_fragment_params.filter_agg_info();
+    // Set the 'pending_count_' to num_aggregators from RuntimeFilterAggregatorInfoPB.
+    int num_agg = agg_info.num_aggregators();
+    DCHECK_EQ(
+        src_fragment_params.instances_size(), agg_info.aggregator_idx_to_report_size());
+    DCHECK_EQ(num_agg, agg_info.aggregator_krpc_addresses_size());
+    DCHECK_EQ(num_agg, agg_info.aggregator_krpc_backends_size());
+    DCHECK_EQ(num_agg, agg_info.num_reporter_per_aggregator_size());
+    for (int i = 0; i < num_agg; i++) {
+      VLOG(2) << "Filter " << filter.filter_id << " backend aggregator " << (i + 1)
+              << " krpc_address=" << agg_info.aggregator_krpc_addresses(i)
+              << " krpc_backend=" << agg_info.aggregator_krpc_backends(i);
+    }
+    f->set_pending_count(num_agg);
+  } else {
+    // Set the 'pending_count_' to zero to indicate that for a filter with
+    // local-only targets the coordinator does not expect to receive any filter
+    // updates. We expect to receive a single aggregated filter from each backend
+    // for partitioned joins.
+    int pending_count =
+        filter.is_broadcast_join ? (filter.has_remote_targets ? 1 : 0) : num_backends;
+    f->set_pending_count(pending_count);
+  }
+
+  for (int i = 0; i < src_idxs.size(); i++) {
+    int src_idx = src_idxs[i];
     TRuntimeFilterSource filter_src;
     filter_src.src_node_id = join_node_id;
     filter_src.filter_id = filter.filter_id;
+    if (has_intermediate_aggregator) {
+      // Find target aggregator for fragment instance i.
+      const RuntimeFilterAggregatorInfoPB& agg_info =
+          src_fragment_params.filter_agg_info();
+      int agg_idx = agg_info.aggregator_idx_to_report(i);
+      string agg_hostname = agg_info.aggregator_krpc_addresses(agg_idx).hostname();
+      int num_reporter = agg_info.num_reporter_per_aggregator(agg_idx);
+      TNetworkAddress agg_address =
+          FromNetworkAddressPB(agg_info.aggregator_krpc_backends(agg_idx));
+
+      // Populate TRuntimeFilterAggDesc for fragment instance i.
+      TRuntimeFilterAggDesc agg_desc;
+      agg_desc.__set_krpc_hostname(agg_hostname);
+      agg_desc.__set_krpc_address(agg_address);
+      agg_desc.__set_num_reporting_hosts(num_reporter);
+      filter_src.__set_aggregator_desc(agg_desc);
+      VLOG(3) << "Instance " << src_fragment_params.instances(i)
+              << " report to backend aggregator " << (agg_idx + 1);
+    }
     filter_routing_table_->finstance_filters_produced[src_idx].emplace_back(
         filter_src);
   }
@@ -595,6 +651,7 @@ string Coordinator::FilterDebugString() {
   table_printer.AddColumn("Est fpp", false);
   table_printer.AddColumn("Min value", false);
   table_printer.AddColumn("Max value", false);
+  table_printer.AddColumn("In-list size", false);
   ObjectPool temp_object_pool;
   MemTracker temp_mem_tracker;
   for (auto& v: filter_routing_table_->id_to_filter) {
@@ -615,14 +672,14 @@ string Coordinator::FilterDebugString() {
     row.push_back(join(partition_filter, ", "));
 
     if (filter_mode_ == TRuntimeFilterMode::GLOBAL) {
-      int pending_count = state.completion_time() != 0L ? 0 : state.pending_count();
+      int pending_count = state.has_completion_time() ? 0 : state.pending_count();
       row.push_back(Substitute("$0 ($1)", pending_count, state.num_producers()));
-      if (state.first_arrival_time() == 0L) {
+      if (!state.has_first_arrival_time()) {
         row.push_back("N/A");
       } else {
         row.push_back(PrettyPrinter::Print(state.first_arrival_time(), TUnit::TIME_NS));
       }
-      if (state.completion_time() == 0L) {
+      if (!state.has_completion_time()) {
         row.push_back("N/A");
       } else {
         row.push_back(PrettyPrinter::Print(state.completion_time(), TUnit::TIME_NS));
@@ -643,15 +700,16 @@ string Coordinator::FilterDebugString() {
       stringstream ss;
       ss << setprecision(3) << fpp;
       row.push_back(ss.str());
-      row.push_back("");
-      row.push_back("");
-    } else {
+      // The following 3 fields belong to MinMax/IN-list filters.
+      for (int i = 0; i < 3; ++i) row.push_back("");
+    } else if (state.is_min_max_filter()) {
       // Add the filter type for minmax filters.
-      row.push_back(PrintThriftEnum(state.desc().type));
+      row.push_back(PrintValue(state.desc().type));
       row.push_back("");
 
       // Also add the min/max value for the accumulated filter as follows.
       //  'PartialUpdates' - The min and the max are partially updated;
+      //  'LOCAL'          - It is a local filter that is not aggregate in coordinator;
       //  'AlwaysTrue'     - One received filter is AlwaysTrue;
       //  'AlwaysFalse'    - No filter is received or all received filters are empty;
       //  'Real values'    - The final accumulated min/max from all filters received.
@@ -676,10 +734,34 @@ string Coordinator::FilterDebugString() {
             row.push_back(MinMaxFilter::DebugString(minmax_filterPB.max(),
                 ColumnType::FromThrift(state.desc().src_expr.nodes[0].type)));
           }
+        } else if (state.desc().has_remote_targets) {
+          row.push_back("PartialUpdates");
+          row.push_back("PartialUpdates");
         } else {
-          row.push_back("PartialUpdates");
-          row.push_back("PartialUpdates");
+          row.push_back("LOCAL");
+          row.push_back("LOCAL");
         }
+      }
+      row.push_back("");
+    } else if (state.is_in_list_filter()) {
+      row.push_back(PrintValue(state.desc().type));
+      // Skip 3 fields belong to Bloom/MinMax filters.
+      for (int i = 0; i < 3; ++i) row.push_back("");
+      const InListFilterPB& in_list_filterPB =
+          const_cast<FilterState*>(&state)->in_list_filter();
+      if (state.AlwaysTrueFilterReceived()) {
+        row.push_back("AlwaysTrue");
+      } else if (state.received_all_updates()) {
+        if (state.AlwaysFalseFlippedToFalse()
+            || InListFilter::AlwaysFalse(in_list_filterPB)) {
+          row.push_back("AlwaysFalse");
+        } else {
+          row.push_back(std::to_string(in_list_filterPB.value().size()));
+        }
+      } else if (state.desc().has_remote_targets) {
+        row.push_back("PartialUpdates");
+      } else {
+        row.push_back("LOCAL");
       }
     }
     table_printer.AddRow(row);
@@ -792,7 +874,10 @@ void Coordinator::HandleExecStateTransition(
   }
   ReleaseQueryAdmissionControlResources();
   // Once the query has released its admission control resources, update its end time.
-  parent_request_state_->UpdateEndTime();
+  // However, for non Query statement like DML statement, we still need to update HMS
+  // after the query finishes. So the end time of non Query statement is not set here.
+  // Instead, we set it in ClientRequestState::Wait().
+  if (stmt_type_ == TStmtType::QUERY) parent_request_state_->UpdateEndTime();
   // Can compute summary only after we stop accepting reports from the backends. Both
   // WaitForBackends() and CancelBackends() ensures that.
   // TODO: should move this off of the query execution path?
@@ -829,7 +914,7 @@ Status Coordinator::FinalizeHdfsDml() {
   DCHECK(has_called_wait_.Load());
   DCHECK(finalize_params() != nullptr);
   bool is_hive_acid = finalize_params()->__isset.write_id;
-  bool is_iceberg_table = finalize_params()->__isset.spec_id;
+  bool is_iceberg_table = finalize_params()->__isset.iceberg_params;
 
   VLOG_QUERY << "Finalizing query: " << PrintId(query_id());
   SCOPED_TIMER(finalization_timer_);
@@ -926,7 +1011,7 @@ Status Coordinator::Wait() {
     RETURN_IF_ERROR(UpdateExecState(FinalizeResultSink(), nullptr, FLAGS_hostname));
   }
 
-  // DML requests are finished at this point.
+  // DML queries are finished at this point.
   RETURN_IF_ERROR(SetNonErrorTerminalState(ExecState::RETURNED_RESULTS));
   query_profile_->AddInfoString(
       "DML Stats", dml_exec_state_.OutputPartitionStats("\n"));
@@ -965,7 +1050,7 @@ Status Coordinator::GetNext(QueryResultSet* results, int max_rows, bool* eos,
 
   Status status = coord_sink_->GetNext(runtime_state, results, max_rows, eos, timeout_us);
   if (!first_row_fetched_ && results->size() > 0) {
-    query_events_->MarkEvent("First row fetched");
+    query_events_->MarkEvent(Coordinator::PROFILE_EVENT_LABEL_FIRST_ROW_FETCHED);
     first_row_fetched_ = true;
   }
   RETURN_IF_ERROR(UpdateExecState(
@@ -1026,7 +1111,8 @@ Status Coordinator::UpdateBackendExecStatus(const ReportExecStatusRequestPB& req
   vector<AuxErrorInfoPB> aux_error_info;
 
   if (backend_state->ApplyExecStatusReport(request, thrift_profiles, &exec_summary_,
-          &progress_, &dml_exec_state_, &aux_error_info, fragment_stats_)) {
+          &scan_progress_, &query_progress_, &dml_exec_state_, &aux_error_info,
+          fragment_stats_)) {
     // This backend execution has completed.
     if (VLOG_QUERY_IS_ON) {
       // Don't log backend completion if the query has already been cancelled.
@@ -1128,9 +1214,9 @@ Status Coordinator::UpdateBlacklistWithAuxErrorInfo(
   // the failed RPC. Only blacklist one node per ReportExecStatusRequestPB to avoid
   // blacklisting nodes too aggressively. Currently, only blacklist the first node
   // that contains a valid RPCErrorInfoPB object.
-  for (auto aux_error : *aux_error_info) {
+  for (const auto& aux_error : *aux_error_info) {
     if (aux_error.has_rpc_error_info()) {
-      RPCErrorInfoPB rpc_error_info = aux_error.rpc_error_info();
+      const RPCErrorInfoPB& rpc_error_info = aux_error.rpc_error_info();
       DCHECK(rpc_error_info.has_dest_node());
       DCHECK(rpc_error_info.has_posix_error_code());
       const NetworkAddressPB& dest_node = rpc_error_info.dest_node();
@@ -1218,6 +1304,7 @@ void Coordinator::HandleFailedExecRpcs(vector<BackendState*> failed_backend_stat
 
   // Create an error based on the Exec RPC failure Status
   vector<string> backend_addresses;
+  backend_addresses.reserve(failed_backend_states.size());
   for (BackendState* backend_state : failed_backend_states) {
     backend_addresses.push_back(
         NetworkAddressPBToString(backend_state->krpc_impalad_address()));
@@ -1390,6 +1477,7 @@ void Coordinator::ReleaseBackendAdmissionControlResources(
       parent_request_state_->admission_control_client();
   DCHECK(admission_control_client != nullptr);
   vector<NetworkAddressPB> host_addrs;
+  host_addrs.reserve(backend_states.size());
   for (auto backend_state : backend_states) {
     host_addrs.push_back(backend_state->impalad_address());
   }
@@ -1421,6 +1509,20 @@ vector<NetworkAddressPB> Coordinator::GetActiveBackends(
   return result;
 }
 
+list<pair<NetworkAddressPB, Coordinator::ResourceUtilization>>
+    Coordinator::BackendResourceUtilization() {
+  DCHECK(exec_rpcs_complete_.Load()) << "Exec() must be called first.";
+  list<pair<NetworkAddressPB, Coordinator::ResourceUtilization>> result;
+
+  lock_guard<SpinLock> l(backend_states_init_lock_);
+  for (BackendState* backend_state : backend_states_) {
+    result.push_back(make_pair(backend_state->impalad_address(),
+        backend_state->GetResourceUtilization()));
+  }
+
+  return result;
+}
+
 void Coordinator::UpdateFilter(const UpdateFilterParamsPB& params, RpcContext* context) {
   VLOG(2) << "Coordinator::UpdateFilter(filter_id=" << params.filter_id() << ")";
   shared_lock<shared_mutex> lock(filter_routing_table_->lock);
@@ -1437,7 +1539,7 @@ void Coordinator::UpdateFilter(const UpdateFilterParamsPB& params, RpcContext* c
   std::unordered_set<int> target_fragment_idxs;
   if (!IsExecuting()) {
     LOG(INFO) << "Filter update received for non-executing query with id: "
-        << query_id();
+        << PrintId(query_id());
     return;
   }
   auto it = filter_routing_table_->id_to_filter.find(params.filter_id());
@@ -1492,9 +1594,11 @@ void Coordinator::UpdateFilter(const UpdateFilterParamsPB& params, RpcContext* c
           || rpc_params.bloom_filter().always_true()
           || !state->bloom_filter_directory().empty());
 
-    } else {
-      DCHECK(state->is_min_max_filter());
+    } else if (state->is_min_max_filter()) {
       MinMaxFilter::Copy(state->min_max_filter(), rpc_params.mutable_min_max_filter());
+    } else {
+      DCHECK(state->is_in_list_filter());
+      *rpc_params.mutable_in_list_filter() = state->in_list_filter();
     }
 
     // Filter is complete. We disable it so future UpdateFilter rpcs will be ignored,
@@ -1528,8 +1632,8 @@ void Coordinator::FilterState::ApplyUpdate(
     const UpdateFilterParamsPB& params, Coordinator* coord, RpcContext* context) {
   DCHECK(enabled());
   DCHECK_GT(pending_count_, 0);
-  DCHECK_EQ(completion_time_, 0L);
-  if (first_arrival_time_ == 0L) {
+  DCHECK(!has_completion_time());
+  if (!has_first_arrival_time()) {
     first_arrival_time_ = coord->query_events_->ElapsedTime();
   }
 
@@ -1575,8 +1679,7 @@ void Coordinator::FilterState::ApplyUpdate(
             sidecar_slice.size());
       }
     }
-  } else {
-    DCHECK(is_min_max_filter());
+  } else if (is_min_max_filter()) {
     DCHECK(params.has_min_max_filter());
     ColumnType col_type = ColumnType::FromThrift(desc_.src_expr.nodes[0].type);
     VLOG(3) << "Coordinator::FilterState::ApplyUpdate() on minmax."
@@ -1598,6 +1701,15 @@ void Coordinator::FilterState::ApplyUpdate(
       MinMaxFilter::Or(params.min_max_filter(), &min_max_filter_, col_type);
     }
     VLOG(3) << " Updated accumulated filter=" << DebugString();
+  } else {
+    DCHECK(is_in_list_filter());
+    DCHECK(params.has_in_list_filter());
+    VLOG(3) << "Update IN-list filter " << params.filter_id() << ", "
+            << InListFilter::DebugString(params.in_list_filter());
+    DCHECK(!in_list_filter_.always_true());
+    DCHECK_EQ(in_list_filter_.value_size(), 0);
+    DCHECK(!in_list_filter_.contains_null());
+    in_list_filter_ = params.in_list_filter();
   }
 
   if (pending_count_ == 0 || disabled()) {
@@ -1611,7 +1723,7 @@ void Coordinator::FilterState::DisableAndRelease(
   Release(tracker);
 }
 
-void Coordinator::FilterState::Disable(const bool all_updates_received) {
+void Coordinator::FilterState::Disable(bool all_updates_received) {
   all_updates_received_ = all_updates_received;
   if (is_bloom_filter()) {
     bloom_filter_.set_always_true(true);
@@ -1619,13 +1731,18 @@ void Coordinator::FilterState::Disable(const bool all_updates_received) {
       always_false_flipped_to_false_ = true;
     }
     bloom_filter_.set_always_false(false);
-  } else {
-    DCHECK(is_min_max_filter());
+  } else if (is_min_max_filter()) {
     min_max_filter_.set_always_true(true);
     if (MinMaxFilter::AlwaysFalse(min_max_filter_)) {
       always_false_flipped_to_false_ = true;
     }
     min_max_filter_.set_always_false(false);
+  } else {
+    DCHECK(is_in_list_filter());
+    if (InListFilter::AlwaysFalse(in_list_filter_)) {
+      always_false_flipped_to_false_ = true;
+    }
+    in_list_filter_.set_always_true(true);
   }
 }
 

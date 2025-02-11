@@ -54,6 +54,8 @@ namespace impala {
   #define ADD_COUNTER(profile, name, unit) (profile)->AddCounter(name, unit)
   #define ADD_TIME_SERIES_COUNTER(profile, name, src_counter) \
       (profile)->AddSamplingTimeSeriesCounter(name, src_counter)
+  #define ADD_SYSTEM_TIME_SERIES_COUNTER(profile, name, src_counter) \
+      (profile)->AddSamplingTimeSeriesCounter(name, src_counter, true)
   #define ADD_TIMER(profile, name) (profile)->AddCounter(name, TUnit::TIME_NS)
   #define ADD_SUMMARY_STATS_TIMER(profile, name) \
       (profile)->AddSummaryStatsCounter(name, TUnit::TIME_NS)
@@ -256,7 +258,7 @@ class SamplingCounterPrototype : public ProfileEntryPrototype {
 
   RuntimeProfileBase::Counter* Instantiate(
       RuntimeProfile* profile, boost::function<int64_t()> sample_fn) {
-    return profile->AddSamplingCounter(name(), sample_fn);
+    return profile->AddSamplingCounter(name(), std::move(sample_fn));
   }
 };
 
@@ -657,10 +659,11 @@ class RuntimeProfile::EventSequence {
 
   /// Stores an event in sequence with the given label and the current time
   /// (relative to the first time Start() was called) as the timestamp.
-  void MarkEvent(std::string label) {
+  int64_t MarkEvent(std::string label) {
     Event event = make_pair(move(label), sw_.ElapsedTime() + offset_);
     std::lock_guard<SpinLock> event_lock(lock_);
     events_.emplace_back(move(event));
+    return event.second;
   }
 
   int64_t ElapsedTime() { return sw_.ElapsedTime(); }
@@ -754,6 +757,9 @@ class RuntimeProfile::TimeSeriesCounter {
 
   TUnit::type unit() const { return unit_; }
 
+  void SetIsSystem() { is_system_ = true; }
+  bool GetIsSystem() const { return  is_system_; }
+
  private:
   friend class RuntimeProfile;
 
@@ -792,9 +798,9 @@ class RuntimeProfile::TimeSeriesCounter {
   virtual void Clear() {}
 
  protected:
-  TimeSeriesCounter(const std::string& name, TUnit::type unit,
-      SampleFunction fn = SampleFunction())
-    : name_(name), unit_(unit), sample_fn_(fn) {}
+  TimeSeriesCounter(
+      const std::string& name, TUnit::type unit, SampleFunction fn = SampleFunction())
+    : name_(name), unit_(unit), sample_fn_(std::move(fn)), is_system_(false) {}
 
   std::string name_;
   TUnit::type unit_;
@@ -802,6 +808,7 @@ class RuntimeProfile::TimeSeriesCounter {
   /// The number of samples that have been retrieved and cleared from this counter.
   int64_t previous_sample_count_ = 0;
   mutable SpinLock lock_;
+  bool is_system_;
 };
 
 typedef StreamingSampler<int64_t, 64> StreamingCounterSampler;
@@ -809,13 +816,17 @@ class RuntimeProfile::SamplingTimeSeriesCounter
     : public RuntimeProfile::TimeSeriesCounter {
  private:
   friend class RuntimeProfile;
+  friend class ToJson_TimeSeriesCounterToJsonTest_Test;
 
   SamplingTimeSeriesCounter(
-      const std::string& name, TUnit::type unit, SampleFunction fn)
-    : TimeSeriesCounter(name, unit, fn) {}
+      const std::string& name, TUnit::type unit, SampleFunction fn, int initial_period)
+    : TimeSeriesCounter(name, unit, std::move(fn)), samples_(initial_period) {}
 
   virtual void AddSampleLocked(int64_t sample, int ms_elapsed) override;
   virtual const int64_t* GetSamplesLocked( int* num_samples, int* period) const override;
+
+  /// Reset the underlying StreamingCounterSampler to the initial state. Used in tests.
+  void Reset();
 
   StreamingCounterSampler samples_;
 };

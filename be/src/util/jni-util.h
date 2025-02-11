@@ -107,31 +107,58 @@ struct JniMethodDescriptor {
   jmethodID* method_id;
 };
 
-/// Helper class for lifetime management of chars from JNI, releasing JNI chars when
-/// destructed
-class JniUtfCharGuard {
+/// Helper class for the lifetime management of JNI char or byte buffers. Releases the JNI
+/// buffer when destructed. T must be either jstring or jbyteArray. If T is a jstring, the
+/// string in the buffer is in utf-8 format.
+///
+/// See also JniScopedArrayCritical, which can also be used for byte buffers but its usage
+/// is more restricted, see https://docs.oracle.com/javase/8/docs/technotes/guides/jni/spec/functions.html#GetPrimitiveArrayCritical_ReleasePrimitiveArrayCritical
+template <class T>
+class JniBufferGuard {
+  static_assert(std::is_same_v<T, jstring> || std::is_same_v<T, jbyteArray>);
  public:
-  /// Construct a JniUtfCharGuards holding nothing
-  JniUtfCharGuard() : utf_chars(nullptr) {}
+  /// Construct a JniBufferGuard holding nothing.
+  JniBufferGuard() : env(nullptr), jbuffer{}, size(0), buffer(nullptr)  {}
 
-  /// Release the held char sequence if there is one.
-  ~JniUtfCharGuard() {
-    if (utf_chars != nullptr) env->ReleaseStringUTFChars(jstr, utf_chars);
+  /// Release the held JNI buffer if there is one.
+  ~JniBufferGuard() {
+    Release(env, jbuffer, buffer);
   }
 
-  /// Try to get chars from jstr. If error is returned, utf_chars and get() remain
-  /// to be nullptr, otherwise they point to a valid char sequence. The char sequence
-  /// lives as long as this guard. jstr should not be null.
-  static Status create(JNIEnv* env, jstring jstr, JniUtfCharGuard* out);
+  /// Try to get chars/bytes from jbuffer. If an error is returned, buffer and get()
+  /// remain 'nullptr's, otherwise they point to a valid char/byte array. The char/byte
+  /// array lives as long as this guard. jbuffer should not be null.
+  static Status create(JNIEnv* env, T jbuffer, JniBufferGuard* out);
 
-  /// Get the char sequence. Returns nullptr if the guard does hold a char sequence.
-  const char* get() { return utf_chars; }
+  /// Get the size of the buffer.
+  uint32_t get_size() { return size; }
+
+  /// Get the buffer. Returns nullptr if the guard does hold a buffer.
+  const char* get() { return buffer; }
  private:
   JNIEnv* env;
-  jstring jstr;
-  const char* utf_chars;
-  DISALLOW_COPY_AND_ASSIGN(JniUtfCharGuard);
+  T jbuffer;
+  uint32_t size;
+  const char* buffer;
+  DISALLOW_COPY_AND_ASSIGN(JniBufferGuard);
+
+  static void Release(JNIEnv* env, T jbuffer, const char* buffer) {
+    if (buffer != nullptr) {
+      if constexpr (std::is_same_v<T, jstring>) {
+        env->ReleaseStringUTFChars(jbuffer, buffer);
+      } else {
+        static_assert(std::is_same_v<T, jbyteArray>);
+        /// Return buffer back. JNI_ABORT indicates to not copy contents back to java
+        /// side.
+        env->ReleaseByteArrayElements(jbuffer,
+            const_cast<jbyte*>(reinterpret_cast<const jbyte*>(buffer)), JNI_ABORT);
+      }
+    }
+  }
 };
+
+using JniUtfCharGuard = JniBufferGuard<jstring>;
+using JniByteArrayGuard = JniBufferGuard<jbyteArray>;
 
 class JniScopedArrayCritical {
  public:
@@ -226,6 +253,8 @@ class JniCall {
 
   Status ObjectToResult(jobject obj, std::string* result) WARN_UNUSED_RESULT;
 
+  Status ObjectToResult(jobject obj, jobject* result) WARN_UNUSED_RESULT;
+
   const jmethodID method_;
   JNIEnv* const env_;
   JniLocalFrame frame_;
@@ -280,6 +309,16 @@ class JniUtil {
   /// (e.g. a JNI exception). This function does not log any errors or exceptions.
   static bool MethodExists(JNIEnv* env, jclass class_ref,
       const char* method_str, const char* method_signature);
+
+  /// Wrapper method around JNI's 'GetMethodID'. Returns the method reference for the
+  /// requested method.
+  static Status GetMethodID(JNIEnv* env, jclass class_ref, const char* method_str,
+      const char* method_signature, jmethodID* method_ref);
+
+  /// Wrapper method around JNI's 'GetStaticMethodID'. Returns the method reference for
+  /// the requested method.
+  static Status GetStaticMethodID(JNIEnv* env, jclass class_ref, const char* method_str,
+      const char* method_signature, jmethodID* method_ref);
 
   /// Returns a global JNI reference to the class specified by class_str into class_ref.
   /// The returned reference must eventually be freed by calling FreeGlobalRef() (or have
@@ -365,6 +404,10 @@ class JniUtil {
     return JniCall::static_method(cls, method).Call();
   }
 
+  template <typename T, typename R>
+  static Status CallStaticJniMethod(const jclass& cls, const jmethodID& method,
+      const T& arg, R* response) WARN_UNUSED_RESULT;
+
   template <typename T>
   static Status CallJniMethod(const jobject& obj, const jmethodID& method,
       const T& arg) WARN_UNUSED_RESULT;
@@ -376,6 +419,10 @@ class JniUtil {
   template <typename R>
   static Status CallJniMethod(const jobject& obj, const jmethodID& method,
       R* response) WARN_UNUSED_RESULT;
+
+  template <typename T>
+  static Status CallJniMethod(const jobject& obj, const jmethodID& method,
+      const T& arg, jobject* response) WARN_UNUSED_RESULT;
 
  private:
   // Slow-path for GetJNIEnv, used on the first call by any thread.
@@ -418,6 +465,12 @@ SPECIALIZE_PRIMITIVE_TO_VALUE(float, f);
 SPECIALIZE_PRIMITIVE_TO_VALUE(double, d);
 #undef SPECIALIZE_PRIMITIVE_TO_VALUE
 
+template <typename T, typename R>
+inline Status JniUtil::CallStaticJniMethod(const jclass& cls, const jmethodID& method,
+    const T& arg, R* response) {
+  return JniCall::static_method(cls, method).with_thrift_arg(arg).Call(response);
+}
+
 template <typename T>
 inline Status JniUtil::CallJniMethod(const jobject& obj, const jmethodID& method,
     const T& arg) {
@@ -440,6 +493,12 @@ template <typename R>
 inline Status JniUtil::CallJniMethod(const jobject& obj, const jmethodID& method,
     R* response) {
   return JniCall::instance_method(obj, method).Call(response);
+}
+
+template <typename T>
+inline Status JniUtil::CallJniMethod(const jobject& obj, const jmethodID& method,
+    const T& arg, jobject* response) {
+  return JniCall::instance_method(obj, method).with_thrift_arg(arg).Call(response);
 }
 
 inline JniCall::JniCall(jmethodID method)
@@ -503,6 +562,14 @@ inline Status JniCall::ObjectToResult(jobject obj, std::string* result) {
   JniUtfCharGuard utf;
   RETURN_IF_ERROR(JniUtfCharGuard::create(env_, static_cast<jstring>(obj), &utf));
   *result = utf.get();;
+  return Status::OK();
+}
+
+inline Status JniCall::ObjectToResult(jobject obj, jobject* result) {
+  DCHECK(obj) << "Call returned unexpected null Thrift object";
+  JNIEnv* env = JniUtil::GetJNIEnv();
+  if (env == nullptr) return Status("Failed to get/create JVM");
+  RETURN_IF_ERROR(JniUtil::LocalToGlobalRef(env, obj, result));
   return Status::OK();
 }
 

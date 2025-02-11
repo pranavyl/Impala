@@ -80,3 +80,217 @@ NULL,0,1
 ---- TYPES
 TINYINT, INT, BIGINT
 ====
+---- QUERY
+# IMPALA-11779: test null slots in the sort tuple
+with v1 as (
+  select '0' as a1, '' as b1 from alltypestiny
+), v2 as (
+  select '' as a2, null as b2
+), v3 as (
+  select b1 as b
+  from v1 left join v2 on a1 = a2
+)
+select 1 from (
+  select row_number() over (partition by b order by b) rnk
+  from v3
+) v
+where rnk = 1
+---- RESULTS
+1
+---- TYPES
+TINYINT
+====
+---- QUERY
+# IMPALA-11779: test null slots in the sort tuple
+with v1 as (
+  select '0' as a1, '' as b1 from alltypes
+), v2 as (
+  select '' as a2, null as b2
+), v3 as (
+  select b1 as b
+  from v1 left join v2 on a1 = a2
+)
+select count(*) from (
+  select row_number() over (partition by b order by b) rnk
+  from v3
+) v
+where rnk < 10
+---- RESULTS
+9
+---- TYPES
+BIGINT
+====
+---- QUERY
+select id, rn from (
+  select id,
+    row_number() over (order by id desc) rn,
+    max(id) over () max_id
+  from functional.alltypesagg) t
+where id = max_id and rn < 10
+---- RESULTS
+9999,1
+---- TYPES
+INT,BIGINT
+====
+---- QUERY
+# IMPALA-12164: test non-materialized slots with BinaryPredicate
+select id,
+       RANK() OVER(ORDER BY id DESC) AS rank_id
+  from (SELECT id
+          FROM functional.alltypesagg
+        WHERE int_col = 0 and false) alias_0
+  order by id
+---- RESULTS
+---- TYPES
+INT,BIGINT
+====
+---- QUERY
+# IMPALA-12164: test non-materialized slots with BinaryPredicate and INNER-JOIN
+select id,
+       RANK() OVER(ORDER BY id DESC) AS rank_id
+  from (SELECT tbl_0.id
+          FROM functional.alltypesagg tbl_0
+          JOIN functional.alltypesagg tbl_1
+          ON tbl_0.id = tbl_1.id
+        WHERE tbl_0.int_col =0 and false) alias_0
+  order by id
+---- RESULTS
+---- TYPES
+INT,BIGINT
+====
+---- QUERY
+# IMPALA-12164: test non-materialized slots with BinaryPredicate and LEFT-JOIN
+select id,
+       RANK() OVER(ORDER BY id DESC) AS rank_id
+  from (SELECT tbl_0.id
+          FROM functional.alltypesagg tbl_0
+          LEFT JOIN functional.alltypesagg tbl_1
+          ON tbl_0.id = tbl_1.id
+        WHERE tbl_0.int_col =0 and false) alias_0
+  order by id
+---- RESULTS
+---- TYPES
+INT,BIGINT
+====
+---- QUERY
+# IMPALA-12164: test non-materialized slots with BinaryPredicate and FULL-JOIN
+select id,
+       RANK() OVER(ORDER BY id DESC) AS rank_id
+  from (SELECT tbl_0.id
+          FROM functional.alltypesagg tbl_0
+          FULL JOIN functional.alltypesagg tbl_1
+          ON tbl_0.id = tbl_1.id
+        WHERE tbl_0.int_col =0 and false) alias_0
+  order by id
+---- RESULTS
+---- TYPES
+INT,BIGINT
+====
+---- QUERY
+# IMPALA-12164: test non-materialized slots with BetweenPredicate
+select id,
+       RANK() OVER(ORDER BY id DESC) AS rank_id
+  from (SELECT id
+          FROM functional.alltypesagg
+        WHERE int_col between 0 and 10 and false) alias_0
+  order by id
+---- RESULTS
+---- TYPES
+INT,BIGINT
+====
+---- QUERY
+# IMPALA-12164: test non-materialized slots with BetweenPredicate and INNER-JOIN
+select id,
+       RANK() OVER(ORDER BY id DESC) AS rank_id
+  from (SELECT tbl_0.id
+          FROM functional.alltypesagg tbl_0
+          JOIN functional.alltypesagg tbl_1
+          ON tbl_0.id = tbl_1.id
+        WHERE tbl_0.int_col between 0 and 10 and false) alias_0
+  order by id
+---- RESULTS
+---- TYPES
+INT,BIGINT
+====
+---- QUERY
+# IMPALA-12164: test non-materialized slots with BetweenPredicate and LEFT-JOIN
+select id,
+       RANK() OVER(ORDER BY id DESC) AS rank_id
+  from (SELECT tbl_0.id
+          FROM functional.alltypesagg tbl_0
+          LEFT JOIN functional.alltypesagg tbl_1
+          ON tbl_0.id = tbl_1.id
+        WHERE tbl_0.int_col between 0 and 10 and false) alias_0
+  order by id
+---- RESULTS
+---- TYPES
+INT,BIGINT
+====
+---- QUERY
+# IMPALA-12164: test non-materialized slots with BetweenPredicate and FULL-JOIN
+select id,
+       RANK() OVER(ORDER BY id DESC) AS rank_id
+  from (SELECT tbl_0.id
+          FROM functional.alltypesagg tbl_0
+          FULL JOIN functional.alltypesagg tbl_1
+          ON tbl_0.id = tbl_1.id
+        WHERE tbl_0.int_col between 0 and 10 and false) alias_0
+  order by id
+---- RESULTS
+---- TYPES
+INT,BIGINT
+====
+---- QUERY
+# IMPALA-12164: test non-materialized slots with InPredicate
+select id,
+       RANK() OVER(ORDER BY id DESC) AS rank_id
+  from (SELECT id
+          FROM functional.alltypesagg
+        WHERE int_col in(1, 2, 3) and false) alias_0
+  order by id
+---- RESULTS
+---- TYPES
+INT,BIGINT
+====
+---- QUERY
+# IMPALA-12164: test non-materialized slots with InPredicate and INNER-JOIN
+select id,
+       RANK() OVER(ORDER BY id DESC) AS rank_id
+  from (SELECT tbl_0.id
+          FROM functional.alltypesagg tbl_0
+          JOIN functional.alltypesagg tbl_1
+          ON tbl_0.id = tbl_1.id
+        WHERE tbl_0.int_col in(1, 2, 3) and false) alias_0
+  order by id
+---- RESULTS
+---- TYPES
+INT,BIGINT
+====
+---- QUERY
+# IMPALA-12164: test non-materialized slots with InPredicate and LEFT-JOIN
+select id,
+       RANK() OVER(ORDER BY id DESC) AS rank_id
+  from (SELECT tbl_0.id
+          FROM functional.alltypesagg tbl_0
+          LEFT JOIN functional.alltypesagg tbl_1
+          ON tbl_0.id = tbl_1.id
+        WHERE tbl_0.int_col in(1, 2, 3) and false) alias_0
+  order by id
+---- RESULTS
+---- TYPES
+INT,BIGINT
+====
+---- QUERY
+# IMPALA-12164: test non-materialized slots with InPredicate and FULL-JOIN
+select id,
+       RANK() OVER(ORDER BY id DESC) AS rank_id
+  from (SELECT tbl_0.id
+          FROM functional.alltypesagg tbl_0
+          FULL JOIN functional.alltypesagg tbl_1
+          ON tbl_0.id = tbl_1.id
+        WHERE tbl_0.int_col in(1, 2, 3) and false) alias_0
+  order by id
+---- RESULTS
+---- TYPES
+INT,BIGINT
+====

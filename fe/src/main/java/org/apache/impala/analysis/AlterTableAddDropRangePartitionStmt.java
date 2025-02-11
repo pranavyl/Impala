@@ -17,6 +17,7 @@
 
 package org.apache.impala.analysis;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.impala.catalog.Column;
@@ -63,6 +64,9 @@ public class AlterTableAddDropRangePartitionStmt extends AlterTableStmt {
   }
 
   @Override
+  public String getOperation() { return operation_.name().toUpperCase(); }
+
+  @Override
   public String toSql(ToSqlOptions options) {
     StringBuilder sb = new StringBuilder("ALTER TABLE " + getTbl());
     sb.append(" " + operation_.name());
@@ -106,6 +110,15 @@ public class AlterTableAddDropRangePartitionStmt extends AlterTableStmt {
       colDef.analyze(analyzer);
       rangeColDefs.add(colDef);
     }
+
+    List<ColumnDef> pkColumnDefs = new ArrayList<>();
+    for (String colName: kuduTable.getPrimaryKeyColumnNames()) {
+      Column col = kuduTable.getColumn(colName);
+      ColumnDef colDef = new ColumnDef(col.getName(), new TypeDef(col.getType()));
+      colDef.analyze(analyzer);
+      pkColumnDefs.add(colDef);
+    }
+    rangePartitionSpec_.setPkColumnDefMap(ColumnDef.mapByColumnNames(pkColumnDefs));
     rangePartitionSpec_.analyze(analyzer, rangeColDefs);
   }
 }

@@ -19,9 +19,11 @@ package org.apache.impala.analysis;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.RoundingMode;
 
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.TypeCompatibility;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.SqlCastException;
 import org.apache.impala.thrift.TDecimalLiteral;
@@ -219,7 +221,7 @@ public class NumericLiteral extends LiteralExpr {
   public Type getExplicitType() { return explicitType_; }
 
   @Override
-  public boolean localEquals(Expr that) {
+  protected boolean localEquals(Expr that) {
     if (!super.localEquals(that)) return false;
     // Analyzed Numeric literals of different types are distinct.
     if (!getType().equals(that.getType())) { return false; }
@@ -429,7 +431,7 @@ public class NumericLiteral extends LiteralExpr {
 
     // If cast to an integer type, round the fractional part.
     if (targetType.isIntegerType() && value.scale() != 0) {
-      return value.setScale(0, BigDecimal.ROUND_HALF_UP);
+      return value.setScale(0, RoundingMode.HALF_UP);
     }
 
     // If non-decimal (integer or float), use the existing value.
@@ -447,7 +449,7 @@ public class NumericLiteral extends LiteralExpr {
 
     // Truncate (round) extra digits if necessary.
     if (value.scale() > decimalType.decimalScale()) {
-      return value.setScale(decimalType.decimalScale(), BigDecimal.ROUND_HALF_UP);
+      return value.setScale(decimalType.decimalScale(), RoundingMode.HALF_UP);
     }
 
     // Existing value fits, use it.
@@ -461,8 +463,12 @@ public class NumericLiteral extends LiteralExpr {
    * @throws SqlCastException
    */
   @Override
-  protected Expr uncheckedCastTo(Type targetType) throws SqlCastException {
-    Preconditions.checkState(targetType.isNumericType());
+  protected Expr uncheckedCastTo(Type targetType, TypeCompatibility compatibility)
+      throws SqlCastException {
+    Preconditions.checkState(targetType.isNumericType() || targetType.isStringType());
+    if (targetType.isStringType()) {
+      return new CastExpr(targetType, this, compatibility);
+    }
     if (type_ == targetType) return this;
     try {
       BigDecimal converted = convertValue(value_, targetType);
@@ -475,7 +481,7 @@ public class NumericLiteral extends LiteralExpr {
         return new NumericLiteral(converted, targetType);
       }
     } catch (SqlCastException e) {
-      return new CastExpr(targetType, this);
+      return new CastExpr(targetType, this, compatibility);
     }
   }
 

@@ -17,13 +17,19 @@
 
 #include "service/hs2-util.h"
 
+#include <sstream>
+
 #include <rapidjson/rapidjson.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
 #include "common/logging.h"
+#include "exprs/scalar-expr.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/slot-ref.h"
+#include "gen-cpp/TCLIService_constants.h"
 #include "runtime/date-value.h"
+#include "runtime/complex-value-writer.inline.h"
 #include "runtime/decimal-value.inline.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/row-batch.h"
@@ -117,10 +123,12 @@ void impala::TColumnValueToHS2TColumn(const TColumnValue& col_val,
     case TPrimitiveType::CHAR:
     case TPrimitiveType::VARCHAR:
     case TPrimitiveType::DECIMAL:
+    case TPrimitiveType::BINARY:
       is_null = !col_val.__isset.string_val;
       column->stringVal.values.push_back(col_val.string_val);
       nulls = &column->stringVal.nulls;
       break;
+
     default:
       DCHECK(false) << "Unhandled type: "
                     << TypeToString(ThriftToType(type.types[0].scalar_type.type));
@@ -135,13 +143,12 @@ void impala::TColumnValueToHS2TColumn(const TColumnValue& col_val,
 // Helper to reserve space in hs2Vals->values and hs2Vals->nulls for the values that the
 // different implementations of ExprValuesToHS2TColumn will write.
 template <typename T>
-void ReserveSpace(int num_rows, uint32_t output_row_idx, T* hs2Vals) {
-  DCHECK_GE(num_rows, 0);
-  int64_t num_output_rows = output_row_idx + num_rows;
-  int64_t num_null_bytes = BitUtil::RoundUpNumBytes(num_output_rows);
+void ReserveSpace(int reserve_count, T* hs2Vals) {
+  DCHECK_GE(reserve_count, 0);
+  int64_t num_null_bytes = BitUtil::RoundUpNumBytes(reserve_count);
   // Round up reserve() arguments to power-of-two to avoid accidentally quadratic
   // behaviour from repeated small increases in size.
-  hs2Vals->values.reserve(BitUtil::RoundUpToPowerOfTwo(num_output_rows));
+  hs2Vals->values.reserve(BitUtil::RoundUpToPowerOfTwo(reserve_count));
   hs2Vals->nulls.reserve(BitUtil::RoundUpToPowerOfTwo(num_null_bytes));
 }
 
@@ -149,7 +156,6 @@ void ReserveSpace(int num_rows, uint32_t output_row_idx, T* hs2Vals) {
 static void BoolExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatch* batch,
     int start_idx, int num_rows, uint32_t output_row_idx,
     apache::hive::service::cli::thrift::TColumn* column) {
-  ReserveSpace(num_rows, output_row_idx, &column->boolVal);
   FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
     BooleanVal val = expr_eval->GetBooleanVal(it.Get());
     column->boolVal.values.push_back(val.val);
@@ -162,7 +168,6 @@ static void BoolExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatch*
 static void TinyIntExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatch* batch,
     int start_idx, int num_rows, uint32_t output_row_idx,
     apache::hive::service::cli::thrift::TColumn* column) {
-  ReserveSpace(num_rows, output_row_idx, &column->byteVal);
   FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
     TinyIntVal val = expr_eval->GetTinyIntVal(it.Get());
     column->byteVal.values.push_back(val.val);
@@ -175,7 +180,6 @@ static void TinyIntExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBat
 static void SmallIntExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
     RowBatch* batch, int start_idx, int num_rows, uint32_t output_row_idx,
     apache::hive::service::cli::thrift::TColumn* column) {
-  ReserveSpace(num_rows, output_row_idx, &column->i16Val);
   FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
     SmallIntVal val = expr_eval->GetSmallIntVal(it.Get());
     column->i16Val.values.push_back(val.val);
@@ -188,7 +192,6 @@ static void SmallIntExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
 static void IntExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatch* batch,
     int start_idx, int num_rows, uint32_t output_row_idx,
     apache::hive::service::cli::thrift::TColumn* column) {
-  ReserveSpace(num_rows, output_row_idx, &column->i32Val);
   FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
     DCHECK_EQ(output_row_idx, column->i32Val.values.size());
     IntVal val = expr_eval->GetIntVal(it.Get());
@@ -202,7 +205,6 @@ static void IntExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatch* 
 static void BigIntExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatch* batch,
     int start_idx, int num_rows, uint32_t output_row_idx,
     apache::hive::service::cli::thrift::TColumn* column) {
-  ReserveSpace(num_rows, output_row_idx, &column->i64Val);
   FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
     BigIntVal val = expr_eval->GetBigIntVal(it.Get());
     column->i64Val.values.push_back(val.val);
@@ -215,7 +217,6 @@ static void BigIntExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatc
 static void FloatExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatch* batch,
     int start_idx, int num_rows, uint32_t output_row_idx,
     apache::hive::service::cli::thrift::TColumn* column) {
-  ReserveSpace(num_rows, output_row_idx, &column->doubleVal);
   FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
     FloatVal val = expr_eval->GetFloatVal(it.Get());
     column->doubleVal.values.push_back(val.val);
@@ -228,7 +229,6 @@ static void FloatExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatch
 static void DoubleExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatch* batch,
     int start_idx, int num_rows, uint32_t output_row_idx,
     apache::hive::service::cli::thrift::TColumn* column) {
-  ReserveSpace(num_rows, output_row_idx, &column->doubleVal);
   FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
     DoubleVal val = expr_eval->GetDoubleVal(it.Get());
     column->doubleVal.values.push_back(val.val);
@@ -241,14 +241,12 @@ static void DoubleExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatc
 static void TimestampExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
     RowBatch* batch, int start_idx, int num_rows, uint32_t output_row_idx,
     apache::hive::service::cli::thrift::TColumn* column) {
-  ReserveSpace(num_rows, output_row_idx, &column->stringVal);
   FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
     TimestampVal val = expr_eval->GetTimestampVal(it.Get());
     column->stringVal.values.emplace_back();
     if (!val.is_null) {
       TimestampValue value = TimestampValue::FromTimestampVal(val);
-      RawValue::PrintValue(
-          &value, ColumnType(TYPE_TIMESTAMP), -1, &(column->stringVal.values.back()));
+      column->stringVal.values.back() = value.ToString();
     }
     SetNullBit(output_row_idx, val.is_null, &column->stringVal.nulls);
     ++output_row_idx;
@@ -259,16 +257,30 @@ static void TimestampExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
 static void DateExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
     RowBatch* batch, int start_idx, int num_rows, uint32_t output_row_idx,
     apache::hive::service::cli::thrift::TColumn* column) {
-  ReserveSpace(num_rows, output_row_idx, &column->stringVal);
   FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
     DateVal val = expr_eval->GetDateVal(it.Get());
     column->stringVal.values.emplace_back();
     if (!val.is_null) {
       DateValue value = DateValue::FromDateVal(val);
-      RawValue::PrintValue(
-          &value, ColumnType(TYPE_DATE), -1, &(column->stringVal.values.back()));
+      column->stringVal.values.back() = value.ToString();
     }
     SetNullBit(output_row_idx, val.is_null, &column->stringVal.nulls);
+    ++output_row_idx;
+  }
+}
+
+// Common logic for BINARY, STRING and VARCHAR.
+static void StringExprValuesToHS2TColumnHelper(ScalarExprEvaluator* expr_eval,
+    RowBatch* batch, int start_idx, int num_rows, uint32_t output_row_idx,
+    vector<string>&  values, string& nulls) {
+  FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
+    StringVal val = expr_eval->GetStringVal(it.Get());
+    if (val.is_null) {
+      values.emplace_back();
+    } else {
+      values.emplace_back(reinterpret_cast<char*>(val.ptr), val.len);
+    }
+    SetNullBit(output_row_idx, val.is_null, &nulls);
     ++output_row_idx;
   }
 }
@@ -277,24 +289,26 @@ static void DateExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
 static void StringExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatch* batch,
     int start_idx, int num_rows, uint32_t output_row_idx,
     apache::hive::service::cli::thrift::TColumn* column) {
-  ReserveSpace(num_rows, output_row_idx, &column->stringVal);
-  FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
-    StringVal val = expr_eval->GetStringVal(it.Get());
-    if (val.is_null) {
-      column->stringVal.values.emplace_back();
-    } else {
-      column->stringVal.values.emplace_back(reinterpret_cast<char*>(val.ptr), val.len);
-    }
-    SetNullBit(output_row_idx, val.is_null, &column->stringVal.nulls);
-    ++output_row_idx;
-  }
+  StringExprValuesToHS2TColumnHelper(
+      expr_eval, batch, start_idx, num_rows, output_row_idx,
+      column->stringVal.values, column->stringVal.nulls);
 }
+
+// Implementation for BINARY. Same as for STRING with the exception of using a different
+// Thrift field.
+static void BinaryExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval, RowBatch* batch,
+    int start_idx, int num_rows, uint32_t output_row_idx,
+    apache::hive::service::cli::thrift::TColumn* column) {
+  StringExprValuesToHS2TColumnHelper(
+      expr_eval, batch, start_idx, num_rows, output_row_idx,
+      column->binaryVal.values, column->binaryVal.nulls);
+}
+
 
 // Implementation for CHAR.
 static void CharExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
     const TColumnType& type, RowBatch* batch, int start_idx, int num_rows,
     uint32_t output_row_idx, apache::hive::service::cli::thrift::TColumn* column) {
-  ReserveSpace(num_rows, output_row_idx, &column->stringVal);
   ColumnType char_type = ColumnType::CreateCharType(type.types[0].scalar_type.len);
   FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
     StringVal val = expr_eval->GetStringVal(it.Get());
@@ -312,7 +326,6 @@ static void CharExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
 static void DecimalExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
     const TColumnType& type, RowBatch* batch, int start_idx, int num_rows,
     uint32_t output_row_idx, apache::hive::service::cli::thrift::TColumn* column) {
-  ReserveSpace(num_rows, output_row_idx, &column->stringVal);
   FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
     DecimalVal val = expr_eval->GetDecimalVal(it.Get());
     const ColumnType& decimalType = ColumnType::FromThrift(type);
@@ -341,53 +354,32 @@ static void DecimalExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
   }
 }
 
-// Gets a StructVal and puts it's JSON format into 'out_stream'. Uses 'column_type' to
-// figure out field names and types. This functions can call itself recursively in case
-// of nested structs.
-static void StructValToJSON(const StructVal& struct_val, const ColumnType& column_type,
-    rapidjson::Writer<rapidjson::StringBuffer>* writer) {
-  DCHECK(column_type.type == TYPE_STRUCT);
-  DCHECK_EQ(struct_val.num_children, column_type.children.size());
-  writer->StartObject();
-  for (int i = 0; i < struct_val.num_children; ++i) {
-    writer->String(column_type.field_names[i].c_str());
-    void* child = (void*)(struct_val.ptr[i]);
-    if (child == nullptr) {
-      writer->Null();
-    } else if (column_type.children[i].IsStructType()) {
-      StructValToJSON(*((StructVal*)child), column_type.children[i], writer);
-    } else {
-      string tmp;
-      RawValue::PrintValue(child, column_type.children[i], -1, &tmp);
-      const ColumnType& child_type = column_type.children[i];
-      if (child_type.IsStringType() || child_type.IsDateType() ||
-          child_type.IsTimestampType()) {
-        writer->String(tmp.c_str());
-      } else if (child_type.IsBooleanType()) {
-        writer->Bool( *(reinterpret_cast<bool*>(child)) );
-      } else {
-        writer->RawValue(tmp.c_str(), tmp.size(), rapidjson::kNumberType);
-      }
-    }
-  }
-  writer->EndObject();
-}
-
 static void StructExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
     const TColumnType& type, RowBatch* batch, int start_idx, int num_rows,
-    uint32_t output_row_idx, apache::hive::service::cli::thrift::TColumn* column) {
+    uint32_t output_row_idx, bool stringify_map_keys,
+    apache::hive::service::cli::thrift::TColumn* column) {
   DCHECK(type.types.size() > 1);
-  ReserveSpace(num_rows, output_row_idx, &column->stringVal);
+  // The buffer used by rapidjson::Writer. We reuse it to eliminate allocations.
+  rapidjson::StringBuffer buffer;
   FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
     StructVal struct_val = expr_eval->GetStructVal(it.Get());
     if (struct_val.is_null) {
       column->stringVal.values.emplace_back();
     } else {
-      int idx = 0;
-      ColumnType column_type(type.types, &idx);
-      rapidjson::StringBuffer buffer;
+      const impala::ScalarExpr& scalar_expr = expr_eval->root();
+      // Currently scalar_expr can be only a slot ref as no functions return arrays.
+      DCHECK(scalar_expr.IsSlotRef());
+      const SlotDescriptor* slot_desc =
+          static_cast<const SlotRef&>(scalar_expr).GetSlotDescriptor();
+      DCHECK(slot_desc != nullptr);
+
+      buffer.Clear();
       rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-      StructValToJSON(struct_val, column_type, &writer);
+
+      ComplexValueWriter<rapidjson::StringBuffer> complex_value_writer(&writer,
+          stringify_map_keys);
+      complex_value_writer.StructValToJSON(struct_val, *slot_desc);
+
       column->stringVal.values.emplace_back(buffer.GetString());
     }
     SetNullBit(output_row_idx, struct_val.is_null, &column->stringVal.nulls);
@@ -395,67 +387,136 @@ static void StructExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
   }
 }
 
+static void CollectionExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
+    const TColumnType& type, RowBatch* batch, int start_idx, int num_rows,
+    uint32_t output_row_idx, bool stringify_map_keys,
+    apache::hive::service::cli::thrift::TColumn* column) {
+  DCHECK(type.types.size() > 1);
+  TTypeNodeType::type coll_thrift_type = type.types[0].type;
+  DCHECK(coll_thrift_type == TTypeNodeType::ARRAY ||
+      coll_thrift_type == TTypeNodeType::MAP);
+  PrimitiveType coll_impala_type = coll_thrift_type == TTypeNodeType::ARRAY ?
+      PrimitiveType::TYPE_ARRAY : PrimitiveType::TYPE_MAP;
+
+  // The buffer used by rapidjson::Writer. We reuse it to eliminate allocations.
+  rapidjson::StringBuffer buffer;
+  FOREACH_ROW_LIMIT(batch, start_idx, num_rows, it) {
+    CollectionVal coll_val = expr_eval->GetCollectionVal(it.Get());
+    if (coll_val.is_null) {
+      column->stringVal.values.emplace_back();
+    } else {
+      const impala::ScalarExpr& scalar_expr = expr_eval->root();
+      // Currently scalar_expr can be only a slot ref as no functions return arrays.
+      DCHECK(scalar_expr.IsSlotRef());
+      const TupleDescriptor* item_tuple_desc = scalar_expr.GetCollectionTupleDesc();
+      DCHECK(item_tuple_desc != nullptr);
+      CollectionValue value(coll_val);
+
+      buffer.Clear();
+      rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+
+      ComplexValueWriter<rapidjson::StringBuffer> complex_value_writer(
+          &writer, stringify_map_keys);
+      complex_value_writer.CollectionValueToJSON(value, coll_impala_type,
+          item_tuple_desc);
+
+      column->stringVal.values.emplace_back(buffer.GetString());
+    }
+    SetNullBit(output_row_idx, coll_val.is_null, &column->stringVal.nulls);
+    ++output_row_idx;
+  }
+}
+
 // For V6 and above
 void impala::ExprValuesToHS2TColumn(ScalarExprEvaluator* expr_eval,
     const TColumnType& type, RowBatch* batch, int start_idx, int num_rows,
-    uint32_t output_row_idx, apache::hive::service::cli::thrift::TColumn* column) {
+    uint32_t output_row_idx, int expected_result_count, bool stringify_map_keys,
+    apache::hive::service::cli::thrift::TColumn* column) {
   // Dispatch to a templated function for the loop over rows. This avoids branching on
   // the type for every row.
   // TODO: instead of relying on stamped out implementations, we could codegen this loop
   // to inline the expression evaluation into the loop body.
-  if (type.types[0].type == TTypeNodeType::STRUCT) {
-    StructExprValuesToHS2TColumn(
-        expr_eval, type, batch, start_idx, num_rows, output_row_idx, column);
-    return;
+  switch (type.types[0].type) {
+    case TTypeNodeType::STRUCT:
+      ReserveSpace(expected_result_count, &column->stringVal);
+      StructExprValuesToHS2TColumn(expr_eval, type, batch, start_idx, num_rows,
+          output_row_idx, stringify_map_keys, column);
+      return;
+    case TTypeNodeType::ARRAY:
+    case TTypeNodeType::MAP:
+      ReserveSpace(expected_result_count, &column->stringVal);
+      CollectionExprValuesToHS2TColumn(expr_eval, type, batch, start_idx, num_rows,
+          output_row_idx, stringify_map_keys, column);
+      return;
+    default:
+      break;
   }
+
   switch (type.types[0].scalar_type.type) {
     case TPrimitiveType::NULL_TYPE:
     case TPrimitiveType::BOOLEAN:
+      ReserveSpace(expected_result_count, &column->boolVal);
       BoolExprValuesToHS2TColumn(
           expr_eval, batch, start_idx, num_rows, output_row_idx, column);
       return;
     case TPrimitiveType::TINYINT:
+      ReserveSpace(expected_result_count, &column->byteVal);
       TinyIntExprValuesToHS2TColumn(
           expr_eval, batch, start_idx, num_rows, output_row_idx, column);
       return;
     case TPrimitiveType::SMALLINT:
+      ReserveSpace(expected_result_count, &column->i16Val);
       SmallIntExprValuesToHS2TColumn(
           expr_eval, batch, start_idx, num_rows, output_row_idx, column);
       return;
     case TPrimitiveType::INT:
+      ReserveSpace(expected_result_count, &column->i32Val);
       IntExprValuesToHS2TColumn(
           expr_eval, batch, start_idx, num_rows, output_row_idx, column);
       return;
     case TPrimitiveType::BIGINT:
+      ReserveSpace(expected_result_count, &column->i64Val);
       BigIntExprValuesToHS2TColumn(
           expr_eval, batch, start_idx, num_rows, output_row_idx, column);
       return;
     case TPrimitiveType::FLOAT:
+      ReserveSpace(expected_result_count, &column->doubleVal);
       FloatExprValuesToHS2TColumn(
           expr_eval, batch, start_idx, num_rows, output_row_idx, column);
       return;
     case TPrimitiveType::DOUBLE:
+      ReserveSpace(expected_result_count, &column->doubleVal);
       DoubleExprValuesToHS2TColumn(
           expr_eval, batch, start_idx, num_rows, output_row_idx, column);
       return;
     case TPrimitiveType::DATE:
+      ReserveSpace(expected_result_count, &column->stringVal);
       DateExprValuesToHS2TColumn(
           expr_eval, batch, start_idx, num_rows, output_row_idx, column);
       break;
     case TPrimitiveType::TIMESTAMP:
+      ReserveSpace(expected_result_count, &column->stringVal);
       TimestampExprValuesToHS2TColumn(
           expr_eval, batch, start_idx, num_rows, output_row_idx, column);
       return;
     case TPrimitiveType::STRING:
     case TPrimitiveType::VARCHAR:
+      ReserveSpace(expected_result_count, &column->stringVal);
       StringExprValuesToHS2TColumn(
           expr_eval, batch, start_idx, num_rows, output_row_idx, column);
       return;
+    case TPrimitiveType::BINARY:
+      ReserveSpace(expected_result_count, &column->binaryVal);
+      BinaryExprValuesToHS2TColumn(
+          expr_eval, batch, start_idx, num_rows, output_row_idx, column);
+      return;
     case TPrimitiveType::CHAR:
+      ReserveSpace(expected_result_count, &column->stringVal);
       CharExprValuesToHS2TColumn(
           expr_eval, type, batch, start_idx, num_rows, output_row_idx, column);
       return;
     case TPrimitiveType::DECIMAL: {
+      ReserveSpace(expected_result_count, &column->stringVal);
       DecimalExprValuesToHS2TColumn(
           expr_eval, type, batch, start_idx, num_rows, output_row_idx, column);
       return;
@@ -511,6 +572,7 @@ void impala::TColumnValueToHS2TColumnValue(const TColumnValue& col_val,
     case TPrimitiveType::DATE:
     case TPrimitiveType::VARCHAR:
     case TPrimitiveType::CHAR:
+    case TPrimitiveType::BINARY:
       // HiveServer2 requires timestamp to be presented as string. Note that the .thrift
       // spec says it should be a BIGINT; AFAICT Hive ignores that and produces a string.
       hs2_col_val->__isset.stringVal = true;
@@ -579,12 +641,13 @@ void impala::ExprValueToHS2TColumnValue(const void* value, const TColumnType& ty
       break;
     case TPrimitiveType::STRING:
     case TPrimitiveType::VARCHAR:
+    // Unlike TColumn, TColumnValue does not differentiate between STRING and BINARY.
+    case TPrimitiveType::BINARY:
       hs2_col_val->__isset.stringVal = true;
       hs2_col_val->stringVal.__isset.value = not_null;
       if (not_null) {
         const StringValue* string_val = reinterpret_cast<const StringValue*>(value);
-        hs2_col_val->stringVal.value.assign(static_cast<char*>(string_val->ptr),
-                                            string_val->len);
+        hs2_col_val->stringVal.value.assign(string_val->Ptr(), string_val->Len());
       }
       break;
     case TPrimitiveType::CHAR:
@@ -798,4 +861,93 @@ bool impala::isOneFieldSet(const impala::TColumnValue& value) {
           value.__isset.timestamp_val ||
           value.__isset.decimal_val ||
           value.__isset.date_val);
+}
+
+thrift::TTypeEntry impala::ColumnToHs2Type(
+    const TColumnType& columnType) {
+  const ColumnType& type = ColumnType::FromThrift(columnType);
+  thrift::TPrimitiveTypeEntry type_entry;
+  switch (type.type) {
+    // Map NULL_TYPE to BOOLEAN, otherwise Hive's JDBC driver won't
+    // work for queries like "SELECT NULL" (IMPALA-914).
+    case TYPE_NULL:
+      type_entry.__set_type(thrift::TTypeId::BOOLEAN_TYPE);
+      break;
+    case TYPE_BOOLEAN:
+      type_entry.__set_type(thrift::TTypeId::BOOLEAN_TYPE);
+      break;
+    case TYPE_TINYINT:
+      type_entry.__set_type(thrift::TTypeId::TINYINT_TYPE);
+      break;
+    case TYPE_SMALLINT:
+      type_entry.__set_type(thrift::TTypeId::SMALLINT_TYPE);
+      break;
+    case TYPE_INT:
+      type_entry.__set_type(thrift::TTypeId::INT_TYPE);
+      break;
+    case TYPE_BIGINT:
+      type_entry.__set_type(thrift::TTypeId::BIGINT_TYPE);
+      break;
+    case TYPE_FLOAT:
+      type_entry.__set_type(thrift::TTypeId::FLOAT_TYPE);
+      break;
+    case TYPE_DOUBLE:
+      type_entry.__set_type(thrift::TTypeId::DOUBLE_TYPE);
+      break;
+    case TYPE_DATE:
+      type_entry.__set_type(thrift::TTypeId::DATE_TYPE);
+      break;
+    case TYPE_TIMESTAMP:
+      type_entry.__set_type(thrift::TTypeId::TIMESTAMP_TYPE);
+      break;
+    case TYPE_STRING:
+      if (type.IsBinaryType()) {
+        type_entry.__set_type(thrift::TTypeId::BINARY_TYPE);
+      } else {
+        type_entry.__set_type(thrift::TTypeId::STRING_TYPE);
+      }
+      break;
+    case TYPE_DECIMAL: {
+      thrift::TTypeQualifierValue tprecision;
+      tprecision.__set_i32Value(type.precision);
+      thrift::TTypeQualifierValue tscale;
+      tscale.__set_i32Value(type.scale);
+
+      thrift::TTypeQualifiers type_quals;
+      type_quals.qualifiers[thrift::g_TCLIService_constants.PRECISION] = tprecision;
+      type_quals.qualifiers[thrift::g_TCLIService_constants.SCALE] = tscale;
+      type_entry.__set_typeQualifiers(type_quals);
+      type_entry.__set_type(thrift::TTypeId::DECIMAL_TYPE);
+      break;
+    }
+    case TYPE_CHAR:
+    case TYPE_VARCHAR: {
+      thrift::TTypeQualifierValue tmax_len;
+      tmax_len.__set_i32Value(type.len);
+
+      thrift::TTypeQualifiers type_quals;
+      type_quals.qualifiers[thrift::g_TCLIService_constants.CHARACTER_MAXIMUM_LENGTH]
+          = tmax_len;
+      type_entry.__set_typeQualifiers(type_quals);
+      type_entry.__set_type((type.type == TYPE_CHAR)
+          ? thrift::TTypeId::CHAR_TYPE : thrift::TTypeId::VARCHAR_TYPE);
+      break;
+    }
+    case TYPE_STRUCT:
+    case TYPE_ARRAY:
+    case TYPE_MAP:
+      type_entry.__set_type(thrift::TTypeId::STRING_TYPE);
+      break;
+    case TYPE_BINARY:
+    default:
+      // HiveServer2 does not have a type for invalid, datetime or
+      // fixed_uda_intermediate. Binary should be stored as TYPE_STRING, not
+      // TYPE_BINARY in the backend.
+      DCHECK(false) << "bad TypeToTValueType() type: " << type.DebugString();
+      type_entry.__set_type(thrift::TTypeId::STRING_TYPE);
+  };
+
+  thrift::TTypeEntry result;
+  result.__set_primitiveEntry(type_entry);
+  return result;
 }

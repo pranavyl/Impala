@@ -130,15 +130,15 @@ class ThreadMgr {
   //   "threads": [
   //       {
   //         "name": "work-loop(Disk: 0, Thread: 0)-17049",
-  //             "user_ns": 0,
-  //             "kernel_ns": 0,
-  //             "iowait_ns": 0
+  //             "user_s": 0,
+  //             "kernel_s": 0,
+  //             "iowait_s": 0
   //             },
   //       {
   //         "name": "work-loop(Disk: 1, Thread: 0)-17050",
-  //             "user_ns": 0,
-  //             "kernel_ns": 0,
-  //             "iowait_ns": 0
+  //             "user_s": 0,
+  //             "kernel_s": 0,
+  //             "iowait_s": 0
   //             }
   //        ]
   void ThreadGroupUrlCallback(const Webserver::WebRequest& req, Document* output);
@@ -280,11 +280,11 @@ void ThreadMgr::ThreadGroupUrlCallback(const Webserver::WebRequest& req,
         LOG_EVERY_N(INFO, 100) << "Could not get per-thread statistics: "
                                << status.GetDetail();
       } else {
-        val.AddMember("user_ns", static_cast<double>(stats.user_ns) / 1e9,
+        val.AddMember("user_s", static_cast<double>(stats.user_ns) / 1e9,
             document->GetAllocator());
-        val.AddMember("kernel_ns", static_cast<double>(stats.kernel_ns) / 1e9,
+        val.AddMember("kernel_s", static_cast<double>(stats.kernel_ns) / 1e9,
             document->GetAllocator());
-        val.AddMember("iowait_ns", static_cast<double>(stats.iowait_ns) / 1e9,
+        val.AddMember("iowait_s", static_cast<double>(stats.iowait_ns) / 1e9,
             document->GetAllocator());
       }
       lst.PushBack(val, document->GetAllocator());
@@ -331,7 +331,7 @@ Status Thread::StartThread(const std::string& category, const std::string& name,
 }
 
 void Thread::SuperviseThread(const string& name, const string& category,
-    Thread::ThreadFunctor functor, const ThreadDebugInfo* parent_thread_info,
+    const Thread::ThreadFunctor& functor, const ThreadDebugInfo* parent_thread_info,
     Promise<int64_t>* thread_started) {
   int64_t system_tid = syscall(SYS_gettid);
   if (system_tid == -1) {

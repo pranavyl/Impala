@@ -17,11 +17,15 @@
 
 package org.apache.impala.catalog.local;
 
+import static org.apache.impala.util.TUniqueIdUtil.PrintId;
+
 import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -35,6 +39,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
+import com.codahale.metrics.Histogram;
+import com.codahale.metrics.Snapshot;
+import com.codahale.metrics.UniformReservoir;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableCollection;
 import com.google.common.collect.ImmutableMap;
@@ -54,18 +61,22 @@ import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.CatalogDeltaLog;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogObjectCache;
-import org.apache.impala.catalog.FeIcebergTable;
+import org.apache.impala.catalog.DataSource;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.HdfsCachePool;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.HdfsPartitionLocationCompressor;
 import org.apache.impala.catalog.HdfsStorageDescriptor;
+import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.ImpaladCatalog.ObjectUpdateSequencer;
 import org.apache.impala.catalog.Principal;
 import org.apache.impala.catalog.PrincipalPrivilege;
 import org.apache.impala.catalog.SqlConstraints;
+import org.apache.impala.catalog.VirtualColumn;
+import org.apache.impala.catalog.local.LocalIcebergTable.TableParams;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
+import org.apache.impala.common.PrintUtils;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.service.FrontendProfile;
@@ -76,15 +87,18 @@ import org.apache.impala.thrift.TBriefTableMeta;
 import org.apache.impala.thrift.TCatalogInfoSelector;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
+import org.apache.impala.thrift.TColumn;
+import org.apache.impala.thrift.TDataSource;
 import org.apache.impala.thrift.TDatabase;
 import org.apache.impala.thrift.TDbInfoSelector;
 import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TFunctionName;
+import org.apache.impala.thrift.TGetLatestCompactionsRequest;
+import org.apache.impala.thrift.TGetLatestCompactionsResponse;
 import org.apache.impala.thrift.TGetPartialCatalogObjectRequest;
 import org.apache.impala.thrift.TGetPartialCatalogObjectResponse;
 import org.apache.impala.thrift.THdfsFileDesc;
-import org.apache.impala.thrift.TIcebergSnapshot;
 import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TPartialPartitionInfo;
 import org.apache.impala.thrift.TPartialTableInfo;
@@ -96,17 +110,22 @@ import org.apache.impala.thrift.TUpdateCatalogCacheRequest;
 import org.apache.impala.thrift.TUpdateCatalogCacheResponse;
 import org.apache.impala.thrift.TValidWriteIdList;
 import org.apache.impala.util.AcidUtils;
+import org.apache.impala.util.IcebergUtil;
 import org.apache.impala.util.ListMap;
+import org.apache.impala.util.TByteBuffer;
+import org.apache.impala.util.ThreadNameAnnotator;
+import org.apache.thrift.TConfiguration;
 import org.apache.thrift.TDeserializer;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
 import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.transport.TByteBuffer;
 import org.ehcache.sizeof.SizeOf;
+import org.github.jamm.CannotAccessFieldException;
+import org.github.jamm.MemoryMeter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Stopwatch;
@@ -122,8 +141,6 @@ import com.google.common.util.concurrent.UncheckedExecutionException;
 import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.errorprone.annotations.Immutable;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
-
-import static org.apache.impala.service.MetadataOp.TABLE_COMMENT_KEY;
 
 /**
  * MetaProvider which fetches metadata in a granular fashion from the catalogd.
@@ -230,6 +247,8 @@ public class CatalogdMetaProvider implements MetaProvider {
   private static final String FUNCTIONS_STATS_CATEGORY = "Functions";
   private static final String RPC_STATS_CATEGORY = "RPCs";
   private static final String STORAGE_METADATA_LOAD_CATEGORY = "StorageLoad";
+  private static final String DATA_SOURCE_LIST_STATS_CATEGORY = "DataSourceLists";
+  private static final Object DS_OBJ_LIST_CACHE_KEY = new Object();
   private static final String RPC_REQUESTS =
       CATALOG_FETCH_PREFIX + "." + RPC_STATS_CATEGORY + ".Requests";
   private static final String RPC_BYTES =
@@ -250,11 +269,6 @@ public class CatalogdMetaProvider implements MetaProvider {
    */
   private final ListMap<TNetworkAddress> cacheHostIndex_ =
       new ListMap<TNetworkAddress>();
-
-  // TODO(todd): currently we haven't implemented catalogd thrift APIs for all pieces
-  // of metadata. In order to incrementally build this out, we delegate various calls
-  // to the "direct" provider for now and circumvent catalogd.
-  private DirectMetaProvider directProvider_ = new DirectMetaProvider();
 
   /**
    * Number of requests which piggy-backed on a concurrent request for the same key,
@@ -283,6 +297,8 @@ public class CatalogdMetaProvider implements MetaProvider {
    * {@link #loadWithCaching(String, String, Object, Callable).
    */
   final Cache<Object,Object> cache_;
+
+  private final Histogram cacheEntrySize_ = new Histogram(new UniformReservoir());
 
   /**
    * The last catalog version seen in an update from the catalogd.
@@ -326,6 +342,10 @@ public class CatalogdMetaProvider implements MetaProvider {
   private TUniqueId catalogServiceId_ = Catalog.INITIAL_CATALOG_SERVICE_ID;
   private final Object catalogServiceIdLock_ = new Object();
 
+  /**
+   * Object that is used to synchronize on and signal when the catalog is ready for use.
+   */
+  private final Object catalogReadyNotifier_ = new Object();
 
   /**
    * Cache of authorization policy metadata. Populated from data pushed from the
@@ -355,21 +375,33 @@ public class CatalogdMetaProvider implements MetaProvider {
       cacheSizeBytes = flags.local_catalog_cache_mb * 1024 * 1024;
     }
     int expirationSecs = flags.local_catalog_cache_expiration_s;
-    LOG.info("Metadata cache configuration: capacity={} MB, expiration={} sec",
-        cacheSizeBytes/1024/1024, expirationSecs);
+    int concurrencyLevel = flags.local_catalog_cache_concurrency_level;
+    if (concurrencyLevel <= 0) {
+      // 4 is the default value of the local cache
+      concurrencyLevel = 4;
+    }
+    LOG.info("Metadata cache configuration: capacity={} MB, expiration={} sec, " +
+        "concurrencyLevel={}", cacheSizeBytes/1024/1024, expirationSecs,
+        concurrencyLevel);
 
     // TODO(todd) add end-to-end test cases which stress cache eviction (both time
     // and size-triggered) and make sure results are still correct.
     cache_ = CacheBuilder.newBuilder()
+        .concurrencyLevel(concurrencyLevel)
         .maximumWeight(cacheSizeBytes)
         .expireAfterAccess(expirationSecs, TimeUnit.SECONDS)
-        .weigher(new SizeOfWeigher())
+        .weigher(new SizeOfWeigher(
+            BackendConfig.INSTANCE.useJammWeigher(), cacheEntrySize_))
         .recordStats()
         .build();
   }
 
   public CacheStats getCacheStats() {
     return cache_.stats();
+  }
+
+  public Snapshot getCacheEntrySize() {
+    return cacheEntrySize_.getSnapshot();
   }
 
   @Override
@@ -380,6 +412,18 @@ public class CatalogdMetaProvider implements MetaProvider {
   @Override
   public AuthorizationPolicy getAuthPolicy() {
     return authPolicy_;
+  }
+
+  @Override
+  public void waitForIsReady(long timeoutMs) {
+    if (isReady()) return;
+    synchronized (catalogReadyNotifier_) {
+      try {
+        catalogReadyNotifier_.wait(timeoutMs);
+      } catch (InterruptedException e) {
+        // Ignore
+      }
+    }
   }
 
   @Override
@@ -435,10 +479,11 @@ public class CatalogdMetaProvider implements MetaProvider {
       case TABLE_NOT_FOUND:
       case TABLE_NOT_LOADED:
       case PARTITION_NOT_FOUND:
+      case DATA_SOURCE_NOT_FOUND:
         invalidateCacheForObject(req.object_desc);
-        throw new InconsistentMetadataFetchException(
-            String.format("Fetching %s failed. Could not find %s",
-                req.object_desc.type.name(), req.object_desc.toString()));
+        throw new InconsistentMetadataFetchException(resp.lookup_status,
+            String.format("Fetching %s failed: %s. Could not find %s",
+                req.object_desc.type, resp.lookup_status, req.object_desc));
       default: break;
     }
     Preconditions.checkState(resp.lookup_status == CatalogLookupStatus.OK);
@@ -456,7 +501,7 @@ public class CatalogdMetaProvider implements MetaProvider {
       LOG.warn("Catalog object {} changed version from {} to {} while fetching metadata",
           req.object_desc.toString(), req.object_desc.catalog_version,
           resp.object_version_number);
-      throw new InconsistentMetadataFetchException(
+      throw new InconsistentMetadataFetchException(CatalogLookupStatus.VERSION_MISMATCH,
           String.format("Catalog object %s changed version between accesses.",
               req.object_desc.toString()));
     }
@@ -512,7 +557,8 @@ public class CatalogdMetaProvider implements MetaProvider {
     Stopwatch sw = Stopwatch.createStarted();
     boolean hit = false;
     boolean isPiggybacked = false;
-    try {
+    try (ThreadNameAnnotator tna = new ThreadNameAnnotator(
+        "LoadWithCaching for " + itemString)) {
       CompletableFuture<Object> f = new CompletableFuture<Object>();
       // NOTE: the Cache ensures that this is an atomic operation of either returning
       // an existing value or inserting our own. Only one thread can think it is the
@@ -609,7 +655,7 @@ public class CatalogdMetaProvider implements MetaProvider {
             req.catalog_info_selector.want_db_names = true;
             TGetPartialCatalogObjectResponse resp = sendRequest(req);
             checkResponse(resp.catalog_info != null && resp.catalog_info.db_names != null,
-                req, "missing table names");
+                req, "missing database names");
             return ImmutableList.copyOf(resp.catalog_info.db_names);
           }
     });
@@ -644,6 +690,14 @@ public class CatalogdMetaProvider implements MetaProvider {
     return req;
   }
 
+  private TGetPartialCatalogObjectRequest newReqForDataSource(String dsName) {
+    TGetPartialCatalogObjectRequest req = new TGetPartialCatalogObjectRequest();
+    req.object_desc = new TCatalogObject();
+    req.object_desc.setType(TCatalogObjectType.DATA_SOURCE);
+    if (dsName == null) dsName = "";
+    req.object_desc.setData_source(new TDataSource(dsName, "", "", ""));
+    return req;
+  }
 
   @Override
   public Database loadDb(final String dbName) throws TException {
@@ -709,6 +763,20 @@ public class CatalogdMetaProvider implements MetaProvider {
   }
 
   @Override
+  public Pair<Table, TableMetaRef> getTableIfPresent(String dbName, String tblName) {
+    TableCacheKey cacheKey = new TableCacheKey(dbName.toLowerCase(),
+        tblName.toLowerCase());
+    try {
+      Object value = getIfPresent(cacheKey);
+      if (value == null) return null;
+      TableMetaRefImpl ref = (TableMetaRefImpl) value;
+      return Pair.create(ref.msTable_, ref);
+    } catch (TException e) {
+      return null;
+    }
+  }
+
+  @Override
   public Pair<Table, TableMetaRef> loadTable(final String dbName, final String tableName)
       throws NoSuchObjectException, MetaException, TException {
     TableCacheKey cacheKey = new TableCacheKey(dbName.toLowerCase(),
@@ -736,9 +804,9 @@ public class CatalogdMetaProvider implements MetaProvider {
                 new ArrayList<>() : resp.table_info.sql_constraints.getForeign_keys();
             return new TableMetaRefImpl(
                 dbName, tableName, resp.table_info.hms_table, resp.object_version_number,
-                new SqlConstraints(primaryKeys, foreignKeys),
+                resp.object_loaded_time_ms, new SqlConstraints(primaryKeys, foreignKeys),
                 resp.table_info.valid_write_ids, resp.table_info.is_marked_cached,
-                resp.table_info.partition_prefixes);
+                resp.table_info.partition_prefixes, resp.table_info.virtual_columns);
            }
       });
     // The table list is populated based on tables in a given Db in catalogd. If a table
@@ -765,15 +833,15 @@ public class CatalogdMetaProvider implements MetaProvider {
     if (dbValue instanceof ImmutableMap) {
       TBriefTableMeta cachedMeta = ((ImmutableMap<String, TBriefTableMeta>) dbValue).get(
           latestMeta.tableName_);
-      String latestComment = latestMeta.msTable_.getParameters().get(TABLE_COMMENT_KEY);
+      String latestComment = MetadataOp.getTableComment(latestMeta.msTable_);
       boolean hasStaleComment = !StringUtils.equals(latestComment, cachedMeta.comment);
       // It's possible that the cached type is null (due to previously unloaded) and the
       // latest msType we get is a table type (e.g. MANAGED_TABLE, EXTERNAL_TABLE).
       // This is the most usual case and we don't consider the cached type is stale since
       // they have the same result after applying MetadataOp.getImpalaTableType().
-      boolean hasStaleType = !StringUtils.equals(
-          MetadataOp.getImpalaTableType(cachedMeta.msType),
-          MetadataOp.getImpalaTableType(latestMeta.msTable_.getTableType()));
+      boolean hasStaleType =
+          MetadataOp.getImpalaTableType(cachedMeta.msType) !=
+          MetadataOp.getImpalaTableType(latestMeta.msTable_.getTableType());
       if (hasStaleType || hasStaleComment) {
         List<String> invalidated = new ArrayList<>();
         invalidateCacheForDb(dbName, ImmutableList.of(DbCacheKey.DbInfoType.TABLE_LIST),
@@ -847,9 +915,13 @@ public class CatalogdMetaProvider implements MetaProvider {
     if (existing == null) return null;
     if (!(existing instanceof Future)) return existing;
     try {
-      return ((Future<Object>)existing).get();
-    } catch (InterruptedException | ExecutionException e) {
-      Throwables.propagateIfPossible(e, TException.class);
+      return Uninterruptibles.getUninterruptibly((Future<Object>) existing);
+    } catch (ExecutionException e) {
+      // Try throwing the cause which is the error in the loading thread.
+      // This is consistent with the error handling in loadWithCaching().
+      // So failures like InconsistentMetadataFetchException can be caught
+      // and retry in Frontend#getTExecRequest().
+      Throwables.propagateIfPossible(e.getCause(), TException.class);
       throw new RuntimeException(e);
     }
   }
@@ -900,8 +972,8 @@ public class CatalogdMetaProvider implements MetaProvider {
         hostIndex, partitionRefs);
     if (BackendConfig.INSTANCE.isAutoCheckCompaction()) {
       // If any partitions are stale after compaction, they will be removed from refToMeta
-      List<PartitionRef> stalePartitions = directProvider_.checkLatestCompaction(
-          refImpl.dbName_, refImpl.tableName_, refImpl, refToMeta);
+      List<PartitionRef> stalePartitions =
+          checkLatestCompaction(refImpl.dbName_, refImpl.tableName_, refImpl, refToMeta);
       cache_.invalidateAll(stalePartitions.stream()
           .map(PartitionRefImpl.class::cast)
           .map(PartitionRefImpl::getId)
@@ -938,6 +1010,55 @@ public class CatalogdMetaProvider implements MetaProvider {
       nameToMeta.put(e.getKey().getName(), e.getValue());
     }
     return nameToMeta;
+  }
+
+  /**
+   * Fetches the latest compactions from catalogd and compares with partition metadata in
+   * cache. If a partition is stale due to compaction, removes it from metas. And return
+   * the stale partitions.
+   */
+  private List<PartitionRef> checkLatestCompaction(String dbName, String tableName,
+      TableMetaRef table, Map<PartitionRef, PartitionMetadata> metas) throws TException {
+    Preconditions.checkNotNull(table, "TableMetaRef must be non-null");
+    Preconditions.checkNotNull(metas, "Partition map must be non-null");
+    if (!table.isTransactional() || metas.isEmpty()) return Collections.emptyList();
+    Stopwatch sw = Stopwatch.createStarted();
+    TGetLatestCompactionsRequest req = new TGetLatestCompactionsRequest();
+    req.db_name = dbName;
+    req.table_name = tableName;
+    req.non_parition_name = HdfsTable.DEFAULT_PARTITION_NAME;
+    if (table.isPartitioned()) {
+      req.partition_names =
+          metas.keySet().stream().map(PartitionRef::getName).collect(Collectors.toList());
+    }
+    req.last_compaction_id = metas.values()
+                                 .stream()
+                                 .mapToLong(PartitionMetadata::getLastCompactionId)
+                                 .max()
+                                 .orElse(-1);
+    byte[] ret = FeSupport.GetLatestCompactions(
+        new TSerializer(new TBinaryProtocol.Factory()).serialize(req));
+    TGetLatestCompactionsResponse resp = new TGetLatestCompactionsResponse();
+    new TDeserializer(new TBinaryProtocol.Factory()).deserialize(resp, ret);
+    if (resp.status.status_code != TErrorCode.OK) {
+      throw new TException(Joiner.on("\n").join(resp.status.getError_msgs()));
+    }
+    Map<String, Long> partNameToCompactionId = resp.partition_to_compaction_id;
+    Preconditions.checkNotNull(
+        partNameToCompactionId, "Partition name to compaction id map must be non-null");
+    List<PartitionRef> stalePartitions = new ArrayList<>();
+    Iterator<Map.Entry<PartitionRef, PartitionMetadata>> iter =
+        metas.entrySet().iterator();
+    while (iter.hasNext()) {
+      Map.Entry<PartitionRef, PartitionMetadata> entry = iter.next();
+      if (partNameToCompactionId.containsKey(entry.getKey().getName())) {
+        stalePartitions.add(entry.getKey());
+        iter.remove();
+      }
+    }
+    LOG.info("Checked the latest compaction info for {}.{}. Time taken: {}", dbName,
+        tableName, PrintUtils.printTimeMs(sw.stop().elapsed(TimeUnit.MILLISECONDS)));
+    return stalePartitions;
   }
 
   /**
@@ -985,7 +1106,7 @@ public class CatalogdMetaProvider implements MetaProvider {
       } else {
         checkResponse(table.msTable_.getPartitionKeysSize() == 0, req,
             "Should not return a partition with missing partition meta unless " +
-            "the table is unpartitioned");
+            "the table is unpartitioned: %s", part);
         // For the only partition of a nonpartitioned table, reuse table-level metadata.
         try {
           hdfsStorageDescriptor = HdfsStorageDescriptor.fromStorageDescriptor(
@@ -1024,35 +1145,48 @@ public class CatalogdMetaProvider implements MetaProvider {
     return ret;
   }
 
-  /**
-   * Utility function for to retrieve table info with Iceberg snapshot. Exists for testing
-   * purposes, use loadIcebergSnapshot() which translates the file descriptors to the
-   * table's host index.
-   */
-  @VisibleForTesting
-  TPartialTableInfo loadTableInfoWithIcebergSnapshot(final TableMetaRef table)
-      throws TException {
+  @Override
+  public TPartialTableInfo loadIcebergTable(final TableMetaRef table) throws TException {
     Preconditions.checkArgument(table instanceof TableMetaRefImpl);
-    TGetPartialCatalogObjectRequest req = newReqForTable(table);
-    req.table_info_selector.want_iceberg_snapshot = true;
-    TGetPartialCatalogObjectResponse resp = sendRequest(req);
-    return resp.table_info;
+    TableMetaRefImpl tableRef = (TableMetaRefImpl)table;
+    String itemStr = "iceberg metadata for " + tableRef.dbName_ + "."
+        + tableRef.tableName_;
+    IcebergMetaCacheKey cacheKey = new IcebergMetaCacheKey(tableRef);
+    return loadWithCaching(itemStr, TABLE_METADATA_CACHE_CATEGORY, cacheKey,
+        new Callable<TPartialTableInfo>() {
+          @Override
+          public TPartialTableInfo call() throws Exception {
+            TGetPartialCatalogObjectRequest req = newReqForTable(table);
+            req.table_info_selector.want_iceberg_table = true;
+            TGetPartialCatalogObjectResponse resp = sendRequest(req);
+            checkResponse(resp.table_info != null &&
+                resp.table_info.iceberg_table != null, req,
+                "missing Iceberg table metadata");
+            return resp.getTable_info();
+          }
+    });
   }
 
   @Override
-  public FeIcebergTable.Snapshot loadIcebergSnapshot(final TableMetaRef table,
-      ListMap<TNetworkAddress> hostIndex)
-      throws TException {
-    TPartialTableInfo tableInfo = loadTableInfoWithIcebergSnapshot(table);
-    Map<String, FileDescriptor> pathToFds =
-        FeIcebergTable.Utils.loadFileDescMapFromThrift(
-            tableInfo.getIceberg_snapshot().getIceberg_file_desc_map(),
-            tableInfo.getNetwork_addresses(),
-            hostIndex);
-    return new FeIcebergTable.Snapshot(
-        tableInfo.getIceberg_snapshot().getSnapshot_id(),
-        pathToFds);
-  }
+  public org.apache.iceberg.Table loadIcebergApiTable(final TableMetaRef table,
+      TableParams params, Table msTable) throws TException {
+    Preconditions.checkArgument(table instanceof TableMetaRefImpl);
+    TableMetaRefImpl tableRef = (TableMetaRefImpl)table;
+    String itemStr = "iceberg api table for " + tableRef.dbName_ + "."
+        + tableRef.tableName_;
+    IcebergApiTableCacheKey cacheKey = new IcebergApiTableCacheKey(tableRef);
+    return loadWithCaching(itemStr, TABLE_METADATA_CACHE_CATEGORY, cacheKey,
+        new Callable<org.apache.iceberg.Table>() {
+          @Override
+          public org.apache.iceberg.Table call() throws Exception {
+            return IcebergUtil.loadTable(
+                params.getIcebergCatalog(),
+                IcebergUtil.getIcebergTableIdentifier(msTable),
+                params.getIcebergCatalogLocation(),
+                msTable.getParameters());
+          }
+        });
+    }
 
   private ImmutableList<FileDescriptor> convertThriftFdList(List<THdfsFileDesc> thriftFds,
       List<TNetworkAddress> networkAddresses, ListMap<TNetworkAddress> hostIndex) {
@@ -1128,7 +1262,7 @@ public class CatalogdMetaProvider implements MetaProvider {
           /** Called to load cache for cache misses */
           @Override
           public String call() throws Exception {
-            return directProvider_.loadNullPartitionKeyValue();
+            return FeSupport.GetNullPartitionName();
           }
         });
   }
@@ -1180,6 +1314,51 @@ public class CatalogdMetaProvider implements MetaProvider {
   }
 
   /**
+   * Get all DataSource objects from catalogd.
+   */
+  public ImmutableList<DataSource> loadDataSources() throws TException {
+    ImmutableList<TDataSource> thriftDataSrcs = loadWithCaching(
+        "DataSource object list", DATA_SOURCE_LIST_STATS_CATEGORY,
+        DS_OBJ_LIST_CACHE_KEY, new Callable<ImmutableList<TDataSource>>() {
+          @Override
+          public ImmutableList<TDataSource> call() throws Exception {
+            TGetPartialCatalogObjectRequest req = newReqForDataSource(null);
+            TGetPartialCatalogObjectResponse resp = sendRequest(req);
+            checkResponse(resp.data_srcs != null, req, "no existing DataSource");
+            return ImmutableList.copyOf(resp.data_srcs);
+          }
+      });
+    ImmutableList.Builder<DataSource> dataSrcBld = ImmutableList.builder();
+    for (TDataSource thriftDataSrc : thriftDataSrcs) {
+      dataSrcBld.add(DataSource.fromThrift(thriftDataSrc));
+    }
+    return dataSrcBld.build();
+  }
+
+  /**
+   * Get the DataSource object from catalogd for the given DataSource name.
+   */
+  public DataSource loadDataSource(String dsName) throws TException {
+    Preconditions.checkState(dsName != null && !dsName.isEmpty());
+    return loadWithCaching("DataSource object for " + dsName,
+        DATA_SOURCE_LIST_STATS_CATEGORY,
+        new DataSourceCacheKey(dsName.toLowerCase()), new Callable<DataSource>() {
+          @Override
+          public DataSource call() throws Exception {
+            TGetPartialCatalogObjectRequest req = newReqForDataSource(dsName);
+            TGetPartialCatalogObjectResponse resp = sendRequest(req);
+            checkResponse(resp.data_srcs != null, req, "missing expected DataSource");
+            if (resp.data_srcs.size() == 1) {
+              return DataSource.fromThrift(resp.data_srcs.get(0));
+            } else {
+              Preconditions.checkState(resp.data_srcs.size() == 0);
+              return null;
+            }
+          }
+      });
+  }
+
+  /**
    * Invalidate portions of the cache as indicated by the provided request.
    *
    * This is called in two scenarios:
@@ -1209,12 +1388,15 @@ public class CatalogdMetaProvider implements MetaProvider {
     ObjectUpdateSequencer hdfsCachePoolSequencer = new ObjectUpdateSequencer();
 
     Pair<Boolean, ByteBuffer> update;
+    int maxMessageSize = BackendConfig.INSTANCE.getThriftRpcMaxMessageSize();
+    final TConfiguration config = new TConfiguration(maxMessageSize,
+        TConfiguration.DEFAULT_MAX_FRAME_SIZE, TConfiguration.DEFAULT_RECURSION_DEPTH);
     while ((update = FeSupport.NativeGetNextCatalogObjectUpdate(req.native_iterator_ptr))
         != null) {
       boolean isDelete = update.first;
       TCatalogObject obj = new TCatalogObject();
       try {
-        obj.read(new TBinaryProtocol(new TByteBuffer(update.second)));
+        obj.read(new TBinaryProtocol(new TByteBuffer(config, update.second)));
       } catch (TException e) {
         // TODO(todd) include the bad key here! currently the JNI bridge doesn't expose
         // the key in any way.
@@ -1307,6 +1489,9 @@ public class CatalogdMetaProvider implements MetaProvider {
     // the update.
     if (nextCatalogVersion != null) {
       lastSeenCatalogVersion_.set(nextCatalogVersion);
+      synchronized (catalogReadyNotifier_) {
+        catalogReadyNotifier_.notifyAll();
+      }
     }
 
     // NOTE: the return value is ignored when this function is called by a DDL
@@ -1407,7 +1592,7 @@ public class CatalogdMetaProvider implements MetaProvider {
         if (!catalogServiceId_.equals(Catalog.INITIAL_CATALOG_SERVICE_ID)) {
           LOG.warn("Detected catalog service restart: service ID changed from " +
               "{} to {}. Invalidating all cached metadata on this coordinator.",
-              catalogServiceId_, serviceId);
+              PrintId(catalogServiceId_), PrintId(serviceId));
         }
         catalogServiceId_ = serviceId;
         cache_.invalidateAll();
@@ -1482,6 +1667,12 @@ public class CatalogdMetaProvider implements MetaProvider {
           DbCacheKey.DbInfoType.HMS_METADATA,
           DbCacheKey.DbInfoType.FUNCTION_NAMES), invalidated);
       break;
+    case DATA_SOURCE:
+      if (cache_.asMap().remove(DS_OBJ_LIST_CACHE_KEY) != null) {
+        invalidated.add("list of DataSource objects");
+      }
+      invalidateCacheForDataSource(obj.data_source.name, invalidated);
+      break;
     default:
       break;
     }
@@ -1540,6 +1731,18 @@ public class CatalogdMetaProvider implements MetaProvider {
     FunctionsCacheKey key = new FunctionsCacheKey(dbName, functionName);
     if (cache_.asMap().remove(key) != null) {
       invalidated.add("function " + dbName + "." + functionName);
+    }
+  }
+
+  /**
+   * Invalidate cached DataSource for the given DataSource name. If anything was
+   * invalidated, adds a human-readable string to 'invalidated' indicating the
+   * invalidated DataSource.
+   */
+  private void invalidateCacheForDataSource(String dsName, List<String> invalidated) {
+    DataSourceCacheKey key = new DataSourceCacheKey(dsName.toLowerCase());
+    if (cache_.asMap().remove(key) != null) {
+      invalidated.add("DataSource " + dsName);
     }
   }
 
@@ -1699,10 +1902,21 @@ public class CatalogdMetaProvider implements MetaProvider {
     private final Table msTable_;
 
     /**
+     * List of virtual columns of this table.
+     */
+    List<VirtualColumn> virtualColumns_ = new ArrayList<>();
+
+    /**
      * The version of the table when we first loaded it. Subsequent requests about
      * the table are verified against this version.
      */
     private final long catalogVersion_;
+
+    /**
+     * The timestamp when the table is loaded in catalogd corresponding to the catalog
+     * version.
+     */
+    private final long loadedTimeMs_;
 
     /**
      * Valid write id list of ACID tables.
@@ -1718,13 +1932,14 @@ public class CatalogdMetaProvider implements MetaProvider {
     private final HdfsPartitionLocationCompressor partitionLocationCompressor_;
 
     public TableMetaRefImpl(String dbName, String tableName,
-        Table msTable, long catalogVersion, SqlConstraints sqlConstraints,
-        TValidWriteIdList validWriteIds, boolean isMarkedCached,
-        List<String> locationPrefixes) {
+        Table msTable, long catalogVersion, long loadedTimeMs,
+        SqlConstraints sqlConstraints, TValidWriteIdList validWriteIds,
+        boolean isMarkedCached, List<String> locationPrefixes, List<TColumn> tvirtCols) {
       this.dbName_ = dbName;
       this.tableName_ = tableName;
       this.msTable_ = msTable;
       this.catalogVersion_ = catalogVersion;
+      this.loadedTimeMs_ = loadedTimeMs;
       this.sqlConstraints_ = sqlConstraints;
       this.validWriteIds_ = validWriteIds;
       this.isMarkedCached_ = isMarkedCached;
@@ -1732,6 +1947,9 @@ public class CatalogdMetaProvider implements MetaProvider {
       this.partitionLocationCompressor_ = (locationPrefixes == null) ? null :
           new HdfsPartitionLocationCompressor(
               msTable.getPartitionKeysSize(), locationPrefixes);
+      for (TColumn tvCol : tvirtCols) {
+        virtualColumns_.add(VirtualColumn.fromThrift(tvCol));
+      }
     }
 
     @Override
@@ -1759,6 +1977,17 @@ public class CatalogdMetaProvider implements MetaProvider {
     public boolean isTransactional() {
       return AcidUtils.isTransactionalTable(msTable_.getParameters());
     }
+
+    @Override
+    public List<VirtualColumn> getVirtualColumns() {
+      return virtualColumns_;
+    }
+
+    @Override
+    public long getCatalogVersion() { return catalogVersion_; }
+
+    @Override
+    public long getLoadedTimeMs() { return loadedTimeMs_; }
   }
 
   /**
@@ -1942,14 +2171,60 @@ public class CatalogdMetaProvider implements MetaProvider {
     }
   }
 
+  /**
+   * Cache key for an entry storing Iceberg table metadata.
+   *
+   * Values for these keys are 'TPartialTableInfo' objects.
+   */
+  private static class IcebergMetaCacheKey extends VersionedTableCacheKey {
+
+    public IcebergMetaCacheKey(TableMetaRefImpl table) {
+      super(table);
+    }
+  }
+
+  /**
+   * Cache key for an entry storing Iceberg API metadata.
+   *
+   * Values for these keys are 'org.apache.iceberg.Table' objects.
+   */
+  private static class IcebergApiTableCacheKey extends VersionedTableCacheKey {
+
+    public IcebergApiTableCacheKey(TableMetaRefImpl table) {
+      super(table);
+    }
+  }
+
+  /**
+   * Cache key for a DataSource object.
+   */
+  @Immutable
+  private static class DataSourceCacheKey {
+    private final String dsName_;
+
+    DataSourceCacheKey(String dsName) {
+      dsName_ = dsName;
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hashCode(dsName_, getClass());
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      if (!(obj instanceof DataSourceCacheKey)) return false;
+      DataSourceCacheKey other = (DataSourceCacheKey)obj;
+      return dsName_.equals(other.dsName_);
+    }
+  }
+
   @VisibleForTesting
   static class SizeOfWeigher implements Weigher<Object, Object> {
     // Bypass flyweight objects like small boxed integers, Boolean.TRUE, enums, etc.
     private static final boolean BYPASS_FLYWEIGHT = true;
     // Cache the reflected sizes of classes seen.
     private static final boolean CACHE_SIZES = true;
-
-    private static SizeOf SIZEOF = SizeOf.newInstance(BYPASS_FLYWEIGHT, CACHE_SIZES);
 
     private static final int BYTES_PER_WORD = 8; // Assume 64-bit VM.
     // Guava cache overhead based on:
@@ -1958,9 +2233,51 @@ public class CatalogdMetaProvider implements MetaProvider {
         12 * BYTES_PER_WORD + // base cost per entry
         4 * BYTES_PER_WORD;  // for use of 'maximumSize()'
 
+    // Retain Ehcache while Jamm is thoroughly tested. We only expect to make one
+    // CatalogdMetaProvider and thus one SizeOfWeigher.
+    private final SizeOf SIZEOF;
+    private final MemoryMeter METER;
+
+    private final boolean useJamm_;
+    private final Histogram entrySize_;
+
+    public SizeOfWeigher(boolean useJamm, Histogram entrySize) {
+      if (useJamm) {
+        METER = MemoryMeter.builder().build();
+        SIZEOF = null;
+      } else {
+        SIZEOF = SizeOf.newInstance(BYPASS_FLYWEIGHT, CACHE_SIZES);
+        METER = null;
+      }
+      useJamm_ = useJamm;
+      entrySize_ = entrySize;
+    }
+
+    public SizeOfWeigher() {
+      this(true, null);
+    }
+
     @Override
     public int weigh(Object key, Object value) {
-      long size = SIZEOF.deepSizeOf(key, value) + OVERHEAD_PER_ENTRY;
+      long size = OVERHEAD_PER_ENTRY;
+      try {
+        if (useJamm_) {
+          size += METER.measureDeep(key);
+          size += METER.measureDeep(value);
+        } else {
+          size += SIZEOF.deepSizeOf(key, value);
+        }
+      } catch (CannotAccessFieldException e) {
+        // This may happen if we miss an add-opens call for lambdas in Java 17.
+        LOG.warn("Unable to weigh cache entry, additional add-opens needed", e);
+      } catch (UnsupportedOperationException e) {
+        // Thrown by ehcache for lambdas in Java 17.
+        LOG.warn("Unable to weigh cache entry", e);
+      }
+
+      if (entrySize_ != null) {
+        entrySize_.update(size);
+      }
       if (size > Integer.MAX_VALUE) {
         return Integer.MAX_VALUE;
       }

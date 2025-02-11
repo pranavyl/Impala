@@ -202,8 +202,12 @@ struct Block {
 
 struct FileSplitGeneratorSpec {
   FileSplitGeneratorSpec() {}
-  FileSplitGeneratorSpec(int64_t length, int64_t block, bool splittable)
-    : length(length), block_size(block), is_splittable(splittable) {}
+  FileSplitGeneratorSpec(
+      int64_t length, int64_t block, bool splittable, bool is_footer_only = false)
+    : length(length),
+      block_size(block),
+      is_splittable(splittable),
+      is_footer_only(is_footer_only) {}
 
   /// Length of file for which to generate file splits.
   int64_t length = DEFAULT_FILE_SIZE;
@@ -212,6 +216,8 @@ struct FileSplitGeneratorSpec {
   int64_t block_size = DEFAULT_BLOCK_SIZE;
 
   bool is_splittable = true;
+
+  bool is_footer_only = false;
 
   static const int64_t DEFAULT_FILE_SIZE;
   static const int64_t DEFAULT_BLOCK_SIZE;
@@ -303,6 +309,9 @@ class Plan {
   const std::vector<TNetworkAddress>& referenced_datanodes() const;
 
   const TScanRangeSpec& scan_range_specs() const;
+
+  /// Add a scan across all coordinators.
+  void AddSystemTableScan();
 
   /// Add a scan of table 'table_name' to the plan. This method will populate the internal
   /// TScanRangeSpecs and can be called multiple times for the same table to schedule
@@ -473,13 +482,13 @@ class Result {
   AssignmentFilter IsHost(int host_idx) const;
 
   /// Filter to only match assignments of cached reads.
-  AssignmentFilter IsCached(AssignmentFilter filter) const;
+  AssignmentFilter IsCached(const AssignmentFilter& filter) const;
 
   /// Filter to only match assignments of non-cached, local disk reads.
-  AssignmentFilter IsDisk(AssignmentFilter filter) const;
+  AssignmentFilter IsDisk(const AssignmentFilter& filter) const;
 
   /// Filter to only match assignments of remote reads.
-  AssignmentFilter IsRemote(AssignmentFilter filter) const;
+  AssignmentFilter IsRemote(const AssignmentFilter& filter) const;
 
   /// Process all recorded assignments and call the supplied callback on each tuple of IP
   /// address and scan_range it iterates over.
@@ -507,10 +516,13 @@ class SchedulerWrapper {
   SchedulerWrapper(const Plan& plan);
 
   /// Call ComputeScanRangeAssignment() with exec_at_coord set to false.
-  Status Compute(Result* result) { return Compute(false, result); }
+  Status Compute(Result* result, bool include_all_coordinators = false) {
+    return Compute(false, result, include_all_coordinators);
+  }
 
   /// Call ComputeScanRangeAssignment().
-  Status Compute(bool exec_at_coord, Result* result);
+  Status Compute(bool exec_at_coord, Result* result,
+      bool include_all_coordinators = false);
 
   /// Reset the state of the scheduler by re-creating and initializing it.
   void Reset() { InitializeScheduler(); }

@@ -137,10 +137,29 @@ class Catalog {
   /// report.
   Status UpdateTableUsage(const TUpdateTableUsageRequest& req);
 
- private:
-  /// Descriptor of Java Catalog class itself, used to create a new instance.
-  jclass catalog_class_;
+  /// Gets the null partition name.
+  Status GetNullPartitionName(TGetNullPartitionNameResponse* resp);
 
+  /// Gets the latest compactions for the request.
+  Status GetLatestCompactions(
+      const TGetLatestCompactionsRequest& req, TGetLatestCompactionsResponse* resp);
+
+  /// Regenerate Catalog Service ID.
+  /// The function should be called when the CatalogD becomes active.
+  void RegenerateServiceId();
+
+  /// Refresh the data sources from metadata store.
+  /// Returns OK if the refreshing was successful, otherwise a Status object with
+  /// information on the error will be returned.
+  Status RefreshDataSources();
+  /// Returns all Hadoop configurations in key, value form in result.
+  Status GetAllHadoopConfigs(TGetAllHadoopConfigsResponse* result);
+
+  /// Update the status of EventProcessor.
+  Status SetEventProcessorStatus(
+      const TSetEventProcessorStatusRequest& req, TSetEventProcessorStatusResponse* resp);
+
+ private:
   jobject catalog_;  // instance of org.apache.impala.service.JniCatalog
   jmethodID update_metastore_id_;  // JniCatalog.updateMetaastore()
   jmethodID exec_ddl_id_;  // JniCatalog.execDdl()
@@ -162,6 +181,12 @@ class Catalog {
   jmethodID prioritize_load_id_; // JniCatalog.prioritizeLoad()
   jmethodID catalog_ctor_;
   jmethodID update_table_usage_id_;
+  jmethodID regenerate_service_id_; // JniCatalog.regenerateServiceId()
+  jmethodID refresh_data_sources_; // JniCatalog.refreshDataSources()
+  jmethodID get_null_partition_name_id_; // JniCatalog.getNullPartitionName()
+  jmethodID get_latest_compactions_id_; // JniCatalog.getLatestCompactions()
+  jmethodID get_hadoop_configs_id_;  // JniCatalog.getAllHadoopConfigs()
+  jmethodID set_event_processor_status_id_; // JniCatalog.setEventProcessorStatus()
 };
 
 }

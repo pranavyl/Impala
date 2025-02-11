@@ -118,18 +118,6 @@ SELECT 1 as "``"
 tinyint
 ====
 ---- QUERY
-#  Select from table that contains unsupported primitive types
-SELECT int_col, str_col, bigint_col from functional.unsupported_types
----- RESULTS
-0,'aaaa',0
-1,'bbbb',10
-2,'cccc',20
-NULL,'NULL',NULL
-4,'eeee',40
----- TYPES
-int, string, bigint
-====
----- QUERY
 # where clause is a SlotRef
 SELECT count(*) from alltypes where bool_col
 ---- RESULTS
@@ -144,24 +132,4 @@ SELECT count(*) from alltypes group by bool_col having bool_col
 3650
 ---- TYPES
 bigint
-====
----- QUERY
-# IMPALA-3812: Verfiy that the correct error message is shown when the star expansion adds
-# the BINARY unsupported type to the select list.
-select * from functional.unsupported_types
----- CATCH
-Unsupported type 'BINARY' in 'functional.unsupported_types.bin_col'.
-====
----- QUERY
-# IMPALA-3812: Verfiy that DATE type is displayed correctly in the describe table.
-describe functional.unsupported_types
----- RESULTS
-'int_col','int',''
-'dec_col','decimal(10,0)',''
-'date_col','date',''
-'str_col','string',''
-'bin_col','binary',''
-'bigint_col','bigint',''
----- TYPES
-STRING, STRING, STRING
 ====

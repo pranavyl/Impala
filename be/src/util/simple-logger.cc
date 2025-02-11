@@ -19,6 +19,7 @@
 
 #include <mutex>
 #include <regex>
+#include <cerrno>
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/date_time/posix_time/posix_time_types.hpp>
@@ -39,6 +40,7 @@ using boost::posix_time::ptime;
 using boost::posix_time::time_from_string;
 using kudu::JoinPathSegments;
 using namespace impala;
+using std::strerror;
 
 const ptime EPOCH = time_from_string("1970-01-01 00:00:00.000");
 
@@ -70,14 +72,13 @@ string SimpleLogger::GenerateLogFileName() {
   return ss.str();
 }
 
-SimpleLogger::SimpleLogger(const string& log_dir, const string& log_file_name_prefix,
+SimpleLogger::SimpleLogger(string log_dir, string log_file_name_prefix,
     uint64_t max_entries_per_file, int max_log_files)
-    : log_dir_(log_dir),
-      log_file_name_prefix_(log_file_name_prefix),
-      num_log_file_entries_(0),
-      max_entries_per_file_(max_entries_per_file),
-      max_log_files_(max_log_files) {
-}
+  : log_dir_(move(log_dir)),
+    log_file_name_prefix_(move(log_file_name_prefix)),
+    num_log_file_entries_(0),
+    max_entries_per_file_(max_entries_per_file),
+    max_log_files_(max_log_files) {}
 
 Status SimpleLogger::Init() {
   // Check that Init hasn't already been called by verifying the log_file_name_ is still
@@ -132,7 +133,10 @@ Status SimpleLogger::FlushInternal() {
     log_file_.close();
   }
   log_file_.open(log_file_name_.c_str(), std::ios_base::app | std::ios_base::out);
-  if (!log_file_.is_open()) return Status("Could not open log file: " + log_file_name_);
+  if(log_file_.fail()) {
+    return Status("Could not open log file: "
+                  + log_file_name_ + ", cause: " + strerror(errno));
+  }
   return Status::OK();
 }
 

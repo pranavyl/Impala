@@ -20,14 +20,19 @@ package org.apache.impala.analysis;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.ColumnStats;
 import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.IcebergColumn;
 import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.common.ThriftSerializationCtx;
 import org.apache.impala.thrift.TSlotDescriptor;
+import org.apache.impala.thrift.TVirtualColumnType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -59,6 +64,9 @@ public class SlotDescriptor {
   // if false, this slot doesn't need to be materialized in parent tuple
   // (and physical layout parameters are invalid)
   private boolean isMaterialized_ = false;
+
+  // If true, then computeMemLayout() should be recursively called for itemTupleDesc_.
+  private boolean shouldMaterializeRecursively_ = false;
 
   // if false, this slot cannot be NULL
   // Note: it is still possible that a SlotRef pointing to this descriptor could have a
@@ -131,7 +139,39 @@ public class SlotDescriptor {
     isMaterialized_ = value;
     LOG.trace("Mark slot(sid={}) of tuple(tid={}) as {}materialized",
         id_, parent_.getId(), isMaterialized_ ? "" : "non-");
+    if (shouldMaterializeRecursively_) {
+      Preconditions.checkState(itemTupleDesc_ != null);
+      itemTupleDesc_.materializeSlots();
+    }
   }
+  public boolean shouldMaterializeRecursively() {
+    return shouldMaterializeRecursively_;
+  }
+
+  public void setShouldMaterializeRecursively(boolean value) {
+    shouldMaterializeRecursively_ = value;
+  }
+
+  /**
+   * Returns true iff this SlotDescriptor and all its children (if any) are materialized,
+   * recursively.
+   * This is relevant in case of complex types, for example when only a subset of the
+   * fields of a struct is queried - in this case the queried fields are materialized, the
+   * other fields are not materialized, but the struct itself also needs to be marked as
+   * materialized because otherwise no memory layout can be calculated for the fields.
+   */
+  public boolean isFullyMaterialized() {
+    if (!isMaterialized()) return false;
+    if (itemTupleDesc_ != null) {
+      Preconditions.checkState(type_.isComplexType());
+      for (SlotDescriptor childSlotDesc : itemTupleDesc_.getSlots()) {
+        if (!childSlotDesc.isFullyMaterialized()) return false;
+      }
+    }
+
+    return true;
+  }
+
   public boolean getIsNullable() { return isNullable_; }
   public void setIsNullable(boolean value) { isNullable_ = value; }
   public int getByteSize() { return byteSize_; }
@@ -156,16 +196,55 @@ public class SlotDescriptor {
     type_ = path_.destType();
     label_ = Joiner.on(".").join(path.getRawPath());
 
-    // Set nullability, if this refers to a KuduColumn.
+    // Set nullability based on column type.
     if (path_.destColumn() instanceof KuduColumn) {
       KuduColumn kuduColumn = (KuduColumn)path_.destColumn();
       isNullable_ = kuduColumn.isNullable();
+    } else if (path_.destColumn() instanceof IcebergColumn) {
+      IcebergColumn icebergColumn = (IcebergColumn)path_.destColumn();
+      isNullable_ = icebergColumn.isNullable();
     }
   }
 
   public Path getPath() { return path_; }
   public boolean isScanSlot() { return path_ != null && path_.isRootedAtTable(); }
   public Column getColumn() { return !isScanSlot() ? null : path_.destColumn(); }
+
+  /**
+   * Populate 'sourceColumns' with Column(s) referred by this SlotDesc.
+   * Return true if this SlotDesc refer a column or all expr in sourceExprs_ refer to
+   * a Column. Otherwise, return false and no Column will be added into 'sourceColumns'.
+   */
+  protected boolean collectColumns(Set<Column> sourceColumns) {
+    Column c = getColumn();
+    if (c != null) {
+      sourceColumns.add(c);
+      return true;
+    } else if (!sourceExprs_.isEmpty()) {
+      // Only populate sourceColumns if all expr in sourceExprs_ refers to a column.
+      Set<Column> thisSourceColumns = new HashSet<>();
+      for (int i = 0; i < sourceExprs_.size(); ++i) {
+        SlotRef slotRef = sourceExprs_.get(i).unwrapSlotRef(false);
+        if (slotRef == null || !slotRef.hasDesc() || slotRef.getDesc() == this
+            || !slotRef.getDesc().collectColumns(thisSourceColumns)) {
+          return false;
+        }
+      }
+      sourceColumns.addAll(thisSourceColumns);
+      return true;
+    }
+    return false;
+  }
+
+  public boolean isVirtualColumn() {
+    if (path_ == null) return false;
+    return path_.getVirtualColumnType() != TVirtualColumnType.NONE;
+  }
+
+  public TVirtualColumnType getVirtualColumnType() {
+    if (path_ == null) return TVirtualColumnType.NONE;
+    return path_.getVirtualColumnType();
+  }
 
   public ColumnStats getStats() {
     if (stats_ == null) {
@@ -177,6 +256,112 @@ public class SlotDescriptor {
       }
     }
     return stats_;
+  }
+
+  public ColumnStats getStats(Set<Column> ignoreColumns) {
+    Preconditions.checkNotNull(ignoreColumns);
+    ColumnStats thisStats = getStats();
+    if (!thisStats.hasNumDistinctValues()) return thisStats;
+
+    Set<Column> sourceColumns = new HashSet<>();
+    boolean allHasSourceColumn = collectColumns(sourceColumns);
+    if (!allHasSourceColumn) return thisStats;
+
+    long ndv = 0;
+    for (Column column : sourceColumns) {
+      if (!column.getStats().hasNumDistinctValues()) return thisStats;
+      if (!ignoreColumns.contains(column)) {
+        ndv += column.getStats().getNumDistinctValues();
+      }
+    }
+    if (thisStats.getNumDistinctValues() > ndv) {
+      // Clone thisStats and lower the ndv to avoid modifying Column.stats_.
+      thisStats = thisStats.clone();
+      thisStats.setNumDistinctValues(ndv);
+    }
+    return thisStats;
+  }
+
+  private void getEnclosingStructSlotAndTupleDescs(List<SlotDescriptor> slotDescs,
+      List<TupleDescriptor> tupleDescs) {
+    TupleDescriptor tupleDesc = getParent();
+    while (tupleDesc != null) {
+      if (tupleDescs != null) tupleDescs.add(tupleDesc);
+
+      final SlotDescriptor parentStructSlotDesc = tupleDesc.getParentSlotDesc();
+      if (parentStructSlotDesc != null && slotDescs != null) {
+        slotDescs.add(parentStructSlotDesc);
+      }
+
+      tupleDesc = parentStructSlotDesc != null ? parentStructSlotDesc.getParent() : null;
+    }
+  }
+
+  /**
+   * Returns the slot descs of the structs that contain this slot desc, recursively; stops
+   * at collection items, does not continue to the parent collection.
+   * For an example struct 'outer: <middle: <inner: <i: int>>>', called for the slot desc
+   * of 'i', the returned list will contain the slot descs of 'inner', 'middle' and
+   * 'outer'.
+   */
+  public List<SlotDescriptor> getEnclosingStructSlotDescs() {
+    List<SlotDescriptor> result = new ArrayList<>();
+    getEnclosingStructSlotAndTupleDescs(result, null);
+    return result;
+  }
+
+  /**
+   * Returns the tuple descs enclosing this slot desc, recursively; stops at collection
+   * items, does not continue to the parent collection.
+   * For an example struct 'outer: <middle: <inner: <i: int>>>', called for the slot desc
+   * of 'i', the returned list will contain the 'itemTupleDesc_'s of 'inner', 'middle'
+   * and 'outer' as well as the tuple desc of the main tuple (the 'parent_' of the slot
+   * desc of 'outer').
+   */
+  public List<TupleDescriptor> getEnclosingTupleDescs() {
+    List<TupleDescriptor> result = new ArrayList<>();
+    getEnclosingStructSlotAndTupleDescs(null, result);
+    return result;
+  }
+
+  /**
+   * Climbs up the struct hierarchy and returns the tuple desc that holds the top level
+   * struct that contains this slot desc; stops at collection items, does not continue to
+   * the parent collection.
+   * For a slot desc that is not within a struct, simply returns 'parent_'.
+   * For an example struct 'outer: <middle: <inner: <i: int>>>', called for the slot desc
+   * of 'i', returns the tuple desc of the main tuple (the 'parent_' of the slot desc of
+   * 'outer').
+   */
+  public TupleDescriptor getTopEnclosingTupleDesc() {
+    List<TupleDescriptor> enclosingTuples = getEnclosingTupleDescs();
+    if (enclosingTuples.isEmpty()) {
+      Preconditions.checkState(getParent() == null);
+      return null;
+    }
+
+    // Return the last enclosing tuple, going upward.
+    return enclosingTuples.get(enclosingTuples.size() - 1);
+  }
+
+  /**
+   * Returns the size of the slot without null indicators.
+   *
+   * Takes materialisation into account: returns 0 for non-materialised slots. This is
+   * most relevant for structs as it is possible that only a subset of the fields are
+   * materialised and the size of the struct varies according to this.
+   */
+  public int getMaterializedSlotSize() {
+    if (!isMaterialized()) return 0;
+    if (!getType().isStructType()) return getType().getSlotSize();
+
+    Preconditions.checkNotNull(itemTupleDesc_);
+    int size = 0;
+    for (SlotDescriptor d : itemTupleDesc_.getSlots()) {
+      size += d.getMaterializedSlotSize();
+    }
+
+    return size;
   }
 
   /**
@@ -285,13 +470,14 @@ public class SlotDescriptor {
     return true;
   }
 
-  public TSlotDescriptor toThrift() {
+  public TSlotDescriptor toThrift(ThriftSerializationCtx serialCtx) {
     Preconditions.checkState(isMaterialized_);
     List<Integer> materializedPath = getMaterializedPath();
     TSlotDescriptor result = new TSlotDescriptor(
-        id_.asInt(), parent_.getId().asInt(), type_.toThrift(),
+        serialCtx.translateSlotId(id_).asInt(),
+        serialCtx.translateTupleId(parent_.getId()).asInt(), type_.toThrift(),
         materializedPath, byteOffset_, nullIndicatorByte_, nullIndicatorBit_,
-        slotIdx_);
+        slotIdx_, getVirtualColumnType());
     if (itemTupleDesc_ != null) {
       // Check for recursive or otherwise invalid item tuple descriptors. Since we assign
       // tuple ids globally in increasing order, the id of an item tuple descriptor must
@@ -300,7 +486,7 @@ public class SlotDescriptor {
       // have such a guarantee.
       Preconditions.checkState(!isScanSlot() ||
           itemTupleDesc_.getId().asInt() > parent_.getId().asInt());
-      result.setItemTupleId(itemTupleDesc_.getId().asInt());
+      result.setItemTupleId(serialCtx.translateTupleId(itemTupleDesc_.getId()).asInt());
     }
     return result;
   }
@@ -317,12 +503,15 @@ public class SlotDescriptor {
   public String debugString() {
     String pathStr = (path_ == null) ? "null" : path_.toString();
     String typeStr = (type_ == null ? "null" : type_.toString());
+    String parentTupleId = parent_ == null ?
+        "null" : String.valueOf(parent_.getId().asInt());
     return MoreObjects.toStringHelper(this)
         .add("id", id_.asInt())
         .add("path", pathStr)
         .add("label", label_)
         .add("type", typeStr)
         .add("materialized", isMaterialized_)
+        .add("shouldMaterializeRecursively", shouldMaterializeRecursively_)
         .add("byteSize", byteSize_)
         .add("byteOffset", byteOffset_)
         .add("nullable", isNullable_)
@@ -331,6 +520,7 @@ public class SlotDescriptor {
         .add("slotIdx", slotIdx_)
         .add("stats", stats_)
         .add("itemTupleDesc", itemTupleDesc_)
+        .add("parent_tuple_id", parentTupleId)
         .toString();
   }
 

@@ -32,6 +32,7 @@
 #include "util/disk-info.h"
 #include "util/impalad-metrics.h"
 #include "util/memory-metrics.h"
+#include "util/uid-util.h"
 
 #include "common/names.h"
 
@@ -61,6 +62,7 @@ Status TestEnv::Init() {
   exec_env_.reset(new ExecEnv);
   // Populate the ExecEnv state that the backend tests need.
   RETURN_IF_ERROR(exec_env_->disk_io_mgr()->Init());
+  RETURN_IF_ERROR(exec_env_->InitHadoopConfig());
   exec_env_->tmp_file_mgr_.reset(new TmpFileMgr);
   if (have_tmp_file_mgr_args_) {
     RETURN_IF_ERROR(tmp_file_mgr()->InitCustom(tmp_dirs_, one_tmp_dir_per_device_,
@@ -71,6 +73,11 @@ Status TestEnv::Init() {
   if (enable_buffer_pool_) {
     exec_env_->InitBufferPool(buffer_pool_min_buffer_len_, buffer_pool_capacity_,
         static_cast<int64_t>(0.1 * buffer_pool_capacity_));
+  } else {
+    // The buffer pool requires tcmalloc's aggressive_memory_decommit to be set.
+    // Since this codepath will never call InitBufferPool(), this needs to manually
+    // set it.
+    exec_env_->InitTcMallocAggressiveDecommit();
   }
   if (process_mem_tracker_use_metrics_) {
     exec_env_->InitMemTracker(process_mem_limit_);
@@ -81,7 +88,7 @@ Status TestEnv::Init() {
   // Initialize RpcMgr and control service.
   IpAddr ip_address;
   RETURN_IF_ERROR(HostnameToIpAddr(FLAGS_hostname, &ip_address));
-  exec_env_->krpc_address_.__set_hostname(ip_address);
+  exec_env_->krpc_address_.set_hostname(ip_address);
   RETURN_IF_ERROR(exec_env_->rpc_mgr_->Init(exec_env_->krpc_address_));
   exec_env_->control_svc_.reset(new ControlService(exec_env_->rpc_metrics_));
   RETURN_IF_ERROR(exec_env_->control_svc_->Init());
@@ -139,6 +146,14 @@ int64_t TestEnv::TotalQueryMemoryConsumption() {
   return total;
 }
 
+std::string TestEnv::GetDefaultFsPath(const std::string& path) {
+  const char* filesystem_prefix = getenv("FILESYSTEM_PREFIX");
+  if (filesystem_prefix != nullptr && filesystem_prefix[0] != '\0') {
+    return Substitute("$0$1", filesystem_prefix, path);
+  }
+  return Substitute("$0$1", exec_env_->default_fs(), path);
+}
+
 Status TestEnv::CreateQueryState(
     int64_t query_id, const TQueryOptions* query_options, RuntimeState** runtime_state) {
   TQueryCtx query_ctx;
@@ -147,9 +162,10 @@ Status TestEnv::CreateQueryState(
   query_ctx.query_id.lo = query_id;
   query_ctx.request_pool = "test-pool";
   query_ctx.coord_hostname = exec_env_->configured_backend_address_.hostname;
-  query_ctx.coord_ip_address = exec_env_->krpc_address_;
-  query_ctx.coord_backend_id.hi = 0;
-  query_ctx.coord_backend_id.lo = 0;
+  query_ctx.coord_ip_address = FromNetworkAddressPB(exec_env_->krpc_address_);
+  TUniqueId backend_id;
+  UniqueIdPBToTUniqueId(exec_env_->backend_id(), &backend_id);
+  query_ctx.__set_coord_backend_id(backend_id);
   TQueryOptions* query_options_to_use = &query_ctx.client_request.query_options;
   int64_t mem_limit =
       query_options_to_use->__isset.mem_limit && query_options_to_use->mem_limit > 0 ?

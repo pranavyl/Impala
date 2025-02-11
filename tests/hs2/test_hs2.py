@@ -17,6 +17,8 @@
 #
 # Client tests for Impala's HiveServer2 interface
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from getpass import getuser
 from contextlib import contextmanager
 import json
@@ -27,7 +29,10 @@ import threading
 import time
 import uuid
 
-from urllib2 import urlopen
+try:
+  from urllib.request import urlopen
+except ImportError:
+  from urllib2 import urlopen
 
 from ImpalaService import ImpalaHiveServer2Service
 from tests.common.environ import ImpalaTestClusterProperties
@@ -67,12 +72,18 @@ class TestHS2(HS2TestSuite):
 
   def test_open_session_query_options(self):
     """Check that OpenSession sets query options"""
-    configuration = {'MAX_ERRORS': '45678', 'NUM_NODES': '1234',
+    configuration = {'MAX_ERRORS': '45678', 'NUM_NODES': '1',
                      'MAX_NUM_RUNTIME_FILTERS': '333'}
     with ScopedSession(self.hs2_client, configuration=configuration) as session:
       TestHS2.check_response(session)
       for k, v in configuration.items():
         assert session.configuration[k] == v
+    # simulate hive jdbc's action, see IMPALA-11992
+    hiveconfs = dict([("set:hiveconf:" + k, v) for k, v in configuration.items()])
+    with ScopedSession(self.hs2_client, configuration=hiveconfs) as sessions:
+      TestHS2.check_response(sessions)
+      for k, v in configuration.items():
+        assert sessions.configuration[k] == v
 
   def get_session_options(self, setCmd):
     """Returns dictionary of query options."""
@@ -144,6 +155,22 @@ class TestHS2(HS2TestSuite):
     assert levels["DEBUG_ACTION"] == "DEVELOPMENT"
     # Removed options are returned by "SET ALL" for the benefit of impala-shell.
     assert levels["MAX_IO_BUFFERS"] == "REMOVED"
+
+  @needs_session()
+  def test_session_option_levels_via_unset_all(self):
+    self.execute_statement("SET COMPRESSION_CODEC=gzip")
+    self.execute_statement("SET SYNC_DDL=1")
+    vals, levels = self.get_session_options("SET")
+    assert vals["COMPRESSION_CODEC"] == "GZIP"
+    assert vals["SYNC_DDL"] == "1"
+
+    # Unset all query options
+    self.execute_statement("UNSET ALL")
+    vals2, levels = self.get_session_options("SET")
+
+    # Reset to default value
+    assert vals2["COMPRESSION_CODEC"] == ""
+    assert vals2["SYNC_DDL"] == "0"
 
   @SkipIfDockerizedCluster.internal_hostname
   def test_open_session_http_addr(self):
@@ -337,14 +364,109 @@ class TestHS2(HS2TestSuite):
         get_operation_status_resp.errorMessage is not ""
     assert get_operation_status_resp.sqlState == SQLSTATE_GENERAL_ERROR
 
+  @needs_session(conf_overlay={"long_polling_time_ms": "10000"})
+  def test_long_polling_success(self):
+    """Tests that GetOperationStatus waits for the query to complete and is interrupted
+    by the completion."""
+
+    # alltypestiny has 8 rows, so this statement is about 80ms of sleeps plus some
+    # regular execution.
+    statement = "SELECT count(sleep(10)) from functional.alltypestiny"
+    execute_statement_resp = self.execute_statement(statement)
+
+    start_time = time.time()
+    get_operation_status_resp = \
+        self.get_operation_status(execute_statement_resp.operationHandle)
+    end_time = time.time()
+    TestHS2.check_response(get_operation_status_resp)
+    # With long polling, get_operation_status only exits if it reaches a completion
+    # state within the interval. This is a short query that must complete before the
+    # long_polling_wait_time_ms of 10 seconds. This must have reached the FINISHED
+    # state.
+    assert get_operation_status_resp.operationState == \
+        TCLIService.TOperationState.FINISHED_STATE
+    # The long polling wait must have been interrupted by the completion, so it should
+    # not come anywhere close to waiting the full 10 seconds. 1 second is not a very
+    # tight time bound.
+    time_diff = end_time - start_time
+    assert time_diff < 1
+    # This should take at least 80ms, because that is the amount of time the query
+    # should sleep
+    assert time_diff >= 0.08
+
+    # Fetch the results so the query completes successfully
+    fetch_results_req = TCLIService.TFetchResultsReq()
+    fetch_results_req.operationHandle = execute_statement_resp.operationHandle
+    fetch_results_req.maxRows = 100
+    fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
+    TestHS2.check_response(fetch_results_resp)
+
+  @needs_session(conf_overlay={"long_polling_time_ms": "50"})
+  def test_long_polling_full_sleep(self):
+    """Tests that GetOperationStatus breaks out of its sleep at the proper time."""
+
+    # alltypestiny has 8 rows, so this statement is about 800ms of sleeps plus some
+    # regular execution.
+    statement = "SELECT count(sleep(100)) from functional.alltypestiny"
+    execute_statement_resp = self.execute_statement(statement)
+
+    while True:
+      start_time = time.time()
+      get_operation_status_resp = \
+          self.get_operation_status(execute_statement_resp.operationHandle)
+      end_time = time.time()
+      TestHS2.check_response(get_operation_status_resp)
+      # Each call into get_operation_status should wait at most 50ms. Verify that the
+      # sleeps are never longer than 100ms.
+      assert end_time - start_time < 0.1
+      if get_operation_status_resp.operationState == \
+         TCLIService.TOperationState.FINISHED_STATE:
+        break
+      # If this did not reach the finished state, then it should have waited at least
+      # 50ms.
+      if get_operation_status_resp.operationState != \
+         TCLIService.TOperationState.FINISHED_STATE:
+        assert end_time - start_time >= 0.050
+
+    # Fetch the results so the query completes successfully
+    fetch_results_req = TCLIService.TFetchResultsReq()
+    fetch_results_req.operationHandle = execute_statement_resp.operationHandle
+    fetch_results_req.maxRows = 100
+    fetch_results_resp = self.hs2_client.FetchResults(fetch_results_req)
+    TestHS2.check_response(fetch_results_resp)
+
+  @needs_session(conf_overlay={"abort_on_error": "1", "long_polling_time_ms": "10000"})
+  def test_long_polling_error(self):
+    """Tests that GetOperationStatus waits for the query to hit an error and is
+    interrupted by the error."""
+
+    # This is the same as test_get_operation_status_error above with long polling.
+    # With long polling, get_operation_status waits for completion, but it will exit
+    # immediately when the statement hits an error. Because it waits, we know that
+    # exactly one get_operation_status call is enough (no need for a loop).
+    statement = "SELECT * FROM functional.alltypeserror"
+    execute_statement_resp = self.execute_statement(statement)
+    start_time = time.time()
+    get_operation_status_resp = \
+        self.get_operation_status(execute_statement_resp.operationHandle)
+    end_time = time.time()
+    TestHS2.check_response(get_operation_status_resp)
+    assert get_operation_status_resp.operationState == \
+        TCLIService.TOperationState.ERROR_STATE
+
+    # The long polling wait must have been interrupted by the error, so it should
+    # not come anywhere close to waiting the full 10 seconds. This is a very short
+    # statement, so it should hit the error within 1 second.
+    assert end_time - start_time < 1.0
+
   @needs_session()
   def test_malformed_get_operation_status(self):
     """Tests that a short guid / secret returns an error (regression would be to crash
     impalad)"""
     operation_handle = TCLIService.TOperationHandle()
     operation_handle.operationId = TCLIService.THandleIdentifier()
-    operation_handle.operationId.guid = "short"
-    operation_handle.operationId.secret = "short_secret"
+    operation_handle.operationId.guid = b"short"
+    operation_handle.operationId.secret = b"short_secret"
     assert len(operation_handle.operationId.guid) != 16
     assert len(operation_handle.operationId.secret) != 16
     operation_handle.operationType = TCLIService.TOperationType.EXECUTE_STATEMENT
@@ -363,8 +485,8 @@ class TestHS2(HS2TestSuite):
   def test_invalid_query_handle(self):
     operation_handle = TCLIService.TOperationHandle()
     operation_handle.operationId = TCLIService.THandleIdentifier()
-    operation_handle.operationId.guid = "\x01\x23\x45\x67\x89\xab\xcd\xef76543210"
-    operation_handle.operationId.secret = "PasswordIsPencil"
+    operation_handle.operationId.guid = b"\x01\x23\x45\x67\x89\xab\xcd\xef76543210"
+    operation_handle.operationId.secret = b"PasswordIsPencil"
     operation_handle.operationType = TCLIService.TOperationType.EXECUTE_STATEMENT
     operation_handle.hasResultSet = False
 
@@ -391,7 +513,7 @@ class TestHS2(HS2TestSuite):
     num_sessions = self.impalad_test_service.get_metric_value(
         "impala-server.num-open-hiveserver2-sessions")
     session_ids = []
-    for _ in xrange(5):
+    for _ in range(5):
       open_session_req = TCLIService.TOpenSessionReq()
       resp = self.hs2_client.OpenSession(open_session_req)
       TestHS2.check_response(resp)
@@ -441,6 +563,59 @@ class TestHS2(HS2TestSuite):
     get_schemas_req.sessionHandle = create_session_handle_without_secret(
         self.session_handle)
     TestHS2.check_invalid_session(self.hs2_client.GetSchemas(get_schemas_req))
+
+  @needs_session_cluster_properties()
+  def test_get_schemas_on_transient_db(self, cluster_properties, unique_database):
+    # Use a new db name
+    unique_database += "_tmp"
+    stop = False
+
+    def create_drop_db():
+      while not stop:
+        self.execute_query("create database if not exists " + unique_database)
+        time.sleep(0.1)
+        if stop:
+          break
+        self.execute_query("drop database " + unique_database)
+    t = threading.Thread(target=create_drop_db)
+    t.start()
+
+    try:
+      get_schemas_req = TCLIService.TGetSchemasReq(self.session_handle)
+      for i in range(100):
+        get_schemas_resp = self.hs2_client.GetSchemas(get_schemas_req)
+        TestHS2.check_response(get_schemas_resp)
+        time.sleep(0.2)
+    finally:
+      stop = True
+      t.join()
+
+  @needs_session_cluster_properties()
+  def test_get_tables_on_transient_db(self, cluster_properties, unique_database):
+    # Use a new db name
+    unique_database += "_tmp"
+    stop = False
+
+    def create_drop_db():
+      while not stop:
+        self.execute_query("create database if not exists " + unique_database)
+        time.sleep(0.1)
+        if stop:
+          break
+        self.execute_query("drop database " + unique_database)
+    t = threading.Thread(target=create_drop_db)
+    t.start()
+
+    try:
+      # Use empty 'schemaName' to get tables in all dbs.
+      get_tables_req = TCLIService.TGetTablesReq(self.session_handle)
+      for i in range(100):
+        get_tables_resp = self.hs2_client.GetTables(get_tables_req)
+        TestHS2.check_response(get_tables_resp)
+        time.sleep(0.2)
+    finally:
+      stop = True
+      t.join()
 
   @needs_session_cluster_properties()
   def test_get_tables(self, cluster_properties, unique_database):
@@ -866,7 +1041,7 @@ class TestHS2(HS2TestSuite):
         args=(profile_fetch_exception, query_uuid, op_handle)))
 
       # Start threads that will race to unregister the query.
-      for i in xrange(NUM_UNREGISTER_THREADS):
+      for i in range(NUM_UNREGISTER_THREADS):
         socket, client = self._open_hs2_connection()
         sockets.append(socket)
         threads.append(threading.Thread(target=self._unregister_query,
@@ -964,7 +1139,7 @@ class TestHS2(HS2TestSuite):
     results = fetch_results_resp.results
     types = ['BOOLEAN', 'TINYINT', 'SMALLINT', 'INT', 'BIGINT', 'FLOAT', 'DOUBLE', 'DATE',
              'TIMESTAMP', 'STRING', 'VARCHAR', 'DECIMAL', 'CHAR', 'ARRAY', 'MAP',
-             'STRUCT']
+             'STRUCT', 'BINARY']
     assert self.get_num_rows(results) == len(types)
     # Validate that each type description (result row) has the required 18 fields as
     # described in the DatabaseMetaData.getTypeInfo() documentation.

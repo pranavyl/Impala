@@ -15,22 +15,23 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import glob
 import os
 import psutil
 import pytest
 import shutil
-import tempfile
 import time
 from resource import setrlimit, RLIMIT_CORE, RLIM_INFINITY
 from signal import SIGSEGV, SIGKILL, SIGUSR1, SIGTERM
 from subprocess import CalledProcessError
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import SkipIfBuildType
 
 DAEMONS = ['impalad', 'statestored', 'catalogd']
 DAEMON_ARGS = ['impalad_args', 'state_store_args', 'catalogd_args']
+
 
 class TestBreakpadBase(CustomClusterTestSuite):
   """Base class with utility methods for all breakpad tests."""
@@ -41,14 +42,14 @@ class TestBreakpadBase(CustomClusterTestSuite):
   def setup_method(self, method):
     # Override parent
     # The temporary directory gets removed in teardown_method() after each test.
-    self.tmp_dir = tempfile.mkdtemp()
+    self.tmp_dir = self.make_tmp_dir('breakpad')
 
   def teardown_method(self, method):
     # Override parent
     # Stop the cluster to prevent future accesses to self.tmp_dir.
     self.kill_cluster(SIGKILL)
-    assert self.tmp_dir
-    shutil.rmtree(self.tmp_dir)
+    assert len(self.TMP_DIRS) > 0
+    self.clear_tmp_dirs()
 
   @classmethod
   def setup_class(cls):
@@ -64,7 +65,7 @@ class TestBreakpadBase(CustomClusterTestSuite):
   def start_cluster_with_args(self, **kwargs):
     cluster_options = []
     for daemon_arg in DAEMON_ARGS:
-      daemon_options = " ".join("-{0}={1}".format(k, v) for k, v in kwargs.iteritems())
+      daemon_options = " ".join("-{0}={1}".format(k, v) for k, v in kwargs.items())
       cluster_options.append("--{0}={1}".format(daemon_arg, daemon_options))
     self._start_impala_cluster(cluster_options)
 
@@ -74,7 +75,7 @@ class TestBreakpadBase(CustomClusterTestSuite):
   def kill_cluster(self, signal):
     self.cluster.refresh()
     processes = self.cluster.impalads + [self.cluster.catalogd, self.cluster.statestored]
-    processes = filter(None, processes)
+    processes = [_f for _f in processes if _f]
     self.kill_processes(processes, signal)
     signal is SIGUSR1 or self.assert_all_processes_killed()
 
@@ -89,7 +90,7 @@ class TestBreakpadBase(CustomClusterTestSuite):
         # For every process in the list we might see the original Impala process plus a
         # forked off child that is writing the minidump. We need to catch both.
         for pid in process.get_pids():
-          print "Checking pid %s" % pid
+          print("Checking pid %s" % pid)
           psutil_process = psutil.Process(pid)
           psutil_process.wait(timeout)
       except psutil.NoSuchProcess:
@@ -142,6 +143,10 @@ class TestBreakpadBase(CustomClusterTestSuite):
     self.assert_impalad_log_contains('INFO', 'Wrote minidump to ',
         expected_count=expected_count)
     self.assert_impalad_log_contains('ERROR', 'Wrote minidump to ',
+        expected_count=expected_count)
+    self.assert_impalad_log_contains('INFO', 'Minidump with no thread info available.',
+        expected_count=expected_count)
+    self.assert_impalad_log_contains('ERROR', 'Minidump with no thread info available.',
         expected_count=expected_count)
 
 
@@ -253,7 +258,6 @@ class TestBreakpadExhaustive(TestBreakpadBase):
     assert self.get_num_processes('catalogd') == 0
     assert self.get_num_processes('statestored') == 0
     assert self.count_all_minidumps() == 0
-    uid = os.getuid()
     # There should be a SIGTERM message in the log now
     # since we raised one above.
     log_str = 'Caught signal: SIGTERM. Daemon will exit.'
@@ -312,7 +316,7 @@ class TestBreakpadExhaustive(TestBreakpadBase):
     cluster_size = self.get_num_processes('impalad')
     # We trigger several rounds of minidump creation to make sure that all daemons wrote
     # enough files to trigger rotation.
-    for i in xrange(max_minidumps + 1):
+    for i in range(max_minidumps + 1):
       self.kill_cluster(SIGUSR1)
       # Breakpad forks to write its minidump files, sleep briefly to allow the forked
       # processes to start.
@@ -382,65 +386,189 @@ class TestBreakpadExhaustive(TestBreakpadBase):
     assert reduced_minidump_size < full_minidump_size
 
 
-class TestLogging(TestBreakpadBase):
-  """Exhaustive tests to check that impala log is rolled periodically, obeying
-  max_log_size and max_log_files, even in the presence of heavy stderr writing.
-  """
+class TestLoggingBase(TestBreakpadBase):
+  _default_max_log_files = 2
+
   @classmethod
   def setup_class(cls):
-    if cls.exploration_strategy() != 'exhaustive':
-      pytest.skip('These logging tests only run in exhaustive')
-    super(TestLogging, cls).setup_class()
+    super(TestLoggingBase, cls).setup_class()
 
   def start_cluster_with_args(self, cluster_size, log_dir, **kwargs):
     cluster_options = []
     for daemon_arg in DAEMON_ARGS:
-      daemon_options = " ".join("-{0}={1}".format(k, v) for k, v in kwargs.iteritems())
+      daemon_options = " ".join("-{0}={1}".format(k, v) for k, v in kwargs.items())
       cluster_options.append("--{0}={1}".format(daemon_arg, daemon_options))
     self._start_impala_cluster(cluster_options, cluster_size=cluster_size,
-                               expected_num_impalads=cluster_size, impala_log_dir=log_dir)
+                               expected_num_impalads=cluster_size,
+                               impala_log_dir=log_dir,
+                               ignore_pid_on_log_rotation=True)
 
-  def assert_logs(self, daemon, max_count, max_bytes, base_dir=None):
+  def assert_logs(self, daemon, max_count, max_bytes, match_pid=True):
     """Assert that there are at most 'max_count' of INFO + ERROR log files for the
-    specified daemon and the individual file size does not exceed 'max_bytes'."""
-    path = base_dir or self.tmp_dir
-    log_paths = glob.glob("%s/%s*log.ERROR.*" % (path, daemon)) \
-                + glob.glob("%s/%s*log.INFO.*" % (path, daemon))
+    specified daemon and the individual file size does not exceed 'max_bytes'.
+    Also assert that stdout/stderr are redirected to correct file on each rotation."""
+    log_dir = self.tmp_dir
+    log_paths = glob.glob("%s/%s*log.ERROR.*" % (log_dir, daemon)) \
+                + glob.glob("%s/%s*log.INFO.*" % (log_dir, daemon))
     assert len(log_paths) <= max_count
-    for path in log_paths:
-      try:
-        log_size = os.path.getsize(path)
-        assert log_size <= max_bytes, "{} exceed {} bytes".format(path, max_bytes)
-      except OSError:
-        # The daemon might delete the log in the middle of assertion.
-        # In that case, do nothing and move on.
-        pass
 
-  @pytest.mark.execute_serially
-  def test_excessive_cerr(self):
+    # group log_paths by kind and pid (if match_pid).
+    log_group = {}
+    for path in sorted(log_paths):
+      tok = path.split('.')
+      key = tok[-1] + '.' + tok[-3] if match_pid else tok[-3]
+      if key in log_group:
+        log_group[key].append(path)
+      else:
+        log_group[key] = [path]
+
+    for key, paths in log_group.items():
+      for i in range(0, len(paths)):
+        try:
+          curr_path = paths[i]
+          # check log size
+          log_size = os.path.getsize(curr_path)
+          assert log_size <= max_bytes, "{} exceed {} bytes".format(curr_path, max_bytes)
+
+          if i < len(paths) - 1:
+            # check that we print the next_path in last line of this log file
+            next_path = paths[i + 1]
+            with open(curr_path, 'r') as f:
+              lines = f.readlines()
+              # There have been some test failures where the next_path is not in the last
+              # line of the output. One theory is that some output could have gone to the
+              # file after the next_path has been written. This tolerates having the
+              # next path in the last 3 lines. It also preserves the logs if there is a
+              # failure.
+              found_next_path = False
+              NUM_LINES_TO_CHECK = 3
+              for i in range(max(NUM_LINES_TO_CHECK, len(lines))):
+                if next_path in lines[-i]:
+                  found_next_path = True
+                  break
+              if not found_next_path:
+                # These logs are in a temporary directory. To improve debuggability,
+                # copy the logs to a location that would be preserved.
+                preserved_log_dir = os.getenv("LOG_DIR", "/tmp/")
+                preserved_path = os.path.join(preserved_log_dir,
+                    os.path.basename(curr_path))
+                shutil.copyfile(curr_path, preserved_path)
+                msg = "Did not find {0} in the last {1} lines of {2}.".format(
+                    next_path, NUM_LINES_TO_CHECK, curr_path)
+                msg += " Preserved the log contents at {0}".format(preserved_path)
+                assert False, msg
+        except OSError:
+          # The daemon might delete the log in the middle of assertion.
+          # In that case, do nothing and move on.
+          pass
+
+  def silent_remove(self, filename):
+    try:
+      os.remove(filename)
+    except OSError:
+      pass
+
+  def start_excessive_cerr_cluster(self, test_cluster_size=1, remove_symlink=False,
+                                   match_pid=True, max_log_count_begin=0,
+                                   max_log_count_end=None):
     """Check that impalad log is kept being rotated when most writing activity is coming
     from stderr stream.
     Along with LogFaultInjectionThread in init.cc, this test will fill impalad error logs
     with approximately 128kb error messages per second."""
-    test_cluster_size = 1
     test_logbufsecs = 3
-    test_max_log_files = 2
+    test_max_log_files = self._default_max_log_files
     test_max_log_size = 1  # 1 MB
     test_error_msg = ('123456789abcde_' * 64)  # 1 KB error message
     test_debug_actions = 'LOG_MAINTENANCE_STDERR:FAIL@1.0@' + test_error_msg
-    os.chmod(self.tmp_dir, 0744)
+    daemon = 'impalad'
+    os.chmod(self.tmp_dir, 0o744)
 
     expected_log_max_bytes = int(1.2 * 1024**2)  # 1.2 MB
-    self.assert_logs('impalad', 0, expected_log_max_bytes)
+    self.assert_logs(daemon, max_log_count_begin, expected_log_max_bytes)
     self.start_cluster_with_args(test_cluster_size, self.tmp_dir,
                                  logbufsecs=test_logbufsecs,
                                  max_log_files=test_max_log_files,
                                  max_log_size=test_max_log_size,
-                                 debug_actions=test_debug_actions)
-    self.wait_for_num_processes('impalad', test_cluster_size, 30)
-    expected_log_max_count = test_max_log_files * 2  # Both INFO and ERROR logs
+                                 debug_actions=test_debug_actions,
+                                 log_rotation_match_pid=('1' if match_pid else '0'))
+    self.wait_for_num_processes(daemon, test_cluster_size, 30)
+    # Count both INFO and ERROR logs
+    if max_log_count_end is None:
+      max_log_count_end = test_max_log_files * test_cluster_size * 2
     # Wait for log maintenance thread to flush and rotate the logs asynchronously.
+    duration = test_logbufsecs * 10
     start = time.time()
-    while (time.time() - start < 40):
+    while (time.time() - start < duration):
       time.sleep(1)
-      self.assert_logs('impalad', expected_log_max_count, expected_log_max_bytes)
+      self.assert_logs(daemon, max_log_count_end, expected_log_max_bytes)
+      if (remove_symlink):
+        pattern = self.tmp_dir + '/' + daemon + '*'
+        symlinks = glob.glob(pattern + '.INFO') + glob.glob(pattern + '.ERROR')
+        for symlink in symlinks:
+          self.silent_remove(symlink)
+
+
+class TestLogging(TestLoggingBase):
+  """Core tests to check that impala log is rolled periodically, obeying
+  max_log_size, max_log_files, and log_rotation_match_pid even in the presence of heavy
+  stderr writing.
+  """
+
+  @classmethod
+  def setup_class(cls):
+    super(TestLogging, cls).setup_class()
+
+  @pytest.mark.execute_serially
+  def test_excessive_cerr_ignore_pid(self):
+    """Test excessive cerr activity twice with restart in between and no PID matching."""
+    self.start_excessive_cerr_cluster(test_cluster_size=1, remove_symlink=False,
+                                      match_pid=False)
+    self.kill_cluster(SIGTERM)
+    # There should be no impalad/catalogd/statestored running.
+    assert self.get_num_processes('impalad') == 0
+    assert self.get_num_processes('catalogd') == 0
+    assert self.get_num_processes('statestored') == 0
+    max_count = self._default_max_log_files * 2
+    self.start_excessive_cerr_cluster(test_cluster_size=1, remove_symlink=False,
+                                      match_pid=False,
+                                      max_log_count_begin=max_count,
+                                      max_log_count_end=max_count)
+
+
+class TestLoggingExhaustive(TestLoggingBase):
+  """Exhaustive tests to check that impala log is rolled periodically, obeying
+  max_log_size, max_log_files, and log_rotation_match_pid even in the presence of heavy
+  stderr writing.
+  """
+
+  @classmethod
+  def setup_class(cls):
+    if cls.exploration_strategy() != 'exhaustive':
+      pytest.skip('TestLoggingExhaustive only run in exhaustive')
+    super(TestLoggingExhaustive, cls).setup_class()
+
+  @pytest.mark.execute_serially
+  def test_excessive_cerr(self):
+    """Test excessive cerr activity with single node cluster."""
+    self.start_excessive_cerr_cluster()
+
+  @pytest.mark.execute_serially
+  def test_excessive_cerr_no_symlink(self):
+    """Test excessive cerr activity with two node cluster and missing log symlinks."""
+    self.start_excessive_cerr_cluster(test_cluster_size=2, remove_symlink=False)
+
+  @pytest.mark.execute_serially
+  def test_excessive_cerr_match_pid(self):
+    """Test excessive cerr activity twice with restart in between and PID matching."""
+    self.start_excessive_cerr_cluster(1, remove_symlink=False, match_pid=True)
+    self.kill_cluster(SIGTERM)
+    # There should be no impalad/catalogd/statestored running.
+    assert self.get_num_processes('impalad') == 0
+    assert self.get_num_processes('catalogd') == 0
+    assert self.get_num_processes('statestored') == 0
+    max_count_begin = self._default_max_log_files * 2
+    max_count_end = max_count_begin * 2
+    self.start_excessive_cerr_cluster(test_cluster_size=1, remove_symlink=False,
+                                      match_pid=True,
+                                      max_log_count_begin=max_count_begin,
+                                      max_log_count_end=max_count_end)

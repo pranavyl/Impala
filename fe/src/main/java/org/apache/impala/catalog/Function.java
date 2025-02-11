@@ -20,8 +20,9 @@ package org.apache.impala.catalog;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 
-import org.apache.commons.lang.NotImplementedException;
+import org.apache.commons.lang3.NotImplementedException;
 import org.apache.impala.analysis.FunctionName;
 import org.apache.impala.analysis.HdfsUri;
 import org.apache.impala.common.AnalysisException;
@@ -196,6 +197,12 @@ public class Function extends CatalogObjectImpl {
     return compare((Function)o, CompareMode.IS_IDENTICAL);
   }
 
+  @Override
+  public int hashCode() {
+    // Use a rough hashing based on name to avoid dealing with different comparison modes.
+    return Objects.hash(name_);
+  }
+
   // Compares this to 'other' for 'mode'.
   public boolean compare(Function other, CompareMode mode) {
     return calcMatchScore(other, mode) >= 0;
@@ -210,8 +217,10 @@ public class Function extends CatalogObjectImpl {
     switch (mode) {
       case IS_IDENTICAL: return calcIdenticalMatchScore(other);
       case IS_INDISTINGUISHABLE: return calcIndistinguishableMatchScore(other);
-      case IS_SUPERTYPE_OF: return calcSuperTypeOfMatchScore(other, true);
-      case IS_NONSTRICT_SUPERTYPE_OF: return calcSuperTypeOfMatchScore(other, false);
+      case IS_SUPERTYPE_OF:
+        return calcSuperTypeOfMatchScore(other, TypeCompatibility.ALL_STRICT);
+      case IS_NONSTRICT_SUPERTYPE_OF:
+        return calcSuperTypeOfMatchScore(other, TypeCompatibility.DEFAULT);
       default:
         Preconditions.checkState(false);
         return -1;
@@ -241,7 +250,7 @@ public class Function extends CatalogObjectImpl {
    * Otherwise returns the number of arguments whose types are an exact match or a
    * wildcard variant.
    */
-  private int calcSuperTypeOfMatchScore(Function other, boolean strict) {
+  private int calcSuperTypeOfMatchScore(Function other, TypeCompatibility compatibility) {
     if (!other.name_.equals(name_)) return -1;
     if (!this.hasVarArgs_ && other.argTypes_.length != this.argTypes_.length) {
       return -1;
@@ -256,7 +265,7 @@ public class Function extends CatalogObjectImpl {
         continue;
       }
       if (!Type.isImplicitlyCastable(
-          other.argTypes_[i], extendedArgTypes[i], strict, strict)) {
+              other.argTypes_[i], extendedArgTypes[i], compatibility)) {
         return -1;
       }
     }
@@ -438,8 +447,7 @@ public class Function extends CatalogObjectImpl {
   // If an error occurs and the mtime cannot be retrieved, an IllegalStateException is
   // thrown.
   public final long getLastModifiedTime() {
-    if (getBinaryType() != TFunctionBinaryType.BUILTIN && getLocation() != null) {
-      Preconditions.checkState(!getLocation().toString().isEmpty());
+    if (!isBuiltinOrJava()) {
       TSymbolLookupParams lookup = Preconditions.checkNotNull(getLookupParams());
       try {
         TSymbolLookupResult result = FeSupport.LookupSymbol(lookup);
@@ -451,6 +459,17 @@ public class Function extends CatalogObjectImpl {
       }
     }
     return -1;
+  }
+
+  /**
+   * Returns true for BUILTINs, and JAVA functions when location is either null or empty.
+   *
+   * @return boolean
+   */
+  private boolean isBuiltinOrJava() {
+    return getBinaryType() == TFunctionBinaryType.BUILTIN ||
+        (getBinaryType() == TFunctionBinaryType.JAVA &&
+            (getLocation() == null || getLocation().toString().isEmpty()));
   }
 
   // Returns the resolved symbol in the binary. The BE will do a lookup of 'symbol'
@@ -523,6 +542,7 @@ public class Function extends CatalogObjectImpl {
     case VARCHAR:
     case CHAR:
     case FIXED_UDA_INTERMEDIATE:
+    case BINARY:
       // These types are marshaled into a StringVal.
       return "StringVal";
     case TIMESTAMP:

@@ -24,9 +24,12 @@ import org.apache.impala.authorization.AuthorizationPolicy;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TGetPartitionStatsResponse;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.util.PatternMatcher;
+
+import javax.annotation.Nullable;
 
 /**
  * Interface between the front-end (analysis and planning) classes and the Catalog.
@@ -35,9 +38,12 @@ public interface FeCatalog {
   /** @see Catalog#getDbs(PatternMatcher) */
   List<? extends FeDb> getDbs(PatternMatcher matcher);
 
-  /** @see Catalog#getTableNames(String, PatternMatcher) */
   List<String> getTableNames(String dbName, PatternMatcher matcher)
       throws DatabaseNotFoundException;
+
+  /** @see Catalog#getTableNames(String, PatternMatcher, Set<String>) */
+  List<String> getTableNames(String dbName, PatternMatcher matcher,
+      Set<TImpalaTableType> tableTypes) throws DatabaseNotFoundException;
 
   /** @see Catalog#getTable(String, String) */
   FeTable getTable(String dbName, String tableName)
@@ -80,7 +86,8 @@ public interface FeCatalog {
   /**
    * Issues a load request to the catalogd for the given tables.
    */
-  void prioritizeLoad(Set<TableName> tableNames) throws InternalException;
+  void prioritizeLoad(Set<TableName> tableNames, @Nullable TUniqueId queryId)
+      throws InternalException;
 
   /**
    * Fetches partition statistics for a table. The table is loaded if needed. If the table

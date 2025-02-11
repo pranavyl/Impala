@@ -41,6 +41,7 @@ namespace impala {
 
 // Number of pinned pages required for a merge with fixed-length data only.
 const int MIN_BUFFERS_PER_MERGE = 3;
+const CodegenFnPtr<SortedRunMerger::HeapifyHelperFn> Sorter::default_heapify_helper_fn_{};
 
 Status Sorter::Page::Init(Sorter* sorter) {
   const BufferPool::BufferHandle* page_buffer;
@@ -120,7 +121,8 @@ Sorter::Run::Run(Sorter* parent, TupleDescriptor* sort_tuple_desc, bool initial_
     is_pinned_(initial_run),
     is_finalized_(false),
     is_sorted_(!initial_run),
-    num_tuples_(0) {}
+    num_tuples_(0),
+    max_num_of_pages_(initial_run ? parent->inmem_run_max_pages_ : 0) {}
 
 Status Sorter::Run::Init() {
   int num_to_create = 1 + has_var_len_slots_
@@ -145,12 +147,38 @@ Status Sorter::Run::Init() {
   } else {
     sorter_->spilled_runs_counter_->Add(1);
   }
+
+  CheckTypesAreValidInSortingTuple();
+
+  return Status::OK();
+}
+
+Status Sorter::Run::TryInit(bool* allocation_failed) {
+  *allocation_failed = true;
+  DCHECK_GT(sorter_->inmem_run_max_pages_, 0);
+  // No need for additional copy page because var-len data is not reordered.
+  // The in-memory merger can copy var-len data directly from the in-memory runs,
+  // which are kept until the merge is finished
+  int num_to_create = 1 + has_var_len_slots_;
+  int64_t required_mem = num_to_create * sorter_->page_len_;
+  if (!sorter_->buffer_pool_client_->IncreaseReservationToFit(required_mem)) {
+    return Status::OK();
+  }
+
+  RETURN_IF_ERROR(AddPage(&fixed_len_pages_));
+  if (has_var_len_slots_) {
+    RETURN_IF_ERROR(AddPage(&var_len_pages_));
+  }
+  if (initial_run_) {
+    sorter_->initial_runs_counter_->Add(1);
+  }
+  *allocation_failed = false;
   return Status::OK();
 }
 
 template <bool HAS_VAR_LEN_SLOTS, bool INITIAL_RUN>
 Status Sorter::Run::AddBatchInternal(
-    RowBatch* batch, int start_index, int* num_processed) {
+    RowBatch* batch, int start_index, int* num_processed, bool* allocation_failed) {
   DCHECK(!is_finalized_);
   DCHECK(!fixed_len_pages_.empty());
   DCHECK_EQ(HAS_VAR_LEN_SLOTS, has_var_len_slots_);
@@ -179,7 +207,9 @@ Status Sorter::Run::AddBatchInternal(
   // processed.
   int cur_input_index = start_index;
   vector<StringValue*> string_values;
+  vector<pair<CollectionValue*, int64_t>> coll_values_and_sizes;
   string_values.reserve(sort_tuple_desc_->string_slots().size());
+  coll_values_and_sizes.reserve(sort_tuple_desc_->collection_slots().size());
   while (cur_input_index < batch->num_rows()) {
     // tuples_remaining is the number of tuples to copy/materialize into
     // cur_fixed_len_page.
@@ -194,7 +224,7 @@ Status Sorter::Run::AddBatchInternal(
       if (INITIAL_RUN) {
         new_tuple->MaterializeExprs<HAS_VAR_LEN_SLOTS, true>(input_row,
             *sort_tuple_desc_, sorter_->sort_tuple_expr_evals_, nullptr,
-            &string_values, &total_var_len);
+            &string_values, &coll_values_and_sizes, &total_var_len);
         if (total_var_len > sorter_->page_len_) {
           int64_t max_row_size = sorter_->state_->query_options().max_row_size;
           return Status(TErrorCode::MAX_ROW_SIZE,
@@ -204,7 +234,8 @@ Status Sorter::Run::AddBatchInternal(
       } else {
         memcpy(new_tuple, input_row->GetTuple(0), sort_tuple_size_);
         if (HAS_VAR_LEN_SLOTS) {
-          CollectNonNullVarSlots(new_tuple, &string_values, &total_var_len);
+          CollectNonNullNonSmallVarSlots(new_tuple, *sort_tuple_desc_, &string_values,
+              &coll_values_and_sizes, &total_var_len);
         }
       }
 
@@ -212,31 +243,32 @@ Status Sorter::Run::AddBatchInternal(
         DCHECK_GT(var_len_pages_.size(), 0);
         Page* cur_var_len_page = &var_len_pages_.back();
         if (cur_var_len_page->BytesRemaining() < total_var_len) {
-          bool added;
-          RETURN_IF_ERROR(TryAddPage(add_mode, &var_len_pages_, &added));
+          bool added = false;
+          if (MaxSortRunSizeReached<INITIAL_RUN>()) {
+            cur_fixed_len_page->FreeBytes(sort_tuple_size_);
+            *allocation_failed = false;
+            return Status::OK();
+          } else {
+            RETURN_IF_ERROR(TryAddPage(add_mode, &var_len_pages_, &added));
+          }
           if (added) {
             cur_var_len_page = &var_len_pages_.back();
           } else {
             // There was not enough space in the last var-len page for this tuple, and
             // the run could not be extended. Return the fixed-len allocation and exit.
             cur_fixed_len_page->FreeBytes(sort_tuple_size_);
+            *allocation_failed = true;
             return Status::OK();
           }
         }
 
-        // Sorting of tuples containing array values is not implemented. The planner
-        // combined with projection should guarantee that none are in each tuple.
-        for (const SlotDescriptor* coll_slot: sort_tuple_desc_->collection_slots()) {
-          DCHECK(new_tuple->IsNull(coll_slot->null_indicator_offset()));
-        }
-
+        DCHECK_EQ(&var_len_pages_.back(), cur_var_len_page);
         uint8_t* var_data_ptr = cur_var_len_page->AllocateBytes(total_var_len);
         if (INITIAL_RUN) {
-          CopyVarLenData(string_values, var_data_ptr);
+          CopyVarLenData(string_values, coll_values_and_sizes, var_data_ptr);
         } else {
-          DCHECK_EQ(&var_len_pages_.back(), cur_var_len_page);
-          CopyVarLenDataConvertOffset(string_values, var_len_pages_.size() - 1,
-              cur_var_len_page->data(), var_data_ptr);
+          CopyVarLenDataConvertOffset(string_values, coll_values_and_sizes,
+              var_len_pages_.size() - 1, cur_var_len_page->data(), var_data_ptr);
         }
       }
       ++num_tuples_;
@@ -246,14 +278,62 @@ Status Sorter::Run::AddBatchInternal(
 
     // If there are still rows left to process, get a new page for the fixed-length
     // tuples. If the run is already too long, return.
+    if (MaxSortRunSizeReached<INITIAL_RUN>()) {
+      *allocation_failed = false;
+      return Status::OK();
+    }
     if (cur_input_index < batch->num_rows()) {
       bool added;
       RETURN_IF_ERROR(TryAddPage(add_mode, &fixed_len_pages_, &added));
-      if (!added) return Status::OK();
+      if (!added) {
+        *allocation_failed = true;
+        return Status::OK();
+      }
       cur_fixed_len_page = &fixed_len_pages_.back();
     }
   }
+  *allocation_failed = false;
   return Status::OK();
+}
+
+template <bool INITIAL_RUN>
+bool Sorter::Run::MaxSortRunSizeReached() {
+  DCHECK_EQ(INITIAL_RUN, initial_run_);
+  DCHECK(!INITIAL_RUN || max_num_of_pages_ == 0 || run_size() <= max_num_of_pages_);
+  return (INITIAL_RUN && max_num_of_pages_ > 0 && run_size() == max_num_of_pages_);
+}
+
+bool IsValidStructInSortingTuple(const ColumnType& struct_type) {
+  DCHECK(struct_type.IsStructType());
+  for (const ColumnType& child_type : struct_type.children) {
+    if (child_type.IsCollectionType()) return false;
+    if (child_type.IsStructType() && !IsValidStructInSortingTuple(child_type)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsValidInSortingTuple(const ColumnType& type) {
+  if (type.IsCollectionType()) {
+    // Check children - one 'item' for arrays and a 'key' and a 'value' for maps.
+    for (const ColumnType& child_type : type.children) {
+      if (!IsValidInSortingTuple(child_type)) return false;
+    }
+    return true;
+  } else if (type.IsStructType()) {
+    return IsValidStructInSortingTuple(type);
+  }
+  return true;
+}
+
+void Sorter::Run::CheckTypesAreValidInSortingTuple() {
+  // Collections within structs (also if they are nested in another struct or collection)
+  // are currently not allowed in the sorting tuple (see IMPALA-12160). See
+  // SortInfo.isValidInSortingTuple().
+  for (const SlotDescriptor* slot: sort_tuple_desc_->slots()) {
+    DCHECK(IsValidInSortingTuple(slot->type()));
+  }
 }
 
 Status Sorter::Run::FinalizeInput() {
@@ -305,8 +385,10 @@ Status Sorter::Run::UnpinAllPages() {
   sorted_var_len_pages.reserve(var_len_pages_.size());
 
   vector<StringValue*> string_values;
+  vector<pair<CollectionValue*, int64_t>> collection_values_and_sizes;
   int total_var_len;
   string_values.reserve(sort_tuple_desc_->string_slots().size());
+  collection_values_and_sizes.reserve(sort_tuple_desc_->collection_slots().size());
   Page* cur_sorted_var_len_page = nullptr;
   if (HasVarLenPages()) {
     DCHECK(var_len_copy_page_.is_open());
@@ -330,7 +412,8 @@ Status Sorter::Run::UnpinAllPages() {
       for (int page_offset = 0; page_offset < cur_fixed_page->valid_data_len();
            page_offset += sort_tuple_size_) {
         Tuple* cur_tuple = reinterpret_cast<Tuple*>(cur_fixed_page->data() + page_offset);
-        CollectNonNullVarSlots(cur_tuple, &string_values, &total_var_len);
+        CollectNonNullNonSmallVarSlots(cur_tuple, *sort_tuple_desc_, &string_values,
+            &collection_values_and_sizes, &total_var_len);
         DCHECK(cur_sorted_var_len_page->is_open());
         if (cur_sorted_var_len_page->BytesRemaining() < total_var_len) {
           bool added;
@@ -341,8 +424,9 @@ Status Sorter::Run::UnpinAllPages() {
         }
         uint8_t* var_data_ptr = cur_sorted_var_len_page->AllocateBytes(total_var_len);
         DCHECK_EQ(&sorted_var_len_pages.back(), cur_sorted_var_len_page);
-        CopyVarLenDataConvertOffset(string_values, sorted_var_len_pages.size() - 1,
-            cur_sorted_var_len_page->data(), var_data_ptr);
+        CopyVarLenDataConvertOffset(string_values, collection_values_and_sizes,
+            sorted_var_len_pages.size() - 1, cur_sorted_var_len_page->data(),
+            var_data_ptr);
       }
     }
     cur_fixed_page->Unpin(sorter_->buffer_pool_client_);
@@ -470,7 +554,7 @@ Status Sorter::Run::GetNext(RowBatch* output_batch, bool* eos) {
     Tuple* input_tuple =
         reinterpret_cast<Tuple*>(fixed_len_page->data() + fixed_len_page_offset_);
 
-    if (CONVERT_OFFSET_TO_PTR && !ConvertOffsetsToPtrs(input_tuple)) {
+    if (CONVERT_OFFSET_TO_PTR && !ConvertOffsetsToPtrs(input_tuple, *sort_tuple_desc_)) {
       DCHECK(!is_pinned_);
       // The var-len data is in the next page. We are done with the current page, so
       // return rows we've accumulated so far along with the page's buffer and advance
@@ -532,16 +616,51 @@ Status Sorter::Run::PinNextReadPage(vector<Page>* pages, int page_index) {
   return Status::OK();
 }
 
-void Sorter::Run::CollectNonNullVarSlots(Tuple* src,
-    vector<StringValue*>* string_values, int* total_var_len) {
+void Sorter::Run::CollectNonNullNonSmallVarSlots(Tuple* src, const TupleDescriptor& tuple_desc,
+    vector<StringValue*>* string_values,
+    vector<pair<CollectionValue*, int64_t>>* collection_values, int* total_var_len) {
   string_values->clear();
+  collection_values->clear();
   *total_var_len = 0;
-  for (const SlotDescriptor* string_slot: sort_tuple_desc_->string_slots()) {
+
+  CollectNonNullNonSmallVarSlotsHelper(src, tuple_desc, string_values, collection_values,
+      total_var_len);
+}
+
+void Sorter::Run::CollectNonNullNonSmallVarSlotsHelper(Tuple* src,
+    const TupleDescriptor& tuple_desc, vector<StringValue*>* string_values,
+    std::vector<std::pair<CollectionValue*, int64_t>>* collection_values,
+    int* total_var_len) {
+  for (const SlotDescriptor* string_slot: tuple_desc.string_slots()) {
     if (!src->IsNull(string_slot->null_indicator_offset())) {
       StringValue* string_val =
           reinterpret_cast<StringValue*>(src->GetSlot(string_slot->tuple_offset()));
+      if (string_val->IsSmall()) continue;
       string_values->push_back(string_val);
-      *total_var_len += string_val->len;
+      *total_var_len += string_val->Len();
+    }
+  }
+
+  for (const SlotDescriptor* collection_slot: tuple_desc.collection_slots()) {
+    if (!src->IsNull(collection_slot->null_indicator_offset())) {
+      CollectionValue* collection_value = reinterpret_cast<CollectionValue*>(
+          src->GetSlot(collection_slot->tuple_offset()));
+      const TupleDescriptor& child_tuple_desc =
+          *collection_slot->children_tuple_descriptor();
+
+      int64_t byte_size = collection_value->ByteSize(child_tuple_desc);
+      *total_var_len += byte_size;
+
+      // Recurse first so that children come before parents in the list. See the function
+      // comment in the header for the reason.
+      for (int i = 0; i < collection_value->num_tuples; i++) {
+        Tuple* child_tuple = reinterpret_cast<Tuple*>(
+            collection_value->ptr + i * child_tuple_desc.byte_size());
+        CollectNonNullNonSmallVarSlotsHelper(child_tuple, child_tuple_desc, string_values,
+            collection_values, total_var_len);
+      }
+
+      collection_values->push_back(make_pair(collection_value, byte_size));
     }
   }
 }
@@ -573,50 +692,133 @@ Status Sorter::Run::AddPage(vector<Page>* page_sequence) {
 }
 
 void Sorter::Run::CopyVarLenData(const vector<StringValue*>& string_values,
+    const vector<pair<CollectionValue*, int64_t>>& collection_values_and_sizes,
     uint8_t* dest) {
   for (StringValue* string_val: string_values) {
-    Ubsan::MemCpy(dest, string_val->ptr, string_val->len);
-    string_val->ptr = reinterpret_cast<char*>(dest);
-    dest += string_val->len;
+    DCHECK(!string_val->IsSmall());
+    Ubsan::MemCpy(dest, string_val->Ptr(), string_val->Len());
+    string_val->SetPtr(reinterpret_cast<char*>(dest));
+    dest += string_val->Len();
+  }
+
+  for (const pair<CollectionValue*, int64_t>& coll_val_and_size
+      : collection_values_and_sizes) {
+    CollectionValue* coll_val = coll_val_and_size.first;
+    int64_t byte_size = coll_val_and_size.second;
+    Ubsan::MemCpy(dest, coll_val->ptr, byte_size);
+    coll_val->ptr = dest;
+    dest += byte_size;
   }
 }
 
+uint64_t PackOffset(uint64_t page_index, uint32_t page_offset) {
+  return (page_index << 32) | page_offset;
+}
+
+void UnpackOffset(uint64_t packed_offset, uint32_t* page_index, uint32_t* page_offset) {
+    *page_index = packed_offset >> 32;
+    *page_offset = packed_offset & 0xFFFFFFFF;
+}
+
 void Sorter::Run::CopyVarLenDataConvertOffset(const vector<StringValue*>& string_values,
+    const vector<pair<CollectionValue*, int64_t>>& collection_values_and_sizes,
     int page_index, const uint8_t* page_start, uint8_t* dest) {
   DCHECK_GE(page_index, 0);
   DCHECK_GE(dest - page_start, 0);
 
   for (StringValue* string_val : string_values) {
-    memcpy(dest, string_val->ptr, string_val->len);
+    DCHECK(!string_val->IsSmall());
+    memcpy(dest, string_val->Ptr(), string_val->Len());
     DCHECK_LE(dest - page_start, sorter_->page_len_);
     DCHECK_LE(dest - page_start, numeric_limits<uint32_t>::max());
     uint32_t page_offset = dest - page_start;
-    uint64_t packed_offset = (static_cast<uint64_t>(page_index) << 32) | page_offset;
-    string_val->ptr = reinterpret_cast<char*>(packed_offset);
-    dest += string_val->len;
+    uint64_t packed_offset = PackOffset(page_index, page_offset);
+    string_val->SetPtr(reinterpret_cast<char*>(packed_offset));
+    dest += string_val->Len();
+  }
+
+  for (const pair<CollectionValue*, int64_t>&  coll_val_and_size
+      : collection_values_and_sizes) {
+    CollectionValue* coll_value = coll_val_and_size.first;
+    int64_t byte_size = coll_val_and_size.second;
+    memcpy(dest, coll_value->ptr, byte_size);
+    DCHECK_LE(dest - page_start, sorter_->page_len_);
+    DCHECK_LE(dest - page_start, numeric_limits<uint32_t>::max());
+    uint32_t page_offset = dest - page_start;
+    uint64_t packed_offset = PackOffset(page_index, page_offset);
+    coll_value->ptr = reinterpret_cast<uint8_t*>(packed_offset);
+    dest += byte_size;
   }
 }
 
-bool Sorter::Run::ConvertOffsetsToPtrs(Tuple* tuple) {
+bool Sorter::Run::ConvertOffsetsToPtrs(Tuple* tuple, const TupleDescriptor& tuple_desc) {
   // We need to be careful to handle the case where var_len_pages_ is empty,
   // e.g. if all strings are nullptr.
   uint8_t* page_start =
       var_len_pages_.empty() ? nullptr : var_len_pages_[var_len_pages_index_].data();
 
-  const vector<SlotDescriptor*>& string_slots = sort_tuple_desc_->string_slots();
-  int num_non_null_string_slots = 0;
-  for (auto slot_desc : string_slots) {
-    if (tuple->IsNull(slot_desc->null_indicator_offset())) continue;
-    ++num_non_null_string_slots;
+  bool strings_converted = ConvertStringValueOffsetsToPtrs(tuple, tuple_desc, page_start);
+  if (!strings_converted) return false;
+  return ConvertCollectionValueOffsetsToPtrs(tuple, tuple_desc, page_start);
+}
 
-    DCHECK(slot_desc->type().IsVarLenStringType());
-    StringValue* value = reinterpret_cast<StringValue*>(
+// Helpers for Sorter::Run::ConvertValueOffsetsToPtr() to get the data size based on the
+// type.
+int64_t GetDataSize(const StringValue& string_value, const SlotDescriptor& slot_desc) {
+  return string_value.IsSmall() ? 0 : string_value.Len();
+}
+
+int64_t GetDataSize(const CollectionValue& collection_value,
+    const SlotDescriptor& slot_desc) {
+ return collection_value.ByteSize(*slot_desc.children_tuple_descriptor());
+}
+
+template <class ValueType>
+bool AllPrevSlotsAreNullsOrSmall(Tuple* tuple, const vector<SlotDescriptor*>& slots,
+    int index) {
+  DCHECK_LT(index, slots.size());
+  for (int i = 0; i < index; ++i) {
+    SlotDescriptor* slot_desc = slots[i];
+    bool is_small = false;
+    bool is_null = tuple->IsNull(slot_desc->null_indicator_offset());
+    if constexpr (std::is_same_v<ValueType, StringValue>) {
+      StringValue* value = reinterpret_cast<ValueType*>(
+          tuple->GetSlot(slot_desc->tuple_offset()));
+      is_small = value->IsSmall();
+    }
+    if (!(is_null || is_small)) return false;
+  }
+  return true;
+}
+
+template <class ValueType>
+bool Sorter::Run::ConvertValueOffsetsToPtrs(Tuple* tuple, uint8_t* page_start,
+    const vector<SlotDescriptor*>& slots) {
+  static_assert(std::is_same_v<ValueType, StringValue>
+      || std::is_same_v<ValueType, CollectionValue>);
+
+  constexpr bool IS_COLLECTION = std::is_same_v<ValueType, CollectionValue>;
+
+  for (int idx = 0; idx < slots.size(); ++idx) {
+    SlotDescriptor* slot_desc = slots[idx];
+    if (tuple->IsNull(slot_desc->null_indicator_offset())) continue;
+
+    ValueType* value = reinterpret_cast<ValueType*>(
         tuple->GetSlot(slot_desc->tuple_offset()));
+
+    if constexpr (IS_COLLECTION) {
+      DCHECK(slot_desc->type().IsCollectionType());
+    } else {
+      DCHECK(slot_desc->type().IsVarLenStringType());
+      if (value->IsSmall()) continue;
+    }
+
     // packed_offset includes the page index in the upper 32 bits and the page
     // offset in the lower 32 bits. See CopyVarLenDataConvertOffset().
-    uint64_t packed_offset = reinterpret_cast<uint64_t>(value->ptr);
-    uint32_t page_index = packed_offset >> 32;
-    uint32_t page_offset = packed_offset & 0xFFFFFFFF;
+    uint64_t packed_offset = reinterpret_cast<uint64_t>(value->Ptr());
+    uint32_t page_index;
+    uint32_t page_offset;
+    UnpackOffset(packed_offset, &page_index, &page_offset);
 
     if (page_index > var_len_pages_index_) {
       // We've reached the page boundary for the current var-len page.
@@ -625,24 +827,50 @@ bool Sorter::Run::ConvertOffsetsToPtrs(Tuple* tuple) {
       DCHECK_LE(page_index, var_len_pages_.size());
       DCHECK_EQ(page_index, var_len_pages_index_ + 1);
       DCHECK_EQ(page_offset, 0); // The data is the first thing in the next page.
-      // This must be the first slot with var len data for the tuple. Var len data
-      // for tuple shouldn't be split across blocks.
-      DCHECK_EQ(num_non_null_string_slots, 1);
+                                 // This must be the first slot with var len data for the
+                                 // tuple. Var len data for tuple shouldn't be split
+                                 // across blocks.
+      DCHECK(AllPrevSlotsAreNullsOrSmall<ValueType>(tuple, slots, idx));
       return false;
     }
-
     DCHECK_EQ(page_index, var_len_pages_index_);
+
+    const int64_t data_size = GetDataSize(*value, *slot_desc);
     if (var_len_pages_.empty()) {
-      DCHECK_EQ(value->len, 0);
+      DCHECK_EQ(data_size, 0);
     } else {
-      DCHECK_LE(page_offset + value->len, var_len_pages_[page_index].valid_data_len());
+      DCHECK_LE(page_offset + data_size, var_len_pages_[page_index].valid_data_len());
     }
     // Calculate the address implied by the offset and assign it. May be nullptr for
     // zero-length strings if there are no pages in the run since page_start is nullptr.
     DCHECK(page_start != nullptr || page_offset == 0);
-    value->ptr = reinterpret_cast<char*>(page_start + page_offset);
+    using ptr_type = decltype(value->Ptr());
+    value->SetPtr(reinterpret_cast<ptr_type>(page_start + page_offset));
+
+    if constexpr (IS_COLLECTION) {
+      const TupleDescriptor* children_tuple_desc = slot_desc->children_tuple_descriptor();
+      DCHECK(children_tuple_desc != nullptr);
+      for (int i = 0; i < value->num_tuples; i++) {
+        Tuple* child_tuple = reinterpret_cast<Tuple*>(
+            value->ptr + i * children_tuple_desc->byte_size());
+
+        if (!ConvertOffsetsToPtrs(child_tuple, *children_tuple_desc)) return false;
+      }
+    }
   }
   return true;
+}
+
+bool Sorter::Run::ConvertStringValueOffsetsToPtrs(Tuple* tuple,
+    const TupleDescriptor& tuple_desc, uint8_t* page_start) {
+  const vector<SlotDescriptor*>& string_slots = tuple_desc.string_slots();
+  return ConvertValueOffsetsToPtrs<StringValue>(tuple, page_start, string_slots);
+}
+
+bool Sorter::Run::ConvertCollectionValueOffsetsToPtrs(Tuple* tuple,
+    const TupleDescriptor& tuple_desc, uint8_t* page_start) {
+  const vector<SlotDescriptor*>& collection_slots = tuple_desc.collection_slots();
+  return ConvertValueOffsetsToPtrs<CollectionValue>(tuple, page_start, collection_slots);
 }
 
 int64_t Sorter::Run::TotalBytes() const {
@@ -657,22 +885,28 @@ int64_t Sorter::Run::TotalBytes() const {
   return total_bytes;
 }
 
-Status Sorter::Run::AddInputBatch(RowBatch* batch, int start_index, int* num_processed) {
+Status Sorter::Run::AddInputBatch(RowBatch* batch, int start_index, int* num_processed,
+    bool* allocation_failed) {
   DCHECK(initial_run_);
   if (has_var_len_slots_) {
-    return AddBatchInternal<true, true>(batch, start_index, num_processed);
+    return AddBatchInternal<true, true>(
+        batch, start_index, num_processed, allocation_failed);
   } else {
-    return AddBatchInternal<false, true>(batch, start_index, num_processed);
+    return AddBatchInternal<false, true>(
+        batch, start_index, num_processed, allocation_failed);
   }
 }
 
 Status Sorter::Run::AddIntermediateBatch(
     RowBatch* batch, int start_index, int* num_processed) {
   DCHECK(!initial_run_);
+  bool allocation_failed = false;
   if (has_var_len_slots_) {
-    return AddBatchInternal<true, false>(batch, start_index, num_processed);
+    return AddBatchInternal<true, false>(
+        batch, start_index, num_processed, &allocation_failed);
   } else {
-    return AddBatchInternal<false, false>(batch, start_index, num_processed);
+    return AddBatchInternal<false, false>(
+        batch, start_index, num_processed, &allocation_failed);
   }
 }
 
@@ -770,6 +1004,7 @@ Sorter::Sorter(const TupleRowComparatorConfig& tuple_row_comparator_config,
     int64_t page_len, RuntimeProfile* profile, RuntimeState* state,
     const string& node_label, bool enable_spilling,
     const CodegenFnPtr<SortHelperFn>& codegend_sort_helper_fn,
+    const CodegenFnPtr<SortedRunMerger::HeapifyHelperFn>& codegend_heapify_helper_fn,
     int64_t estimated_input_size)
   : node_label_(node_label),
     state_(state),
@@ -778,6 +1013,7 @@ Sorter::Sorter(const TupleRowComparatorConfig& tuple_row_comparator_config,
     compare_less_than_(nullptr),
     in_mem_tuple_sorter_(nullptr),
     codegend_sort_helper_fn_(codegend_sort_helper_fn),
+    codegend_heapify_helper_fn_(codegend_heapify_helper_fn),
     buffer_pool_client_(buffer_pool_client),
     page_len_(page_len),
     has_var_len_slots_(false),
@@ -791,6 +1027,7 @@ Sorter::Sorter(const TupleRowComparatorConfig& tuple_row_comparator_config,
     initial_runs_counter_(nullptr),
     num_merges_counter_(nullptr),
     in_mem_sort_timer_(nullptr),
+    in_mem_merge_timer_(nullptr),
     sorted_data_size_(nullptr),
     run_sizes_(nullptr) {
   switch (tuple_row_comparator_config.sorting_order_) {
@@ -804,13 +1041,15 @@ Sorter::Sorter(const TupleRowComparatorConfig& tuple_row_comparator_config,
     default:
       DCHECK(false);
   }
-
+  int max_sort_run_size = state->query_options().max_sort_run_size;
+  inmem_run_max_pages_ = max_sort_run_size >= 2 ? max_sort_run_size : 0;
   if (estimated_input_size > 0) ComputeSpillEstimate(estimated_input_size);
 }
 
 Sorter::~Sorter() {
   DCHECK(sorted_runs_.empty());
   DCHECK(merging_runs_.empty());
+  DCHECK(sorted_inmem_runs_.empty());
   DCHECK(unsorted_run_ == nullptr);
   DCHECK(merge_output_run_ == nullptr);
 }
@@ -859,6 +1098,7 @@ Status Sorter::Prepare(ObjectPool* obj_pool) {
     initial_runs_counter_ = ADD_COUNTER(profile_, "RunsCreated", TUnit::UNIT);
   }
   in_mem_sort_timer_ = ADD_TIMER(profile_, "InMemorySortTime");
+  in_mem_merge_timer_ = ADD_TIMER(profile_, "InMemoryMergeTime");
   sorted_data_size_ = ADD_COUNTER(profile_, "SortDataSize", TUnit::BYTES);
   run_sizes_ = ADD_SUMMARY_STATS_COUNTER(profile_, "NumRowsPerRun", TUnit::UNIT);
 
@@ -898,12 +1138,23 @@ Status Sorter::AddBatch(RowBatch* batch) {
     RETURN_IF_ERROR(AddBatchNoSpill(batch, cur_batch_index, &num_processed));
 
     cur_batch_index += num_processed;
+
     if (MustSortAndSpill(cur_batch_index, batch->num_rows())) {
-      // The current run is full. Sort it, spill it and begin the next one.
-      int64_t unsorted_run_bytes = unsorted_run_->TotalBytes();
       RETURN_IF_ERROR(state_->StartSpilling(mem_tracker_));
-      RETURN_IF_ERROR(SortCurrentInputRun());
-      RETURN_IF_ERROR(sorted_runs_.back()->UnpinAllPages());
+      int64_t unsorted_run_bytes = unsorted_run_->TotalBytes();
+
+      if (inmem_run_max_pages_ == 0) {
+        // The current run is full. Sort it and spill it.
+        RETURN_IF_ERROR(SortCurrentInputRun());
+        sorted_runs_.push_back(unsorted_run_);
+        unsorted_run_ = nullptr;
+        RETURN_IF_ERROR(sorted_runs_.back()->UnpinAllPages());
+      } else {
+        // The memory is full with miniruns. Sort, merge and spill them.
+        RETURN_IF_ERROR(MergeAndSpill());
+      }
+
+      // After we freed memory by spilling, initialize the next run.
       unsorted_run_ =
           run_pool_.Add(new Run(this, output_row_desc_->tuple_descriptors()[0], true));
       RETURN_IF_ERROR(unsorted_run_->Init());
@@ -940,6 +1191,70 @@ int64_t Sorter::GetSortRunBytesLimit() const {
   }
 }
 
+Status Sorter::InitializeNewMinirun(bool* allocation_failed) {
+  // The minirun reached its size limit (max_num_of_pages).
+  // We should sort the run, append to the sorted miniruns, and start a new minirun.
+  DCHECK(!*allocation_failed && unsorted_run_->run_size() == inmem_run_max_pages_);
+
+  // When the first minirun is full, and there are more tuples to come, we first
+  // need to ensure that these in-memory miniruns can be merged later, by trying
+  // to reserve pages for the output run of the in-memory merger. Only if this
+  // initialization was successful, can we move on to create the 2nd inmem run.
+  // If it fails and/or only 1 inmem_run could fit into memory, start spilling.
+  // No need to initialize 'merge_output_run_' if spilling is disabled, because the
+  // output will be read directly from the merger in GetNext().
+  if (enable_spilling_ && sorted_inmem_runs_.empty()) {
+    DCHECK(merge_output_run_ == nullptr) << "Should have finished previous merge.";
+    merge_output_run_ = run_pool_.Add(
+        new Run(this, output_row_desc_->tuple_descriptors()[0], false));
+    RETURN_IF_ERROR(merge_output_run_->TryInit(allocation_failed));
+    if (*allocation_failed) {
+      return Status::OK();
+    }
+  }
+  RETURN_IF_ERROR(SortCurrentInputRun());
+  sorted_inmem_runs_.push_back(unsorted_run_);
+  unsorted_run_ =
+      run_pool_.Add(new Run(this, output_row_desc_->tuple_descriptors()[0], true));
+  RETURN_IF_ERROR(unsorted_run_->TryInit(allocation_failed));
+  if (*allocation_failed) {
+    unsorted_run_->CloseAllPages();
+  }
+  return Status::OK();
+}
+
+Status Sorter::MergeAndSpill() {
+  // The last minirun might have been created just before we ran out of memory.
+  // In this case it should not be sorted and merged.
+  if (unsorted_run_->run_size() == 0){
+    unsorted_run_ = nullptr;
+  } else {
+    RETURN_IF_ERROR(SortCurrentInputRun());
+    sorted_inmem_runs_.push_back(unsorted_run_);
+  }
+
+  // If only 1 run was created, do not merge.
+  if (sorted_inmem_runs_.size() == 1) {
+    sorted_runs_.push_back(sorted_inmem_runs_.back());
+    sorted_inmem_runs_.clear();
+    DCHECK_GT(sorted_runs_.back()->fixed_len_size(), 0);
+    RETURN_IF_ERROR(sorted_runs_.back()->UnpinAllPages());
+    // If 'merge_output_run_' was initialized but no merge was executed,
+    // set it back to nullptr.
+    if (merge_output_run_ != nullptr){
+      merge_output_run_->CloseAllPages();
+      merge_output_run_ = nullptr;
+    }
+  } else {
+    DCHECK(merge_output_run_ != nullptr) << "Should have reserved memory for the merger.";
+    RETURN_IF_ERROR(MergeInMemoryRuns());
+    DCHECK(merge_output_run_ == nullptr) << "Should have finished previous merge.";
+  }
+
+  DCHECK(sorted_inmem_runs_.empty());
+  return Status::OK();
+}
+
 bool Sorter::MustSortAndSpill(const int rows_added, const int batch_num_rows) {
   if (rows_added < batch_num_rows) {
     return true;
@@ -968,7 +1283,28 @@ void Sorter::TryLowerMemUpToSortRunBytesLimit() {
 
 Status Sorter::AddBatchNoSpill(RowBatch* batch, int start_index, int* num_processed) {
   DCHECK(batch != nullptr);
-  RETURN_IF_ERROR(unsorted_run_->AddInputBatch(batch, start_index, num_processed));
+  bool allocation_failed = false;
+
+  RETURN_IF_ERROR(unsorted_run_->AddInputBatch(batch, start_index, num_processed,
+      &allocation_failed));
+
+  if (inmem_run_max_pages_ > 0) {
+    start_index += *num_processed;
+    // We try to add the entire input batch. If it does not fit into 1 minirun,
+    // initialize a new one.
+    while (!allocation_failed && start_index < batch->num_rows()) {
+      RETURN_IF_ERROR(InitializeNewMinirun(&allocation_failed));
+      if (allocation_failed) {
+        break;
+      }
+      int processed = 0;
+      RETURN_IF_ERROR(unsorted_run_->AddInputBatch(batch, start_index, &processed,
+          &allocation_failed));
+      start_index += processed;
+      *num_processed += processed;
+    }
+  }
+
   // Clear any temporary allocations made while materializing the sort tuples.
   expr_results_pool_.Clear();
   return Status::OK();
@@ -977,6 +1313,45 @@ Status Sorter::AddBatchNoSpill(RowBatch* batch, int start_index, int* num_proces
 Status Sorter::InputDone() {
   // Sort the tuples in the last run.
   RETURN_IF_ERROR(SortCurrentInputRun());
+
+  if (inmem_run_max_pages_ > 0) {
+    sorted_inmem_runs_.push_back(unsorted_run_);
+    unsorted_run_ = nullptr;
+    if (!HasSpilledRuns()) {
+      if (sorted_inmem_runs_.size() == 1) {
+        DCHECK(sorted_inmem_runs_.back()->is_pinned());
+        DCHECK(merge_output_run_ == nullptr);
+        RETURN_IF_ERROR(sorted_inmem_runs_.back()->PrepareRead());
+        return Status::OK();
+      }
+      if (enable_spilling_) {
+        DCHECK(merge_output_run_ != nullptr);
+        merge_output_run_->CloseAllPages();
+        merge_output_run_ = nullptr;
+      }
+      // 'merge_output_run_' is not initialized for partial sort, because the output
+      // will be read directly from the merger.
+      DCHECK(enable_spilling_ || merge_output_run_ == nullptr);
+      return CreateMerger(sorted_inmem_runs_.size(), false);
+    }
+    DCHECK(enable_spilling_);
+
+    if (sorted_inmem_runs_.size() == 1) {
+      sorted_runs_.push_back(sorted_inmem_runs_.back());
+      sorted_inmem_runs_.clear();
+      DCHECK_GT(sorted_runs_.back()->run_size(), 0);
+      RETURN_IF_ERROR(sorted_runs_.back()->UnpinAllPages());
+    } else {
+      RETURN_IF_ERROR(MergeInMemoryRuns());
+    }
+    DCHECK(sorted_inmem_runs_.empty());
+    // Merge intermediate runs until we have a final merge set-up.
+    return MergeIntermediateRuns();
+  } else {
+    sorted_runs_.push_back(unsorted_run_);
+  }
+
+  unsorted_run_ = nullptr;
 
   if (sorted_runs_.size() == 1) {
     // The entire input fit in one run. Read sorted rows in GetNext() directly from the
@@ -996,10 +1371,19 @@ Status Sorter::InputDone() {
   return MergeIntermediateRuns();
 }
 
+
 Status Sorter::GetNext(RowBatch* output_batch, bool* eos) {
-  if (sorted_runs_.size() == 1) {
+  if (sorted_inmem_runs_.size() == 1 && !HasSpilledRuns()) {
+    DCHECK(sorted_inmem_runs_.back()->is_pinned());
+    return sorted_inmem_runs_.back()->GetNext<false>(output_batch, eos);
+  } else if (inmem_run_max_pages_ == 0 && sorted_runs_.size() == 1) {
     DCHECK(sorted_runs_.back()->is_pinned());
     return sorted_runs_.back()->GetNext<false>(output_batch, eos);
+  } else if (inmem_run_max_pages_ > 0 && !HasSpilledRuns()) {
+    RETURN_IF_ERROR(merger_->GetNext(output_batch, eos));
+    // Clear any temporary allocations made by the merger.
+    expr_results_pool_.Clear();
+    return Status::OK();
   } else {
     RETURN_IF_ERROR(merger_->GetNext(output_batch, eos));
     // Clear any temporary allocations made by the merger.
@@ -1026,6 +1410,7 @@ void Sorter::Close(RuntimeState* state) {
 }
 
 void Sorter::CleanupAllRuns() {
+  Run::CleanupRuns(&sorted_inmem_runs_);
   Run::CleanupRuns(&sorted_runs_);
   Run::CleanupRuns(&merging_runs_);
   if (unsorted_run_ != nullptr) unsorted_run_->CloseAllPages();
@@ -1042,10 +1427,8 @@ Status Sorter::SortCurrentInputRun() {
     SCOPED_TIMER(in_mem_sort_timer_);
     RETURN_IF_ERROR(in_mem_tuple_sorter_->Sort(unsorted_run_));
   }
-  sorted_runs_.push_back(unsorted_run_);
   sorted_data_size_->Add(unsorted_run_->TotalBytes());
   run_sizes_->UpdateCounter(unsorted_run_->num_tuples());
-  unsorted_run_ = nullptr;
 
   RETURN_IF_CANCELLED(state_);
   return Status::OK();
@@ -1118,8 +1501,31 @@ int Sorter::GetNumOfRunsForMerge() const {
   return max_runs_in_next_merge;
 }
 
+Status Sorter::MergeInMemoryRuns() {
+  DCHECK_GE(sorted_inmem_runs_.size(), 2);
+  DCHECK_GT(sorted_inmem_runs_.back()->run_size(), 0);
+
+  // No need to allocate more memory before doing in-memory merges, because the
+  // buffers of the in-memory runs are already open and they fit into memory.
+  // The merge output run is already initialized, too.
+
+  DCHECK(merge_output_run_ != nullptr) << "Should have initialized output run for merge.";
+  RETURN_IF_ERROR(CreateMerger(sorted_inmem_runs_.size(), false));
+  {
+    SCOPED_TIMER(in_mem_merge_timer_);
+    RETURN_IF_ERROR(ExecuteIntermediateMerge(merge_output_run_));
+  }
+  spilled_runs_counter_->Add(1);
+  sorted_runs_.push_back(merge_output_run_);
+  DCHECK_GT(sorted_runs_.back()->fixed_len_size(), 0);
+  merge_output_run_ = nullptr;
+  DCHECK(sorted_inmem_runs_.empty());
+  return Status::OK();
+}
+
 Status Sorter::MergeIntermediateRuns() {
   DCHECK_GE(sorted_runs_.size(), 2);
+  DCHECK_GT(sorted_runs_.back()->fixed_len_size(), 0);
 
   // Attempt to allocate more memory before doing intermediate merges. This may
   // be possible if other operators have relinquished memory after the sort has built
@@ -1130,7 +1536,7 @@ Status Sorter::MergeIntermediateRuns() {
     int num_of_runs_to_merge = GetNumOfRunsForMerge();
 
     DCHECK(merge_output_run_ == nullptr) << "Should have finished previous merge.";
-    RETURN_IF_ERROR(CreateMerger(num_of_runs_to_merge));
+    RETURN_IF_ERROR(CreateMerger(num_of_runs_to_merge, true));
 
     // If CreateMerger() consumed all the sorted runs, we have set up the final merge.
     if (sorted_runs_.empty()) return Status::OK();
@@ -1145,9 +1551,16 @@ Status Sorter::MergeIntermediateRuns() {
   return Status::OK();
 }
 
-Status Sorter::CreateMerger(int num_runs) {
+Status Sorter::CreateMerger(int num_runs, bool external) {
+  std::deque<impala::Sorter::Run *>* runs_to_merge;
+
+  if (external) {
+    DCHECK_GE(sorted_runs_.size(), 2);
+    runs_to_merge = &sorted_runs_;
+  } else {
+    runs_to_merge = &sorted_inmem_runs_;
+  }
   DCHECK_GE(num_runs, 2);
-  DCHECK_GE(sorted_runs_.size(), 2);
   // Clean up the runs from the previous merge.
   Run::CleanupRuns(&merging_runs_);
 
@@ -1155,23 +1568,25 @@ Status Sorter::CreateMerger(int num_runs) {
   // from the runs being merged. This is unnecessary overhead that is not required if we
   // correctly transfer resources.
   merger_.reset(
-      new SortedRunMerger(*compare_less_than_, output_row_desc_, profile_, true));
+      new SortedRunMerger(*compare_less_than_, output_row_desc_, profile_, external,
+          codegend_heapify_helper_fn_));
 
   vector<function<Status (RowBatch**)>> merge_runs;
   merge_runs.reserve(num_runs);
   for (int i = 0; i < num_runs; ++i) {
-    Run* run = sorted_runs_.front();
+    Run* run = runs_to_merge->front();
     RETURN_IF_ERROR(run->PrepareRead());
 
     // Run::GetNextBatch() is used by the merger to retrieve a batch of rows to merge
     // from this run.
     merge_runs.emplace_back(bind<Status>(mem_fn(&Run::GetNextBatch), run, _1));
-    sorted_runs_.pop_front();
+    runs_to_merge->pop_front();
     merging_runs_.push_back(run);
   }
   RETURN_IF_ERROR(merger_->Prepare(merge_runs));
-
-  num_merges_counter_->Add(1);
+  if (external) {
+    num_merges_counter_->Add(1);
+  }
   return Status::OK();
 }
 
@@ -1211,21 +1626,26 @@ const char* Sorter::TupleSorter::LLVM_CLASS_NAME = "class.impala::Sorter::TupleS
 
 // A method to code-gen for TupleSorter::SortHelper().
 Status Sorter::TupleSorter::Codegen(FragmentState* state, llvm::Function* compare_fn,
-    CodegenFnPtr<SortHelperFn>* codegened_fn) {
+    int tuple_size, CodegenFnPtr<SortHelperFn>* codegened_fn) {
   LlvmCodeGen* codegen = state->codegen();
   DCHECK(codegen != nullptr);
 
   llvm::Function* fn = codegen->GetFunction(IRFunction::TUPLE_SORTER_SORT_HELPER, true);
   DCHECK(fn != NULL);
 
-  // There are 6 calls to Less() which calls comparator_.Less() once in each.
+  // There are 8 calls to Less() and Compare() which calls
+  // comparator_.Less() and comparator_.Compare() respectively once in each.
   int replaced =
       codegen->ReplaceCallSites(fn, compare_fn, TupleRowComparator::COMPARE_SYMBOL);
-  DCHECK_REPLACE_COUNT(replaced, 6) << LlvmCodeGen::Print(fn);
+  DCHECK_REPLACE_COUNT(replaced, 8) << LlvmCodeGen::Print(fn);
 
   // There are 2 recursive calls within SorterHelper() to replace with.
   replaced = codegen->ReplaceCallSites(fn, fn, SORTER_HELPER_SYMBOL);
   DCHECK_REPLACE_COUNT(replaced, 2) << LlvmCodeGen::Print(fn);
+
+  replaced = codegen->ReplaceCallSitesWithValue(fn,
+      codegen->GetI32Constant(tuple_size), "get_tuple_size");
+  DCHECK_REPLACE_COUNT(replaced, 3) << LlvmCodeGen::Print(fn);
 
   fn = codegen->FinalizeFunction(fn);
   if (fn == nullptr) {

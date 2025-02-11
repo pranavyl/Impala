@@ -273,7 +273,7 @@ PLAN-ROOT SINK
 |
 00:SCAN HDFS [functional.alltypes]
    HDFS partitions=24/24 files=24 size=478.45KB
-   predicates: int_col = 10, TRUE OR 10 + random() * functional.alltypes.tinyint_col = 100
+   predicates: int_col = 10
    row-size=5B cardinality=231
 ====
 # Collection predicates within HDFS scan nodes get optimized
@@ -311,7 +311,7 @@ PLAN-ROOT SINK
    HDFS partitions=1/1 files=4 size=289.08MB
    predicates: c.c_nationkey = 10, !empty(c.c_orders)
    predicates on o: !empty(o.o_lineitems), o_orderkey = 4
-   predicates on o_lineitems: l_partkey < 10, l_suppkey = 10
+   predicates on o.o_lineitems: l_partkey < 10, l_suppkey = 10
    row-size=14B cardinality=6.00K
 ====
 # Nested predicates also get propagated
@@ -351,7 +351,7 @@ PLAN-ROOT SINK
    HDFS partitions=1/1 files=4 size=289.08MB
    predicates: c.c_nationkey = 10, !empty(c.c_orders)
    predicates on o: !empty(o.o_lineitems), o.o_orderkey = 10, o.o_shippriority = 10
-   predicates on o_lineitems: l_partkey < 10, l_suppkey = 10
+   predicates on o.o_lineitems: l_partkey < 10, l_suppkey = 10
    row-size=14B cardinality=6.00K
 ====
 # Using IS NULL
@@ -432,6 +432,38 @@ PLAN-ROOT SINK
    partition predicates: date_col >= DATE '2009-01-01' AND date_col <= DATE '2009-02-01'
    HDFS partitions=32/55 files=32 size=15.99KB
    predicates: functional.alltypes_date_partition.timestamp_col <= TIMESTAMP '2009-02-01 00:00:00', functional.alltypes_date_partition.timestamp_col >= TIMESTAMP '2009-01-01 00:00:00', date_col = CAST(timestamp_col AS DATE)
+   row-size=65B cardinality=30
+====
+# Same as above but using < > and timestamps with time-of-day parts.
+# Regression test for IMPALA-11960.
+with dp_view as
+(select * from functional.alltypes_date_partition
+where date_col = cast(timestamp_col as date))
+select * from dp_view
+where timestamp_col > '2009-01-01 01:00:00' and timestamp_col < '2009-02-01 01:00:00';
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [functional.alltypes_date_partition]
+   partition predicates: date_col >= DATE '2009-01-01' AND date_col <= DATE '2009-02-01'
+   HDFS partitions=32/55 files=32 size=15.99KB
+   predicates: functional.alltypes_date_partition.timestamp_col < TIMESTAMP '2009-02-01 01:00:00', functional.alltypes_date_partition.timestamp_col > TIMESTAMP '2009-01-01 01:00:00', date_col = CAST(timestamp_col AS DATE)
+   row-size=65B cardinality=30
+====
+# Same as above but using >= instead of >.
+# Regression test for IMPALA-11960.
+with dp_view as
+(select * from functional.alltypes_date_partition
+where date_col = cast(timestamp_col as date))
+select * from dp_view
+where timestamp_col >= '2009-01-01 01:00:00' and timestamp_col < '2009-02-01 01:00:00';
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN HDFS [functional.alltypes_date_partition]
+   partition predicates: date_col >= DATE '2009-01-01' AND date_col <= DATE '2009-02-01'
+   HDFS partitions=32/55 files=32 size=15.99KB
+   predicates: functional.alltypes_date_partition.timestamp_col < TIMESTAMP '2009-02-01 01:00:00', functional.alltypes_date_partition.timestamp_col >= TIMESTAMP '2009-01-01 01:00:00', date_col = CAST(timestamp_col AS DATE)
    row-size=65B cardinality=30
 ====
 # Mix of various predicates some of which are eligible for propagation
@@ -521,8 +553,8 @@ and timestamp_col > from_timestamp('2009-02-01 00:02:00', 'yyyy-mm-dd');
 PLAN-ROOT SINK
 |
 00:SCAN HDFS [functional.alltypes_date_partition]
-   partition predicates: date_col > DATE '2009-02-01'
-   HDFS partitions=23/55 files=23 size=11.28KB
+   partition predicates: date_col >= DATE '2009-02-01'
+   HDFS partitions=24/55 files=24 size=11.82KB
    predicates: timestamp_col > TIMESTAMP '2009-02-01 00:00:00', date_col = CAST(timestamp_col AS DATE)
    row-size=65B cardinality=21
 ====

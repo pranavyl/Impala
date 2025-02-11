@@ -17,9 +17,10 @@
 # under the License.
 #
 
-import six
 import datetime
 import os.path
+import sys
+
 from six.moves import http_cookies
 
 
@@ -49,15 +50,38 @@ def get_cookie_expiry(c):
   return None
 
 
-def get_all_matching_cookies(cookie_names, path, resp_headers):
-  matching_cookies = None
+def get_cookies(resp_headers):
   if 'Set-Cookie' not in resp_headers:
     return None
 
   cookies = http_cookies.SimpleCookie()
   try:
-    cookies.load(resp_headers['Set-Cookie'])
+    if sys.version_info.major == 2:
+      cookies.load(resp_headers['Set-Cookie'])
+    else:
+      cookie_headers = resp_headers.get_all('Set-Cookie')
+      for header in cookie_headers:
+        cookies.load(header)
+    return cookies
   except Exception:
+    return None
+
+
+def get_all_cookies(path, resp_headers):
+  cookies = get_cookies(resp_headers)
+  if not cookies:
+    return None
+
+  matching_cookies = []
+  for c in cookies.values():
+    if c and cookie_matches_path(c, path):
+      matching_cookies.append(c)
+  return matching_cookies
+
+
+def get_all_matching_cookies(cookie_names, path, resp_headers):
+  cookies = get_cookies(resp_headers)
+  if not cookies:
     return None
 
   matching_cookies = []

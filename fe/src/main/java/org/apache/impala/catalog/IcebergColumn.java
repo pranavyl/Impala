@@ -41,11 +41,18 @@ public class IcebergColumn extends Column {
 
   public IcebergColumn(String name, Type type, String comment, int position,
       int fieldId, int fieldMapKeyId, int fieldMapValueId, boolean isNullable) {
-    super(name, type, comment, position);
+    super(name.toLowerCase(), type, comment, position);
     fieldId_ = fieldId;
     fieldMapKeyId_ = fieldMapKeyId;
     fieldMapValueId_ = fieldMapValueId;
     isNullable_ = isNullable;
+  }
+
+  public static IcebergColumn cloneWithNullability(IcebergColumn source,
+      boolean isNullable) {
+    return new IcebergColumn(source.name_, source.type_, source.comment_,
+        source.position_, source.fieldId_, source.fieldMapKeyId_, source.fieldMapKeyId_,
+        isNullable);
   }
 
   public int getFieldId() {

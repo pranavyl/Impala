@@ -17,18 +17,24 @@
 
 package org.apache.impala.planner;
 
+import java.util.Stack;
+
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.SortInfo;
 import org.apache.impala.analysis.TupleId;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.service.BackendConfig;
+import org.apache.impala.thrift.TDataSinkType;
 import org.apache.impala.thrift.TExchangeNode;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TSortInfo;
+import org.apache.impala.util.ExprUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
 
@@ -45,14 +51,29 @@ import com.google.common.base.Preconditions;
  * inputs are also sorted individually on the same SortInfo parameter.
  */
 public class ExchangeNode extends PlanNode {
+  private static final Logger LOG = LoggerFactory.getLogger(ExchangeNode.class);
+
   // The serialization overhead per tuple in bytes when sent over an exchange.
   // Currently it accounts only for the tuple_offset entry per tuple (4B) in a
   // BE TRowBatch. If we modify the RowBatch serialization, then we need to
   // update this constant as well.
   private static final double PER_TUPLE_SERIALIZATION_OVERHEAD = 4.0;
 
+  // The overhead in bytes per tuple for a deserialized row batch
+  // TODO: The per-row sizes calculated from profile counters suggest we
+  // may actually have an overhead of 9 bytes per tuple. Investigate this
+  // further.
+  private static final double PER_TUPLE_DESERIALIZED_OVERHEAD = 8.0;
+
   // Empirically derived minimum estimate (in bytes) for the exchange node.
   private static final int MIN_ESTIMATE_BYTES = 16 * 1024;
+
+  // Coefficients for estimating exchange receiver CPU costs.  Derived from benchmarking.
+  private static final double COST_COEFFICIENT_MERGING_XCHG_RCVR_ROWS = 0.2369;
+  private static final double COST_COEFFICIENT_MERGING_XCHG_RCVR_BYTES = 0.0020;
+  private static final double COST_COEFFICIENT_BCAST_XCHG_RCVR_ROWS = 0.1329;
+  private static final double COST_COEFFICIENT_PART_XCHG_RCVR_ROWS = 0.0743;
+  private static final double COST_COEFFICIENT_PART_XCHG_RCVR_BYTES = 0.0046;
 
   // The parameters based on which sorted input streams are merged by this
   // exchange node. Null if this exchange does not merge sorted streams
@@ -62,19 +83,41 @@ public class ExchangeNode extends PlanNode {
   // only if mergeInfo_ is non-null, i.e. this is a merging exchange node.
   private long offset_;
 
-  private boolean isMergingExchange() {
-    return mergeInfo_ != null;
-  }
+  protected boolean isMergingExchange() { return mergeInfo_ != null; }
 
-  private boolean isBroadcastExchange() {
+  protected boolean isBroadcastExchange() {
     // If the output of the sink is not partitioned but the target fragment is
     // partitioned, then the data exchange is broadcast.
     Preconditions.checkState(!children_.isEmpty());
+    // Has to examine isDirectedExchange() too because for a DIRECTED exchange the below
+    // code would also return true.
+    if (isDirectedExchange()) return false;
     DataSink sink = getChild(0).getFragment().getSink();
     if (sink == null) return false;
     Preconditions.checkState(sink instanceof DataStreamSink);
     DataStreamSink streamSink = (DataStreamSink) sink;
     return !streamSink.getOutputPartition().isPartitioned() && fragment_.isPartitioned();
+  }
+
+  protected boolean isDirectedExchange() {
+    if (fragment_.getSink().getSinkType() == TDataSinkType.ICEBERG_DELETE_BUILDER) {
+      // If this EXCHANGE is using a JoinBuildSink to send to an IcebergDeleteNode in a
+      // separate fragment.
+      return true;
+    }
+    // If this EXCHANGE is right below an IcebergDeleteNode in the same fragment.
+    return isChildOfIcebergDeleteNode(fragment_.getPlanRoot());
+  }
+
+  protected boolean isChildOfIcebergDeleteNode(PlanNode currNode) {
+    if (currNode instanceof IcebergDeleteNode) {
+      Preconditions.checkState(currNode.getChildCount() == 2);
+      if (currNode.getChild(1) == this) return true;
+    }
+    for (PlanNode child : currNode.getChildren()) {
+      if (isChildOfIcebergDeleteNode(child)) return true;
+    }
+    return false;
   }
 
   public ExchangeNode(PlanNodeId id, PlanNode input) {
@@ -110,6 +153,7 @@ public class ExchangeNode extends PlanNode {
     cardinality_ = capCardinalityAtLimit(children_.get(0).getCardinality());
     // Apply the offset correction if there's a valid cardinality
     if (cardinality_ > -1) cardinality_ = Math.max(0, cardinality_ - offset_);
+    hasHardEstimates_ = children_.get(0).hasHardEstimates_;
   }
 
   /**
@@ -160,7 +204,9 @@ public class ExchangeNode extends PlanNode {
     Preconditions.checkState(!children_.isEmpty());
     DataSink sink = getChild(0).getFragment().getSink();
     if (sink == null) return "";
-    if (isBroadcastExchange()) {
+    if (isDirectedExchange()) {
+      return "DIRECTED";
+    } else if (isBroadcastExchange()) {
       return "BROADCAST";
     } else {
       Preconditions.checkState(sink instanceof DataStreamSink);
@@ -171,11 +217,79 @@ public class ExchangeNode extends PlanNode {
 
   /**
    * Returns the average size of rows produced by 'exchInput' when serialized for
-   * being sent through an exchange.
+   * being sent through an exchange. Static method because we call this in some
+   * cases where we can't be 100% sure the PlanNode is actually an ExchangeNode.
    */
   public static double getAvgSerializedRowSize(PlanNode exchInput) {
-    return exchInput.getAvgRowSize() +
-        (exchInput.getTupleIds().size() * PER_TUPLE_SERIALIZATION_OVERHEAD);
+    return exchInput.getAvgRowSize()
+        + (exchInput.getTupleIds().size() * PER_TUPLE_SERIALIZATION_OVERHEAD);
+  }
+
+  /**
+   * Returns the average size of rows produced by 'exchInput' after deserialization.
+   */
+  public double getAvgDeserializedRowSize() {
+    return getAvgRowSize() + (getTupleIds().size() * PER_TUPLE_DESERIALIZED_OVERHEAD);
+  }
+
+  // Return the number of sending instances of this exchange.
+  public int getNumSenders() {
+    Preconditions.checkState(!children_.isEmpty());
+    Preconditions.checkNotNull(children_.get(0).getFragment());
+    return children_.get(0).getFragment().getNumInstances();
+  }
+
+  // Return the number of receiving instances of this exchange.
+  public int getNumReceivers() {
+    DataSink sink = fragment_.getSink();
+    if (sink == null) return 1;
+    return sink.getFragment().getNumInstances();
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    // The computation for the processing cost for exchange splits into two parts:
+    //   1. The sending processing cost which is computed in the DataStreamSink of the
+    //      bottom sending fragment;
+    //   2. The receiving processing cost in the top receiving fragment which is computed
+    //      here.
+    long inputCardinality = Math.max(0, getChild(0).getFilteredCardinality());
+
+    // It's not obvious whether the per-byte CPU costs are more accurately estimated
+    // using the serialized or deserialized sizes, but the coefficients were determined
+    // using deserialized sizes since those are more readily available in query profiles.
+    // So for consistency we used deserialized size to calculate costs here.
+    long inputSize = (long) (getAvgDeserializedRowSize() * inputCardinality);
+    double totalCost = 0.0;
+    String exchType;
+
+    if (isMergingExchange()) {
+      exchType = "MERGING";
+      totalCost = (inputCardinality * COST_COEFFICIENT_MERGING_XCHG_RCVR_ROWS)
+          + (inputSize * COST_COEFFICIENT_MERGING_XCHG_RCVR_BYTES);
+    } else if (isBroadcastExchange()) {
+      exchType = "BROADCAST";
+      totalCost = inputCardinality * COST_COEFFICIENT_BCAST_XCHG_RCVR_ROWS;
+    } else {
+      exchType = isDirectedExchange() ? "DIRECTED" : "PARTITIONED";
+      // Use the partitioned exchange costing for all other cases incuding DIRECTED.
+      // TODO: Add specific costing for DIRECTED exchange based on benchmarks.
+      totalCost = (inputCardinality * COST_COEFFICIENT_PART_XCHG_RCVR_ROWS)
+          + (inputSize * COST_COEFFICIENT_PART_XCHG_RCVR_BYTES);
+    }
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Total CPU cost estimate: " + totalCost + ", ExchangeType: " + exchType
+          + ", Input Card: " + inputCardinality + ", Input Size: " + inputSize);
+    }
+    processingCost_ = ProcessingCost.basicCost(getDisplayLabel(), totalCost);
+
+    if (isBroadcastExchange()) {
+      processingCost_ = ProcessingCost.broadcastCost(processingCost_,
+          ()
+              -> fragment_.hasAdjustedInstanceCount() ?
+              fragment_.getAdjustedInstanceCount() :
+              getNumReceivers());
+    }
   }
 
   @Override
@@ -193,9 +307,7 @@ public class ExchangeNode extends PlanNode {
     // the system load. This makes it difficult to accurately estimate the
     // memory usage at runtime. The following estimates assume that memory usage will
     // lean towards the soft limits.
-    Preconditions.checkState(!children_.isEmpty());
-    Preconditions.checkNotNull(children_.get(0).getFragment());
-    int numSenders = children_.get(0).getFragment().getNumInstances();
+    int numSenders = getNumSenders();
     long estimatedTotalQueueByteSize = estimateTotalQueueByteSize(numSenders);
     long estimatedDeferredRPCQueueSize = estimateDeferredRPCQueueSize(queryOptions,
         numSenders);
@@ -209,13 +321,12 @@ public class ExchangeNode extends PlanNode {
   // assuming that at least one row batch rpc payload per sender is queued.
   private long estimateDeferredRPCQueueSize(TQueryOptions queryOptions,
       int numSenders) {
-    long rowBatchSize = queryOptions.isSetBatch_size() && queryOptions.batch_size > 0
-        ? queryOptions.batch_size : DEFAULT_ROWBATCH_SIZE;
+    long rowBatchSize = getRowBatchSize(queryOptions);
     // Set an upper limit based on estimated cardinality.
     if (getCardinality() > 0) rowBatchSize = Math.min(rowBatchSize, getCardinality());
-    long avgRowBatchByteSize = Math.min(
-        (long) Math.ceil(rowBatchSize * getAvgSerializedRowSize(this)),
-        ROWBATCH_MAX_MEM_USAGE);
+    long avgRowBatchByteSize =
+        Math.min((long) Math.ceil(rowBatchSize * getAvgSerializedRowSize(this)),
+            ROWBATCH_MAX_MEM_USAGE);
     long deferredBatchQueueSize = avgRowBatchByteSize * numSenders;
     return deferredBatchQueueSize;
   }
@@ -251,6 +362,10 @@ public class ExchangeNode extends PlanNode {
 
   @Override
   protected void toThrift(TPlanNode msg) {
+    if (processingCost_.isValid() && processingCost_ instanceof BroadcastProcessingCost) {
+      Preconditions.checkState(
+          getNumReceivers() == processingCost_.getNumInstancesExpected());
+    }
     msg.node_type = TPlanNodeType.EXCHANGE_NODE;
     msg.exchange_node = new TExchangeNode();
     for (TupleId tid: tupleIds_) {
@@ -264,5 +379,12 @@ public class ExchangeNode extends PlanNode {
       msg.exchange_node.setSort_info(sortInfo);
       msg.exchange_node.setOffset(offset_);
     }
+  }
+
+  @Override
+  protected void reduceCardinalityByRuntimeFilter(
+      Stack<PlanNode> nodeStack, double reductionScale) {
+    if (!nodeStack.isEmpty()) nodeStack.add(this);
+    getChild(0).reduceCardinalityByRuntimeFilter(nodeStack, reductionScale);
   }
 }

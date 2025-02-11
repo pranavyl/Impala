@@ -27,6 +27,7 @@
 #include <boost/scoped_ptr.hpp>
 
 #include <thrift/transport/TBufferTransports.h>
+#include "rpc/thrift-util.h"
 #include "transport/TSaslTransport.h"
 
 #include "common/names.h"
@@ -37,8 +38,9 @@ const int32_t DEFAULT_MEM_BUF_SIZE = 32 * 1024;
 namespace apache { namespace thrift { namespace transport {
 
   TSaslTransport::TSaslTransport(std::shared_ptr<TTransport> transport)
-      : transport_(transport),
-        memBuf_(new TMemoryBuffer(DEFAULT_MEM_BUF_SIZE)),
+      : TVirtualTransport(transport->getConfiguration()),
+        transport_(move(transport)),
+        memBuf_(new TMemoryBuffer(DEFAULT_MEM_BUF_SIZE, transport_->getConfiguration())),
         sasl_(NULL),
         shouldWrap_(false),
         isClient_(false) {
@@ -46,9 +48,10 @@ namespace apache { namespace thrift { namespace transport {
 
   TSaslTransport::TSaslTransport(std::shared_ptr<sasl::TSasl> saslClient,
                                  std::shared_ptr<TTransport> transport)
-      : transport_(transport),
-        memBuf_(new TMemoryBuffer()),
-        sasl_(saslClient),
+    : TVirtualTransport(transport->getConfiguration()),
+        transport_(move(transport)),
+        memBuf_(new TMemoryBuffer(transport_->getConfiguration())),
+        sasl_(move(saslClient)),
         shouldWrap_(false),
         isClient_(true) {
   }
@@ -57,7 +60,7 @@ namespace apache { namespace thrift { namespace transport {
     delete memBuf_;
   }
 
-  bool TSaslTransport::isOpen() {
+  bool TSaslTransport::isOpen() const {
     return transport_->isOpen();
   }
 
@@ -67,6 +70,10 @@ namespace apache { namespace thrift { namespace transport {
 
   string TSaslTransport::getUsername() {
     return sasl_->getUsername();
+  }
+
+  string TSaslTransport::getMechanismName() {
+    return sasl_->getMechanismName();
   }
 
   void TSaslTransport::doSaslNegotiation() {

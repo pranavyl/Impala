@@ -26,7 +26,9 @@ import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TAlterTableAddPartitionParams;
 import org.apache.impala.thrift.TAlterTableParams;
+import org.apache.impala.thrift.TAlterTableSetFileFormatParams;
 import org.apache.impala.thrift.TAlterTableType;
+import org.apache.impala.thrift.THdfsFileFormat;
 
 import java.util.HashSet;
 import java.util.List;
@@ -38,6 +40,8 @@ import java.util.Set;
 public class AlterTableAddPartitionStmt extends AlterTableStmt {
   private final boolean ifNotExists_;
   private final List<PartitionDef> partitions_;
+
+  private THdfsFileFormat fileFormat;
 
   public AlterTableAddPartitionStmt(TableName tableName,
       boolean ifNotExists, List<PartitionDef> partitions) {
@@ -55,7 +59,21 @@ public class AlterTableAddPartitionStmt extends AlterTableStmt {
     }
   }
 
+  public AlterTableAddPartitionStmt(TableName tableName,
+      boolean ifNotExists, List<PartitionDef> partitions, THdfsFileFormat fileFormat) {
+    this(tableName, ifNotExists, partitions);
+    this.fileFormat = fileFormat;
+  }
+
   public boolean getIfNotExists() { return ifNotExists_; }
+
+  @Override
+  public String getOperation() {
+    StringBuilder sb = new StringBuilder("ADD ");
+    if (ifNotExists_) sb.append("IF NOT EXISTS ");
+    sb.append("PARTITION");
+    return sb.toString();
+  }
 
   @Override
   public String toSql(ToSqlOptions options) {
@@ -64,6 +82,12 @@ public class AlterTableAddPartitionStmt extends AlterTableStmt {
     sb.append(getTbl()).append(" ADD");
     if (ifNotExists_) sb.append(" IF NOT EXISTS");
     for (PartitionDef p : partitions_) sb.append(" " + p.toSql(options));
+
+    if (fileFormat != null) {
+      sb.append(" SET FILEFORMAT ");
+      sb.append(fileFormat);
+    }
+
     return sb.toString();
   }
 
@@ -75,6 +99,14 @@ public class AlterTableAddPartitionStmt extends AlterTableStmt {
     TAlterTableParams params = super.toThrift();
     params.setAlter_type(TAlterTableType.ADD_PARTITION);
     params.setAdd_partition_params(addPartParams);
+
+    if (fileFormat != null) {
+      TAlterTableSetFileFormatParams fileFormatParams =
+          new TAlterTableSetFileFormatParams();
+      fileFormatParams.setFile_format(fileFormat);
+      params.setSet_file_format_params(fileFormatParams);
+    }
+
     return params;
   }
 

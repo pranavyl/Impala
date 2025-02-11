@@ -20,6 +20,156 @@
     "key": "external-data-source.class-cache.hits"
   },
   {
+    "description": "The total number of cache misses in the CodeGen Cache",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "CodeGen Cache Misses",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.codegen-cache.misses"
+  },
+  {
+    "description": "The number of in-use CodeGen Cache Entries",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "In-use CodeGen Cache Entries",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "impala.codegen-cache.entries-in-use"
+  },
+  {
+    "description": "The total bytes of in-use CodeGen Cache Entries",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "In-use CodeGen Cache Entries total bytes",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "impala.codegen-cache.entries-in-use-bytes"
+  },
+  {
+    "description": "The number of evicted CodeGen Cache Entries",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Evicted CodeGen Cache Entries",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.codegen-cache.entries-evicted"
+  },
+  {
+    "description": "The total number of cache hits in the CodeGen Cache",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "CodeGen Cache Hits",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.codegen-cache.hits"
+  },
+  {
+    "description": "Statistics for codegen cache entry sizes allocated from the system.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "CodeGen Cache Entry Sizes.",
+    "units": "BYTES",
+    "kind": "HISTOGRAM",
+    "key": "impala.codegen-cache.entry-sizes"
+  },
+  {
+    "description": "The total number of cache hits in the Tuple Cache",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Tuple Cache Hits",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.tuple-cache.hits"
+  },
+  {
+    "description": "The total number of cache misses in the Tuple Cache",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Tuple Cache Misses",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.tuple-cache.misses"
+  },
+  {
+    "description": "The total number of Tuple Cache that skipped writing",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Tuple Cache Skipped Writing",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.tuple-cache.skipped"
+  },
+  {
+    "description": "The total number of Tuple Cache that halted writing",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Tuple Cache Halted Writing",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.tuple-cache.halted"
+  },
+  {
+    "description": "The number of in-use Tuple Cache Entries",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "In-use Tuple Cache Entries",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "impala.tuple-cache.entries-in-use"
+  },
+  {
+    "description": "The total bytes of in-use Tuple Cache Entries",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "In-use Tuple Cache Entries total bytes",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "impala.tuple-cache.entries-in-use-bytes"
+  },
+  {
+    "description": "The number of in-use Tuple Cache Tombstones",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "In-use Tuple Cache Tombstones",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "impala.tuple-cache.tombstones-in-use"
+  },
+  {
+    "description": "The number of evicted Tuple Cache Entries",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Evicted Tuple Cache Entries",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.tuple-cache.entries-evicted"
+  },
+  {
+    "description": "Statistics for Tuple Cache Entries sizes.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Tuple Cache Entries Sizes.",
+    "units": "BYTES",
+    "kind": "HISTOGRAM",
+    "key": "impala.tuple-cache.entry-sizes"
+  },
+  {
     "description": "Resource Pool $0 Configured Max Mem Resources",
     "contexts": [
       "RESOURCE_POOL"
@@ -90,6 +240,26 @@
     "key": "admission-controller.pool-clamp-mem-limit-query-option.$0"
   },
   {
+    "description": "Resource Pool $0 Max Query CPU Core Per Node Limit",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Max Query CPU Core Per Node Limit",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "admission-controller.pool-max-query-cpu-core-per-node-limit.$0"
+  },
+  {
+    "description": "Resource Pool $0 Max Query CPU Core Coordinator Limit",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Max Query CPU Core Coordinator Limit",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "admission-controller.pool-max-query-cpu-core-coordinator-limit.$0"
+  },
+  {
     "description": "Resource Pool $0 Aggregate Queue Size",
     "contexts": [
       "RESOURCE_POOL"
@@ -118,6 +288,16 @@
     "units": "NONE",
     "kind": "GAUGE",
     "key": "admission-controller.agg-num-running.$0"
+  },
+  {
+    "description": "Resource Pool $0 Aggregate Users",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Aggregate Users",
+    "units": "NONE",
+    "kind": "SET",
+    "key": "admission-controller.agg-current-users.$0"
   },
   {
     "description": "Total number of requests admitted to pool $0",
@@ -200,6 +380,16 @@
     "key": "admission-controller.local-num-admitted-running.$0"
   },
   {
+    "description": "Resource Pool $0 Local Users",
+    "contexts": [
+      "RESOURCE_POOL"
+    ],
+    "label": "Resource Pool $0 Local Users",
+    "units": "NONE",
+    "kind": "SET",
+    "key": "admission-controller.local-current-users.$0"
+  },
+  {
     "description": "Total number of requests queued in pool $0",
     "contexts": [
       "RESOURCE_POOL"
@@ -250,8 +440,69 @@
     "key": "catalog-server.topic-processing-time-s"
   },
   {
-    "description": "The number of databases in the catalog.",
+    "description": "The total size of all thread pools used in loading file metadata.",
     "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalog Server File Metadata Loading Threads",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog-server.metadata.file.num-loading-threads"
+  },
+  {
+    "description": "The total number of unfinished file metadata loading tasks. Each task corresponds to a partition.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalog Server File Metadata Loading Tasks",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog-server.metadata.file.num-loading-tasks"
+  },
+  {
+    "description": "The total number of tables that are loading file metadata.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalog Server File Metadata Loading Tables",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog-server.metadata.table.num-loading-file-metadata"
+  },
+  {
+    "description": "The total number of tables that are loading metadata.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalog Server Metadata Loading Tables",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog-server.metadata.table.num-loading-metadata"
+  },
+  {
+    "description": "The total number of tables that are loading metadata asynchronously. E.g. initial metadata loading triggered by the first access on a table.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalog Server Async Metadata Loading Tables",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog-server.metadata.table.async-loading.num-in-progress"
+  },
+  {
+    "description": "The total number of tables that are waiting for loading metadata asynchronously.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Catalog Server Queue Size for Async Metadata Loading Tables",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog-server.metadata.table.async-loading.queue-len"
+  },
+  {
+    "description": "The number of databases in the catalog. Untracked in LocalCatalog mode coordinators.",
+    "contexts": [
+      "CATALOGSERVER",
       "IMPALAD"
     ],
     "label": "Databases",
@@ -260,14 +511,45 @@
     "key": "catalog.num-databases"
   },
   {
-    "description": "The number of tables in the catalog.",
+    "description": "The number of tables in the catalog. Untracked in LocalCatalog mode coordinators.",
     "contexts": [
+      "CATALOGSERVER",
       "IMPALAD"
     ],
     "label": "Tables",
     "units": "NONE",
     "kind": "GAUGE",
     "key": "catalog.num-tables"
+  },
+  {
+    "description": "The number of functions in the catalog.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Functions",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.num-functions"
+  },
+  {
+    "description": "The number of Hive Metastore Clients that are idle.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Idle HMS Clients",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.hms-client-pool.num-idle"
+  },
+  {
+    "description": "The number of Hive Metastore Clients that are in use.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "HMS Clients In Use",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.hms-client-pool.num-in-use"
   },
   {
     "description": "Catalog topic update version.",
@@ -320,6 +602,16 @@
     "key": "catalog.ready"
   },
   {
+    "description": "The address of the Active Catalog Server daemon.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Address of Active Catalog daemon",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "catalog.active-catalogd-address"
+  },
+  {
     "description": "The number of clients currently in use by the Catalog Server client cache.",
     "contexts": [
       "IMPALAD"
@@ -338,6 +630,26 @@
     "units": "NONE",
     "kind": "GAUGE",
     "key": "catalog.server.client-cache.total-clients"
+  },
+  {
+    "description": "The number of clients currently in use by the Catalog Server client cache for lightweight RPC.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Catalog Server Client Cache Clients In Use for lightweight RPC",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.server.client-cache.clients-in-use-for-lightweight-rpc"
+  },
+  {
+    "description": "The total number of clients in the Catalog Server client cache for lightweight RPC.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Catalog Server Client Cache Total Clients for lightweight RPC",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.server.client-cache.total-clients-for-lightweight-rpc"
   },
   {
     "description": "The full version string of the Catalog Server.",
@@ -408,6 +720,26 @@
     "units": "BYTES",
     "kind": "COUNTER",
     "key": "impala-server.io-mgr.cached-bytes-read"
+  },
+  {
+    "description": "Total number of encrypted bytes read by the IO manager.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Encrypted Bytes Read",
+    "units": "BYTES",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.encrypted-bytes-read"
+  },
+  {
+    "description": "Total number of erasure-coded bytes read by the IO manager.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Erasure Coded Bytes Read",
+    "units": "BYTES",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.erasure-coded-bytes-read"
   },
   {
     "description": "Total number of local bytes read by the IO manager.",
@@ -558,6 +890,46 @@
     "units": "TIME_NS",
     "kind": "HISTOGRAM",
     "key": "impala-server.io-mgr.remote-data-cache-partition-$0.eviction-latency"
+  },
+  {
+    "description": "Total number of bytes of async writes outstanding in the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Async Writes Outstanding In Bytes",
+    "units": "BYTES",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-async-writes-outstanding-bytes"
+  },
+  {
+    "description": "Total number of async writes submitted in the remote data cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Num Async Writes Submitted",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-num-async-writes-submitted"
+  },
+  {
+    "description": "Total number of bytes not inserted in the remote data cache due to async writes buffer size limit.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Bytes Not Inserted Due To Async Writes Buffer Size Limit",
+    "units": "BYTES",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-async-writes-dropped-bytes"
+  },
+  {
+    "description": "Total number of entries not inserted in the remote data cache due to async writes buffer size limit.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impala Server Io Mgr Remote Data Cache Entries Not Inserted Due To Async Writes Buffer Size Limit",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.io-mgr.remote-data-cache-async-writes-dropped-entries"
   },
   {
     "description": "The number of allocated IO buffers. IO buffers are shared by all queries.",
@@ -942,6 +1314,26 @@
     "key": "impala.thrift-server.CatalogService.timedout-cnxn-requests"
   },
   {
+    "description": "Current active status of this Catalog Server daemon.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "The active status of Catalog Server daemon",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "catalog-server.active-status"
+  },
+  {
+    "description": "The number of active status changes made to this Catalog Server Daemon.",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Number of active status changes",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "catalog-server.ha-number-active-status-change"
+  },
+  {
     "description": "The number of active connections to this StateStore's service.",
     "contexts": [
       "STATESTORE"
@@ -1000,6 +1392,66 @@
     "units": "NONE",
     "kind": "GAUGE",
     "key": "impala.thrift-server.StatestoreService.timedout-cnxn-requests"
+  },
+  {
+    "description": "The number of active connections to this StateStore's HA service.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "StateStore HA Service Active Connections",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.StatestoreHaService.connections-in-use"
+  },
+  {
+    "description": "Amount of time clients of StateStore HA Service spent waiting for connection to be set up",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "StateStore HA Service client connection setup time",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.StatestoreHaService.connection-setup-time"
+  },
+  {
+    "description": "Amount of time clients of StateStore HA Service spent waiting for service threads",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "StateStore HA Service clients' wait time for service threads",
+    "units": "TIME_US",
+    "kind": "HISTOGRAM",
+    "key": "impala.thrift-server.StatestoreHaService.svc-thread-wait-time"
+  },
+  {
+    "description": "The total number of connections made to this StateStore's StateStore HA service over its lifetime.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "StateStore HA Service Connections",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.StatestoreHaService.total-connections"
+  },
+  {
+    "description": "The number of connections to the Statestore HA Service that have been accepted and are waiting to be setup.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Statestore HA Service Connections Queued for Setup",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.StatestoreHaService.connection-setup-queue-size"
+  },
+  {
+    "description": "The number of connection requests to the Statestore HA Service that have been timed out waiting to be setup.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Statestore HA Service Connection Requests Timed Out",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.StatestoreHaService.timedout-cnxn-requests"
   },
   {
     "description": "The number of active Impala Backend client connections to this Impala Daemon.",
@@ -1422,6 +1874,26 @@
     "key": "impala.thrift-server.hiveserver2-http-frontend.total-jwt-token-auth-failure"
   },
   {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that were successfully authenticated using OAuth Token.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection OAuth Token Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-oauth-token-auth-success"
+  },
+  {
+    "description": "The number of HiveServer2 HTTP API connection requests to this Impala Daemon that were attempted to authenticate using OAuth Token but were unsuccessful.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 HTTP API Connection OAuth Token Failure",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.thrift-server.hiveserver2-http-frontend.total-oauth-token-auth-failure"
+  },
+  {
     "description": "The amount of memory freed by the last memory tracker garbage collection.",
     "contexts": [
       "IMPALAD"
@@ -1590,6 +2062,53 @@
     "key": "statestore-subscriber.registration-id"
   },
   {
+    "description": "The most recent statestore ID for this subscriber with the statestore. Set to 'N/A' if no registration has been completed",
+    "contexts": [
+      "ADMISSIOND",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Statestore Id",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "statestore-subscriber.statestore-id"
+  },
+  {
+    "description": "The number of RPCs received for updating catalogd.",
+    "contexts": [
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Number of UpdateCatalogd RPCs",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "statestore-subscriber.num-update-catalogd-rpc"
+  },
+  {
+    "description": "The number of RPCs received for updating role of statestored.",
+    "contexts": [
+      "ADMISSIOND",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Number of UpdateStatestoredRole RPCs",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "statestore-subscriber.num-update-statestored-role-rpc"
+  },
+  {
+    "description": "The number of Re-Registration Attempt.",
+    "contexts": [
+      "ADMISSIOND",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Number of Re-Registration Attempt",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "statestore-subscriber.num-re-register-attempt"
+  },
+  {
     "description": "The number of active StateStore subscriber clients in this Impala Daemon's client cache. These clients are for communication from this role to the StateStore.",
     "contexts": [
       "CATALOGSERVER",
@@ -1656,6 +2175,30 @@
     "key": "statestore-subscriber.topic-update-interval-time"
   },
   {
+    "description": "Current active status of the Statestore daemon.",
+    "contexts": [
+      "ADMISSIOND",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "The active status of Statestore daemon",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "statestore-subscriber.statestore-active-status"
+  },
+  {
+    "description": "Current active status of the Statestore daemon.",
+    "contexts": [
+      "ADMISSIOND",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "The active status of Statestore daemon",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "statestore2-subscriber.statestore-active-status"
+  },
+  {
     "description": "The time (sec) spent sending heartbeat RPCs. Includes subscriber-side processing time and network transmission time.",
     "contexts": [
       "STATESTORE"
@@ -1664,6 +2207,66 @@
     "units": "TIME_S",
     "kind": "STATS",
     "key": "statestore.heartbeat-durations"
+  },
+  {
+    "description": "The number of successful RPCs for updating catalogd.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Number of successful UpdateCatalogd RPCs sent by statestore",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "statestore.num-successful-update-catalogd-rpc"
+  },
+  {
+    "description": "The number of failed RPCs for updating catalogd.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Number of failed UpdateCatalogd RPCs sent by statestore",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "statestore.num-failed-update-catalogd-rpc"
+  },
+  {
+    "description": "The number of successful RPCs for updating role of statestored.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Number of successful UpdateStatestoredRole RPCs sent by statestore",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "statestore.num-successful-update-statestored-role-rpc"
+  },
+  {
+    "description": "The number of failed RPCs for updating role of statestored.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Number of failed UpdatetatestoredRole RPCs sent by statestore",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "statestore.num-failed-update-statestored-role-rpc"
+  },
+  {
+    "description": "The number of requests for clearing topic entries from catalogd.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Number of request for clearing topic entries",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "statestore.num-clear-topic-entries-requests"
+  },
+  {
+    "description": "The address of the Active Catalog Server daemon.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Address of Active Catalog daemon",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "statestore.active-catalogd-address"
   },
   {
     "description": "The number of registered Statestore subscribers.",
@@ -1684,6 +2287,16 @@
     "units": "NONE",
     "kind": "SET",
     "key": "statestore.live-backends.list"
+  },
+  {
+    "description": "The number of Statestore subscribers received heartbeat in last monitoring interval.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Number of Statestore subscribers received heartbeat",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "statestore.subscribers-received-heartbeat"
   },
   {
     "description": "The time (sec) spent sending non-priority topic update RPCs. Includes subscriber-side processing time and network transmission time.",
@@ -1746,6 +2359,46 @@
     "key": "statestore.version"
   },
   {
+    "description": "Current active status of this Statestore daemon.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "The active status of Statestore daemon",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "statestore.active-status"
+  },
+  {
+    "description": "Statestore service is started and ready to accept connections.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Statestore service started",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "statestore.service-started"
+  },
+  {
+    "description": "Statestored instance is in HA recovery mode.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Statestored in HA recovery mode",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "statestore.in-ha-recovery-mode"
+  },
+  {
+    "description": "Statestored instance connected with peer statestored.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Statestored connected with peer statestored",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "statestore.connected-with-peer-statestored"
+  },
+  {
     "description": "The number of clients in use by the Statestore heartbeat client cache.",
     "contexts": [
       "STATESTORE"
@@ -1784,6 +2437,66 @@
     "units": "NONE",
     "kind": "GAUGE",
     "key": "subscriber-update-state.client-cache.total-clients"
+  },
+  {
+    "description": "The number of clients in use by the Statestore update catalogd client cache.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Subscriber Update Catalogd Client Cache Clients In Use",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "subscriber-update-catalogd.client-cache.clients-in-use"
+  },
+  {
+    "description": "The total number of clients in the Statestore update catalogd client cache.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Subscriber Update Catalogd Client Cache Total Clients",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "subscriber-update-catalogd.client-cache.total-clients"
+  },
+  {
+    "description": "The number of clients in use by the Statestore update statestored client cache.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Subscriber Update role of Statestored Client Cache Clients In Use",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "subscriber-update-statestored.client-cache.clients-in-use"
+  },
+  {
+    "description": "The total number of clients in the Statestore update statestored client cache.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Subscriber Update role of Statestored Client Cache Total Clients",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "subscriber-update-statestored.client-cache.total-clients"
+  },
+  {
+    "description": "The number of clients in use by the Statestore update statestored client cache.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Subscriber Update role of Statestored Client Cache Clients In Use",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "statestored-ha.client-cache.clients-in-use"
+  },
+  {
+    "description": "The total number of clients in the Statestore update statestored client cache.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Subscriber Update role of Statestored Client Cache Total Clients",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "statestored-ha.client-cache.total-clients"
   },
   {
     "description": "Number of bytes used by the application. This will not typically match the memory use reported by the OS, because it does not include TCMalloc overhead or memory fragmentation.",
@@ -2301,6 +3014,16 @@
     "key": "impala-server.query-durations-ms"
   },
   {
+    "description": "Estimated total size of query logs that are currently retained in memory.",
+    "contexts": [
+        "IMPALAD"
+    ],
+    "label": "Query log size in memory.",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "impala-server.query-log-est-total-bytes"
+  },
+  {
     "description": "Distribution of DDL operation latencies",
     "contexts": [
         "IMPALAD"
@@ -2419,6 +3142,26 @@
     "units": "BYTES",
     "kind": "GAUGE",
     "key": "tmp-file-mgr.scratch-space-bytes-used.dir-$0"
+  },
+  {
+    "description": "The current total read memory buffer bytes for all scratch directories.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Read memory buffer used for scratch directories",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "tmp-file-mgr.scratch-read-memory-buffer-used"
+  },
+  {
+    "description": "The high water mark for read memory buffer bytes of all scratch directories.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Read memory buffer HWM for scratch directories",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "tmp-file-mgr.scratch-read-memory-buffer-used-high-water-mark"
   },
   {
     "description": "The current total spilled bytes for the local buffer directory.",
@@ -2643,6 +3386,26 @@
     "key": "catalog.cache.total-load-time"
   },
   {
+    "description": "Median size of entries added to the Impalad Catalog cache.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache entry median size",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "catalog.cache.entry-median-size"
+  },
+  {
+    "description": "99th percentile size of entries added to the Impalad Catalog.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Impalad catalog cache entry 99th percentile size",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "catalog.cache.entry-99th-size"
+  },
+  {
     "description": "RPC queue length for partial object fetches.",
     "contexts": [
       "CATALOGSERVER"
@@ -2690,7 +3453,47 @@
     "label": "Average duration to fetch metastore events",
     "units": "TIME_S",
     "kind": "GAUGE",
-    "key": "events-processor.avg-events-fetch-duration"
+    "key": "events-processor.events-fetch-duration-avg"
+  },
+  {
+    "description": "75th percentile of the time taken to fetch a batch of metastore events",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "P75 duration to fetch metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-fetch-duration-p75"
+  },
+  {
+    "description": "95th percentile of the time taken to fetch a batch of metastore events",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "P95 duration to fetch metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-fetch-duration-p95"
+  },
+  {
+    "description": "99th percentile of the time taken to fetch a batch of metastore events",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "P99 duration to fetch metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-fetch-duration-p99"
+  },
+  {
+    "description": "Last time taken to fetch a batch of metastore events",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Last duration to fetch a batch of metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-fetch-duration-latest"
   },
   {
     "description": "Average time taken to process a batch of events received from metastore",
@@ -2700,7 +3503,47 @@
     "label": "Average duration to process a batch of metastore events",
     "units": "TIME_S",
     "kind": "GAUGE",
-    "key": "events-processor.avg-events-process-duration"
+    "key": "events-processor.events-process-duration-avg"
+  },
+  {
+    "description": "75th percentile of the time taken to process a batch of events received from metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "P75 duration to process a batch of metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-process-duration-p75"
+  },
+  {
+    "description": "95th percentile of the time taken to process a batch of events received from metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "P95 duration to process a batch of metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-process-duration-p95"
+  },
+  {
+    "description": "99th percentile of the time taken to process a batch of events received from metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "P99 duration to process a batch of metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-process-duration-p99"
+  },
+  {
+    "description": "Last time taken to process a batch of events received from metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Last duration to process a batch of metastore events",
+    "units": "TIME_S",
+    "kind": "GAUGE",
+    "key": "events-processor.events-process-duration-latest"
   },
   {
     "description": "Exponentially weighted moving average (EWMA) of number of events received in last 1 min",
@@ -2741,6 +3584,56 @@
     "units": "NONE",
     "kind" : "COUNTER",
     "key" : "events-processor.last-synced-event-id"
+  },
+  {
+    "description": "Last metastore event time that the catalog server processed and synced to",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Last Synced Event Time",
+    "units": "NONE",
+    "kind" : "COUNTER",
+    "key" : "events-processor.last-synced-event-time"
+  },
+  {
+    "description": "Latest event id in Hive metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Latest Event Id",
+    "units": "NONE",
+    "kind" : "COUNTER",
+    "key" : "events-processor.latest-event-id"
+  },
+  {
+    "description": "Event time of the latest event in Hive metastore",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Latest Event Time",
+    "units": "NONE",
+    "kind" : "COUNTER",
+    "key" : "events-processor.latest-event-time"
+  },
+  {
+    "description": "Number of pending events to be synced, i.e. the difference between latest-event-id and last-synced-event-id",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Pending Events",
+    "units": "NONE",
+    "kind" : "COUNTER",
+    "key" : "events-processor.pending-events"
+  },
+  {
+    "description": "Lag time of the event processing, i.e. the difference between latest-event-time and last-synced-event-time",
+    "contexts": [
+      "CATALOGSERVER"
+    ],
+    "label": "Lag Time",
+    "units": "TIME_S",
+    "kind" : "COUNTER",
+    "key" : "events-processor.lag-time"
   },
   {
     "description": "Total number of executor groups that have at least one executor",
@@ -2790,7 +3683,8 @@
     "units": "NONE",
     "kind": "COUNTER",
     "key": "cluster-membership.group-set.executor-groups.total-healthy.$0"
-  },{
+  },
+  {
     "description": "Total number of backends in the executor group set $0 registered with the statestore",
     "contexts": [
       "IMPALAD"
@@ -2931,6 +3825,30 @@
     "key": "impala.webserver.total-jwt-token-auth-failure"
   },
   {
+    "description": "The number of HTTP connection requests to this daemon's webserver that were successfully authenticated using OAuth token.",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Webserver HTTP Connection OAuth Token Auth Success",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.webserver.total-oauth-token-auth-success"
+  },
+  {
+    "description": "The number of HTTP connection requests to this daemon's webserver that provided an invalid OAuth token.",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Webserver HTTP Connection OAuth Token Auth Failure",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala.webserver.total-oauth-token-auth-failure"
+  },
+  {
     "description": "The number of times the FAIL debug action returned an error. For testing only.",
     "contexts": [
       "IMPALAD"
@@ -3009,5 +3927,65 @@
     "units": "NONE",
     "kind" : "GAUGE",
     "key" : "catalogd.hms.cache.status.api.requests.15min"
+  },
+  {
+    "description": "The number of completed queries queued up and waiting to be written to the query log table.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Queued Completed Queries",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala-server.completed-queries.queued"
+  },
+  {
+    "description": "The number of completed queries successfully written to the query log table.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Completed Queries Successfully Written",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala-server.completed-queries.written"
+  },
+  {
+    "description": "The number of completed queries that failed to be written to the query log table. If the same query fails to be written multiple times, each attempt will increase this counter by 1.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Completed Queries Failed to Write",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala-server.completed-queries.failure"
+  },
+  {
+    "description": "Count of the times that completed queries were written to the query log table at the regularly scheduled time.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Completed Queries Write Attempts",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala-server.completed-queries.scheduled-writes"
+  },
+  {
+    "description": "Count of the times that completed queries were written to the query log table because the max records queued count was reached.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Completed Queries Max Records Hit",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala-server.completed-queries.max-records-writes"
+  },
+  {
+    "description": "Time spent writing completed queries to the query log table.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Completed Queries Write Duration Distribution",
+    "units": "TIME_NS",
+    "kind": "HISTOGRAM",
+    "key": "impala-server.completed-queries.write-durations"
   }
 ]

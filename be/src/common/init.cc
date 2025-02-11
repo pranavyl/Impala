@@ -18,14 +18,17 @@
 #include "common/init.h"
 
 #include <csignal>
+#include <regex>
+#include <boost/filesystem.hpp>
 #include <gperftools/heap-profiler.h>
 #include <third_party/lss/linux_syscall_support.h>
 
 #include "common/global-flags.h"
 #include "common/logging.h"
 #include "common/status.h"
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/string-functions.h"
 #include "exprs/timezone_db.h"
 #include "gutil/atomicops.h"
 #include "gutil/strings/substitute.h"
@@ -42,6 +45,7 @@
 #include "util/cpu-info.h"
 #include "util/debug-util.h"
 #include "util/disk-info.h"
+#include "util/filesystem-util.h"
 #include "util/jni-util.h"
 #include "util/logging-support.h"
 #include "util/mem-info.h"
@@ -50,6 +54,8 @@
 #include "util/network-util.h"
 #include "util/openssl-util.h"
 #include "util/os-info.h"
+#include "util/os-util.h"
+#include "util/parse-util.h"
 #include "util/periodic-counter-updater.h"
 #include "util/pretty-printer.h"
 #include "util/redactor.h"
@@ -61,6 +67,7 @@
 #include "common/names.h"
 
 using namespace impala;
+namespace filesystem = boost::filesystem;
 
 DECLARE_bool(enable_process_lifetime_heap_profiling);
 DECLARE_string(heap_profile_dir);
@@ -72,9 +79,12 @@ DECLARE_int32(max_log_files);
 DECLARE_int32(max_minidumps);
 DECLARE_string(redaction_rules_file);
 DECLARE_bool(redirect_stdout_stderr);
+DECLARE_string(re2_mem_limit);
 DECLARE_string(reserved_words_version);
 DECLARE_bool(symbolize_stacktrace);
 DECLARE_string(debug_actions);
+DECLARE_int64(thrift_rpc_max_message_size);
+DECLARE_int64(thrift_external_rpc_max_message_size);
 
 DEFINE_int32(memory_maintenance_sleep_time_ms, 10000, "Sleep time in milliseconds "
     "between memory maintenance iterations");
@@ -89,6 +99,15 @@ DEFINE_int64(pause_monitor_warn_threshold_ms, 10000, "If the pause monitor sleep
 DEFINE_string(local_library_dir, "/tmp",
     "Scratch space for local fs operations. Currently used for copying "
     "UDF binaries locally from HDFS and also for initializing the timezone db");
+
+DEFINE_bool(jvm_automatic_add_opens, true,
+    "Adds necessary --add-opens options for core Java modules necessary to correctly "
+    "calculate catalog metadata cache object sizes.");
+
+DEFINE_string_hidden(java_weigher, "auto",
+    "Choose between 'jamm' (com.github.jbellis:jamm) and 'sizeof' (org.ehcache:sizeof) "
+    "weighers for determining catalog metadata cache entry size. 'auto' uses 'sizeof' "
+    "for Java 8 - 11, and 'jamm' for Java 15+.");
 
 // Defined by glog. This allows users to specify the log level using a glob. For
 // example -vmodule=*scanner*=3 would enable full logging for scanners. If redaction
@@ -151,6 +170,10 @@ extern "C" { void __gcov_flush(); }
         std::cerr << now << " " << i << " "
                   << " LOG_MAINTENANCE_STDERR " << status.msg().msg() << endl;
       }
+
+      // Check that impalad can always find INFO and ERROR log path.
+      DCHECK(impala::HasLog(google::INFO));
+      DCHECK(impala::HasLog(google::ERROR));
     }
   }
 }
@@ -162,7 +185,7 @@ extern "C" { void __gcov_flush(); }
     sleep(sleep_duration);
 
     const int64_t now = MonotonicMillis();
-    bool max_log_file_exceeded = RedirectStdoutStderr() && impala::CheckLogSize();
+    bool max_log_file_exceeded = RedirectStdoutStderr() && impala::CheckLogSize(false);
     if ((now - last_flush) / 1000 < FLAGS_logbufsecs && !max_log_file_exceeded) {
       continue;
     }
@@ -171,7 +194,7 @@ extern "C" { void __gcov_flush(); }
 
     // Check log size again and force log rotation this time if they still big after
     // FlushLogFiles.
-    if (max_log_file_exceeded && impala::CheckLogSize()) impala::ForceRotateLog();
+    if (max_log_file_exceeded && impala::CheckLogSize(true)) impala::ForceRotateLog();
 
     // No need to rotate log files in tests.
     if (impala::TestInfo::is_test()) continue;
@@ -289,6 +312,174 @@ void BlockImpalaShutdownSignal() {
   AbortIfError(pthread_sigmask(SIG_BLOCK, &signals, nullptr), error_msg);
 }
 
+// Returns Java major version, such as 8, 11, or 17.
+static int GetJavaMajorVersion() {
+  string cmd = "java";
+  const char* java_home = getenv("JAVA_HOME");
+  if (java_home != NULL) {
+    cmd = (filesystem::path(java_home) / "bin" / "java").string();
+  }
+  cmd += " -version 2>&1";
+  string msg;
+  if (!RunShellProcess(cmd, &msg, false, {"JAVA_TOOL_OPTIONS"})) {
+    LOG(INFO) << Substitute("Unable to determine Java version (default to 8): $0", msg);
+    return 8;
+  }
+
+  // Find a version string in the first line.
+  string first_line;
+  std::getline(istringstream(msg), first_line);
+  // Need to allow for a wide variety of formats for different JDK implementations.
+  // Example: openjdk version "11.0.19" 2023-04-18
+  std::regex java_version_pattern("\"([0-9]{1,3})\\.[0-9]+\\.[0-9]+[^\"]*\"");
+  std::smatch matches;
+  if (!std::regex_search(first_line, matches, java_version_pattern)) {
+    LOG(INFO) << Substitute("Unable to determine Java version (default to 8): $0", msg);
+    return 8;
+  }
+  DCHECK_EQ(matches.size(), 2);
+  return std::stoi(matches.str(1));
+}
+
+// Append the javaagent arg to JAVA_TOOL_OPTIONS to load jamm.
+static Status JavaAddJammAgent() {
+  stringstream val_out;
+  char* current_val_c = getenv("JAVA_TOOL_OPTIONS");
+  if (current_val_c != NULL) {
+    val_out << current_val_c << " ";
+  }
+
+  istringstream classpath {getenv("CLASSPATH")};
+  string jamm_path, test_path;
+  while (getline(classpath, test_path, ':')) {
+    Status status = FileSystemUtil::FindFileInPath(test_path, "jamm-.*.jar", &jamm_path);
+    // Error during FindFileInPath is not fatal if jamm path is found in another path.
+    if (!status.ok()) {
+      LOG(ERROR) << "Error when processing class path: " << status.msg().msg();
+    }
+    if (!jamm_path.empty()) break;
+  }
+  if (jamm_path.empty()) {
+    return Status("Could not find jamm-*.jar in Java CLASSPATH");
+  }
+  val_out << "-javaagent:" << jamm_path;
+
+  if (setenv("JAVA_TOOL_OPTIONS", val_out.str().c_str(), 1) < 0) {
+    return Status(Substitute("Could not update JAVA_TOOL_OPTIONS: $0", GetStrErrMsg()));
+  }
+  return Status::OK();
+}
+
+// Append add-opens args to JAVA_TOOL_OPTIONS for ehcache and jamm.
+static Status JavaAddOpens(bool useSizeOf) {
+  if (!FLAGS_jvm_automatic_add_opens) return Status::OK();
+
+  stringstream val_out;
+  char* current_val_c = getenv("JAVA_TOOL_OPTIONS");
+  if (current_val_c != NULL) {
+    val_out << current_val_c;
+  }
+
+  for (const string& param : {
+    // Needed for jamm and ehcache (jamm needs it to access lambdas)
+    "--add-opens=java.base/java.lang=ALL-UNNAMED",
+    "--add-opens=java.base/java.nio=ALL-UNNAMED",
+    "--add-opens=java.base/java.util.regex=ALL-UNNAMED",
+    "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+  }) {
+    val_out << " " << param;
+  }
+
+  if (useSizeOf) {
+    for (const string& param : {
+      // Only needed for ehcache
+      "--add-opens=java.base/java.io=ALL-UNNAMED",
+      "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",
+      "--add-opens=java.base/java.lang.module=ALL-UNNAMED",
+      "--add-opens=java.base/java.lang.ref=ALL-UNNAMED",
+      "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+      "--add-opens=java.base/java.net=ALL-UNNAMED",
+      "--add-opens=java.base/java.nio.charset=ALL-UNNAMED",
+      "--add-opens=java.base/java.nio.file.attribute=ALL-UNNAMED",
+      "--add-opens=java.base/java.security=ALL-UNNAMED",
+      "--add-opens=java.base/java.util.concurrent.locks=ALL-UNNAMED",
+      "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",
+      "--add-opens=java.base/java.util.jar=ALL-UNNAMED",
+      "--add-opens=java.base/java.util.zip=ALL-UNNAMED",
+      "--add-opens=java.base/java.util=ALL-UNNAMED",
+      "--add-opens=java.base/jdk.internal.loader=ALL-UNNAMED",
+      "--add-opens=java.base/jdk.internal.math=ALL-UNNAMED",
+      "--add-opens=java.base/jdk.internal.module=ALL-UNNAMED",
+      "--add-opens=java.base/jdk.internal.perf=ALL-UNNAMED",
+      "--add-opens=java.base/jdk.internal.platform=ALL-UNNAMED",
+      "--add-opens=java.base/jdk.internal.platform.cgroupv1=ALL-UNNAMED",
+      "--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED",
+      "--add-opens=java.base/jdk.internal.reflect=ALL-UNNAMED",
+      "--add-opens=java.base/jdk.internal.util.jar=ALL-UNNAMED",
+      "--add-opens=java.base/sun.net.www.protocol.jar=ALL-UNNAMED",
+      "--add-opens=java.base/sun.nio.fs=ALL-UNNAMED",
+      "--add-opens=jdk.dynalink/jdk.dynalink.beans=ALL-UNNAMED",
+      "--add-opens=jdk.dynalink/jdk.dynalink.linker.support=ALL-UNNAMED",
+      "--add-opens=jdk.dynalink/jdk.dynalink.linker=ALL-UNNAMED",
+      "--add-opens=jdk.dynalink/jdk.dynalink.support=ALL-UNNAMED",
+      "--add-opens=jdk.dynalink/jdk.dynalink=ALL-UNNAMED",
+      "--add-opens=jdk.management.jfr/jdk.management.jfr=ALL-UNNAMED",
+      "--add-opens=jdk.management/com.sun.management.internal=ALL-UNNAMED"
+    }) {
+      val_out << " " << param;
+    }
+  }
+
+  if (setenv("JAVA_TOOL_OPTIONS", val_out.str().c_str(), 1) < 0) {
+    return Status(Substitute("Could not update JAVA_TOOL_OPTIONS: $0", GetStrErrMsg()));
+  }
+  return Status::OK();
+}
+
+static Status InitializeJavaWeigher() {
+  // This is set up so the default if things go wrong is to continue using ehcache.sizeof.
+  int version = GetJavaMajorVersion();
+  if (FLAGS_java_weigher == "auto") {
+    // Update for backend-gflag-util.cc setting use_jamm_weigher.
+    FLAGS_java_weigher = (version >= 15) ? "jamm" : "sizeof";
+  }
+  LOG(INFO) << "Using Java weigher " << FLAGS_java_weigher;
+
+  if (FLAGS_java_weigher == "jamm") {
+    RETURN_IF_ERROR(JavaAddJammAgent());
+  }
+  if (version >= 9) {
+    // add-opens is only supported in Java 9+.
+    RETURN_IF_ERROR(JavaAddOpens(FLAGS_java_weigher != "jamm"));
+  }
+  return Status::OK();
+}
+
+static Status JavaSetProcessName(const string& name) {
+  string current_val;
+  char* current_val_c = getenv("JAVA_TOOL_OPTIONS");
+  if (current_val_c != NULL) {
+    current_val = current_val_c;
+  }
+
+  if (!current_val.empty() && current_val.find("-Dsun.java.command") != string::npos) {
+    LOG(WARNING) << "Overriding sun.java.command in JAVA_TOOL_OPTIONS to " << name;
+  }
+
+  stringstream val_out;
+  if (!current_val.empty()) {
+    val_out << current_val << " ";
+  }
+  // Set sun.java.command so jps reports the name correctly, and ThreadNameAnnotator can
+  // use the process name for the main thread (and correctly restore the process name).
+  val_out << "-Dsun.java.command=" << name;
+
+  if (setenv("JAVA_TOOL_OPTIONS", val_out.str().c_str(), 1) < 0) {
+    return Status(Substitute("Could not update JAVA_TOOL_OPTIONS: $0", GetStrErrMsg()));
+  }
+  return Status::OK();
+}
+
 void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
     TestInfo::Mode test_mode, bool external_fe) {
   srand(time(NULL));
@@ -334,22 +525,48 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
     CLEAN_EXIT_WITH_ERROR(Substitute("read_size can not be lower than $0",
         READ_SIZE_MIN_VALUE));
   }
+
+  bool is_percent = false; // not used
+  int64_t re2_mem_limit = ParseUtil::ParseMemSpec(FLAGS_re2_mem_limit, &is_percent, 0);
+  if (re2_mem_limit <= 0) {
+    CLEAN_EXIT_WITH_ERROR(
+        Substitute("Invalid mem limit for re2's regex engine: $0", FLAGS_re2_mem_limit));
+  } else {
+    StringFunctions::SetRE2MemLimit(re2_mem_limit);
+  }
+
   if (FLAGS_reserved_words_version != "2.11.0" && FLAGS_reserved_words_version != "3.0.0")
   {
     CLEAN_EXIT_WITH_ERROR(Substitute("Invalid flag reserved_words_version. The value must"
         " be one of [\"2.11.0\", \"3.0.0\"], while the provided value is $0.",
         FLAGS_reserved_words_version));
   }
+
+  // Enforce a minimum value for thrift_max_message_size, as configuring the limit to
+  // a small value is very unlikely to work.
+  if (!impala::TestInfo::is_test() && FLAGS_thrift_rpc_max_message_size > 0
+      && FLAGS_thrift_rpc_max_message_size < ThriftDefaultMaxMessageSize()) {
+    CLEAN_EXIT_WITH_ERROR(
+        Substitute("Invalid $0: $1 is less than the minimum value of $2.",
+            "thrift_rpc_max_message_size", FLAGS_thrift_rpc_max_message_size,
+            ThriftDefaultMaxMessageSize()));
+  }
+
+  // Enforce a minimum value for thrift_external_max_message_size, as configuring the
+  // limit to a small value is very unlikely to work.
+  if (!impala::TestInfo::is_test() && FLAGS_thrift_external_rpc_max_message_size > 0
+      && FLAGS_thrift_external_rpc_max_message_size < ThriftDefaultMaxMessageSize()) {
+    CLEAN_EXIT_WITH_ERROR(
+        Substitute("Invalid $0: $1 is less than the minimum value of $2.",
+            "thrift_external_rpc_max_message_size",
+            FLAGS_thrift_external_rpc_max_message_size, ThriftDefaultMaxMessageSize()));
+  }
+
   impala::InitGoogleLoggingSafe(argv[0]);
   // Breakpad needs flags and logging to initialize.
   if (!external_fe) {
     ABORT_IF_ERROR(RegisterMinidump(argv[0]));
   }
-#ifndef THREAD_SANITIZER
-#ifndef __aarch64__
-  AtomicOps_x86CPUFeaturesInit();
-#endif
-#endif
   impala::InitThreading();
   impala::datetime_parse_util::SimpleDateFormatTokenizer::InitCtx();
   impala::SeedOpenSSLRNG();
@@ -386,6 +603,7 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
 
   LOG(INFO) << impala::GetVersionString();
   LOG(INFO) << "Using hostname: " << FLAGS_hostname;
+  LOG(INFO) << "Using locale: " << std::locale("").name();
   impala::LogCommandLineFlags();
 
   // When a process calls send(2) on a socket closed on the other end, linux generates
@@ -426,6 +644,8 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
 
   if (init_jvm) {
     if (!external_fe) {
+      ABORT_IF_ERROR(InitializeJavaWeigher());
+      ABORT_IF_ERROR(JavaSetProcessName(filesystem::path(argv[0]).filename().string()));
       JniUtil::InitLibhdfs();
     }
     ABORT_IF_ERROR(JniUtil::Init());

@@ -86,12 +86,14 @@ void AddTestData(TestData* data, int n, int32_t min = -10, int32_t max = 10,
 
 #define DIGIT(c) (c -'0')
 
-inline int32_t AtoiUnsafe(char* s, int len) {
+inline int32_t AtoiUnsafe(const char* s, int len) {
   int32_t val = 0;
   bool negative = false;
   int i = 0;
   switch (*s) {
-    case '-': negative = true;
+    case '-':
+      negative = true;
+      [[fallthrough]];
     case '+': ++i;
   }
 
@@ -102,30 +104,39 @@ inline int32_t AtoiUnsafe(char* s, int len) {
   return negative ? -val : val;
 }
 
-inline int32_t AtoiUnrolled(char* s, int len) {
+inline int32_t AtoiUnrolled(const char* s, int len) {
   if (LIKELY(len <= 8)) {
     int32_t val = 0;
     bool negative = false;
     switch (*s) {
-      case '-': negative = true;
+      case '-':
+        negative = true;
+        [[fallthrough]];
       case '+': --len; ++s;
     }
 
     switch(len) {
       case 8:
         val += (DIGIT(s[len - 8])) * 10000;
+        [[fallthrough]];
       case 7:
         val += (DIGIT(s[len - 7])) * 10000;
+        [[fallthrough]];
       case 6:
         val += (DIGIT(s[len - 6])) * 10000;
+        [[fallthrough]];
       case 5:
         val += (DIGIT(s[len - 5])) * 10000;
+        [[fallthrough]];
       case 4:
         val += (DIGIT(s[len - 4])) * 1000;
+        [[fallthrough]];
       case 3:
         val += (DIGIT(s[len - 3])) * 100;
+        [[fallthrough]];
       case 2:
         val += (DIGIT(s[len - 2])) * 10;
+        [[fallthrough]];
       case 1:
         val += (DIGIT(s[len - 1]));
     }
@@ -135,12 +146,14 @@ inline int32_t AtoiUnrolled(char* s, int len) {
   }
 }
 
-inline int32_t AtoiCased(char* s, int len) {
+inline int32_t AtoiCased(const char* s, int len) {
   if (LIKELY(len <= 5)) {
     int32_t val = 0;
     bool negative = false;
     switch (*s) {
-      case '-': negative = true;
+      case '-':
+        negative = true;
+        [[fallthrough]];
       case '+': --len; ++s;
     }
 
@@ -173,7 +186,7 @@ void TestAtoi(int batch_size, void* d) {
   for (int i = 0; i < batch_size; ++i) {
     int n = data->data.size();
     for (int j = 0; j < n; ++j) {
-      data->result[j] = atoi(data->data[j].ptr);
+      data->result[j] = atoi(data->data[j].Ptr());
     }
   }
 }
@@ -183,7 +196,7 @@ void TestStrtol(int batch_size, void* d) {
   for (int i = 0; i < batch_size; ++i) {
     int n = data->data.size();
     for (int j = 0; j < n; ++j) {
-      data->result[j] = strtol(data->data[j].ptr, NULL, 10);
+      data->result[j] = strtol(data->data[j].Ptr(), NULL, 10);
     }
   }
 }
@@ -195,8 +208,8 @@ void TestImpala(int batch_size, void* d) {
     for (int j = 0; j < n; ++j) {
       const StringValue& str = data->data[j];
       StringParser::ParseResult dummy;
-      int32_t val = StringParser::StringToInt<int32_t>(str.ptr, str.len, &dummy);
-      VALIDATE_RESULT(val, data->result[j], str.ptr);
+      int32_t val = StringParser::StringToInt<int32_t>(str.Ptr(), str.Len(), &dummy);
+      VALIDATE_RESULT(val, data->result[j], str.Ptr());
       data->result[j] = val;
     }
   }
@@ -208,8 +221,8 @@ void TestImpalaUnsafe(int batch_size, void* d) {
     int n = data->data.size();
     for (int j = 0; j < n; ++j) {
       const StringValue& str = data->data[j];
-      int32_t val = AtoiUnsafe(str.ptr, str.len);
-      VALIDATE_RESULT(val, data->result[j], str.ptr);
+      int32_t val = AtoiUnsafe(str.Ptr(), str.Len());
+      VALIDATE_RESULT(val, data->result[j], str.Ptr());
       data->result[j] = val;
     }
   }
@@ -221,8 +234,8 @@ void TestImpalaUnrolled(int batch_size, void* d) {
     int n = data->data.size();
     for (int j = 0; j < n; ++j) {
       const StringValue& str = data->data[j];
-      int32_t val = AtoiUnrolled(str.ptr, str.len);
-      VALIDATE_RESULT(val, data->result[j], str.ptr);
+      int32_t val = AtoiUnrolled(str.Ptr(), str.Len());
+      VALIDATE_RESULT(val, data->result[j], str.Ptr());
       data->result[j] = val;
     }
   }
@@ -234,8 +247,8 @@ void TestImpalaCased(int batch_size, void* d) {
     int n = data->data.size();
     for (int j = 0; j < n; ++j) {
       const StringValue& str = data->data[j];
-      int32_t val = AtoiCased(str.ptr, str.len);
-      VALIDATE_RESULT(val, data->result[j], str.ptr);
+      int32_t val = AtoiCased(str.Ptr(), str.Len());
+      VALIDATE_RESULT(val, data->result[j], str.Ptr());
       data->result[j] = val;
     }
   }

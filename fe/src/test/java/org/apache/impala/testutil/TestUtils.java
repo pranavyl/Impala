@@ -178,7 +178,7 @@ public class TestUtils {
    */
   public static final ResultFilter SCAN_NODE_SCHEME_FILTER = new ResultFilter() {
 
-    private final String fsSchemes = "(HDFS|S3|LOCAL|ADLS)";
+    private final String fsSchemes = "(HDFS|S3|LOCAL|ADLS|OSS)";
     private final Pattern scanNodeFsScheme = Pattern.compile("SCAN " + fsSchemes);
     // We don't match the size because the FILE_SIZE_FILTER could remove it
     private final Pattern scanNodeInputMetadata =
@@ -206,10 +206,14 @@ public class TestUtils {
   public static final IgnoreValueFilter ROW_SIZE_FILTER =
       new IgnoreValueFilter("row-size", "\\S+");
 
-  // Ignore cardinality=27.30K or cardinality=unavailable
-  // entries
-  public static final IgnoreValueFilter CARDINALITY_FILTER =
-      new IgnoreValueFilter("cardinality", "\\S+");
+  // Ignore 'cardinality=27.30K' or 'cardinality=unavailable' or
+  // 'cardinality=1.58K(filtered from 2.88M)' entries.
+  // See PlanNode.getExplainString().
+  public static final IgnoreValueFilter CARDINALITY_FILTER = new IgnoreValueFilter(
+      "cardinality", "(unavailable|[0-9\\.KMGT]+(\\(filtered from [0-9\\.KMGT]+\\))?)");
+
+  public static final IgnoreValueFilter ICEBERG_SNAPSHOT_ID_FILTER =
+      new IgnoreValueFilter("Iceberg snapshot id", " \\d+", ':');
 
   // Ignore any values after 'rows=' in partitions: 0/24 rows=12.83K or
   // partitions: 0/24 rows=unavailable entries

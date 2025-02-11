@@ -106,9 +106,9 @@ void TextConverter::UnescapeString(const char* src, char* dest, int* len,
 //}
 // TODO: convert this function to use cross-compilation + constant substitution in whole
 // or part. It is currently too complex and doesn't implement the full functionality.
-Status TextConverter::CodegenWriteSlot(LlvmCodeGen* codegen,
-    TupleDescriptor* tuple_desc, SlotDescriptor* slot_desc, llvm::Function** fn,
-    const char* null_col_val, int len, bool check_null, bool strict_mode) {
+Status TextConverter::CodegenWriteSlot(LlvmCodeGen* codegen, TupleDescriptor* tuple_desc,
+    SlotDescriptor* slot_desc, llvm::Function** fn, const char* null_col_val, int len,
+    bool check_null, bool strict_mode) {
   DCHECK(fn != nullptr);
   DCHECK(SupportsCodegenWriteSlot(slot_desc->type()));
 
@@ -183,10 +183,9 @@ Status TextConverter::CodegenWriteSlot(LlvmCodeGen* codegen,
       builder.CreateStructGEP(NULL, args[0], slot_desc->llvm_field_idx(), "slot");
 
   if (slot_desc->type().IsVarLenStringType()) {
-    llvm::Value* ptr = builder.CreateStructGEP(NULL, slot, 0, "string_ptr");
-    llvm::Value* len = builder.CreateStructGEP(NULL, slot, 1, "string_len");
+    llvm::Function* str_assign_fn = codegen->GetFunction(
+        IRFunction::STRING_VALUE_ASSIGN, false);
 
-    builder.CreateStore(args[1], ptr);
     // TODO codegen memory allocation for CHAR
     DCHECK(slot_desc->type().type != TYPE_CHAR);
     if (slot_desc->type().type == TYPE_VARCHAR) {
@@ -196,9 +195,11 @@ Status TextConverter::CodegenWriteSlot(LlvmCodeGen* codegen,
           builder.CreateICmpSLT(args[2], maxlen, "len_lt_maxlen");
       llvm::Value* minlen =
           builder.CreateSelect(len_lt_maxlen, args[2], maxlen, "select_min_len");
-      builder.CreateStore(minlen, len);
+      builder.CreateCall(str_assign_fn,
+          llvm::ArrayRef<llvm::Value*>({slot, args[1], minlen}));
     } else {
-      builder.CreateStore(args[2], len);
+      builder.CreateCall(str_assign_fn,
+          llvm::ArrayRef<llvm::Value*>({slot, args[1], args[2]}));
     }
     builder.CreateRet(codegen->true_value());
   } else {
@@ -350,5 +351,6 @@ Status TextConverter::CodegenWriteSlot(LlvmCodeGen* codegen,
 }
 
 bool TextConverter::SupportsCodegenWriteSlot(const ColumnType& col_type) {
-  return col_type.type != TYPE_CHAR;
+  // TODO: implement codegen for binary (IMPALA-11475)
+  return col_type.type != TYPE_CHAR && !col_type.IsBinaryType();
 }

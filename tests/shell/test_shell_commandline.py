@@ -18,6 +18,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import errno
 import getpass
 import os
@@ -34,12 +36,15 @@ from tests.common.environ import ImpalaTestClusterProperties
 from tests.common.impala_service import ImpaladService
 from tests.common.impala_test_suite import ImpalaTestSuite, IMPALAD_HS2_HOST_PORT
 from tests.common.skip import SkipIf
-from tests.common.test_dimensions import create_client_protocol_dimension
-from tests.common.test_dimensions import create_client_protocol_strict_dimension
+from tests.common.test_dimensions import (
+  create_client_protocol_dimension, create_client_protocol_strict_dimension,
+  create_uncompressed_text_dimension, create_single_exec_option_dimension)
+from tests.common.test_result_verifier import error_msg_expected
 from time import sleep, time
-from util import (get_impalad_host_port, assert_var_substitution, run_impala_shell_cmd,
-                  ImpalaShell, IMPALA_SHELL_EXECUTABLE, SHELL_IS_PYTHON_2,
-                  build_shell_env, wait_for_query_state)
+from tests.shell.util import (get_impalad_host_port, assert_var_substitution,
+  run_impala_shell_cmd, ImpalaShell, build_shell_env, wait_for_query_state,
+  create_impala_shell_executable_dimension, get_impala_shell_executable,
+  stderr_get_first_error_msg)
 from contextlib import closing
 
 
@@ -48,6 +53,19 @@ QUERY_FILE_PATH = os.path.join(os.environ['IMPALA_HOME'], 'tests', 'shell')
 
 RUSSIAN_CHARS = (u"А, Б, В, Г, Д, Е, Ё, Ж, З, И, Й, К, Л, М, Н, О, П, Р,"
                  u"С, Т, У, Ф, Х, Ц,Ч, Ш, Щ, Ъ, Ы, Ь, Э, Ю, Я")
+
+"""IMPALA-12216 implemented timestamp to be printed in case of any error/warning
+  during query execution, below is an example :
+
+   2024-07-15 12:49:27 [Exception] type=<class 'socket.error'> in FetchResults.
+   2024-07-15 12:49:27 [Warning]  Cancelling Query
+   2024-07-15 12:49:27 [Warning] close session RPC failed: <class 'shell_exceptions.
+   QueryCancelledByShellException'>
+
+  To avoid test flakiness due to timestamp, we would be ignoring timestamp in actual
+  result before asserting with expected result, (YYYY-MM-DD hh:mm:ss ) is of length 20
+"""
+TS_LEN = 20
 
 
 def find_query_option(key, string, strip_brackets=True):
@@ -77,7 +95,7 @@ def empty_table(unique_database, request):
   Returns:
     fq_table_name (str): the fully qualified name of the table: : dbname.table_name
   """
-  table_name = request.node.function.func_name
+  table_name = request.node.function.__name__
   fq_table_name = '.'.join([unique_database, table_name])
   stmt = "CREATE TABLE %s (i integer, s string)" % fq_table_name
   request.instance.execute_query_expect_success(request.instance.client, stmt,
@@ -134,11 +152,18 @@ class TestImpalaShell(ImpalaTestSuite):
 
   @classmethod
   def add_test_dimensions(cls):
+    super(TestImpalaShell, cls).add_test_dimensions()
+    # Limit to uncompressed text with default exec options
+    cls.ImpalaTestMatrix.add_dimension(
+        create_uncompressed_text_dimension(cls.get_workload()))
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
     # Run with both beeswax and HS2 to ensure that behaviour is the same.
     cls.ImpalaTestMatrix.add_dimension(create_client_protocol_dimension())
     cls.ImpalaTestMatrix.add_dimension(create_client_protocol_strict_dimension())
     cls.ImpalaTestMatrix.add_constraint(lambda v:
-          v.get_value('protocol') != 'beeswax' or not v.get_value('strict_hs2_protocol'))
+        v.get_value('protocol') != 'beeswax' or not v.get_value('strict_hs2_protocol'))
+    # Test combination of Python versions and tarball/PyPI
+    cls.ImpalaTestMatrix.add_dimension(create_impala_shell_executable_dimension())
 
   def test_no_args(self, vector):
     args = ['-q', DEFAULT_QUERY]
@@ -173,8 +198,14 @@ class TestImpalaShell(ImpalaTestSuite):
   def test_unsecure_message(self, vector):
     if vector.get_value('strict_hs2_protocol'):
       pytest.skip("Strict protocol always runs with LDAP.")
-    results = run_impala_shell_cmd(vector, [], wait_until_connected=False)
+    results = run_impala_shell_cmd(vector, [])
     assert "with no authentication" in results.stderr
+
+  def test_fastbinary_warning_message(self, vector):
+    results = run_impala_shell_cmd(vector, [])
+    # Verify that we don't print any message about fastbinary
+    # This doesn't check the full error string, because that could change.
+    assert "fastbinary" not in results.stderr
 
   def test_print_header(self, vector, populated_table):
     args = ['--print_header', '-B', '--output_delim=,', '-q',
@@ -258,8 +289,11 @@ class TestImpalaShell(ImpalaTestSuite):
     args = ['-q', 'set abort_on_error=true;'
             'select id from functional_parquet.bad_column_metadata t']
     result = run_impala_shell_cmd(vector, args, expect_success=False)
-    assert 'ERROR: Column metadata states there are 11 values, ' in result.stderr
-    assert 'but read 10 values from column id.' in result.stderr
+    assert error_msg_expected(
+      stderr_get_first_error_msg(result.stderr),
+      "Column metadata states there are 11 values, but read 10 values from column id."
+    )
+
 
   def test_completed_query_errors_2(self, vector):
     if vector.get_value('strict_hs2_protocol'):
@@ -268,9 +302,10 @@ class TestImpalaShell(ImpalaTestSuite):
             'select id, cnt from functional_parquet.bad_column_metadata t, '
             '(select 1 cnt) u']
     result = run_impala_shell_cmd(vector, args, expect_success=False)
-    assert 'ERROR: Column metadata states there are 11 values, ' in result.stderr,\
-        result.stderr
-    assert 'but read 10 values from column id.' in result.stderr, result.stderr
+    assert error_msg_expected(
+      stderr_get_first_error_msg(result.stderr),
+      "Column metadata states there are 11 values, but read 10 values from column id."
+    )
 
   def test_no_warnings_in_log_with_quiet_mode(self, vector):
     if vector.get_value('strict_hs2_protocol'):
@@ -291,17 +326,25 @@ class TestImpalaShell(ImpalaTestSuite):
         result.stderr
 
   def test_output_format(self, vector):
-    expected_output = ['1'] * 3
-    args = ['-q', 'select 1,1,1', '-B', '--quiet']
-    result = run_impala_shell_cmd(vector, args)
+    expected_output = ['1', '2', '3']
+    args = ['-q', 'select 1 as col_00001, 2 as col_2, 3 as col_03', '--quiet']
+    result = run_impala_shell_cmd(vector, args + ['-B'])
     actual_output = [r.strip() for r in result.stdout.split('\t')]
     assert actual_output == expected_output
-    result = run_impala_shell_cmd(vector, args + ['--output_delim=|'])
+    result = run_impala_shell_cmd(vector, args + ['-B', '--output_delim=|'])
     actual_output = [r.strip() for r in result.stdout.split('|')]
     assert actual_output == expected_output
-    result = run_impala_shell_cmd(vector, args + ['--output_delim=||'],
+    result = run_impala_shell_cmd(vector, args + ['-B', '--output_delim=||'],
                                   expect_success=False)
     assert "Illegal delimiter" in result.stderr
+    result = run_impala_shell_cmd(vector, args + ['-E'])
+    result_rows = result.stdout.strip().split('\n')
+    assert len(result_rows) == 4
+    assert "************************************** " \
+      "1.row **************************************" == result_rows[0]
+    assert "col_00001: 1" == result_rows[1]
+    assert "    col_2: 2" == result_rows[2]
+    assert "   col_03: 3" == result_rows[3]
 
   def test_do_methods(self, vector, empty_table):
     """Ensure that the do_ methods in the shell work.
@@ -358,7 +401,7 @@ class TestImpalaShell(ImpalaTestSuite):
 
   def test_runtime_profile(self, vector):
     if vector.get_value('strict_hs2_protocol'):
-      pytest.skip("Runtime profile not support in strict hs2 mode.")
+      pytest.skip("Runtime profile is not supported in strict hs2 mode.")
     # test summary is in both the profile printed by the
     # -p option and the one printed by the profile command
     args = ['-p', '-q', 'select 1; profile;']
@@ -368,6 +411,80 @@ class TestImpalaShell(ImpalaTestSuite):
     # We expect two query profiles.
     assert len(re.findall(regex, result_set.stdout)) == 2, \
         "Could not detect two profiles, stdout: %s" % result_set.stdout
+
+  def test_runtime_profile_referenced_tables(self, vector, unique_database):
+    if vector.get_value('strict_hs2_protocol'):
+      pytest.skip("Runtime profile is not supported in strict hs2 mode.")
+    db = unique_database
+    base_args = ['-p', '-q']
+
+    statements = ['select id from %s.shell_profile_test' % db,
+                  'alter table %s.shell_profile_test add column b int' % db,
+                  'insert into %s.shell_profile_test(id) values (1)' % db,
+                  'truncate table %s.shell_profile_test' % db,
+                  'drop table %s.shell_profile_test' % db]
+
+    args = base_args + ['create table %s.shell_profile_test (id int)' % db]
+    create = run_impala_shell_cmd(vector, args)
+    assert "Referenced Tables: \n" in create.stdout
+    assert "Original Table Versions: \n" in create.stdout
+
+    TABLE_VERSION = re.compile(
+        r"Original Table Versions: (\w+\.\w+), (\d+), (\d+), ([^\n]*)\n")
+    for statement in statements:
+      args = base_args + [statement]
+      result = run_impala_shell_cmd(vector, args)
+      assert "Referenced Tables: %s.shell_profile_test" % unique_database in result.stdout
+      m = TABLE_VERSION.search(result.stdout)
+      assert m, "Original Table Versions not found in profile:\n" + result.stdout
+      assert m.group(1) == unique_database + ".shell_profile_test"
+      assert int(m.group(2)) > 0, "Invalid catalog version in " + m.group(0) + statement
+      assert int(m.group(3)) > 0, "Invalid loaded timestamp in " + m.group(0) + statement
+      assert len(m.group(4)) > 0, "Invalid timestamp string in " + m.group(0) + statement
+
+  def test_runtime_profile_multiple_referenced_tables(self, vector, unique_database):
+    if vector.get_value('strict_hs2_protocol'):
+      pytest.skip("Runtime profile is not supported in strict hs2 mode.")
+
+    def get_referenced_tables(profile):
+      return re.findall(r'Referenced Tables: (.*)', profile)[0].split(', ')
+
+    db = unique_database
+    base_args = ['-p', '-q']
+
+    for i in range(0, 2):
+      args = base_args + ['create table %s.shell_profile_test%d (id int)' % (db, i)]
+      run_impala_shell_cmd(vector, args)
+
+    args = base_args + ["select * from {db}.shell_profile_test0 t0 inner join "
+                        "{db}.shell_profile_test1 t1 on t0.id = t1.id".format(db=db)]
+    result = run_impala_shell_cmd(vector, args)
+    referenced_tables = get_referenced_tables(result.stdout)
+
+    assert len(referenced_tables) == 2
+    for i in range(0, 2):
+      assert "{db}.shell_profile_test{index}".format(db=db, index=i) in referenced_tables
+
+    args = base_args + ["select * from {db}.shell_profile_test0 t0 inner join "
+                        "{db}.shell_profile_test1 t1 on t0.id = t1.id inner join "
+                        "{db}.shell_profile_test1 t11 on t0.id = t11.id".format(db=db)]
+
+    result = run_impala_shell_cmd(vector, args)
+    referenced_tables = get_referenced_tables(result.stdout)
+
+    assert len(referenced_tables) == 2
+    for i in range(0, 2):
+      assert "{db}.shell_profile_test{index}".format(db=db, index=i) in referenced_tables
+
+    TABLE_VERSIONS = re.compile(r"Original Table Versions: (\w+\.\w+), (\d+), (\d+), "
+                                r"([^\n]*)\n(\w+\.\w+), (\d+), (\d+), ([^\n]*)\n")
+    m = TABLE_VERSIONS.search(result.stdout)
+    assert m, "Original Table Versions not found in profile:\n" + result.stdout
+    for i in (0, 4):
+      assert db + ".shell_profile_test" in m.group(i + 1), "missing tables:" + m.group(0)
+      assert int(m.group(i + 2)) > 0, "Invalid catalog version: " + m.group(0)
+      assert int(m.group(i + 3)) > 0, "Invalid timestamp: " + m.group(0)
+      assert len(m.group(i + 4)) > 0, "Invalid timestamp string: " + m.group(0)
 
   def test_summary(self, vector):
     if vector.get_value('strict_hs2_protocol'):
@@ -384,10 +501,28 @@ class TestImpalaShell(ImpalaTestSuite):
     result_set = run_impala_shell_cmd(vector, args)
     assert "Summary not available" in result_set.stderr
 
+    args = ['-q', 'show tables; summary 1;']
+    result_set = run_impala_shell_cmd(vector, args, expect_success=False)
+    invalid_err = "Invalid value for query attempt display mode"
+    valid_opts = "Valid values are [ALL | LATEST | ORIGINAL]"
+    assert "{0}: '1'. {1}".format(invalid_err, valid_opts) in result_set.stdout
+
     # Test queries without an exchange
     args = ['-q', 'select 1; summary;']
     result_set = run_impala_shell_cmd(vector, args)
     assert "00:UNION" in result_set.stdout
+
+    args = ['-q', 'select 1; summary all;']
+    result_set = run_impala_shell_cmd(vector, args)
+    assert "00:UNION" in result_set.stdout
+
+    args = ['-q', 'select 1; summary latest;']
+    result_set = run_impala_shell_cmd(vector, args)
+    assert "00:UNION" in result_set.stdout
+
+    args = ['-q', 'select 1; summary original;']
+    result_set = run_impala_shell_cmd(vector, args)
+    assert "No failed summary found" in result_set.stdout
 
   @pytest.mark.execute_serially
   def test_queries_closed(self, vector):
@@ -516,6 +651,16 @@ class TestImpalaShell(ImpalaTestSuite):
     assert 'UnicodeDecodeError' not in result.stderr
     assert RUSSIAN_CHARS.encode('utf-8') in result.stdout
 
+  def test_international_characters_profile(self, vector):
+    """IMPALA-12145: ensure we can handle international characters in the profile. """
+    if vector.get_value('strict_hs2_protocol'):
+      pytest.skip("Profile not supported in strict hs2 mode.")
+    text = RUSSIAN_CHARS.encode('utf-8')
+    args = ['-o', '/dev/null', '-p', '-q', "select '{0}'".format(text)]
+    result = run_impala_shell_cmd(vector, args)
+    assert 'UnicodeDecodeError' not in result.stderr
+    assert text in result.stdout
+
   def test_utf8_decoding_error_handling(self, vector):
     """IMPALA-10145,IMPALA-10299: Regression tests for elegantly handling malformed utf-8
     characters."""
@@ -533,8 +678,11 @@ class TestImpalaShell(ImpalaTestSuite):
     result = run_impala_shell_cmd(vector, ['-B', '-q', "select unhex('aa')"])
     assert 'UnicodeDecodeError' not in result.stderr
     # Same as above, the result using thrift <0.10.0 is '\xaa'. The result using
-    # thrift >=0.10.0 is '\xef\xbf\xbd'.
-    assert '\xef\xbf\xbd' in result.stdout or '\xaa' in result.stdout
+    # thrift >=0.10.0 is '\xef\xbf\xbd'. When testing with strict_hs2_protocol, this
+    # is running against Hive which is another variable. On thrift 0.14 and higher,
+    # talking to Hive, the result is b'\\xaa', so allow this as another possibility.
+    assert '\xef\xbf\xbd' in result.stdout or '\xaa' in result.stdout or \
+           '\\xaa' in result.stdout
 
   def test_global_config_file(self, vector):
     """Test global and user configuration files."""
@@ -619,8 +767,7 @@ class TestImpalaShell(ImpalaTestSuite):
 
     # Testing config file related warning and error messages
     args = ['--config_file=%s/impalarc_with_warnings' % QUERY_FILE_PATH]
-    result = run_impala_shell_cmd(
-        vector, args, expect_success=True, wait_until_connected=False)
+    result = run_impala_shell_cmd(vector, args, expect_success=True)
     assert "WARNING: Option 'config_file' can be only set from shell." in result.stderr
     err_msg = ("WARNING: Unable to read configuration file correctly. "
                "Ignoring unrecognized config option: 'invalid_option'\n")
@@ -632,21 +779,25 @@ class TestImpalaShell(ImpalaTestSuite):
                "'maybe' is not a valid value for a boolean option.")
     assert  err_msg in result.stderr
 
-    # Test the optional configuration file with live_progress and live_summary
-    # Positive test
-    args = ['--config_file=%s/good_impalarc3' % QUERY_FILE_PATH]
-    result = run_impala_shell_cmd(vector, args)
-    assert 'WARNING:' not in result.stderr, \
-      "A valid config file should not trigger any warning: {0}".format(result.stderr)
-    # Negative Tests
-    # specified config file with live_summary enabled for non interactive mode
-    args = ['--config_file=%s/good_impalarc3' % QUERY_FILE_PATH, '--query=select 3']
-    result = run_impala_shell_cmd(vector, args, expect_success=False)
-    assert 'live_summary is available for interactive mode only' in result.stderr
+    # live_progress and live_summary are not supported with strict_hs2_protocol
+    if not vector.get_value('strict_hs2_protocol'):
+      # Test the optional configuration file with live_progress and live_summary
+      # Positive test
+      args = ['--config_file=%s/good_impalarc3' % QUERY_FILE_PATH]
+      result = run_impala_shell_cmd(vector, args)
+      filtered_stderr = [line for line in result.stderr.splitlines()
+                         if 'WARNING: Unable to load command history' not in line]
+      assert 'WARNING:' not in '\n'.join(filtered_stderr), \
+        "A valid config file should not trigger any warning: {0}".format(result.stderr)
+      # Negative Tests
+      # specified config file with live_summary enabled for non interactive mode
+      args = ['--config_file=%s/good_impalarc3' % QUERY_FILE_PATH, '--query=select 3']
+      result = run_impala_shell_cmd(vector, args, expect_success=False)
+      assert 'live_summary is available for interactive mode only' in result.stderr
+
     # testing config file related warning messages
     args = ['--config_file=%s/impalarc_with_warnings2' % QUERY_FILE_PATH]
-    result = run_impala_shell_cmd(
-      vector, args, expect_success=True, wait_until_connected=False)
+    result = run_impala_shell_cmd(vector, args, expect_success=True)
     err_msg = ("WARNING: Unable to read configuration file correctly. "
                "Ignoring unrecognized config option: 'Live_Progress'\n")
     assert err_msg in result.stderr
@@ -666,7 +817,7 @@ class TestImpalaShell(ImpalaTestSuite):
       query_file_handle = open(query_file, 'r')
       query = query_file_handle.read()
       query_file_handle.close()
-    except Exception, e:
+    except Exception as e:
       assert query_file_handle is not None, "Exception %s: Could not find query file" % e
     result = run_impala_shell_cmd(vector, args, expect_success=True, stdin_input=query)
     output = result.stdout
@@ -755,10 +906,8 @@ class TestImpalaShell(ImpalaTestSuite):
         assert msg not in result_stderr, result_stderr
 
   def test_query_time_and_link_message(self, vector, unique_database):
-    if vector.get_value('strict_hs2_protocol'):
-      pytest.skip("IMPALA-10827: Messages not sent back is strict hs2 mode.")
     shell_messages = ["Query submitted at: ", "(Coordinator: ",
-        "Query progress can be monitored at: "]
+        "Query state can be monitored at: "]
     # CREATE statements should not print query time and webserver address.
     results = run_impala_shell_cmd(
         vector, ['--query=create table %s.shell_msg_test (id int)' % unique_database])
@@ -797,50 +946,69 @@ class TestImpalaShell(ImpalaTestSuite):
     self._validate_shell_messages(results.stderr, shell_messages, should_exist=False)
 
   def test_insert_status(self, vector, unique_database):
-    if vector.get_value('strict_hs2_protocol'):
-      pytest.skip("No message sent back in strict hs2 mode.")
     run_impala_shell_cmd(
         vector, ['--query=create table %s.insert_test (id int)' % unique_database])
     results = run_impala_shell_cmd(
         vector, ['--query=insert into %s.insert_test values (1)' % unique_database])
-    assert "Modified 1 row(s)" in results.stderr
 
-  def _validate_dml_stmt(self, vector, stmt, expected_rows_modified, expected_row_errors):
-    results = run_impala_shell_cmd(vector, ['--query=%s' % stmt])
-    expected_output = "Modified %d row(s), %d row error(s)" %\
-        (expected_rows_modified, expected_row_errors)
-    assert expected_output in results.stderr, results.stderr
+    if vector.get_value('strict_hs2_protocol'):
+      assert "Time elapsed" in results.stderr
+    else:
+      assert "Modified 1 row(s)" in results.stderr
 
   def test_kudu_dml_reporting(self, vector, unique_database):
     if vector.get_value('strict_hs2_protocol'):
       pytest.skip("Kudu not supported in strict hs2 mode.")
-    db = unique_database
-    run_impala_shell_cmd(vector, [
-        '--query=create table %s.dml_test (id int primary key, '
-        'age int null) partition by hash(id) partitions 2 stored as kudu' % db])
+    create_sql = 'create table %s (id int primary key, age int null)' \
+        'partition by hash(id) partitions 2 stored as kudu'
+    self._test_dml_reporting(vector, create_sql, unique_database, True)
 
-    self._validate_dml_stmt(
-        vector, "insert into %s.dml_test (id) values (7), (7)" % db, 1, 1)
-    self._validate_dml_stmt(vector, "insert into %s.dml_test (id) values (7)" % db, 0, 1)
-    self._validate_dml_stmt(
-        vector, "upsert into %s.dml_test (id) values (7), (7)" % db, 2, 0)
-    self._validate_dml_stmt(
-        vector, "update %s.dml_test set age = 1 where id = 7" % db, 1, 0)
-    self._validate_dml_stmt(vector, "delete from %s.dml_test where id = 7" % db, 1, 0)
+  def test_iceberg_dml_reporting(self, vector, unique_database):
+    if vector.get_value('strict_hs2_protocol'):
+      pytest.skip("DML results are not completely supported in strict hs2 mode.")
+    create_sql = 'create table %s (id int, age int) ' \
+        'stored as iceberg tblproperties("format-version"="2")'
+    self._test_dml_reporting(vector, create_sql, unique_database, False)
 
-    # UPDATE/DELETE where there are no matching rows; there are no errors because the
-    # scan produced no rows.
-    self._validate_dml_stmt(
-        vector, "update %s.dml_test set age = 1 where id = 8" % db, 0, 0)
-    self._validate_dml_stmt(vector, "delete from %s.dml_test where id = 7" % db, 0, 0)
+  def _test_dml_reporting(self, vector, create_sql, db, is_kudu):
+    """ Runs DMLs on Kudu or Iceberg tables and verifies that modifed / deleted row
+        count and number of row errors in Kudu are reported correctly. Kudu and Iceberg
+        can have different results when adding rows with the same primary key as this
+        leads to row errors in Kudu.
+    """
+    tbl = db + ".dml_test"
+    run_impala_shell_cmd(vector, ['--query=' + create_sql % tbl])
+
+    def validate(stmt, expected_rows_modified_iceberg, expected_rows_modified_kudu,
+                 expected_row_errors_kudu, is_delete=False):
+      results = run_impala_shell_cmd(vector, ['--query=' + stmt % tbl])
+      expected = ""
+      if is_kudu:
+        expected = "Modified %d row(s), %d row error(s)" \
+            % (expected_rows_modified_kudu, expected_row_errors_kudu)
+      elif is_delete and expected_rows_modified_iceberg > 0:
+        expected = "Deleted %d row(s)" % expected_rows_modified_iceberg
+      else:
+        expected = "Modified %d row(s)" % expected_rows_modified_iceberg
+      assert expected in results.stderr, results.stderr
+
+    validate("insert into %s (id) values (7), (7)", 2, 1, 1)
+    validate("insert into %s (id) values (7)", 1, 0, 1)
+    if is_kudu:
+      validate("upsert into %s (id) values (7), (7)", -1, 2, 0)
+    validate("update %s set age = 1 where id = 7", 3, 1, 0)
+    validate("delete from %s where id = 7", 3, 1, 0, is_delete=True)
+
+    # UPDATE/DELETE where there are no matching rows; there are no errors in Kudu because
+    # the scan produced no rows.
+    validate("update %s set age = 1 where id = 8", 0, 0, 0)
+    validate("delete from %s where id = 7", 0, 0, 0, is_delete=True)
 
     # WITH clauses, only apply to INSERT and UPSERT
-    self._validate_dml_stmt(vector,
-        "with y as (values(7)) insert into %s.dml_test (id) select * from y" % db, 1, 0)
-    self._validate_dml_stmt(vector,
-        "with y as (values(7)) insert into %s.dml_test (id) select * from y" % db, 0, 1)
-    self._validate_dml_stmt(vector,
-        "with y as (values(7)) upsert into %s.dml_test (id) select * from y" % db, 1, 0)
+    validate("with y as (values(7)) insert into %s (id) select * from y", 1, 1, 0)
+    validate("with y as (values(7)) insert into %s (id) select * from y", 1, 0, 1)
+    if is_kudu:
+      validate("with y as (values(7)) upsert into %s (id) select * from y", -1, 1, 0)
 
   def test_missing_query_file(self, vector):
     result = run_impala_shell_cmd(vector, ['-f', 'nonexistent.sql'], expect_success=False)
@@ -850,7 +1018,8 @@ class TestImpalaShell(ImpalaTestSuite):
     # Building an one-off shell command instead of using Util::ImpalaShell since we need
     # to customize the impala daemon socket.
     protocol = vector.get_value("protocol")
-    shell_cmd = [IMPALA_SHELL_EXECUTABLE, "--protocol={0}".format(protocol)]
+    impala_shell_executable = get_impala_shell_executable(vector)
+    shell_cmd = impala_shell_executable + ["--protocol={0}".format(protocol)]
     if protocol == 'beeswax':
       expected_output = "get_default_configuration"
     else:
@@ -867,7 +1036,7 @@ class TestImpalaShell(ImpalaTestSuite):
           try:
             connection, client_address = sock.accept()
             break
-          except IOError, e:
+          except IOError as e:
             if e.errno != errno.EINTR:
               raise
         data = connection.recv(1024)
@@ -930,7 +1099,7 @@ class TestImpalaShell(ImpalaTestSuite):
     # This generates a sql file size of ~50K.
     num_cols = 1000
     os.write(sql_file, "select \n")
-    for i in xrange(num_cols):
+    for i in range(num_cols):
       if i < num_cols:
         os.write(sql_file, "col_{0} as a{1},\n".format(i, i))
         os.write(sql_file, "col_{0} as b{1},\n".format(i, i))
@@ -946,7 +1115,9 @@ class TestImpalaShell(ImpalaTestSuite):
       assert "Could not resolve table reference: 'non_existence_large_table'" \
           in result.stderr
       end_time = time()
-      time_limit_s = 20
+      # Use higher timeout in ASAN/UBSAN to avoid flakiness (IMPALA-11921).
+      build_runs_slowly = ImpalaTestClusterProperties.get_instance().runs_slowly()
+      time_limit_s = 60 if build_runs_slowly else 20
       actual_time_s = end_time - start_time
       assert actual_time_s <= time_limit_s, (
           "It took {0} seconds to execute the query. Time limit is {1} seconds.".format(
@@ -1000,15 +1171,18 @@ class TestImpalaShell(ImpalaTestSuite):
 
     # --connect_timeout_ms not supported with HTTP transport. Refer to the comment
     # in ImpalaClient::_get_http_transport() for details.
-    if vector.get_value('protocol') == 'hs2-http': pytest.skip("THRIFT-4600")
+    # --http_socket_timeout_s not supported for strict_hs2_protocol.
+    if (vector.get_value('protocol') == 'hs2-http' and
+          vector.get_value('strict_hs2_protocol')):
+        pytest.skip("THRIFT-4600")
 
     with closing(socket.socket()) as s:
       s.bind(("", 0))
       # maximum number of queued connections on this socket is 1.
       s.listen(1)
       test_port = s.getsockname()[1]
-      args = ['-q', 'select foo; select bar;', '--ssl', '-t', '2000', '-i',
-              'localhost:%d' % (test_port)]
+      args = ['-q', 'select foo; select bar;', '--ssl', '-t', '2000',
+              '--http_socket_timeout_s', '2', '-i', 'localhost:%d' % (test_port)]
       run_impala_shell_cmd(vector, args, expect_success=False)
 
   def test_client_identifier(self, vector):
@@ -1071,6 +1245,31 @@ class TestImpalaShell(ImpalaTestSuite):
     assert "| a    | b     |" in result.stdout, result.stdout
     assert "| true | false |" in result.stdout, result.stdout
 
+  def test_binary_display(self, vector):
+    """Test that binary values are displayed correctly."""
+    query = "select binary_col from functional.binary_tbl"
+    result = run_impala_shell_cmd(vector, ['-q', query])
+    assert "| binary1            |" in result.stdout, result.stdout
+    assert "| NULL               |" in result.stdout, result.stdout
+    assert "|                    |" in result.stdout, result.stdout
+    assert "| árvíztűrőtükörfúró |" in result.stdout, result.stdout
+    assert "| 你好hello          |" in result.stdout, result.stdout
+    assert "| \x00\xef\xbf\xbd\x00\xef\xbf\xbd                 |" in result.stdout, \
+        result.stdout
+    assert '| \xef\xbf\xbdD3"\x11\x00              |' in result.stdout, result.stdout
+
+  def test_binary_as_string(self, vector):
+    query = """select cast(binary_col as string) from functional.binary_tbl
+               where string_col != "invalid utf8" """
+    result = run_impala_shell_cmd(vector, ['-q', query])
+    # Column length omitted because some strict HS2 protocol returns header "binary_col"
+    # while others return "cast(binary_col as string)".
+    assert "| binary1            " in result.stdout, result.stdout
+    assert "| NULL               " in result.stdout, result.stdout
+    assert "|                    " in result.stdout, result.stdout
+    assert "| árvíztűrőtükörfúró " in result.stdout, result.stdout
+    assert "| 你好hello          " in result.stdout, result.stdout
+
   def test_null_values(self, vector):
     """Test that null values are displayed correctly."""
     if vector.get_value('strict_hs2_protocol'):
@@ -1083,18 +1282,26 @@ class TestImpalaShell(ImpalaTestSuite):
     assert "1\t1\t10.1" in result.stdout, result.stdout
     assert "2\t2\t20.2" in result.stdout, result.stdout
 
-    if (vector.get_value("protocol") in ('hs2', 'hs2-http')) and not SHELL_IS_PYTHON_2:
-      # The HS2 client returns binary values for float/double types, and these must
-      # be converted to strings for display. However, due to differences between the
-      # way that python2 and python3 represent floating point values, the output
-      # from the shell will differ with regard to which version of python the
-      # shell is running under.
-      assert "3\t3\t30.299999999999997" in result.stdout, result.stdout
-    else:
-      # python 2, or python 3 with beeswax protocol
-      assert "3\t3\t30.3" in result.stdout, result.stdout
+    # The HS2 client returns binary values for float/double types, and these must
+    # be converted to strings for display. However, due to differences between the
+    # way that python2 and python3 represent floating point values, the output
+    # from the shell will differ with regard to which version of python the
+    # shell is running under.
+    assert("3\t3\t30.299999999999997" in result.stdout or
+      "3\t3\t30.3" in result.stdout), result.stdout
 
     assert "4\t4\t40.4" in result.stdout, result.stdout
+
+  def test_large_fetch(self, vector):
+    query = "select ss_sold_time_sk from tpcds.store_sales limit 50000"
+    output = run_impala_shell_cmd(vector, ['-q', query, '-B', '--output_delimiter=;'])
+    assert "Fetched 50000 row(s)" in output.stderr
+
+  def test_single_null_fetch(self, vector):
+    query = "select null"
+    output = run_impala_shell_cmd(vector, ['-q', query, '-B', '--output_delimiter=;'])
+    assert "NULL" in output.stdout
+    assert "Fetched 1 row(s)" in output.stderr
 
   def test_fetch_size(self, vector):
     """Test the --fetch_size option with and without result spooling enabled."""
@@ -1178,3 +1385,361 @@ class TestImpalaShell(ImpalaTestSuite):
     with open(tmp_file, "r") as f:
       rows_from_file = [line.rstrip() for line in f]
       assert rows_from_stdout == rows_from_file
+
+  def test_output_file_utf8(self, vector, tmp_file):
+    """Test that writing UTF-8 output to a file using '--output_file' produces the
+    same output as written to stdout."""
+    # This is purely about UTF-8 output, so it doesn't need multiple rows.
+    query = "select '引'"
+    # Run the query normally and keep the stdout
+    output = run_impala_shell_cmd(vector, ['-q', query, '-B', '--output_delimiter=;'])
+    assert "Fetched 1 row(s)" in output.stderr
+    rows_from_stdout = output.stdout.strip().split('\n')
+    # Run the query with output sent to a file using '--output_file'.
+    result = run_impala_shell_cmd(vector, ['-q', query, '-B', '--output_delimiter=;',
+                                           '--output_file=%s' % tmp_file])
+    assert "Fetched 1 row(s)" in result.stderr
+    with open(tmp_file, "r") as f:
+      rows_from_file = [line.rstrip() for line in f]
+      assert rows_from_stdout == rows_from_file
+
+  def test_http_socket_timeout(self, vector):
+    """Test setting different http_socket_timeout_s values."""
+    if (vector.get_value('strict_hs2_protocol') or
+          vector.get_value('protocol') != 'hs2-http'):
+        pytest.skip("http socket timeout not supported in strict hs2 mode."
+                    " Only supported with hs2-http protocol.")
+    # Test http_socket_timeout_s=0, expect errors
+    args = ['--quiet', '-B', '--query', 'select 0;']
+    result = run_impala_shell_cmd(vector, args + ['--http_socket_timeout_s=0'],
+                                  expect_success=False)
+
+    # Outside the docker-based tests, Python 2 and Python 3 produce "Operating
+    # now in progress" with slightly different error classes. When running with
+    # docker-based tests, it results in a different error code and "Cannot
+    # assign requested address" for both Python 2 and Python 3.
+    # Tolerate all three of these variants.
+    error_template = (
+      "[Exception] type=<class '{0}'> in OpenSession. Num remaining tries: 3 "
+      "[Errno {1}] {2}")
+    expected_err_py2 = \
+        error_template.format("socket.error", 115, "Operation now in progress")
+    expected_err_py3 = \
+        error_template.format("BlockingIOError", 115, "Operation now in progress")
+    expected_err_docker = \
+        error_template.format("OSError", 99, "Cannot assign requested address")
+    actual_err = result.stderr.splitlines()[0]
+    assert actual_err[TS_LEN:] in [expected_err_py2, expected_err_py3,
+                                   expected_err_docker]
+
+    # Test http_socket_timeout_s=-1, expect errors
+    result = run_impala_shell_cmd(vector, args + ['--http_socket_timeout_s=-1'],
+                                  expect_success=False)
+    expected_err = ("http_socket_timeout_s must be a nonnegative floating point number"
+                    " expressing seconds, or None")
+    assert result.stderr.splitlines()[0] == expected_err
+
+    # Test http_socket_timeout_s>0, expect success
+    result = run_impala_shell_cmd(vector, args + ['--http_socket_timeout_s=2'])
+    assert result.stderr == ""
+    assert result.stdout == "0\n"
+
+    # Test http_socket_timeout_s=None, expect success
+    result = run_impala_shell_cmd(vector, args + ['--http_socket_timeout_s=None'])
+    assert result.stderr == ""
+    assert result.stdout == "0\n"
+
+  def test_connect_max_tries(self, vector):
+    """Test setting different connect_max_tries values."""
+    if (vector.get_value('strict_hs2_protocol')
+        or vector.get_value('protocol') != 'hs2-http'):
+      pytest.skip("connect_max_tries not supported in strict hs2 mode."
+                  " Only supported with hs2-http protocol.")
+
+    # Test connect_max_tries=-1, expect errors
+    args = ['--quiet', '-B', '--query', 'select 0;']
+    result = run_impala_shell_cmd(vector, args + ['--connect_max_tries=-1'],
+                                  expect_success=False)
+    expected_err = ("connect_max_tries must be greater than or equal to 1")
+    assert result.stderr.splitlines()[0] == expected_err
+
+    # Test connect_max_tries=0, expect errors
+    result = run_impala_shell_cmd(vector, args + ['--connect_max_tries=0'],
+                                  expect_success=False)
+    expected_err = ("connect_max_tries must be greater than or equal to 1")
+    assert result.stderr.splitlines()[0] == expected_err
+
+    # Test connect_max_tries>0, expect success
+    result = run_impala_shell_cmd(vector, args + ['--connect_max_tries=2'])
+    assert result.stderr == ""
+    assert result.stdout == "0\n"
+
+  def test_trailing_whitespace(self, vector):
+    """Test CSV output with trailing whitespace"""
+
+    # Ten trailing spaces
+    query = "select 'Trailing Whitespace          ' as x"
+    # Only one column, no need for output_delimiter
+    output = run_impala_shell_cmd(vector, ['-q', query, '-B'])
+    assert "Fetched 1 row(s)" in output.stderr
+    assert "Trailing Whitespace          \n" in output.stdout
+    output = run_impala_shell_cmd(vector, ['-q', query, '-E'])
+    assert "Fetched 1 row(s)" in output.stderr
+    assert "x: Trailing Whitespace          \n" in output.stdout
+
+  def test_shell_flush(self, vector, tmp_file):
+    """Verify that the rows are flushed before the Fetch X row(s) message"""
+
+    # Run a simple "select 1" with stdout and stderr redirected to the same file.
+    with open(tmp_file, "w") as f:
+      output = run_impala_shell_cmd(vector, ['-q', DEFAULT_QUERY, '-B'], stdout_file=f,
+                                    stderr_file=f)
+      # Stdout and stderr should be empty
+      assert output.stderr is None
+      assert output.stdout is None
+
+    # Verify the file contents
+    # The output should be in this order:
+    # 1\n
+    # Fetched 1 row(s) in ...\n
+    with open(tmp_file, "r") as f:
+      lines = f.readlines()
+      assert len(lines) >= 2
+      assert "1\n" in lines[len(lines) - 2]
+      assert "Fetched 1 row(s)" in lines[len(lines) - 1]
+
+  def skip_if_protocol_is_beeswax(self, vector,
+      skip_msg="Floating-point value formatting is not supported with Beeswax"):
+    """Helper to skip Beeswax protocol on formatting tests"""
+    if vector.get_value("protocol") == "beeswax":
+      pytest.skip(skip_msg)
+
+  def validate_fp_format(self, vector, column_type, format, value, expected_values):
+    args = ['--hs2_fp_format', format, '-q',
+           'select cast("%s" as %s) as fp_value' % (value, column_type)]
+    result = run_impala_shell_cmd(vector, args)
+
+    assert(any(expected_value in result.stdout for expected_value in expected_values))
+
+  def test_hs2_fp_format_types(self, vector):
+    """Tests formatting with double and float value"""
+    self.skip_if_protocol_is_beeswax(vector)
+    self.validate_fp_format(vector, column_type='double', format='.16f',
+                            value='0.1234567891011121314',
+                            expected_values='0.1234567891011121')
+
+    expected_values_float = ['0.12345679104328156', '0.12345679000000000']
+    self.validate_fp_format(vector, column_type='float', format='.17f',
+                            value='0.1234567891011121314',
+                            expected_values=expected_values_float)
+
+  def test_hs2_fp_format_modifiers(self, vector):
+    """Test formatting with various modifiers, like mode, grouping, sign"""
+    self.skip_if_protocol_is_beeswax(vector)
+    self.validate_fp_format(vector, column_type='double', format='+f',
+                            value='123456789123456789',
+                            expected_values='+123456789123456784.000000')
+
+    self.validate_fp_format(vector, column_type='double', format='+.16f',
+                            value='-12.3456789123456789',
+                            expected_values='-12.3456789123456794')
+
+    expected_grouped_value = '+123,456,788,999,999,994,034,486,658,482,569,216.000000'
+    self.validate_fp_format(vector, column_type='double', format='+,f',
+                            value='1.23456789e+35',
+                            expected_values=expected_grouped_value)
+
+    self.validate_fp_format(vector, column_type='double', format='+E',
+                            value='12345678912345',
+                            expected_values='+1.234568E+13')
+
+  def test_hs2_fp_format_nan_inf_null(self, vector):
+    """Test NaN, inf, null value formatting"""
+    self.skip_if_protocol_is_beeswax(vector)
+    self.validate_fp_format(vector, column_type='double', format='F',
+                            value='NaN',
+                            expected_values='NAN')
+
+    self.validate_fp_format(vector, column_type='double', format='F',
+                            value='-inf',
+                            expected_values=['-INF', 'NULL'])
+
+    self.validate_fp_format(vector, column_type='double', format='F',
+                            value='NULL',
+                            expected_values='NULL')
+
+  def test_hs2_fp_format_invalid(self, vector):
+    """Test invalid format specification"""
+    self.skip_if_protocol_is_beeswax(vector)
+    error_message = 'Invalid floating point format specification: invalid'
+    args = ['--hs2_fp_format', 'invalid']
+    result = run_impala_shell_cmd(vector, args, expect_success=False)
+
+    assert error_message in result.stderr
+
+  def test_fp_default(self, vector):
+    """Test default floating point value formatting"""
+    expected_py2 = '0.123456789101'
+    expected_py3 = '0.1234567891011121'
+    args = ['-q', 'select cast("0.1234567891011121314" as double) as fp_value', '-B']
+    result = run_impala_shell_cmd(vector, args)
+
+    assert expected_py2 in result.stdout or expected_py3 in result.stdout
+
+  def test_hs2_x_forward(self, vector):
+    """Test that when we use the --hs2_x_forward flag with hs2-http
+    protocol then the X-Forwarded-For http header is set, and this
+    value is reported in the 'Http Origin' field of the profile."""
+    if vector.get_value('strict_hs2_protocol'):
+      pytest.skip("Skip as no profile with strict protocol.")
+    expect_header = vector.get_value('protocol') == 'hs2-http'
+    args = ['-q', 'select 1;profile;',
+            '--hs2_x_forward=a_forwarded_origin_header b_forwarded_origin_header']
+    result = run_impala_shell_cmd(vector, args)
+    found_http_origin = ("Http Origin: a_forwarded_origin_header "
+                         "b_forwarded_origin_header") in result.stdout
+    assert found_http_origin == expect_header
+
+  def test_hs2_x_forward_long(self, vector):
+    """Test that when we use the --hs2_x_forward flag with hs2-http
+    protocol then when passing a very long string, the 'Http Origin'
+    field of the profile is truncated."""
+    if vector.get_value('strict_hs2_protocol'):
+      pytest.skip("Skip as no profile with strict protocol.")
+    expect_header = vector.get_value('protocol') == 'hs2-http'
+    long_string = 'a' * 10000
+    expected_string = 'a' * 8096
+    args = ['-q', 'select 1;profile;',
+            '--hs2_x_forward={0}'.format(long_string)]
+    result = run_impala_shell_cmd(vector, args)
+    found_http_origin = ("Http Origin: {0}".format(expected_string)) in result.stdout
+    assert found_http_origin == expect_header
+    assert long_string not in result.stdout
+
+  def test_output_rpc_to_screen_and_file(self, vector, populated_table, tmp_file):
+    """Tests the flags that output hs2 rpc call details to both stdout
+    and a file.  Asserts the expected text is written."""
+    self.skip_if_protocol_is_beeswax(vector,
+        "rpc detail output not supported with beeswax protocol")
+
+    args = ['--rpc_stdout', '--rpc_file', tmp_file,
+            '-q', 'select * from {0}'.format(populated_table),
+            '--protocol={0}'.format(vector.get_value("protocol"))]
+    if vector.get_value("strict_hs2_protocol") is True:
+      args.append('--strict_hs2_protocol')
+
+    result = run_impala_shell_cmd(vector, args)
+
+    stdout_data = result.stdout.strip()
+    rpc_file_data = open(tmp_file, "r").read().strip()
+
+    # compare the rpc details from stdout and file to ensure they match
+    # stdout contains additional output such as query results, remove all non-rpc details
+    rpc_sep = "------------------------------------------------" + \
+              "------------------------------------------------"
+    stdout_data_rpc_only = ""
+    in_rpc_detail = False
+    for line in stdout_data.split("\n"):
+      if line == rpc_sep:
+        in_rpc_detail = not in_rpc_detail
+        stdout_data_rpc_only += line + "\n"
+      elif in_rpc_detail:
+        stdout_data_rpc_only += line + "\n"
+
+    # rpc only stdout data contains an extra ending newline
+    rpc_file_data += "\n"
+
+    assert stdout_data_rpc_only == rpc_file_data, \
+        "difference found between stdout and rpc file:\nSTDOUT:\n{0}\nFILE:\n{1}" \
+        .format(stdout_data_rpc_only, rpc_file_data)
+
+    def check_multiline(check_desc, regex_lines):
+      """Build and runs a multi-line regular expression against both the
+      shell's stdout and rpc file contents to ensure the expected data about
+      the hs2 rpc calls was outputted."""
+      the_re = re.compile("^" + "\n".join(regex_lines) + "$", re.MULTILINE)
+      assert the_re.search(stdout_data), \
+             "'{0}' assert failed in stdout: \n{1}" \
+             .format(check_desc, stdout_data)
+      assert the_re.search(rpc_file_data), \
+             "'{0}' assert failed in the rpc file contents: \n{1}" \
+             .format(check_desc, rpc_file_data)
+
+    check_multiline("Open Session Request",
+                    [
+                      "{0}{1}".format(
+                        "\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{6}\\] ",
+                        "RPC CALL STARTED:"),
+                      "OPERATION: OpenSession",
+                      "DETAILS:",
+                      "  \\* Impala Session Id: None",
+                      "  \\* Impala Query Id:   None",
+                      "  \\* Attempt Count:     1",
+                      "",
+                      "RPC REQUEST:",
+                      "\\<TOpenSessionReq\\>",
+                      "    - client_protocol: 5",
+                      "    - configuration: <None>",
+                      "    - password: <None>",
+                      "    - username: .*?",
+                    ])
+
+    check_multiline("Open Session Response",
+                    [
+                      "{0}{1}".format(
+                        "\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{6}\\] ",
+                        "RPC CALL FINISHED:"),
+                      "OPERATION: OpenSession",
+                      "DETAILS:",
+                      "  \\* Time:   \\d+(\\.\\d+)?ms",
+                      "  \\* Result: SUCCESS",
+                      "",
+                      "RPC RESPONSE:",
+                      "\\<TOpenSessionResp\\>",
+                      "    - configuration: .*?",
+                      "    - serverProtocolVersion: .*?",
+                      "    - sessionHandle: \\<TSessionHandle\\>",
+                      "                       - sessionId: \\<THandleIdentifier\\>",
+                      "                                      - guid: \\<binary data\\>",
+                      "                                      - secret: "
+                      "\\*\\*\\*\\*\\*\\*\\*",
+                      "    - status: \\<TStatus\\>",
+                      "                - errorCode: \\<None\\>",
+                      "                - errorMessage: \\<None\\>",
+                      "                - infoMessages: \\<None\\>",
+                      "                - sqlState: \\<None\\>",
+                      "                - statusCode: 0",
+                    ])
+
+    check_multiline("Session and Query Id",
+                    [
+                      "{0}{1}".format(
+                        "\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{6}\\] ",
+                        "RPC CALL STARTED:"),
+                      "OPERATION: FetchResults",
+                      "DETAILS:",
+                      "  \\* Impala Session Id: [a-z0-9]*:[a-z0-9]*",
+                      "  \\* Impala Query Id:   [a-z0-9]*:[a-z0-9]*",
+                    ])
+
+    check_multiline("TRowSet Skipped",
+                    [
+                      "{0}{1}".format(
+                        "\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{6}\\] ",
+                        "RPC CALL FINISHED:"),
+                      "OPERATION: FetchResults",
+                      "DETAILS:",
+                      "  \\* Time:   \\d+(\\.\\d+)?ms",
+                      "  \\* Result: SUCCESS",
+                      "",
+                      "RPC RESPONSE:",
+                      "<TFetchResultsResp>",
+                      "    - hasMoreRows: False",
+                      "    - results: <TRowSet> - <skipping>",
+                      "    - status: <TStatus>",
+                      "                - errorCode: <None>",
+                      "                - errorMessage: <None>",
+                      "                - infoMessages: <None>",
+                      "                - sqlState: <None>",
+                      "                - statusCode: 0",
+                    ])

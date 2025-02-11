@@ -17,13 +17,10 @@
 
 package org.apache.impala.analysis;
 
+import com.google.common.base.Joiner;
 import java.util.ArrayList;
 import java.util.List;
-
-import com.google.common.base.Joiner;
-
 import org.apache.impala.common.AnalysisException;
-import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TIcebergPartitionSpec;
 
 /**
@@ -39,13 +36,13 @@ import org.apache.impala.thrift.TIcebergPartitionSpec;
  * )
  */
 public class IcebergPartitionSpec extends StmtNode {
-  // Partition id from iceberg PartitionSpec
-  private int partitionId_;
+  // Partition spec id from iceberg PartitionSpec
+  private int specId_;
 
   private List<IcebergPartitionField> icebergPartitionFields_;
 
   public IcebergPartitionSpec(int partitionId, List<IcebergPartitionField> fields) {
-    partitionId_ = partitionId;
+    specId_ = partitionId;
     icebergPartitionFields_ = fields;
   }
 
@@ -60,6 +57,8 @@ public class IcebergPartitionSpec extends StmtNode {
   public boolean hasPartitionFields() {
     return icebergPartitionFields_ != null && (!icebergPartitionFields_.isEmpty());
   }
+
+  public int getSpecId() { return specId_; }
 
   public int getIcebergPartitionFieldsSize() {
     if (!hasPartitionFields()) return 0;
@@ -97,7 +96,7 @@ public class IcebergPartitionSpec extends StmtNode {
 
   public TIcebergPartitionSpec toThrift() {
     TIcebergPartitionSpec result = new TIcebergPartitionSpec();
-    result.setPartition_id(partitionId_);
+    result.setSpec_id(specId_);
     if (!hasPartitionFields()) return result;
     for (IcebergPartitionField field : icebergPartitionFields_) {
       result.addToPartition_fields(field.toThrift());

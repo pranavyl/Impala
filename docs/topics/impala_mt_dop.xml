@@ -21,7 +21,7 @@ under the License.
 <concept id="mt_dop">
 
   <title>MT_DOP Query Option</title>
-  <titlealts audience="PDF"><navtitle>MT_DOP</navtitle></titlealts>
+  <titlealts audience="PDF"><navtitle>MT DOP</navtitle></titlealts>
   <prolog>
     <metadata>
       <data name="Category" value="Impala"/>
@@ -68,13 +68,6 @@ under the License.
             than 0 to control intra-node parallelism. This may be useful to tune
             query performance and in particular to reduce execution time of
             long-running, CPU-intensive queries.
-          </p>
-        </li>
-        <li>
-          <p>
-            <codeph>DML</codeph> statements. <codeph>MT_DOP</codeph> values greater
-            than zero are not currently supported for DML statements. DML statements
-            will produce an error if <codeph>MT_DOP</codeph> is set to a non-zero value.
           </p>
         </li>
         <li>

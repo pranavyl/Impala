@@ -43,14 +43,32 @@
 using std::hex;
 using std::rename;
 
+DEFINE_bool_hidden(codegen_symbol_emitter_log_successful_destruction_test_only, false,
+    "Log when a 'CodegenSymbolCache' object is destroyed correctly, i.e. "
+    "'non_freed_objects_' is zero. Only used for testing.");
+
 namespace impala {
 
 SpinLock CodegenSymbolEmitter::perf_map_lock_;
 unordered_map<const void*, vector<CodegenSymbolEmitter::PerfMapEntry>>
     CodegenSymbolEmitter::perf_map_;
 
+CodegenSymbolEmitter::~CodegenSymbolEmitter() {
+  if (non_freed_objects_ != 0) {
+    stringstream s;
+    s << "The difference between the number of emitted and freed object files "
+        << "should be zero, but was " << non_freed_objects_ << ".";
+    const string& msg = s.str();
+    DCHECK(false) << msg;
+    LOG(WARNING) << msg;
+  } else if (FLAGS_codegen_symbol_emitter_log_successful_destruction_test_only) {
+    LOG(INFO) << "Successful destruction of CodegenSymbolEmitter object.";
+  }
+}
+
 void CodegenSymbolEmitter::NotifyObjectEmitted(const llvm::object::ObjectFile& obj,
     const llvm::RuntimeDyld::LoadedObjectInfo& loaded_obj) {
+  non_freed_objects_++;
   vector<PerfMapEntry> perf_map_entries;
 
   ofstream asm_file;
@@ -74,7 +92,10 @@ void CodegenSymbolEmitter::NotifyObjectEmitted(const llvm::object::ObjectFile& o
     ProcessSymbol(&dwarf_ctx, pair.first, pair.second, &perf_map_entries, asm_file);
   }
 
-  if (asm_file.is_open()) asm_file.close();
+  if (asm_file.is_open()) {
+    asm_file.close();
+    LOG(INFO) << "Saved disassembly to " << asm_path_;
+  }
 
   ofstream perf_map_file;
   if (emit_perf_map_) {
@@ -86,6 +107,7 @@ void CodegenSymbolEmitter::NotifyObjectEmitted(const llvm::object::ObjectFile& o
 }
 
 void CodegenSymbolEmitter::NotifyFreeingObject(const llvm::object::ObjectFile& obj) {
+  non_freed_objects_--;
   if (emit_perf_map_) {
     lock_guard<SpinLock> perf_map_lock(perf_map_lock_);
     DCHECK(perf_map_.find(obj.getData().data()) != perf_map_.end());

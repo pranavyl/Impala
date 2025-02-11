@@ -17,6 +17,8 @@
 #
 # Tests for IMPALA-2273
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import os
 import pytest
 import random
@@ -24,8 +26,7 @@ import string
 import subprocess
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon, SkipIfGCS,
-                               SkipIfCOS)
+from tests.common.skip import SkipIfFS
 
 class TestParquetMaxPageHeader(CustomClusterTestSuite):
   '''This tests large page headers in parquet files. Parquet page header size can
@@ -59,13 +60,12 @@ class TestParquetMaxPageHeader(CustomClusterTestSuite):
 
   def setup_method(self, method):
     super(TestParquetMaxPageHeader, self).setup_method(method)
-    impalad = self.cluster.impalads[0]
-    client = impalad.service.create_beeswax_client()
-    self.client = client
+    self.create_impala_clients()
     self.__create_test_tbls()
 
   def teardown_method(self, method):
     self.__drop_test_tbls()
+    self.close_impala_clients()
 
   def __drop_test_tbls(self):
     self.client.execute("DROP TABLE IF EXISTS %s PURGE" % self.TEXT_TABLE_NAME)
@@ -90,23 +90,18 @@ class TestParquetMaxPageHeader(CustomClusterTestSuite):
     """Creates a file in HDFS containing two MAX_STRING_LENGTH lines."""
     file_name = os.path.join(dir, file)
     # Create two 10MB long strings.
-    random_text1 = "".join([random.choice(string.letters)
-        for i in xrange(self.MAX_STRING_LENGTH)])
-    random_text2 = "".join([random.choice(string.letters)
-        for i in xrange(self.MAX_STRING_LENGTH)])
+    random_text1 = "".join([random.choice(string.ascii_letters)
+        for i in range(self.MAX_STRING_LENGTH)])
+    random_text2 = "".join([random.choice(string.ascii_letters)
+        for i in range(self.MAX_STRING_LENGTH)])
     put = subprocess.Popen(["hdfs", "dfs", "-put", "-d", "-f", "-", file_name],
-        stdin=subprocess.PIPE, bufsize=-1)
+        stdin=subprocess.PIPE, bufsize=-1, universal_newlines=True)
     put.stdin.write(random_text1 + "\n")
     put.stdin.write(random_text2)
     put.stdin.close()
     put.wait()
 
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
+  @SkipIfFS.hive
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args("-max_page_header_size=31457280")
   def test_large_page_header_config(self, vector):

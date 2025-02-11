@@ -22,12 +22,12 @@
 #include <algorithm>
 #include <iostream>
 #include <numeric>
+#include <type_traits>
 
 #include <boost/utility.hpp>
 
 #include "runtime/multi-precision.h"
 #include "testutil/gtest-util.h"
-#include "gutil/sysinfo.h"
 #include "util/arithmetic-util.h"
 #include "util/bit-util.h"
 #include "util/cpu-info.h"
@@ -135,7 +135,7 @@ TEST(BitUtil, TrailingBits) {
 void TestByteSwapSimd_Unit(const int64_t CpuFlag) {
   void (*bswap_fptr)(const uint8_t* src, uint8_t* dst) = NULL;
   int buf_size = 0;
-  if (base::IsAarch64() || CpuFlag == CpuInfo::SSSE3) {
+  if (IS_AARCH64 || CpuFlag == CpuInfo::SSSE3) {
     buf_size = 16;
     bswap_fptr = SimdByteSwap::ByteSwap128;
   } else {
@@ -180,7 +180,7 @@ void TestByteSwapSimd(const int64_t CpuFlag, const int buf_size) {
   std::iota(src_buf, src_buf + buf_size, 0);
 
   int start_size = 0;
-  if (base::IsAarch64() || CpuFlag == CpuInfo::SSSE3) {
+  if (IS_AARCH64 || CpuFlag == CpuInfo::SSSE3) {
     start_size = 16;
   } else if (CpuFlag == CpuInfo::AVX2) {
     start_size = 32;
@@ -189,7 +189,7 @@ void TestByteSwapSimd(const int64_t CpuFlag, const int buf_size) {
   for (int i = start_size; i < buf_size; ++i) {
     // Initialize dst buffer and swap i bytes.
     memset(dst_buf, 0, buf_size);
-    if (base::IsAarch64() || CpuFlag == CpuInfo::SSSE3) {
+    if (IS_AARCH64 || CpuFlag == CpuInfo::SSSE3) {
       SimdByteSwap::ByteSwapSimd<16>(src_buf, i, dst_buf);
     } else if (CpuFlag == CpuInfo::AVX2) {
       SimdByteSwap::ByteSwapSimd<32>(src_buf, i, dst_buf);
@@ -254,6 +254,44 @@ TEST(BitUtil, ByteSwap) {
 
   // Test BitUtil::ByteSwap(Black Box Testing)
   for (int i = 0; i <= 32; ++i) TestByteSwapSimd(0, i);
+}
+
+template <class INT_T>
+void TestCountLeadingZeros() {
+  constexpr int BITWIDTH = sizeof(INT_T) * 8;
+  using UINT_T = typename MakeUnsigned<INT_T>::type;
+  // Unsigned constant 1 with bit width of BITWIDTH.
+  constexpr UINT_T ONE = 1;
+
+  // Test 0.
+  EXPECT_EQ(BITWIDTH, BitUtil::CountLeadingZeros<INT_T>(0));
+
+  // Test 1.
+  EXPECT_EQ(BITWIDTH - 1, BitUtil::CountLeadingZeros<INT_T>(ONE));
+
+  for (int i = 2; i < BITWIDTH - 1; ++i) {
+    INT_T smallest_with_bit_width = ONE << (i - 1);
+    EXPECT_EQ(BITWIDTH - i, BitUtil::CountLeadingZeros(smallest_with_bit_width));
+
+    INT_T largest_with_bit_width = (ONE << i) - 1;
+    EXPECT_EQ(BITWIDTH - i, BitUtil::CountLeadingZeros(largest_with_bit_width));
+  }
+
+  // Test max value for unsigned int types - for signed types they are negative which we
+  // don't allow.
+  if (std::is_same_v<INT_T, UINT_T>) {
+    UINT_T max = std::numeric_limits<UINT_T>::max();
+    EXPECT_EQ(0, BitUtil::CountLeadingZeros(max));
+  }
+}
+
+TEST(BitUtil, CountLeadingZeros) {
+  TestCountLeadingZeros<int32_t>();
+  TestCountLeadingZeros<uint32_t>();
+  TestCountLeadingZeros<int64_t>();
+  TestCountLeadingZeros<uint64_t>();
+  TestCountLeadingZeros<__int128>();
+  TestCountLeadingZeros<unsigned __int128>();
 }
 
 TEST(BitUtil, Log2) {

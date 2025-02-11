@@ -20,7 +20,6 @@
 #include <algorithm>
 #include <mutex>
 #include <sstream>
-#include <boost/lexical_cast.hpp>
 #include <boost/unordered_set.hpp>
 #include <rapidjson/prettywriter.h>
 #include <rapidjson/stringbuffer.h>
@@ -43,8 +42,8 @@
 #include "service/client-request-state.h"
 #include "service/frontend.h"
 #include "service/impala-server.h"
+#include "service/query-state-record.h"
 #include "thrift/protocol/TDebugProtocol.h"
-#include "util/coding-util.h"
 #include "util/debug-util.h"
 #include "util/logging-support.h"
 #include "util/pretty-printer.h"
@@ -64,6 +63,7 @@ using namespace rapidjson;
 using namespace strings;
 
 DECLARE_int32(query_log_size);
+DECLARE_int64(query_log_size_in_bytes);
 DECLARE_int32(query_stmt_size);
 DECLARE_bool(use_local_catalog);
 DECLARE_string(admission_service_host);
@@ -105,6 +105,14 @@ ImpalaHttpHandler::ImpalaHttpHandler(ImpalaServer* server,
 void ImpalaHttpHandler::RegisterHandlers(Webserver* webserver, bool metrics_only) {
   DCHECK(webserver != NULL);
 
+  Webserver::RawUrlCallback healthz_callback =
+    [this](const auto& req, auto* data, auto* response) {
+      return this->HealthzHandler(req, data, response);
+    };
+  webserver->RegisterUrlCallback("/healthz", healthz_callback);
+
+  if (metrics_only) return;
+
   if (is_admissiond_) {
     // The admissiond only exposes a subset of endpoints that have info relevant to
     // admission control.
@@ -118,14 +126,6 @@ void ImpalaHttpHandler::RegisterHandlers(Webserver* webserver, bool metrics_only
         MakeCallback(this, &ImpalaHttpHandler::ResetResourcePoolStatsHandler), false);
     return;
   }
-
-  Webserver::RawUrlCallback healthz_callback =
-    [this](const auto& req, auto* data, auto* response) {
-      return this->HealthzHandler(req, data, response);
-    };
-  webserver->RegisterUrlCallback("/healthz", healthz_callback);
-
-  if (metrics_only) return;
 
   webserver->RegisterUrlCallback("/backends", "backends.tmpl",
       MakeCallback(this, &ImpalaHttpHandler::BackendsHandler), true);
@@ -187,6 +187,11 @@ void ImpalaHttpHandler::RegisterHandlers(Webserver* webserver, bool metrics_only
       [this](const auto& req, auto* doc) {
         this->QuerySummaryHandler(true, true, req, doc); }, false);
 
+  webserver->RegisterUrlCallback("/query_timeline", "query_timeline.tmpl",
+      [this](const auto& req, auto* doc) {
+        this->QueryProfileHelper(req, doc, TRuntimeProfileFormat::JSON, true);
+        }, false);
+
   webserver->RegisterUrlCallback("/query_plan_text", "query_plan_text.tmpl",
       [this](const auto& req, auto* doc) {
         this->QuerySummaryHandler(false, false, req, doc); }, false);
@@ -210,7 +215,9 @@ void ImpalaHttpHandler::RegisterHandlers(Webserver* webserver, bool metrics_only
 
 void ImpalaHttpHandler::HealthzHandler(const Webserver::WebRequest& req,
     std::stringstream* data, HttpStatusCode* response) {
-  if (server_->IsHealthy()) {
+  if ((server_ != nullptr && server_->IsHealthy()) ||
+      (is_admissiond_ &&
+       AdmissiondEnv::GetInstance()->admission_control_service()->IsHealthy())) {
     (*data) << "OK";
     *response = HttpStatusCode::Ok;
     return;
@@ -223,11 +230,17 @@ void ImpalaHttpHandler::HadoopVarzHandler(const Webserver::WebRequest& req,
     Document* document) {
   TGetAllHadoopConfigsResponse response;
   Status status  = server_->exec_env_->frontend()->GetAllHadoopConfigs(&response);
-  if (!status.ok()) return;
+  if (!status.ok()) {
+    LOG(ERROR) << "Error getting cluster configuration for hadoop-varz: "
+               << status.GetDetail();
+    Value error(status.GetDetail().c_str(), document->GetAllocator());
+    document->AddMember("error", error, document->GetAllocator());
+    return;
+  }
 
   Value configs(kArrayType);
   typedef map<string, string> ConfigMap;
-  for (const ConfigMap::value_type& config: response.configs) {
+  for (const auto& config: response.configs) {
     Value key(config.first.c_str(), document->GetAllocator());
     Value value(config.second.c_str(), document->GetAllocator());
     Value config_json(kObjectType);
@@ -297,6 +310,9 @@ void ImpalaHttpHandler::QueryProfileHandler(const Webserver::WebRequest& req,
     return;
   }
 
+  Value query_id_val(PrintId(unique_id).c_str(), document->GetAllocator());
+  document->AddMember("query_id", query_id_val, document->GetAllocator());
+
   ImpalaServer::RuntimeProfileOutput runtime_profile;
   stringstream ss;
   runtime_profile.string_output = &ss;
@@ -310,13 +326,10 @@ void ImpalaHttpHandler::QueryProfileHandler(const Webserver::WebRequest& req,
 
   Value profile(ss.str().c_str(), document->GetAllocator());
   document->AddMember("profile", profile, document->GetAllocator());
-  const auto& args = req.parsed_args;
-  Value query_id(args.find("query_id")->second.c_str(), document->GetAllocator());
-  document->AddMember("query_id", query_id, document->GetAllocator());
 }
 
 void ImpalaHttpHandler::QueryProfileHelper(const Webserver::WebRequest& req,
-    Document* document, TRuntimeProfileFormat::type format) {
+    Document* document, TRuntimeProfileFormat::type format, bool internal_profile) {
   TUniqueId unique_id;
   stringstream ss;
   Status status = ParseIdFromRequest(req, &unique_id, "query_id");
@@ -324,10 +337,16 @@ void ImpalaHttpHandler::QueryProfileHelper(const Webserver::WebRequest& req,
     ss << status.GetDetail();
   } else {
     ImpalaServer::RuntimeProfileOutput runtime_profile;
-    runtime_profile.string_output = &ss;
+    if (internal_profile) {
+      Value query_id_val(PrintId(unique_id).c_str(), document->GetAllocator());
+      document->AddMember("query_id", query_id_val, document->GetAllocator());
+      document->AddMember("internal_profile", true, document->GetAllocator());
+    }
+    if (format != TRuntimeProfileFormat::JSON) {
+      runtime_profile.string_output = &ss;
+    }
     runtime_profile.json_output = document;
-    Status status =
-        server_->GetRuntimeProfileOutput(unique_id, "", format, &runtime_profile);
+    status = server_->GetRuntimeProfileOutput(unique_id, "", format, &runtime_profile);
     if (!status.ok()) {
       ss.str(Substitute("Could not obtain runtime profile: $0", status.GetDetail()));
     }
@@ -336,6 +355,16 @@ void ImpalaHttpHandler::QueryProfileHelper(const Webserver::WebRequest& req,
   if (format != TRuntimeProfileFormat::JSON){
     Value profile(ss.str().c_str(), document->GetAllocator());
     document->AddMember("contents", profile, document->GetAllocator());
+  } else if (internal_profile) {
+    if (!status.ok()) {
+      Value error(ss.str().c_str(), document->GetAllocator());
+      document->AddMember("error", error, document->GetAllocator());
+      return;
+    }
+    // Add OK Status like other handlers have. These status lines could be
+    // eliminated if error was handled uniformly in all handlers.
+    Value json_status("OK");
+    document->AddMember("status", json_status, document->GetAllocator());
   }
 }
 
@@ -399,8 +428,98 @@ void ImpalaHttpHandler::QueryMemoryHandler(const Webserver::WebRequest& req,
   document->AddMember("query_id", query_id, document->GetAllocator());
 }
 
-void ImpalaHttpHandler::QueryStateToJson(const ImpalaServer::QueryStateRecord& record,
-    Value* value, Document* document) {
+void ImpalaHttpHandler::AddQueryRecordTips(Document* document) {
+  document->AddMember("tips_query_id", "Unique ID of the query, click ID to jump to the "
+      "query details page to get more detailed information.", document->GetAllocator());
+
+  document->AddMember("tips_action_cancel", "Cancel the query, abort the execution and "
+      "release resources.", document->GetAllocator());
+
+  document->AddMember("tips_action_close", "Close the query and release resources.",
+      document->GetAllocator());
+
+  document->AddMember("tips_user", "The user who submitted the query.",
+      document->GetAllocator());
+
+  document->AddMember("tips_default_db", "The default database for query.",
+      document->GetAllocator());
+
+  document->AddMember("tips_query_type", "The type of query.",
+      document->GetAllocator());
+
+  document->AddMember("tips_start_time", "The start time of the query, i.e. the time when"
+      " the query was submitted.", document->GetAllocator());
+
+  document->AddMember("tips_waiting_time", "The duration of the query in the waiting to "
+      "close state.", document->GetAllocator());
+
+  document->AddMember("tips_end_time", "The end time of the query, i.e. the time when the"
+      " query is completed, canceled or failed.", document->GetAllocator());
+
+  document->AddMember("tips_first_fetch", "The time taken to fetch the first row."
+      " Available in the query profile as \"First row fetched\".",
+      document->GetAllocator());
+
+  document->AddMember("tips_client_fetch_duration", "Total time spent returning rows to "
+      "the client and other client-side processing. Available in the query profile as "
+      "\"ClientFetchWaitTimer\".", document->GetAllocator());
+
+  document->AddMember("tips_duration", "The total duration of the query, including queued"
+      " time.", document->GetAllocator());
+
+  document->AddMember("tips_queued_duration", "The duration of the query being queued due"
+      " to admission control.", document->GetAllocator());
+
+  document->AddMember("tips_mem_usage", "The sum of memory usage peaks on each executor "
+      "during the query execution.", document->GetAllocator());
+
+  document->AddMember("tips_mem_estimate", "The cluster wide estimated memory usage of "
+      "this query.", document->GetAllocator());
+
+  document->AddMember("tips_scan_progress", "The scan progress of the query, i.e. the "
+      "completed number of scan ranges / the total number of scan ranges.",
+      document->GetAllocator());
+
+  document->AddMember("tips_query_progress", "The progress of the query, i.e. the number "
+      "of completed fragment instances / the total number of fragment instances.",
+      document->GetAllocator());
+
+  document->AddMember("tips_bytes_read", "The total number of bytes read from the data "
+      "source during the query execution.", document->GetAllocator());
+
+  document->AddMember("tips_bytes_sent", "The total number of bytes sent by this query in"
+      " exchange nodes. Does not include remote reads, data written to disk, or data sent"
+      " to the client.", document->GetAllocator());
+
+  document->AddMember("tips_state", "The current state of the query.",
+      document->GetAllocator());
+
+  document->AddMember("tips_last_event", "The latest event reported during the execution "
+      "of the query.", document->GetAllocator());
+
+  document->AddMember("tips_rows_fetched", "The number of rows already fetched from the "
+      "query by the client.", document->GetAllocator());
+
+  document->AddMember("tips_resource_pool", "The resource pool that the query is "
+      "submitted to.", document->GetAllocator());
+
+  document->AddMember("tips_statement", "The statement submitted for the query.",
+      document->GetAllocator());
+}
+
+std::string ImpalaHttpHandler::ProgressToString(int64_t num_completed, int64_t total) {
+  stringstream ss;
+  ss << num_completed << " / " << total << " (" << setw(4);
+  if (num_completed == 0 || total == 0) {
+    ss << "0%)";
+  } else {
+    ss << (100.0 * num_completed / (1.f * total)) << "%)";
+  }
+  return ss.str();
+}
+
+void ImpalaHttpHandler::QueryStateToJson(const QueryStateRecord& record,
+    Value* value, Document* document, bool inflight) {
   Value user(record.effective_user.c_str(), document->GetAllocator());
   value->AddMember("effective_user", user, document->GetAllocator());
 
@@ -420,12 +539,32 @@ void ImpalaHttpHandler::QueryStateToJson(const ImpalaServer::QueryStateRecord& r
   value->AddMember("stmt_type", stmt_type, document->GetAllocator());
 
   Value start_time(ToStringFromUnixMicros(record.start_time_us,
-      TimePrecision::Nanosecond).c_str(), document->GetAllocator());
+      TimePrecision::Millisecond).c_str(), document->GetAllocator());
   value->AddMember("start_time", start_time, document->GetAllocator());
 
   Value end_time(ToStringFromUnixMicros(record.end_time_us,
-      TimePrecision::Nanosecond).c_str(), document->GetAllocator());
+      TimePrecision::Millisecond).c_str(), document->GetAllocator());
   value->AddMember("end_time", end_time, document->GetAllocator());
+
+  vector<string>::const_iterator it = std::find(record.event_sequence.labels.begin(),
+      record.event_sequence.labels.end(),
+      Coordinator::PROFILE_EVENT_LABEL_FIRST_ROW_FETCHED);
+  int64_t first_fetch_ns = 0;
+  if (it != record.event_sequence.labels.end()) {
+    first_fetch_ns = record.event_sequence.timestamps[it
+        - record.event_sequence.labels.begin()];
+  }
+  const string& printed_first_fetch = PrettyPrinter::Print(first_fetch_ns,
+      TUnit::TIME_NS);
+  Value val_first_fetch(printed_first_fetch.c_str(), document->GetAllocator());
+  value->AddMember("first_fetch", val_first_fetch, document->GetAllocator());
+
+  const string& printed_client_fetch_duration = PrettyPrinter::Print(
+      record.client_fetch_wait_time_ns, TUnit::TIME_NS);
+  Value val_client_fetch_duration(printed_client_fetch_duration.c_str(),
+      document->GetAllocator());
+  value->AddMember("client_fetch_duration", val_client_fetch_duration,
+      document->GetAllocator());
 
   // record.end_time_us might still be zero if the query is not yet done
   // Use the current Unix time in that case. Note that the duration can be
@@ -437,21 +576,44 @@ void ImpalaHttpHandler::QueryStateToJson(const ImpalaServer::QueryStateRecord& r
   Value val_duration(printed_duration.c_str(), document->GetAllocator());
   value->AddMember("duration", val_duration, document->GetAllocator());
 
+  const string& printed_queued_duration = PrettyPrinter::Print(record.wait_time_ms,
+      TUnit::TIME_MS);
+  Value queued_duration(printed_queued_duration.c_str(), document->GetAllocator());
+  value->AddMember("queued_duration", queued_duration, document->GetAllocator());
+
+  const string& printed_mem_usage = PrettyPrinter::Print(record.total_peak_mem_usage,
+      TUnit::BYTES);
+  Value mem_usage(printed_mem_usage.c_str(), document->GetAllocator());
+  value->AddMember("mem_usage", mem_usage, document->GetAllocator());
+
+  const string& printed_mem_est = PrettyPrinter::Print(record.cluster_mem_est,
+      TUnit::BYTES);
+  Value mem_est(printed_mem_est.c_str(), document->GetAllocator());
+  value->AddMember("mem_est", mem_est, document->GetAllocator());
+
   string progress = "N/A";
+  string query_progress = "N/A";
   if (record.has_coord) {
-    stringstream ss;
-    ss << record.num_complete_fragments << " / " << record.total_fragments
-       << " (" << setw(4);
-    if (record.total_fragments == 0) {
-      ss << "0%)";
-    } else {
-      ss << (100.0 * record.num_complete_fragments / (1.f * record.total_fragments))
-         << "%)";
-    }
-    progress = ss.str();
+    progress =
+        ProgressToString(record.num_completed_scan_ranges, record.total_scan_ranges);
+    query_progress = ProgressToString(record.num_completed_fragment_instances,
+        record.total_fragment_instances);
   }
   Value progress_json(progress.c_str(), document->GetAllocator());
   value->AddMember("progress", progress_json, document->GetAllocator());
+
+  Value query_progress_json(query_progress.c_str(), document->GetAllocator());
+  value->AddMember("query_progress", query_progress_json, document->GetAllocator());
+
+  const string& printed_bytes_read = PrettyPrinter::Print(record.bytes_read,
+      TUnit::BYTES);
+  Value bytes_read(printed_bytes_read.c_str(), document->GetAllocator());
+  value->AddMember("bytes_read", bytes_read, document->GetAllocator());
+
+  const string& printed_bytes_sent = PrettyPrinter::Print(record.bytes_sent,
+      TUnit::BYTES);
+  Value bytes_sent(printed_bytes_sent.c_str(), document->GetAllocator());
+  value->AddMember("bytes_sent", bytes_sent, document->GetAllocator());
 
   Value state(record.query_state.c_str(), document->GetAllocator());
   value->AddMember("state", state, document->GetAllocator());
@@ -470,8 +632,8 @@ void ImpalaHttpHandler::QueryStateToJson(const ImpalaServer::QueryStateRecord& r
   // Waiting to be closed.
   bool waiting = record.beeswax_query_state == beeswax::QueryState::EXCEPTION ||
       record.all_rows_returned;
-  value->AddMember("waiting", waiting, document->GetAllocator());
-  value->AddMember("executing", !waiting, document->GetAllocator());
+  value->AddMember("waiting", inflight && waiting, document->GetAllocator());
+  value->AddMember("executing", inflight && !waiting, document->GetAllocator());
 
   int64_t waiting_time = impala::UnixMillis() - record.last_active_time_ms;
   string waiting_time_str = "";
@@ -487,21 +649,23 @@ void ImpalaHttpHandler::QueryStateToJson(const ImpalaServer::QueryStateRecord& r
 
 void ImpalaHttpHandler::QueryStateHandler(const Webserver::WebRequest& req,
     Document* document) {
-  set<ImpalaServer::QueryStateRecord, ImpalaServer::QueryStateRecordLessThan>
+  AddQueryRecordTips(document);
+
+  set<QueryStateRecord, QueryStateRecord::StartTimeComparator>
       sorted_query_records;
 
   server_->query_driver_map_.DoFuncForAllEntries(
       [&](const std::shared_ptr<QueryDriver>& query_driver) {
         sorted_query_records.insert(
-            ImpalaServer::QueryStateRecord(*query_driver->GetActiveClientRequestState()));
+            QueryStateRecord(*query_driver->GetActiveClientRequestState()));
       });
 
   unordered_set<TUniqueId> in_flight_query_ids;
   Value in_flight_queries(kArrayType);
   int64_t num_waiting_queries = 0;
-  for (const ImpalaServer::QueryStateRecord& record: sorted_query_records) {
+  for (const QueryStateRecord& record: sorted_query_records) {
     Value record_json(kObjectType);
-    QueryStateToJson(record, &record_json, document);
+    QueryStateToJson(record, &record_json, document, true);
 
     if (record_json["waiting"].GetBool()) ++num_waiting_queries;
 
@@ -526,17 +690,19 @@ void ImpalaHttpHandler::QueryStateHandler(const Webserver::WebRequest& req,
   Value completed_queries(kArrayType);
   {
     lock_guard<mutex> l(server_->query_log_lock_);
-    for (const unique_ptr<ImpalaServer::QueryStateRecord>& log_entry :
+    for (const shared_ptr<QueryStateRecord>& log_entry :
         server_->query_log_) {
       // Don't show duplicated entries between in-flight and completed queries.
       if (in_flight_query_ids.find(log_entry->id) != in_flight_query_ids.end()) continue;
       Value record_json(kObjectType);
-      QueryStateToJson(*log_entry, &record_json, document);
+      QueryStateToJson(*log_entry, &record_json, document, false);
       completed_queries.PushBack(record_json, document->GetAllocator());
     }
   }
   document->AddMember("completed_queries", completed_queries, document->GetAllocator());
   document->AddMember("completed_log_size", FLAGS_query_log_size,
+      document->GetAllocator());
+  document->AddMember("completed_log_size_in_bytes", FLAGS_query_log_size_in_bytes,
       document->GetAllocator());
 
   Value query_locations(kArrayType);
@@ -561,14 +727,30 @@ void ImpalaHttpHandler::QueryStateHandler(const Webserver::WebRequest& req,
 
 void ImpalaHttpHandler::SessionsHandler(const Webserver::WebRequest& req,
     Document* document) {
+  VLOG(1) << "Step1: Fill the sessions information into the document.";
+  FillSessionsInfo(document);
+
+  ThriftServer::ConnectionContextList connection_contexts;
+  server_->GetAllConnectionContexts(&connection_contexts);
+  VLOG(1) << "Step2: Fill the client hosts information into the document.";
+  FillClientHostsInfo(document, connection_contexts);
+
+  VLOG(1) << "Step3: Fill the connections information into the document.";
+  FillConnectionsInfo(document, connection_contexts);
+
+  VLOG(1) << "Step4: Fill the hs2 users information into the document.";
+  FillUsersInfo(document);
+}
+
+void ImpalaHttpHandler::FillSessionsInfo(Document* document) {
   lock_guard<mutex> l(server_->session_state_map_lock_);
   Value sessions(kArrayType);
   int num_active = 0;
-  for (const ImpalaServer::SessionStateMap::value_type& session:
-           server_->session_state_map_) {
+  for (const ImpalaServer::SessionStateMap::value_type& session :
+      server_->session_state_map_) {
     shared_ptr<ImpalaServer::SessionState> state = session.second;
     Value session_json(kObjectType);
-    Value type(PrintThriftEnum(state->session_type).c_str(), document->GetAllocator());
+    Value type(PrintValue(state->session_type).c_str(), document->GetAllocator());
     session_json.AddMember("type", type, document->GetAllocator());
 
     session_json.AddMember("inflight_queries",
@@ -586,9 +768,9 @@ void ImpalaHttpHandler::SessionsHandler(const Webserver::WebRequest& req,
     Value session_id(PrintId(session.first).c_str(), document->GetAllocator());
     session_json.AddMember("session_id", session_id, document->GetAllocator());
 
-    Value network_address(TNetworkAddressToString(state->network_address).c_str(),
+    Value connection_ids(PrintIdSet(state->connections, "\n").c_str(),
         document->GetAllocator());
-    session_json.AddMember("network_address", network_address, document->GetAllocator());
+    session_json.AddMember("connection_ids", connection_ids, document->GetAllocator());
 
     Value default_db(state->database.c_str(), document->GetAllocator());
     session_json.AddMember("default_database", default_db, document->GetAllocator());
@@ -623,6 +805,173 @@ void ImpalaHttpHandler::SessionsHandler(const Webserver::WebRequest& req,
       document->GetAllocator());
 }
 
+// Comparer that will sort the users array by the session_count field.
+bool SessionCountComparer(const Value& a, const Value& b) {
+  return a["session_count"].GetInt64() < b["session_count"].GetInt64();
+}
+
+void ImpalaHttpHandler::FillUsersInfo(Document* document) {
+  Value users(kArrayType);
+  {
+    lock_guard<mutex> l(server_->per_user_session_count_lock_);
+    for (auto const& it : server_->per_user_session_count_map_) {
+      const string& name = it.first;
+      const int64& session_count = it.second;
+      Value users_json(kObjectType);
+      Value user_name(name.c_str(), document->GetAllocator());
+      users_json.AddMember("user", user_name, document->GetAllocator());
+      users_json.AddMember("session_count", session_count, document->GetAllocator());
+      users.PushBack(users_json, document->GetAllocator());
+    }
+  }
+  sort(users.Begin(), users.End(), SessionCountComparer);
+  document->AddMember("users", users, document->GetAllocator());
+}
+
+void ImpalaHttpHandler::FillClientHostsInfo(
+    Document* document, const ThriftServer::ConnectionContextList& connection_contexts) {
+  lock_guard<mutex> session_state_map_l(server_->session_state_map_lock_);
+  lock_guard<mutex> connection_to_sessions_map_l(
+      server_->connection_to_sessions_map_lock_);
+  Value client_hosts(kArrayType);
+  /// Map from a client hostname to the associated list of connections.
+  std::map<std::string, std::set<TUniqueId>> client_hostname_to_connections_map;
+  for (const ThriftServer::ConnectionContextList::value_type& connection_context :
+      connection_contexts) {
+    client_hostname_to_connections_map[connection_context->network_address.hostname]
+        .insert(connection_context->connection_id);
+  }
+  for (const auto& pair : client_hostname_to_connections_map) {
+    std::set<TUniqueId> client_hostname_sessions;
+    Value client_host_json(kObjectType);
+    int64_t total_connections = 0;
+    int64_t total_sessions = 0;
+    int64_t total_active_sessions = 0;
+    int64_t total_inactive_sessions = 0;
+    int64_t inflight_queries = 0;
+    int64_t total_queries = 0;
+    std::set<TUniqueId> connection_ids = pair.second;
+    total_connections += connection_ids.size();
+    Value hostname(pair.first.c_str(), document->GetAllocator());
+    client_host_json.AddMember("hostname", hostname, document->GetAllocator());
+    for (const TUniqueId& connection_id : connection_ids) {
+      ImpalaServer::ConnectionToSessionMap::iterator it =
+          server_->connection_to_sessions_map_.find(connection_id);
+      if (it != server_->connection_to_sessions_map_.end()) {
+        std::set<TUniqueId> session_ids = it->second;
+        for (const TUniqueId& session_id : session_ids) {
+          ImpalaServer::SessionStateMap::iterator session_state_map_iterator =
+              server_->session_state_map_.find(session_id);
+          if (session_state_map_iterator != server_->session_state_map_.end()
+              && client_hostname_sessions.find(session_id)
+                  == client_hostname_sessions.end()) {
+            client_hostname_sessions.insert(session_id);
+            ++total_sessions;
+            shared_ptr<ImpalaServer::SessionState> session_state =
+                session_state_map_iterator->second;
+            if (session_state->expired || session_state->closed) {
+              ++total_inactive_sessions;
+            } else {
+              ++total_active_sessions;
+            }
+            inflight_queries += session_state->inflight_queries.size();
+            total_queries += session_state->total_queries;
+          }
+        }
+      }
+    }
+    client_host_json.AddMember("total_connections", total_connections,
+        document->GetAllocator());
+    client_host_json.AddMember("total_sessions", total_sessions,
+        document->GetAllocator());
+    client_host_json.AddMember("total_active_sessions", total_active_sessions,
+        document->GetAllocator());
+    client_host_json.AddMember("total_inactive_sessions", total_inactive_sessions,
+        document->GetAllocator());
+    client_host_json.AddMember("inflight_queries", inflight_queries,
+        document->GetAllocator());
+    client_host_json.AddMember("total_queries", total_queries, document->GetAllocator());
+    client_hosts.PushBack(client_host_json, document->GetAllocator());
+  }
+  document->AddMember("client_hosts", client_hosts, document->GetAllocator());
+}
+
+void ImpalaHttpHandler::FillConnectionsInfo(
+    Document* document, const ThriftServer::ConnectionContextList& connection_contexts) {
+  lock_guard<mutex> session_state_map_l(server_->session_state_map_lock_);
+  lock_guard<mutex> connection_to_sessions_map_l(
+      server_->connection_to_sessions_map_lock_);
+  Value connections(kArrayType);
+  int64_t num_beeswax_frontend_connections = 0;
+  int64_t num_hiveserver2_frontend_connections = 0;
+  int64_t num_hiveserver2_http_frontend_connections = 0;
+  int64_t num_external_frontend_connections = 0;
+  for (const ThriftServer::ConnectionContextList::value_type& connection_context :
+      connection_contexts) {
+    if (connection_context.get()) {
+      if (connection_context->server_name == ImpalaServer::BEESWAX_SERVER_NAME) {
+        ++num_beeswax_frontend_connections;
+      } else if (connection_context->server_name == ImpalaServer::HS2_SERVER_NAME) {
+        ++num_hiveserver2_frontend_connections;
+      } else if (connection_context->server_name == ImpalaServer::HS2_HTTP_SERVER_NAME) {
+        ++num_hiveserver2_http_frontend_connections;
+      } else if (connection_context->server_name
+          == ImpalaServer::EXTERNAL_FRONTEND_SERVER_NAME) {
+        ++num_external_frontend_connections;
+      }
+      Value connection_json(kObjectType);
+      Value connection_id(PrintId(connection_context->connection_id).c_str(),
+          document->GetAllocator());
+      connection_json.AddMember("connection_id", connection_id, document->GetAllocator());
+
+      Value user(connection_context->username.c_str(), document->GetAllocator());
+      connection_json.AddMember("user", user, document->GetAllocator());
+
+      Value delegated_user(
+          connection_context->do_as_user.c_str(), document->GetAllocator());
+      connection_json.AddMember(
+          "delegated_user", delegated_user, document->GetAllocator());
+
+      Value network_address(
+          TNetworkAddressToString(connection_context->network_address).c_str(),
+          document->GetAllocator());
+      connection_json.AddMember(
+          "network_address", network_address, document->GetAllocator());
+
+      Value server_name(
+          connection_context->server_name.c_str(), document->GetAllocator());
+      connection_json.AddMember("server_name", server_name, document->GetAllocator());
+
+      std::set<TUniqueId> valid_session_ids;
+      ImpalaServer::ConnectionToSessionMap::iterator it =
+          server_->connection_to_sessions_map_.find(connection_context->connection_id);
+      if (it != server_->connection_to_sessions_map_.end()) {
+        // Filter out invalid session
+        for (const TUniqueId& session_id : it->second) {
+          if (server_->session_state_map_.find(session_id)
+              != server_->session_state_map_.end())
+            valid_session_ids.insert(session_id);
+        }
+      }
+      Value session_ids_str(PrintIdSet(valid_session_ids, "\n").c_str(),
+          document->GetAllocator());
+      connection_json.AddMember("session_ids", session_ids_str, document->GetAllocator());
+      connections.PushBack(connection_json, document->GetAllocator());
+    }
+  }
+  document->AddMember("connections", connections, document->GetAllocator());
+  document->AddMember(
+      "num_connections", connection_contexts.size(), document->GetAllocator());
+  document->AddMember("num_beeswax_frontend_connections",
+      num_beeswax_frontend_connections, document->GetAllocator());
+  document->AddMember("num_hiveserver2_frontend_connections",
+      num_hiveserver2_frontend_connections, document->GetAllocator());
+  document->AddMember("num_hiveserver2_http_frontend_connections",
+      num_hiveserver2_http_frontend_connections, document->GetAllocator());
+  document->AddMember("num_external_frontend_connections",
+      num_external_frontend_connections, document->GetAllocator());
+}
+
 void ImpalaHttpHandler::CatalogHandler(const Webserver::WebRequest& req,
     Document* document) {
   TGetDbsResult get_dbs_result;
@@ -640,8 +989,8 @@ void ImpalaHttpHandler::CatalogHandler(const Webserver::WebRequest& req,
     database.AddMember("name", str, document->GetAllocator());
 
     TGetTablesResult get_table_results;
-    Status status = server_->exec_env_->frontend()->GetTableNames(
-        db.db_name, NULL, NULL, &get_table_results);
+    status = server_->exec_env_->frontend()->GetTableNames(
+        db.db_name, nullptr, nullptr, &get_table_results);
     if (!status.ok()) {
       Value error(status.GetDetail().c_str(), document->GetAllocator());
       database.AddMember("error", error, document->GetAllocator());
@@ -820,6 +1169,10 @@ void PlanToJson(const vector<TPlanFragment>& fragments, const TExecSummary& summ
         Value target(label_map[sink.stream_sink.dest_node_id].c_str(),
             document->GetAllocator());
         plan_fragment.AddMember("data_stream_target", target, document->GetAllocator());
+      } else if (sink.__isset.join_build_sink) {
+        Value target(label_map[sink.join_build_sink.dest_node_id].c_str(),
+            document->GetAllocator());
+        plan_fragment.AddMember("join_build_target", target, document->GetAllocator());
       }
     }
     nodes.PushBack(plan_fragment, document->GetAllocator());
@@ -849,6 +1202,8 @@ void ImpalaHttpHandler::QueryBackendsHandler(
       return;
     }
     query_handle->GetCoordinator()->BackendsToJson(document);
+  } else {
+    VLOG(1) << "Failed to get backends of the query: " << status.GetDetail();
   }
 }
 
@@ -872,6 +1227,8 @@ void ImpalaHttpHandler::QueryFInstancesHandler(
       return;
     }
     query_handle->GetCoordinator()->FInstanceStatsToJson(document);
+  } else {
+    VLOG(1) << "Failed to get fragment instances of the query: " << status.GetDetail();
   }
 }
 
@@ -888,11 +1245,12 @@ void ImpalaHttpHandler::QuerySummaryHandler(bool include_json_plan, bool include
     return;
   }
 
+  shared_ptr<QueryStateRecord> query_record = nullptr;
   TExecSummary summary;
   string stmt;
   string plan;
   Status query_status;
-  bool found = false;
+  bool inflight = false;
   vector<TPlanFragment> fragments;
 
   // Search the in-flight queries first, followed by the archived ones.
@@ -900,7 +1258,8 @@ void ImpalaHttpHandler::QuerySummaryHandler(bool include_json_plan, bool include
     QueryHandle query_handle;
     status = server_->GetQueryHandle(query_id, &query_handle);
     if (status.ok()) {
-      found = true;
+      inflight = true;
+      query_record = make_shared<QueryStateRecord>(*query_handle);
       // If the query plan isn't generated, avoid waiting for the request
       // state lock to be acquired, since it could potentially be an expensive
       // call, if the table Catalog metadata loading is in progress. Instead
@@ -913,14 +1272,15 @@ void ImpalaHttpHandler::QuerySummaryHandler(bool include_json_plan, bool include
       lock_guard<mutex> l(*(*query_handle).lock());
       query_status = query_handle->query_status();
       stmt = query_handle->sql_stmt();
-      plan = query_handle->exec_request().query_exec_request.query_plan;
+      const TExecRequest& exec_request = query_handle->exec_request();
+      plan = exec_request.query_exec_request.query_plan;
       if ((include_json_plan || include_summary)
           && query_handle->GetCoordinator() != nullptr) {
         query_handle->GetCoordinator()->GetTExecSummary(&summary);
       }
       if (include_json_plan) {
         for (const TPlanExecInfo& plan_exec_info:
-            query_handle->exec_request().query_exec_request.plan_exec_info) {
+            exec_request.query_exec_request.plan_exec_info) {
           for (const TPlanFragment& fragment: plan_exec_info.fragments) {
             fragments.push_back(fragment);
           }
@@ -929,24 +1289,21 @@ void ImpalaHttpHandler::QuerySummaryHandler(bool include_json_plan, bool include
     }
   }
 
-  if (!found) {
-    lock_guard<mutex> l(server_->query_log_lock_);
-    ImpalaServer::QueryLogIndex::const_iterator query_record =
-        server_->query_log_index_.find(query_id);
-    if (query_record == server_->query_log_index_.end()) {
+  if (!inflight) {
+    if (!server_->GetQueryRecord(query_id, &query_record).ok()) {
       const string& err = Substitute("Unknown query id: $0", PrintId(query_id));
       Value json_error(err.c_str(), document->GetAllocator());
       document->AddMember("error", json_error, document->GetAllocator());
       return;
     }
     if (include_json_plan || include_summary) {
-      summary = query_record->second->exec_summary;
+      summary = query_record->exec_summary;
     }
-    stmt = query_record->second->stmt;
-    plan = query_record->second->plan;
-    query_status = query_record->second->query_status;
+    stmt = query_record->stmt;
+    plan = query_record->plan;
+    query_status = query_record->query_status;
     if (include_json_plan) {
-      fragments = query_record->second->fragments;
+      fragments = query_record->fragments;
     }
   }
 
@@ -959,18 +1316,28 @@ void ImpalaHttpHandler::QuerySummaryHandler(bool include_json_plan, bool include
     const string& printed_summary = PrintExecSummary(summary);
     Value json_summary(printed_summary.c_str(), document->GetAllocator());
     document->AddMember("summary", json_summary, document->GetAllocator());
+    Value json_timeline(query_record->timeline.c_str(), document->GetAllocator());
+    document->AddMember("timeline", json_timeline, document->GetAllocator());
   }
   Value json_stmt(RedactCopy(stmt).c_str(), document->GetAllocator());
   document->AddMember("stmt", json_stmt, document->GetAllocator());
   Value json_plan_text(RedactCopy(plan).c_str(), document->GetAllocator());
   document->AddMember("plan", json_plan_text, document->GetAllocator());
-  Value json_inflight(found);
+  Value json_inflight(inflight);
   document->AddMember("inflight", json_inflight, document->GetAllocator());
+  Value json_not_inflight(!inflight);
+  document->AddMember("not_inflight", json_not_inflight, document->GetAllocator());
 
   // Redact the error in case the query is contained in the error message.
   Value json_status(query_status.ok() ? "OK" :
       RedactCopy(query_status.GetDetail()).c_str(), document->GetAllocator());
   document->AddMember("status", json_status, document->GetAllocator());
+
+  AddQueryRecordTips(document);
+
+  Value record_json(kObjectType);
+  QueryStateToJson(*query_record, &record_json, document, inflight);
+  document->AddMember("record_json", record_json, document->GetAllocator());
 }
 
 void ImpalaHttpHandler::BackendsHandler(const Webserver::WebRequest& req,
@@ -1056,6 +1423,10 @@ void ImpalaHttpHandler::BackendsHandler(const Webserver::WebRequest& req,
     Value executor_groups(JoinStrings(group_names, ", ").c_str(),
         document->GetAllocator());
     backend_obj.AddMember("executor_groups", executor_groups, document->GetAllocator());
+    Value start_time_val(backend.process_start_time().c_str(), document->GetAllocator());
+    backend_obj.AddMember("process_start_time", start_time_val, document->GetAllocator());
+    Value version_val(backend.version().c_str(), document->GetAllocator());
+    backend_obj.AddMember("version", version_val, document->GetAllocator());
     backends_list.PushBack(backend_obj, document->GetAllocator());
   }
   document->AddMember("backends", backends_list, document->GetAllocator());

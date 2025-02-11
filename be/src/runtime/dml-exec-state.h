@@ -20,6 +20,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <boost/unordered_map.hpp>
 
 #include "common/hdfs.h"
@@ -66,15 +67,26 @@ class DmlExecState {
   void AddPartition(const std::string& name, int64_t id, const std::string* base_dir,
       const std::string* staging_dir_to_clean_up);
 
+  /// Returns true if partition with 'name' already exists.
+  bool PartitionExists(const std::string& name) {
+    return per_partition_status_.find(name) != per_partition_status_.end();
+  }
+
   /// Merge given values into stats for partition with name 'partition_name'.
   /// Ignores 'insert_stats' if nullptr.
   /// Requires that the partition already exist.
-  void UpdatePartition(const std::string& partition_name,
-      int64_t num_modified_rows_delta, const DmlStatsPB* insert_stats);
+  void UpdatePartition(const std::string& partition_name, int64_t num_rows_delta,
+      const DmlStatsPB* insert_stats, bool is_delete = false);
 
-  /// Extract information from 'partition', and add a new Iceberg data file.
+  /// Extract information from 'partition', and add a new data file.
   /// 'insert_stats' contains stats for the Iceberg data file.
   void AddCreatedFile(const OutputPartition& partition, bool is_iceberg,
+      const IcebergFileStats& insert_stats);
+
+  /// Extract information from 'partition', and add a new delete file. This function
+  /// can only be called for Iceberg tables.
+  /// 'insert_stats' contains stats for the Iceberg delete file.
+  void AddCreatedDeleteFile(const OutputPartition& partition,
       const IcebergFileStats& insert_stats);
 
   /// Used to initialize this state when execute Kudu DML. Must be called before
@@ -97,7 +109,8 @@ class DmlExecState {
 
   /// Populates 'catalog_update' with PartitionStatusMap data.
   /// Returns true if a catalog update is required, false otherwise.
-  bool PrepareCatalogUpdate(TUpdateCatalogRequest* catalog_update);
+  bool PrepareCatalogUpdate(TUpdateCatalogRequest* catalog_update,
+      const TFinalizeParams& finalize_params);
 
   /// For HDFS (and other Hadoop FileSystem) INSERT, moves all temporary staging files
   /// to their final destinations, as indicated by 'params', and creates new partitions
@@ -114,10 +127,33 @@ class DmlExecState {
   /// Beeswax.
   void ToTDmlResult(TDmlResult* dml_result);
 
-  // Encodes file list info in flatbuffer format expected by Iceberg API.
+  // Encodes data file list info in flatbuffer format expected by Iceberg API.
   std::vector<std::string> CreateIcebergDataFilesVector();
 
+  // Encodes delete file list info in flatbuffer format expected by Iceberg API.
+  std::vector<std::string> CreateIcebergDeleteFilesVector();
+
+  // Returns vector of Iceberg data files referenced by position delete records by
+  // this DML statement.
+  const std::vector<std::string>& DataFilesReferencedByPositionDeletes() const {
+    return data_files_referenced_by_position_deletes_;
+  }
+
+  // Reserves capacity for 'data_files_referenced_by_position_deletes_'.
+  void reserveReferencedDataFiles(int capacity) {
+    data_files_referenced_by_position_deletes_.reserve(capacity);
+  }
+
+  // Adds file_path to the list of data files referenced by position delete records.
+  void addReferencedDataFile(std::string&& file_path) {
+    data_files_referenced_by_position_deletes_.emplace_back(std::move(file_path));
+  }
+
  private:
+  /// Auxiliary function used by 'AddCreatedFile' and 'AddCreatedDeleteFile'.
+  void AddFileAux(const OutputPartition& partition, bool is_iceberg,
+    const IcebergFileStats& insert_stats, bool is_delete);
+
   /// protects all fields below
   std::mutex lock_;
 
@@ -133,6 +169,10 @@ class DmlExecState {
   /// deleted.  Uses ordered map so that iteration order is deterministic.
   typedef std::map<std::string, std::string> FileMoveMap;
   FileMoveMap files_to_move_;
+
+  /// In case of Iceberg modify statements it contains the data files referenced
+  /// by position delete records.
+  std::vector<std::string> data_files_referenced_by_position_deletes_;
 
   /// Determines what the permissions of directories created by INSERT statements should
   /// be if permission inheritance is enabled. Populates a map from all prefixes of

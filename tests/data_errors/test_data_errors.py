@@ -19,15 +19,17 @@
 #
 # Tests Impala properly handles errors when reading and writing data.
 
+from __future__ import absolute_import, division, print_function, unicode_literals
 import pytest
-import random
 import subprocess
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import (SkipIf, SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfGCS,
-                               SkipIfCOS, SkipIfLocal)
+from tests.common.skip import SkipIf, SkipIfFS
 from tests.common.test_dimensions import create_exec_option_dimension
+from tests.util.filesystem_utils import get_fs_path
+from tests.util.test_file_parser import QueryTestSectionReader
+
 
 class TestDataErrors(ImpalaTestSuite):
   # batch_size of 1 can expose some interesting corner cases at row batch boundaries.
@@ -44,12 +46,13 @@ class TestDataErrors(ImpalaTestSuite):
   def get_workload(self):
     return 'functional-query'
 
+
 # Regression test for IMP-633. Added as a part of IMPALA-5198.
-@SkipIf.not_hdfs
+@SkipIf.not_dfs
 class TestHdfsFileOpenFailErrors(ImpalaTestSuite):
   @pytest.mark.execute_serially
   def test_hdfs_file_open_fail(self):
-    absolute_location = "/test-warehouse/file_open_fail"
+    absolute_location = get_fs_path("/test-warehouse/file_open_fail")
     create_stmt = \
         "create table file_open_fail (x int) location '" + absolute_location + "'"
     insert_stmt = "insert into file_open_fail values(1)"
@@ -65,6 +68,7 @@ class TestHdfsFileOpenFailErrors(ImpalaTestSuite):
     except ImpalaBeeswaxException as e:
       assert "Failed to open HDFS file" in str(e)
     self.client.execute(drop_stmt)
+
 
 # Test for IMPALA-5331 to verify that the libHDFS API hdfsGetLastExceptionRootCause()
 # works.
@@ -106,11 +110,8 @@ class TestHdfsUnknownErrors(ImpalaTestSuite):
       assert error is "", "Couldn't turn Safe mode OFF. Error: %s" % (error)
       assert "Safe mode is OFF" in output
 
-@SkipIfS3.qualified_path
-@SkipIfGCS.qualified_path
-@SkipIfCOS.qualified_path
-@SkipIfABFS.qualified_path
-@SkipIfADLS.qualified_path
+
+@SkipIfFS.qualified_path
 class TestHdfsScanNodeErrors(TestDataErrors):
   @classmethod
   def add_test_dimensions(cls):
@@ -127,12 +128,8 @@ class TestHdfsScanNodeErrors(TestDataErrors):
       pytest.xfail("Expected results differ across file formats")
     self.run_test_case('DataErrorsTest/hdfs-scan-node-errors', vector)
 
-@SkipIfS3.qualified_path
-@SkipIfGCS.qualified_path
-@SkipIfCOS.qualified_path
-@SkipIfABFS.qualified_path
-@SkipIfADLS.qualified_path
-@SkipIfLocal.qualified_path
+
+@SkipIfFS.qualified_path
 class TestHdfsSeqScanNodeErrors(TestHdfsScanNodeErrors):
   @classmethod
   def add_test_dimensions(cls):
@@ -145,11 +142,7 @@ class TestHdfsSeqScanNodeErrors(TestHdfsScanNodeErrors):
     self.run_test_case('DataErrorsTest/hdfs-sequence-scan-errors', vector)
 
 
-@SkipIfS3.qualified_path
-@SkipIfGCS.qualified_path
-@SkipIfCOS.qualified_path
-@SkipIfABFS.qualified_path
-@SkipIfADLS.qualified_path
+@SkipIfFS.qualified_path
 class TestHdfsRcFileScanNodeErrors(TestHdfsScanNodeErrors):
   @classmethod
   def add_test_dimensions(cls):
@@ -160,6 +153,22 @@ class TestHdfsRcFileScanNodeErrors(TestHdfsScanNodeErrors):
   def test_hdfs_rcfile_scan_node_errors(self, vector):
     vector.get_value('exec_option')['abort_on_error'] = 0
     self.run_test_case('DataErrorsTest/hdfs-rcfile-scan-node-errors', vector)
+
+
+@SkipIfFS.qualified_path
+class TestHdfsJsonScanNodeErrors(TestHdfsScanNodeErrors):
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestHdfsJsonScanNodeErrors, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format == 'json')
+
+  def test_hdfs_json_scan_node_errors(self, vector):
+    vector.get_value('exec_option')['abort_on_error'] = 0
+    table_format = vector.get_value('table_format')
+    db_name = QueryTestSectionReader.get_db_name(table_format)
+    self.run_test_case('DataErrorsTest/hdfs-json-scan-node-errors', vector,
+        use_db=db_name)
 
 
 class TestAvroErrors(TestDataErrors):
@@ -173,6 +182,7 @@ class TestAvroErrors(TestDataErrors):
   def test_avro_errors(self, vector):
     vector.get_value('exec_option')['abort_on_error'] = 0
     self.run_test_case('DataErrorsTest/avro-errors', vector)
+
 
 class TestHBaseDataErrors(TestDataErrors):
   @classmethod

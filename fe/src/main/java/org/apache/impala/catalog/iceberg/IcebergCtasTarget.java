@@ -35,7 +35,7 @@ import org.apache.iceberg.types.TypeUtil;
 import org.apache.impala.analysis.ColumnDef;
 import org.apache.impala.analysis.IcebergPartitionSpec;
 import org.apache.impala.catalog.CatalogException;
-import org.apache.impala.catalog.CatalogObject;
+import org.apache.impala.catalog.CatalogObject.ThriftObjectType;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.CtasTargetTable;
 import org.apache.impala.catalog.Db;
@@ -46,13 +46,14 @@ import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.HdfsStorageDescriptor;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.IcebergColumn;
+import org.apache.impala.catalog.IcebergContentFileStore;
 import org.apache.impala.catalog.IcebergStructField;
 import org.apache.impala.catalog.IcebergTable;
-import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.local.LocalDb;
 import org.apache.impala.catalog.local.LocalFsTable;
 import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.catalog.StructType;
+import org.apache.impala.service.MetadataOp;
 import org.apache.impala.thrift.CatalogObjectsConstants;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TColumn;
@@ -62,6 +63,8 @@ import org.apache.impala.thrift.THdfsStorageDescriptor;
 import org.apache.impala.thrift.THdfsTable;
 import org.apache.impala.thrift.TIcebergCatalog;
 import org.apache.impala.thrift.TIcebergFileFormat;
+import org.apache.impala.thrift.TIcebergPartitionStats;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableType;
 import org.apache.impala.util.IcebergSchemaConverter;
@@ -84,13 +87,14 @@ public class IcebergCtasTarget extends CtasTargetTable implements FeIcebergTable
   private String icebergTableLocation_;
   private String icebergCatalogLocation_;
   private HdfsStorageDescriptor hdfsSd_;
+  private final IcebergContentFileStore icebergContentFiles_;
 
   public IcebergCtasTarget(FeDb db, org.apache.hadoop.hive.metastore.api.Table msTbl,
-      List<ColumnDef> columnDefs, IcebergPartitionSpec partSpec)
-      throws CatalogException {
+        List<ColumnDef> columnDefs, List<String> primaryKeyNames,
+        IcebergPartitionSpec partSpec) throws CatalogException, ImpalaRuntimeException {
     super(msTbl, db, msTbl.getTableName(), msTbl.getOwner());
     createFsTable(db, msTbl);
-    createIcebergSchema(columnDefs);
+    createIcebergSchema(columnDefs, primaryKeyNames);
     createPartitionSpec(partSpec);
     icebergCatalog_ = IcebergUtil.getTIcebergCatalog(msTbl);
     setLocations();
@@ -100,33 +104,35 @@ public class IcebergCtasTarget extends CtasTargetTable implements FeIcebergTable
     icebergParquetPlainPageSize_ = Utils.getIcebergParquetPlainPageSize(msTbl);
     icebergParquetDictPageSize_ = Utils.getIcebergParquetDictPageSize(msTbl);
     hdfsSd_ = HdfsStorageDescriptor.fromStorageDescriptor(name_, msTable_.getSd());
+    icebergContentFiles_ = new IcebergContentFileStore();
   }
 
-  private void createIcebergSchema(List<ColumnDef> columnDefs) throws CatalogException {
+  private void createIcebergSchema(List<ColumnDef> columnDefs,
+      List<String> primaryKeyNames) throws CatalogException {
     List<TColumn> tcols = new ArrayList<>();
     for (ColumnDef col : columnDefs) {
       tcols.add(col.toThrift());
     }
     try {
-      iceSchema_ = IcebergSchemaConverter.genIcebergSchema(tcols);
+      iceSchema_ = IcebergSchemaConverter.genIcebergSchema(tcols, primaryKeyNames);
       // In genIcebergSchema() we did our best to assign correct field ids to columns,
       // but to be sure, let's use Iceberg's API function to assign field ids.
       iceSchema_ = TypeUtil.assignIncreasingFreshIds(iceSchema_);
+      for (Column col : IcebergSchemaConverter.convertToImpalaSchema(iceSchema_)) {
+        addColumn((IcebergColumn)col);
+      }
     } catch (ImpalaRuntimeException ex) {
       throw new CatalogException(
         "Exception caught during generating Iceberg schema:", ex);
     }
-    for (Column col : IcebergSchemaConverter.convertToImpalaSchema(iceSchema_)) {
-      addColumn((IcebergColumn)col);
-    }
   }
 
   private void createPartitionSpec(IcebergPartitionSpec partSpec)
-      throws CatalogException {
+      throws CatalogException, ImpalaRuntimeException {
     Preconditions.checkState(iceSchema_ != null);
     PartitionSpec iceSpec = null;
     try {
-      // Let's create an Iceberg PartitionSpec with the help of Icebeg from 'partSpec',
+      // Let's create an Iceberg PartitionSpec with the help of Iceberg from 'partSpec',
       // then convert it back to an IcebergPartitionSpec.
       if (partSpec == null) {
         iceSpec = PartitionSpec.unpartitioned();
@@ -138,7 +144,7 @@ public class IcebergCtasTarget extends CtasTargetTable implements FeIcebergTable
         "Exception caught during generating Iceberg schema:", ex);
     }
     IcebergPartitionSpec resolvedIcebergSpec =
-        FeIcebergTable.Utils.convertPartitionSpec(iceSpec);
+        FeIcebergTable.Utils.convertPartitionSpec(iceSchema_, iceSpec);
     partitionSpecs_.add(resolvedIcebergSpec);
   }
 
@@ -180,8 +186,8 @@ public class IcebergCtasTarget extends CtasTargetTable implements FeIcebergTable
   }
 
   @Override
-  public Map<String, FileDescriptor> getPathHashToFileDescMap() {
-    return Collections.<String, FileDescriptor>emptyMap();
+  public IcebergContentFileStore getContentFileStore() {
+    return icebergContentFiles_;
   }
 
   @Override
@@ -250,8 +256,25 @@ public class IcebergCtasTarget extends CtasTargetTable implements FeIcebergTable
   }
 
   @Override
+  public THdfsTable transformToTHdfsTable(boolean updatePartitionFlag,
+      ThriftObjectType type) {
+    throw new IllegalStateException("not implemented here");
+  }
+
+
+  @Override
   public long snapshotId() {
     return -1;
+  }
+
+  @Override
+  public Map<String, TIcebergPartitionStats> getIcebergPartitionStats() {
+    return null;
+  }
+
+  @Override
+  public org.apache.iceberg.Table getIcebergApiTable() {
+    return null;
   }
 
   public void addColumn(IcebergColumn col) {
@@ -270,7 +293,7 @@ public class IcebergCtasTarget extends CtasTargetTable implements FeIcebergTable
         getNumClusteringCols(),
         getName(), db_.getName());
 
-    desc.setIcebergTable(Utils.getTIcebergTable(this));
+    desc.setIcebergTable(Utils.getTIcebergTable(this, ThriftObjectType.DESCRIPTOR_ONLY));
     desc.setHdfsTable(transformToTHdfsTable());
     return desc;
   }
@@ -285,7 +308,7 @@ public class IcebergCtasTarget extends CtasTargetTable implements FeIcebergTable
 
   private THdfsTable transformOldToTHdfsTable() {
     THdfsTable hdfsTable = ((HdfsTable)fsTable_).getTHdfsTable(
-        CatalogObject.ThriftObjectType.FULL, null);
+        ThriftObjectType.FULL, null);
     hdfsTable.setPrototype_partition(createPrototypePartition());
     return hdfsTable;
   }
@@ -312,5 +335,15 @@ public class IcebergCtasTarget extends CtasTargetTable implements FeIcebergTable
   @Override
   public TCatalogObjectType getCatalogObjectType() {
     return TCatalogObjectType.TABLE;
+  }
+
+  @Override
+  public TImpalaTableType getTableType() {
+    return TImpalaTableType.TABLE;
+  }
+
+  @Override
+  public String getTableComment() {
+    return MetadataOp.getTableComment(msTable_);
   }
 }

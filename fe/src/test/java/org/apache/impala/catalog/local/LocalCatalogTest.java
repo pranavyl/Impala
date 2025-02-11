@@ -20,13 +20,11 @@ package org.apache.impala.catalog.local;
 import static org.junit.Assert.*;
 
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 
 import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
 import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
 import org.apache.hive.service.rpc.thrift.TGetColumnsReq;
-import org.apache.hive.service.rpc.thrift.TGetSchemasReq;
 import org.apache.hive.service.rpc.thrift.TGetTablesReq;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.ToSqlUtils;
@@ -37,31 +35,30 @@ import org.apache.impala.catalog.FeCatalogUtils;
 import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.FeFsPartition;
 import org.apache.impala.catalog.FeFsTable;
-import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
+import org.apache.impala.catalog.IcebergContentFileStore;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
-import org.apache.impala.fb.FbFileBlock;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.fb.FbFileBlock;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.service.Frontend;
-import org.apache.impala.service.MetadataOp;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.TCatalogObjectType;
+import org.apache.impala.thrift.TIcebergContentFileStore;
 import org.apache.impala.thrift.TMetadataOpRequest;
 import org.apache.impala.thrift.TMetadataOpcode;
 import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TPartialTableInfo;
-import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TResultSet;
+import org.apache.impala.util.IcebergUtil;
 import org.apache.impala.util.ListMap;
 import org.apache.impala.util.MetaStoreUtil;
 import org.apache.impala.util.PatternMatcher;
 import org.hamcrest.CoreMatchers;
 import org.junit.Assert;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Test;
 
 import com.google.common.base.Joiner;
@@ -163,6 +160,25 @@ public class LocalCatalogTest {
   }
 
   @Test
+  public void testLoadBinaryTableBasics() throws Exception {
+    FeDb functionalDb = catalog_.getDb("functional");
+    CatalogTest.checkTableCols(functionalDb, "binary_tbl", 0,
+        new String[] {"id", "string_col", "binary_col"},
+        new Type[] {Type.INT, Type.STRING, Type.BINARY});
+    FeTable t = functionalDb.getTable("binary_tbl");
+    assertEquals(8, t.getNumRows());
+
+    assertTrue(t instanceof LocalFsTable);
+    FeFsTable fsTable = (FeFsTable) t;
+    assertEquals(MetaStoreUtil.DEFAULT_NULL_PARTITION_KEY_VALUE,
+        fsTable.getNullPartitionKeyValue());
+
+    // Stats should have one row per partition, plus a "total" row.
+    TResultSet stats = fsTable.getTableStats();
+    assertEquals(1, stats.getRowsSize());
+  }
+
+  @Test
   public void testPartitioning() throws Exception {
     FeFsTable t = (FeFsTable) catalog_.getTable("functional",  "alltypes");
     CatalogTest.checkAllTypesPartitioning(t);
@@ -256,25 +272,29 @@ public class LocalCatalogTest {
   }
 
   /**
-   * This test verifies that the network adresses used by the LocalIcebergTable are
+   * This test verifies that the network addresses used by the LocalIcebergTable are
    * the same used by CatalogD.
    */
   @Test
   public void testLoadIcebergFileDescriptors() throws Exception {
     LocalIcebergTable t = (LocalIcebergTable)catalog_.getTable(
         "functional_parquet", "iceberg_partitioned");
-    Map<String, FileDescriptor> localTblFdMap = t.getPathHashToFileDescMap();
-    TPartialTableInfo tblInfo = provider_.loadTableInfoWithIcebergSnapshot(t.ref_);
+    IcebergContentFileStore fileStore = t.getContentFileStore();
+    TPartialTableInfo tblInfo = provider_.loadIcebergTable(t.ref_);
     ListMap<TNetworkAddress> catalogdHostIndexes = new ListMap<>();
     catalogdHostIndexes.populate(tblInfo.getNetwork_addresses());
-    Map<String, FileDescriptor> catalogFdMap =
-        FeIcebergTable.Utils.loadFileDescMapFromThrift(
-            tblInfo.getIceberg_snapshot().getIceberg_file_desc_map(),
-            null, null);
-    for (Map.Entry<String, FileDescriptor> entry : localTblFdMap.entrySet()) {
-      String path = entry.getKey();
-      FileDescriptor localFd = entry.getValue();
-      FileDescriptor catalogFd = catalogFdMap.get(path);
+    IcebergContentFileStore catalogFileStore = IcebergContentFileStore.fromThrift(
+        tblInfo.getIceberg_table().getContent_files(),
+        null, null);
+    TIcebergContentFileStore icebergContentFileStore = catalogFileStore.toThrift();
+    assertEquals(tblInfo.getIceberg_table().getContent_files(), icebergContentFileStore);
+    for (FileDescriptor localFd : fileStore.getAllDataFiles()) {
+      String path = localFd.getAbsolutePath(t.getLocation());
+      // For this test table the manifest files contain data paths without FS-scheme, so
+      // they are loaded to the file content store without them.
+      path = path.substring(path.indexOf("/test-warehouse"));
+      String pathHash = IcebergUtil.getFilePathHash(path);
+      FileDescriptor catalogFd = catalogFileStore.getDataFileDescriptor(pathHash);
       assertEquals(localFd.getNumFileBlocks(), 1);
       FbFileBlock localBlock = localFd.getFbFileBlock(0);
       FbFileBlock catalogBlock = catalogFd.getFbFileBlock(0);
@@ -336,6 +356,16 @@ public class LocalCatalogTest {
   }
 
   @Test
+  public void testBinaryColumnStats() throws Exception {
+    FeFsTable t = (FeFsTable) catalog_.getTable("functional",  "binary_tbl");
+    ColumnStats stats = t.getColumn("binary_col").getStats();
+    assertEquals(26, stats.getMaxSize());
+    assertEquals(8.714285850524902, stats.getAvgSize(), 0.0001);
+    assertEquals(-1, stats.getNumDistinctValues());
+    assertEquals(1, stats.getNumNulls());
+  }
+
+  @Test
   public void testView() throws Exception {
     FeView v = (FeView) catalog_.getTable("functional",  "alltypes_view");
     assertEquals(TCatalogObjectType.VIEW, v.getCatalogObjectType());
@@ -383,7 +413,7 @@ public class LocalCatalogTest {
       // tblproperties substring separately
       Assert.assertTrue("Synchronized Kudu tables in Hive-3 must contain external.table"
           + ".purge table property", output.contains("'external.table.purge'='TRUE'"));
-      Assert.assertFalse("Found internal property TRANSLATED_TO_EXTERNAL in table "
+      Assert.assertTrue("Internal property TRANSLATED_TO_EXTERNAL not found in table "
           + "properties", output.contains("TRANSLATED_TO_EXTERNAL"));
     } else {
     // Assert on the generated SQL for the table, but not the table properties, since
@@ -430,6 +460,19 @@ public class LocalCatalogTest {
         ")\n" +
         "STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'\n" +
         "WITH SERDEPROPERTIES ('hbase.columns.mapping'=':key,d:date_col,d:date_part', " +
+        "'serialization.format'='1')"
+    ));
+
+    t = (LocalHbaseTable) catalog_.getTable("functional_hbase", "binary_tbl");
+    Assert.assertThat(ToSqlUtils.getCreateTableSql(t), CoreMatchers.startsWith(
+        "CREATE EXTERNAL TABLE functional_hbase.binary_tbl (\n" +
+        "  id INT,\n" +
+        "  binary_col BINARY,\n" +
+        "  string_col STRING\n" +
+        ")\n" +
+        "STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'\n" +
+        "WITH SERDEPROPERTIES (" +
+        "'hbase.columns.mapping'=':key,d:string_col,d:binary_col', " +
         "'serialization.format'='1')"
     ));
   }

@@ -20,9 +20,13 @@ package org.apache.impala.analysis;
 import java.util.Collections;
 import java.util.List;
 
-import org.apache.commons.lang.NotImplementedException;
+import java.util.Optional;
+import org.apache.commons.lang3.NotImplementedException;
+import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.TypeCompatibility;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.rewrite.ExprRewriter;
 
@@ -194,15 +198,39 @@ public abstract class StatementBase extends StmtNode {
    * message.
    *
    * 'widestTypeSrcExpr' is the first widest type expression of the source expressions.
-   * This is only used when constructing an AnalysisException message to make sure the
-   * right expression is blamed in the error message.
    *
-   * If strictDecimal is true, only consider casts that result in no loss of information
-   * when casting between decimal types.
+   * If compatibility is unsafe and the source expression is not constant, compatibility
+   * ignores the unsafe option.
    */
   public static Expr checkTypeCompatibility(String dstTableName, Column dstCol,
-      Expr srcExpr, boolean strictDecimal, Expr widestTypeSrcExpr)
-      throws AnalysisException {
+      Expr srcExpr, Analyzer analyzer, Expr widestTypeSrcExpr) throws AnalysisException {
+    // In 'ValueStmt', if all values in a column are CHARs but they have different
+    // lengths, they are implicitly cast to VARCHAR to avoid padding (see IMPALA-10753 and
+    // ValuesStmt.java). Since VARCHAR cannot normally be cast to CHAR because of possible
+    // loss of precision, if the destination column is CHAR, we have to manually cast the
+    // values back to CHAR. There is no danger of loss of precision here because we cast
+    // the values to the CHAR type of the same length as the VARCHAR type. If that is
+    // still not compatible with the destination column, we throw an AnalysisException.
+    if (widestTypeSrcExpr != null &&  widestTypeSrcExpr.isImplicitCast()) {
+      // TODO: Can we avoid casting CHAR -> VARCHAR -> CHAR for CHAR dst columns?
+      Expr exprWithoutImplicitCast = widestTypeSrcExpr.ignoreImplicitCast();
+      if (srcExpr.getType().isVarchar() && exprWithoutImplicitCast.getType().isChar()) {
+        ScalarType varcharType = (ScalarType) srcExpr.getType();
+        ScalarType charType = (ScalarType) exprWithoutImplicitCast.getType();
+        Preconditions.checkState(varcharType.getLength() >= charType.getLength());
+        Type newCharType = ScalarType.createCharType(varcharType.getLength());
+        Expr newCharExpr = new CastExpr(newCharType, srcExpr);
+        return checkTypeCompatibilityHelper(dstTableName, dstCol, newCharExpr,
+            analyzer, null);
+      }
+    }
+
+    return checkTypeCompatibilityHelper(dstTableName, dstCol, srcExpr, analyzer,
+        widestTypeSrcExpr);
+  }
+
+  private static Expr checkTypeCompatibilityHelper(String dstTableName, Column dstCol,
+      Expr srcExpr, Analyzer analyzer, Expr widestTypeSrcExpr) throws AnalysisException {
     Type dstColType = dstCol.getType();
     Type srcExprType = srcExpr.getType();
 
@@ -210,8 +238,25 @@ public abstract class StatementBase extends StmtNode {
     // Trivially compatible, unless the type is complex.
     if (dstColType.equals(srcExprType) && !dstColType.isComplexType()) return srcExpr;
 
-    Type compatType = Type.getAssignmentCompatibleType(
-        dstColType, srcExprType, false, strictDecimal);
+    TypeCompatibility permissiveCompatibility =
+        analyzer.getPermissiveCompatibilityLevel();
+    TypeCompatibility compatibilityLevel = analyzer.getRegularCompatibilityLevel();
+
+    Type compatType =
+        Type.getAssignmentCompatibleType(srcExprType, dstColType, compatibilityLevel);
+
+    if (compatType.isInvalid() && permissiveCompatibility.isUnsafe()) {
+      Optional<Expr> expr = srcExpr.getFirstNonConstSourceExpr();
+      if (expr.isPresent()) {
+        throw new AnalysisException(String.format(
+            "Unsafe implicit cast is prohibited for non-const expression: %s ",
+            expr.get().toSql()));
+      }
+      compatType = Type.getAssignmentCompatibleType(
+          srcExprType, dstColType, permissiveCompatibility);
+      compatibilityLevel = permissiveCompatibility;
+    }
+
     if (!compatType.isValid()) {
       throw new AnalysisException(String.format(
           "Target table '%s' is incompatible with source expressions.\nExpression '%s' " +
@@ -219,13 +264,38 @@ public abstract class StatementBase extends StmtNode {
           dstTableName, srcExpr.toSql(), srcExprType.toSql(), dstCol.getName(),
           dstColType.toSql()));
     }
-    if (!compatType.equals(dstColType) && !compatType.isNull()) {
+
+    if (!compatType.equals(dstColType) && !compatType.isNull()
+        && !permissiveCompatibility.isUnsafe()) {
       throw new AnalysisException(String.format(
           "Possible loss of precision for target table '%s'.\nExpression '%s' (type: "
               + "%s) would need to be cast to %s for column '%s'",
           dstTableName, widestTypeSrcExpr.toSql(), srcExprType.toSql(),
           dstColType.toSql(), dstCol.getName()));
     }
-    return srcExpr.castTo(compatType);
+    return srcExpr.castTo(compatType, compatibilityLevel);
+  }
+
+  /**
+   * This method is designed to allow custom authorization exception handling. A
+   * statement class that extends StatementBase can customize how it handles an
+   * authorization exception by
+   * 1. Registering a masked privilege request and set the associated error message to
+   *    null, so that this custom handler will be called when an authorization exception
+   *    is thrown;
+   * 2. Overriding this method to specify how to handle the authorization exception for
+   *    this statement class.
+   *
+   * By default, the handler ignores the exception. If a statement class registers only
+   * masked authorization exceptions with error message set to null, it might need to
+   * override this method.
+   *
+   * NOTE: Currently access to the runtime profile is set to disabled when a masked
+   * authorization exception is thrown before this handler gets called (Refer to
+   * BaseAuthorizationChecker.authorize() for details).
+   * @param analysisResult
+   */
+  public void handleAuthorizationException(AnalysisResult analysisResult) {
+    // Do nothing
   }
 }

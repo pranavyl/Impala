@@ -17,9 +17,8 @@
 #
 # Client tests for Query Event Hooks
 
-import os
+from __future__ import absolute_import, division, print_function
 import pytest
-import tempfile
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 
@@ -29,16 +28,16 @@ class TestHooks(CustomClusterTestSuite):
   Tests for FE QueryEventHook invocations.
   """
   DUMMY_HOOK = "org.apache.impala.testutil.DummyQueryEventHook"
-  MINIDUMP_PATH = tempfile.mkdtemp()
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impala_log_dir=tempfile.mkdtemp(prefix="test_hooks_", dir=os.getenv("LOG_DIR")),
-      impalad_args="--query_event_hook_classes={0} "
-                   "--minidump_path={1} -logbuflevel=-1"
-                   .format(DUMMY_HOOK, MINIDUMP_PATH),
-      catalogd_args="--minidump_path={0}".format(MINIDUMP_PATH))
-  def test_query_event_hooks_execute(self, unique_database):
+      impala_log_dir="{query_event_hooks_log}",
+      impalad_args=("--query_event_hook_classes={0} -logbuflevel=-1 ".format(DUMMY_HOOK)
+                    + "--minidump_path={query_event_hooks_minidump}"),
+      catalogd_args="--minidump_path={query_event_hooks_minidump}",
+      tmp_dir_placeholders=['query_event_hooks_log', 'query_event_hooks_minidump'],
+      disable_log_buffering=True)
+  def test_query_event_hooks_execute(self):
     """
     Tests that the post query execution hook actually executes by using a
     dummy hook implementation.
@@ -73,19 +72,18 @@ class TestHooksStartupFail(CustomClusterTestSuite):
 
   FAILING_HOOK = "org.apache.impala.testutil.AlwaysErrorQueryEventHook"
   NONEXIST_HOOK = "captain.hook"
-  LOG_DIR1 = tempfile.mkdtemp(prefix="test_hooks_startup_fail_", dir=os.getenv("LOG_DIR"))
-  LOG_DIR2 = tempfile.mkdtemp(prefix="test_hooks_startup_fail_", dir=os.getenv("LOG_DIR"))
-  MINIDUMP_PATH = tempfile.mkdtemp()
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
+      expect_cores=True,
       cluster_size=1,
       impalad_timeout_s=5,
-      impala_log_dir=LOG_DIR1,
-      impalad_args="--query_event_hook_classes={0} "
-                   "--minidump_path={1}"
-                   .format(FAILING_HOOK, MINIDUMP_PATH),
-      catalogd_args="--minidump_path={0}".format(MINIDUMP_PATH))
+      impala_log_dir="{hook_startup_fail_log}",
+      impalad_args=("--query_event_hook_classes={0} ".format(FAILING_HOOK)
+                    + "--minidump_path={hook_startup_fail_minidump}"),
+      catalogd_args="--minidump_path={hook_startup_fail_minidump}",
+      tmp_dir_placeholders=['hook_startup_fail_log', 'hook_startup_fail_minidump'],
+      disable_log_buffering=True)
   def test_hook_startup_fail(self):
     """
     Tests that exception during QueryEventHook.onImpalaStart will prevent
@@ -99,13 +97,16 @@ class TestHooksStartupFail(CustomClusterTestSuite):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
+      expect_cores=True,
       cluster_size=1,
       impalad_timeout_s=5,
-      impala_log_dir=LOG_DIR2,
-      impalad_args="--query_event_hook_classes={0} "
-                   "--minidump_path={1}"
-                   .format(NONEXIST_HOOK, MINIDUMP_PATH),
-      catalogd_args="--minidump_path={0}".format(MINIDUMP_PATH))
+      impala_log_dir="{hook_instantiation_fail_log}",
+      impalad_args=("--query_event_hook_classes={0} ".format(NONEXIST_HOOK)
+                    + "--minidump_path={hook_instantiation_fail_minidump}"),
+      catalogd_args="--minidump_path={hook_instantiation_fail_minidump}",
+      tmp_dir_placeholders=['hook_instantiation_fail_log',
+                            'hook_instantiation_fail_minidump'],
+      disable_log_buffering=True)
   def test_hook_instantiation_fail(self):
     """
     Tests that failure to instantiate a QueryEventHook will prevent
@@ -115,21 +116,3 @@ class TestHooksStartupFail(CustomClusterTestSuite):
     self.assert_impalad_log_contains("INFO",
                                      "Unable to instantiate query event hook class {0}"
                                      .format(self.NONEXIST_HOOK), expected_count=-1)
-
-  def setup_method(self, method):
-    # Explicitly override CustomClusterTestSuite.setup_method() to
-    # allow it to exception, since this test suite is for cases where
-    # startup fails
-    try:
-      super(TestHooksStartupFail, self).setup_method(method)
-    except Exception:
-      self._stop_impala_cluster()
-
-  def teardown_method(self, method):
-    # Explicitly override CustomClusterTestSuite.teardown_method() to
-    # allow it to exception, since it relies on setup_method() having
-    # completed successfully
-    try:
-      super(TestHooksStartupFail, self).teardown_method(method)
-    except Exception:
-      self._stop_impala_cluster()

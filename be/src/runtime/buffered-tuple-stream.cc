@@ -832,8 +832,13 @@ Status BufferedTupleStream::GetNextInternal(ReadIterator* RESTRICT read_iter,
   DCHECK(read_iter->read_page_->is_pinned()) << DebugString();
   DCHECK_GE(read_iter->read_page_rows_returned_, 0);
 
-  int rows_left_in_page = read_iter->GetRowsLeftInPage();
-  int rows_to_fill = std::min(batch->capacity() - batch->num_rows(), rows_left_in_page);
+  int64_t rows_left_in_page = read_iter->GetRowsLeftInPage();
+  // We are casting an int64_t to int here but this is OK because rows_to_fill is
+  // no greater than batch->capacity(), which in turn is no greater than INT_MAX.
+  int64_t rows_to_fill_temp = std::min(
+      static_cast<int64_t>(batch->capacity() - batch->num_rows()), rows_left_in_page);
+  DCHECK_LE(rows_to_fill_temp, INT_MAX);
+  int rows_to_fill = static_cast<int>(rows_to_fill_temp);
   DCHECK_GE(rows_to_fill, 1);
   uint8_t* tuple_row_mem = reinterpret_cast<uint8_t*>(batch->GetRow(batch->num_rows()));
 
@@ -915,8 +920,9 @@ void BufferedTupleStream::FixUpStringsForRead(const vector<SlotDescriptor*>& str
     if (tuple->IsNull(slot_desc->null_indicator_offset())) continue;
 
     StringValue* sv = tuple->GetStringSlot(slot_desc->tuple_offset());
-    sv->ptr = reinterpret_cast<char*>(read_iter->read_ptr_);
-    read_iter->AdvanceReadPtr(sv->len);
+    if (sv->IsSmall()) continue;
+    sv->SetPtr(reinterpret_cast<char*>(read_iter->read_ptr_));
+    read_iter->AdvanceReadPtr(sv->Len());
   }
 }
 
@@ -944,7 +950,8 @@ void BufferedTupleStream::FixUpCollectionsForRead(
   }
 }
 
-int64_t BufferedTupleStream::ComputeRowSize(TupleRow* row) const noexcept {
+int64_t BufferedTupleStream::ComputeRowSize(TupleRow* row)
+    const noexcept {
   int64_t size = 0;
   if (has_nullable_tuple_) {
     size += NullIndicatorBytesPerRow();
@@ -962,7 +969,9 @@ int64_t BufferedTupleStream::ComputeRowSize(TupleRow* row) const noexcept {
     const vector<SlotDescriptor*>& slots = inlined_string_slots_[i].second;
     for (auto it = slots.begin(); it != slots.end(); ++it) {
       if (tuple->IsNull((*it)->null_indicator_offset())) continue;
-      size += tuple->GetStringSlot((*it)->tuple_offset())->len;
+      StringValue* sv = tuple->GetStringSlot((*it)->tuple_offset());
+      if (sv->IsSmall()) continue;
+      size += sv->Len();
     }
   }
 
@@ -979,7 +988,7 @@ int64_t BufferedTupleStream::ComputeRowSize(TupleRow* row) const noexcept {
       if (!item_desc.HasVarlenSlots()) continue;
       for (int j = 0; j < cv->num_tuples; ++j) {
         Tuple* item = reinterpret_cast<Tuple*>(&cv->ptr[j * item_desc.byte_size()]);
-        size += item->VarlenByteSize(item_desc);
+        size += item->VarlenByteSize(item_desc, false /*assume_smallify*/);
       }
     }
   }
@@ -1030,6 +1039,8 @@ bool BufferedTupleStream::AddRow(TupleRow* row, Status* status) noexcept {
   if (UNLIKELY(write_page_ == nullptr || !DeepCopy(row, &write_ptr_, write_end_ptr_))) {
     return AddRowSlow(row, status);
   }
+  DCHECK_LT(num_rows_, INT64_MAX);
+  DCHECK_LT(write_page_->num_rows, INT64_MAX);
   ++num_rows_;
   ++write_page_->num_rows;
   return true;
@@ -1111,11 +1122,12 @@ bool BufferedTupleStream::CopyStrings(const Tuple* tuple,
   for (const SlotDescriptor* slot_desc : string_slots) {
     if (tuple->IsNull(slot_desc->null_indicator_offset())) continue;
     const StringValue* sv = tuple->GetStringSlot(slot_desc->tuple_offset());
-    if (LIKELY(sv->len > 0)) {
-      if (UNLIKELY(*data + sv->len > data_end)) return false;
+    if (LIKELY(sv->Len() > 0) && !sv->IsSmall()) {
+      StringValue::SimpleString s = sv->ToSimpleString();
+      if (UNLIKELY(*data + s.len > data_end)) return false;
 
-      memcpy(*data, sv->ptr, sv->len);
-      *data += sv->len;
+      memcpy(*data, s.ptr, s.len);
+      *data += s.len;
     }
   }
   return true;

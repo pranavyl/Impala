@@ -17,24 +17,77 @@
 
 package org.apache.impala.customcluster;
 
+import static org.apache.impala.customcluster.LdapKerberosImpalaShellTestBase.flagsToArgs;
+import static org.apache.impala.customcluster.LdapKerberosImpalaShellTestBase.mergeFlags;
 import static org.apache.impala.testutil.LdapUtil.*;
 
+import com.google.common.collect.ImmutableMap;
 import org.apache.directory.server.core.annotations.CreateDS;
 import org.apache.directory.server.core.annotations.CreatePartition;
+import org.junit.ClassRule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+
+import java.io.IOException;
 
 /**
  * Impala shell connectivity tests with Search Bind LDAP authentication.
+ *
+ * The test suite is parameterized, all tests are executed with both Kerberos
+ * authentication disabled and with Kerberos authentication enabled to validate
+ * that LDAP search bind authentication is not broken even if Kerberos authentication
+ * is enabled.
  */
 @CreateDS(name = "myDS",
     partitions = { @CreatePartition(name = "test", suffix = "dc=myorg,dc=com") })
+@RunWith(Parameterized.class)
 public class LdapSearchBindImpalaShellTest extends LdapImpalaShellTest {
+
+  @ClassRule
+  public static KerberosKdcEnvironment kerberosKdcEnvironment =
+          new KerberosKdcEnvironment(new TemporaryFolder());
+
+  private final boolean kerberosAuthenticationEnabled;
+
+  @Parameterized.Parameters(name = "kerberosAuthenticationEnabled={0}")
+  public static Boolean[] kerberosAuthenticationEnabled() {
+    return new Boolean[] {Boolean.FALSE, Boolean.TRUE};
+  }
+
+  public LdapSearchBindImpalaShellTest(boolean isKerberosAuthenticationEnabled) {
+    this.kerberosAuthenticationEnabled = isKerberosAuthenticationEnabled;
+  }
+
+
+  @Override
+  protected int startImpalaCluster(String args) throws IOException, InterruptedException {
+    if (kerberosAuthenticationEnabled) {
+      return kerberosKdcEnvironment.startImpalaClusterWithArgs(args);
+    } else {
+      return super.startImpalaCluster(args);
+    }
+  }
+
   @Override
   public void setUp(String extraArgs) throws Exception {
     String searchBindArgs = String.format("--ldap_search_bind_authentication=true "
-            + "--ldap_bind_dn=%s --ldap_bind_password_cmd='echo -n %s' %s",
-        TEST_USER_DN_1, TEST_PASSWORD_1, extraArgs);
+                    + "--ldap_bind_dn=%s --ldap_bind_password_cmd='echo -n %s' %s %s",
+            TEST_USER_DN_1, TEST_PASSWORD_1, getKerberosArgs(), extraArgs);
     super.setUp(searchBindArgs);
+  }
+
+  private String getKerberosArgs() throws IOException {
+    return kerberosAuthenticationEnabled ?
+            flagsToArgs(mergeFlags(
+                    kerberosKdcEnvironment.getKerberosAuthFlags(),
+                    ImmutableMap.of(
+                            "allow_custom_ldap_filters_with_kerberos_auth", "true"
+                    )
+            ))
+            :
+            "";  // empty if Kerberos authentication is disabled
   }
 
   /**
@@ -44,7 +97,7 @@ public class LdapSearchBindImpalaShellTest extends LdapImpalaShellTest {
   public void testShellLdapAuth() throws Exception {
     setUp("--ldap_user_search_basedn=dc=myorg,dc=com "
         + "--ldap_user_filter=(&(objectClass=person)(cn={0}))");
-    testShellLdapAuthImpl();
+    testShellLdapAuthImpl(null);
   }
 
   /**
@@ -71,7 +124,7 @@ public class LdapSearchBindImpalaShellTest extends LdapImpalaShellTest {
     setUp(String.format("--ldap_user_search_basedn=dc=myorg,dc=com "
             + "--ldap_group_search_basedn=ou=Groups,dc=myorg,dc=com "
             + "--ldap_user_filter=(&(objectClass=person)(cn={0})(!(cn=%s))) "
-            + "--ldap_group_filter=(uniqueMember={1})",
+            + "--ldap_group_filter=(uniqueMember={0})",
         TEST_USER_2));
     testLdapFiltersImpl();
   }
@@ -89,7 +142,7 @@ public class LdapSearchBindImpalaShellTest extends LdapImpalaShellTest {
     setUp(String.format("--ldap_user_search_basedn=dc=myorg,dc=com "
             + "--ldap_group_search_basedn=ou=Groups,dc=myorg,dc=com "
             + "--ldap_user_filter=(&(objectClass=person)(cn={0})(!(cn=%s))) "
-            + "--ldap_group_filter=(&(cn=%s)(uniqueMember={1}))",
+            + "--ldap_group_filter=(&(cn=%s)(uniqueMember={0}))",
         TEST_USER_2, TEST_USER_GROUP));
     testLdapFiltersImpl();
   }
@@ -107,10 +160,35 @@ public class LdapSearchBindImpalaShellTest extends LdapImpalaShellTest {
     setUp(String.format("--ldap_user_search_basedn=dc=myorg,dc=com "
             + "--ldap_group_search_basedn=ou=Groups,dc=myorg,dc=com "
             + "--ldap_user_filter=(&(objectClass=person)(cn={0})(!(cn=Test2Ldap))) "
-            + "--ldap_group_filter=(&(cn=group1)(uniqueMember={1})) "
+            + "--ldap_group_filter=(&(cn=group1)(uniqueMember={0})) "
             + "--authorized_proxy_user_config=%s=* ",
         TEST_USER_4));
     testLdapFiltersWithProxyImpl();
+  }
+
+  /**
+   * Tests proxy-user authentication without impersonation over all available protocols.
+   */
+  @Test
+  public void testLdapFiltersWithProxyWithoutDoAsUser() throws Exception {
+    // These correspond to the values in fe/src/test/resources/users.ldif
+    // Sets up a cluster where TEST_USER_1 can act as a proxy for any other user
+    // and TEST_USER_1 passes the group filter, and user filter, too.
+    setUp(String.format("--ldap_user_search_basedn=dc=myorg,dc=com "
+            + "--ldap_group_search_basedn=ou=Groups,dc=myorg,dc=com "
+            + "--ldap_user_filter=(&(objectClass=person)(cn={0})(!(cn=Test2Ldap))) "
+            + "--ldap_group_filter=(&(cn=group1)(uniqueMember={0})) "
+            + "--authorized_proxy_user_config=%s=* ", TEST_USER_1));
+
+    String query = "select logged_in_user()";
+
+    for (String protocol : getProtocolsToTest()) {
+      // Run as the proxy without a delegate user,
+      // testcase should pass since the proxy user passes the filters.
+      String[] command =
+          buildCommand(query, protocol, TEST_USER_1, TEST_PASSWORD_1, "/cliservice");
+      RunShellCommand.Run(command, /* shouldSucceed */ true, TEST_USER_1, "");
+    }
   }
 
   /**
@@ -145,7 +223,7 @@ public class LdapSearchBindImpalaShellTest extends LdapImpalaShellTest {
     setUp("--ldap_user_search_basedn=dc=myorg,dc=com "
         + "--ldap_group_search_basedn=ou=Groups,dc=myorg,dc=com "
         + "--ldap_user_filter=(cn={0}) "
-        + "--ldap_group_filter=(uniqueMember={1}) ");
+        + "--ldap_group_filter=(uniqueMember={0}) ");
     String query = "select logged_in_user()";
 
     // Authentications should succeed with user who has escaped character in its DN

@@ -15,10 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 import os
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
+from tests.common.skip import SkipIf
 
 IMPALA_HOME = os.getenv('IMPALA_HOME')
 HIVE_SITE_EVENTS_CLEANUP = IMPALA_HOME + '/fe/src/test/resources/hive-site-events-cleanup'
@@ -27,6 +29,7 @@ HIVE_SITE_EVENTS_CLEANUP = IMPALA_HOME + '/fe/src/test/resources/hive-site-event
 class TestTableLoadingWithEventsCleanUp(CustomClusterTestSuite):
 
   @pytest.mark.execute_serially
+  @SkipIf.is_test_jdk
   @CustomClusterTestSuite.with_args(hive_conf_dir=HIVE_SITE_EVENTS_CLEANUP)
   def test_table_load_with_events_cleanup(self, unique_database):
     """Regression test for IMPALA-11028"""

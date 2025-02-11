@@ -25,11 +25,13 @@ import org.apache.impala.analysis.Path.PathType;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HdfsFileFormat;
-import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.TypeCompatibility;
+import org.apache.impala.catalog.iceberg.IcebergMetadataTable;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.ThriftSerializationCtx;
 import org.apache.impala.common.UnsupportedFeatureException;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
@@ -37,18 +39,22 @@ import org.apache.impala.thrift.TSlotRef;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.MoreObjects;
-import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 
 public class SlotRef extends Expr {
   protected List<String> rawPath_;
-  private final String label_;  // printed in toSql()
+  protected final String label_;  // printed in toSql()
 
   // Results of analysis.
-  private SlotDescriptor desc_;
+  protected SlotDescriptor desc_;
 
   // The resolved path after resolving 'rawPath_'.
   protected Path resolvedPath_ = null;
+
+  // Indicates if this SlotRef is coming from zipping unnest where the unnest is given in
+  // the FROM clause. Note, when the unnest is in the select list then an UnnestExpr
+  // would be used instead of a SlotRef.
+  protected boolean isZippingUnnest_ = false;
 
   public SlotRef(List<String> rawPath) {
     super();
@@ -83,6 +89,9 @@ public class SlotRef extends Expr {
     String alias = desc.getParent().getAlias();
     label_ = (alias != null ? alias + "." : "") + desc.getLabel();
     numDistinctValues_ = adjustNumDistinctValues();
+
+    if (type_.isStructType()) addStructChildrenAsSlotRefs();
+
     analysisDone();
   }
 
@@ -102,7 +111,7 @@ public class SlotRef extends Expr {
     }
     label_ = other.label_;
     desc_ = other.desc_;
-    type_ = other.type_;
+    isZippingUnnest_ = other.isZippingUnnest_;
   }
 
   /**
@@ -147,8 +156,9 @@ public class SlotRef extends Expr {
       // Should never happen because we only check registered table aliases.
       Preconditions.checkState(false);
     }
+
     Preconditions.checkNotNull(resolvedPath_);
-    desc_ = analyzer.registerSlotRef(resolvedPath_);
+    desc_ = analyzer.registerSlotRef(resolvedPath_, false /*duplicateIfCollections*/);
     type_ = desc_.getType();
     if (!type_.isSupported()) {
       throw new UnsupportedFeatureException("Unsupported type '"
@@ -160,10 +170,9 @@ public class SlotRef extends Expr {
       // HMS string.
       throw new UnsupportedFeatureException("Unsupported type in '" + toSql() + "'.");
     }
-    // Register scalar columns of a catalog table.
-    if (!resolvedPath_.getMatchedTypes().isEmpty()
-        && !resolvedPath_.getMatchedTypes().get(0).isComplexType()) {
-      analyzer.registerScalarColumnForMasking(desc_);
+    // Register columns of a catalog table for column masking.
+    if (!resolvedPath_.getMatchedTypes().isEmpty()) {
+      analyzer.registerColumnForMasking(desc_);
     }
 
     numDistinctValues_ = adjustNumDistinctValues();
@@ -172,95 +181,91 @@ public class SlotRef extends Expr {
       // The NDV cannot exceed the #rows in the table.
       numDistinctValues_ = Math.min(numDistinctValues_, rootTable.getNumRows());
     }
-    if (type_.isStructType() && rootTable != null) {
-      if (!(rootTable instanceof FeFsTable)) {
-        throw new AnalysisException(String.format(
-            "%s is not supported when querying STRUCT type %s",
-            rootTable.getClass().toString(), type_.toSql()));
+
+    if (type_.isStructType()) {
+      addStructChildrenAsSlotRefs();
+      checkForUnsupportedStructFeatures();
+    }
+  }
+
+  /**
+   * Re-expands the struct: recreates the item tuple descriptor of 'desc_' and the child
+   * 'SlotRef's, recursively.
+   * Expects this 'SlotRef' to be a struct.
+   */
+  public void reExpandStruct(Analyzer analyzer) throws AnalysisException {
+    Preconditions.checkState(type_ != null && type_.isStructType());
+    desc_.clearItemTupleDesc();
+    children_.clear();
+
+    analyzer.createStructTuplesAndSlotDescs(desc_);
+    addStructChildrenAsSlotRefs();
+    checkForUnsupportedStructFeatures();
+  }
+
+  // Throws an AnalysisException if any of the struct fields, recursively, of this SlotRef
+  // is a collection or unsupported type or has any other unsupported feature.
+  // Should only be used if this is a struct.
+  public void checkForUnsupportedStructFeatures() throws AnalysisException {
+    Preconditions.checkState(type_ instanceof StructType);
+    for (Expr child : getChildren()) {
+      final Type fieldType = child.getType();
+      if (!fieldType.isSupported()) {
+        throw new AnalysisException("Unsupported type '"
+            + fieldType.toSql() + "' in '" + toSql() + "'.");
       }
-      FeFsTable feTable = (FeFsTable)rootTable;
-      for (HdfsFileFormat format : feTable.getFileFormats()) {
-        if (format != HdfsFileFormat.ORC) {
-          throw new AnalysisException("Querying STRUCT is only supported for ORC file " +
-              "format.");
+
+      if (fieldType.isStructType()) {
+        Preconditions.checkState(child instanceof SlotRef);
+        ((SlotRef) child).checkForUnsupportedStructFeatures();
+      }
+    }
+    if (resolvedPath_ != null) {
+      FeTable rootTable = resolvedPath_.getRootTable();
+      if (rootTable != null) {
+        checkTableTypeSupportsStruct(rootTable);
+        if (rootTable instanceof FeFsTable) {
+          checkFileFormatSupportsStruct((FeFsTable)rootTable);
         }
       }
     }
-    if (type_.isStructType()) expandSlotRefForStruct(analyzer);
   }
 
-  // This function expects this SlotRef to be a Struct and creates SlotRefs to represent
-  // the children of the struct. Also creates slot and tuple descriptors for the children
-  // of the struct.
-  private void expandSlotRefForStruct(Analyzer analyzer) throws AnalysisException {
-    Preconditions.checkState(type_ != null && type_.isStructType());
-    // If the same struct is present multiple times in the select list we create only a
-    // single TupleDescriptor instead of one for each occurence.
-    if (desc_.getItemTupleDesc() == null) {
-      checkForUnsupportedFieldsForStruct();
-      createStructTuplesAndSlots(analyzer, resolvedPath_);
+  private void checkTableTypeSupportsStruct(FeTable feTable) throws AnalysisException {
+    if (!(feTable instanceof FeFsTable) &&
+        !(feTable instanceof IcebergMetadataTable)) {
+      throw new AnalysisException(
+          String.format("%s is not supported when querying STRUCT type %s",
+              feTable, type_.toSql()));
     }
-    addStructChildrenAsSlotRefs(analyzer, desc_.getItemTupleDesc());
   }
 
-  // Expects the type of this SlotRef as a StructType. Throws an AnalysisException if any
-  // of the struct fields of this Slot ref is a collection or unsupported type.
-  private void checkForUnsupportedFieldsForStruct() throws AnalysisException {
-    Preconditions.checkState(type_ instanceof StructType);
-    for (StructField structField : ((StructType)type_).getFields()) {
-      if (!structField.getType().isSupported()) {
-        throw new AnalysisException("Unsupported type '"
-            + structField.getType().toSql() + "' in '" + toSql() + "'.");
-      }
-      if (structField.getType().isCollectionType()) {
-        throw new AnalysisException("Struct containing a collection type is not " +
-            "allowed in the select list.");
+  // Throws exception if the given HdfsFileFormat does not support querying STRUCT types.
+  // Iceberg tables also have ICEBERG as HdfsFileFormat. In case of Iceberg there is no
+  // need to throw exception because the data file formats in the Iceberg table will be
+  // also tested separately.
+  private void checkFileFormatSupportsStruct(FeFsTable feFsTable)
+      throws AnalysisException {
+    for (HdfsFileFormat format : feFsTable.getFileFormats()) {
+      if (! (format == HdfsFileFormat.PARQUET ||
+           format == HdfsFileFormat.ORC ||
+           format == HdfsFileFormat.ICEBERG)) {
+        throw new AnalysisException("Querying STRUCT is only supported for ORC and "
+            + "Parquet file formats.");
       }
     }
   }
 
-  /**
-   * Creates a TupleDescriptor to hold the children of a struct slot and then creates and
-   * adds SlotDescriptors as struct children to this TupleDescriptor. Sets the created
-   * parent TupleDescriptor to 'desc_.itemTupleDesc_'.
-   */
-  public void createStructTuplesAndSlots(Analyzer analyzer, Path resolvedPath) {
-    TupleDescriptor structTuple =
-        analyzer.getDescTbl().createTupleDescriptor("struct_tuple");
-    if (resolvedPath != null) structTuple.setPath(resolvedPath);
-    structTuple.setType((StructType)type_);
-    structTuple.setParentSlotDesc(desc_);
-    for (StructField structField : ((StructType)type_).getFields()) {
-      SlotDescriptor slotDesc = analyzer.getDescTbl().addSlotDescriptor(structTuple);
-      // 'resolvedPath_' could be null e.g. when the query has an order by clause and
-      // this is the sorting tuple.
-      if (resolvedPath != null) {
-        Path relPath = Path.createRelPath(resolvedPath, structField.getName());
-        relPath.resolve();
-        slotDesc.setPath(relPath);
-      }
-      slotDesc.setType(structField.getType());
-      slotDesc.setIsMaterialized(true);
-    }
-    desc_.setItemTupleDesc(structTuple);
-  }
-
-  /**
-   * Assuming that 'structTuple' is the tuple for struct children this function iterates
-   * its slots, creates a SlotRef for each slot and adds them to 'children_' of this
-   * SlotRef.
-   */
-  public void addStructChildrenAsSlotRefs(Analyzer analyzer,
-      TupleDescriptor structTuple) throws AnalysisException {
+  // Assumes this 'SlotRef' is a struct and that desc_.itemTupleDesc_ has already been
+  // filled. Creates the children 'SlotRef's for the struct recursively.
+  private void addStructChildrenAsSlotRefs() {
+    Preconditions.checkState(desc_.getType().isStructType());
+    TupleDescriptor structTuple = desc_.getItemTupleDesc();
     Preconditions.checkState(structTuple != null);
-    Preconditions.checkState(structTuple.getParentSlotDesc() != null);
-    Preconditions.checkState(structTuple.getParentSlotDesc().getType().isStructType());
     for (SlotDescriptor childSlot : structTuple.getSlots()) {
+      // If 'childSlot' is also a struct, the constructor will call this method on it.
       SlotRef childSlotRef = new SlotRef(childSlot);
       children_.add(childSlotRef);
-      if (childSlot.getType().isStructType()) {
-        childSlotRef.expandSlotRefForStruct(analyzer);
-      }
     }
   }
 
@@ -283,11 +288,15 @@ public class SlotRef extends Expr {
   @Override
   protected boolean isConstantImpl() { return false; }
 
+  public boolean hasDesc() { return desc_ != null; }
+
   public SlotDescriptor getDesc() {
     Preconditions.checkState(isAnalyzed());
     Preconditions.checkNotNull(desc_);
     return desc_;
   }
+
+  public List<String> getRawPath() { return rawPath_; }
 
   public SlotId getSlotId() {
     Preconditions.checkState(isAnalyzed());
@@ -300,6 +309,8 @@ public class SlotRef extends Expr {
     return desc_.getPath();
   }
 
+  public void setIsZippingUnnest(boolean b) { isZippingUnnest_ = b; }
+
   @Override
   public String toSqlImpl(ToSqlOptions options) {
     if (label_ != null) return label_;
@@ -309,12 +320,17 @@ public class SlotRef extends Expr {
 
   @Override
   protected void toThrift(TExprNode msg) {
+    Preconditions.checkState(false, "Unexpected use of old toThrift() signature");
+  }
+
+  @Override
+  protected void toThrift(TExprNode msg, ThriftSerializationCtx serialCtx) {
     msg.node_type = TExprNodeType.SLOT_REF;
-    msg.slot_ref = new TSlotRef(desc_.getId().asInt());
+    msg.slot_ref = new TSlotRef(serialCtx.translateSlotId(desc_.getId()).asInt());
     // we shouldn't be sending exprs over non-materialized slots
-    Preconditions.checkState(desc_.isMaterialized(), String.format(
-        "Illegal reference to non-materialized slot: tid=%s sid=%s",
-        desc_.getParent().getId(), desc_.getId()));
+    Preconditions.checkState(desc_.isMaterialized(),
+        "Illegal reference to non-materialized slot: %s", this);
+    Preconditions.checkState(desc_.getByteOffset() >= 0);
     // check that the tuples associated with this slot are executable
     desc_.getParent().checkIsExecutable();
     if (desc_.getItemTupleDesc() != null) desc_.getItemTupleDesc().checkIsExecutable();
@@ -331,14 +347,19 @@ public class SlotRef extends Expr {
     return toStrHelper.toString();
   }
 
+  /**
+   * Overrides hashCode to ignore children, as done in
+   * {@link Expr#matches(Expr, Comparator)}.
+   */
   @Override
   public int hashCode() {
     if (desc_ != null) return desc_.getId().hashCode();
-    return Objects.hashCode(Joiner.on('.').join(rawPath_).toLowerCase());
+    if (label_ != null) return label_.toLowerCase().hashCode();
+    return super.localHash();
   }
 
   @Override
-  public boolean localEquals(Expr that) {
+  protected boolean localEquals(Expr that) {
     if (!super.localEquals(that)) return false;
     SlotRef other = (SlotRef) that;
     // check slot ids first; if they're both set we only need to compare those
@@ -363,10 +384,32 @@ public class SlotRef extends Expr {
   };
 
   @Override
+  protected Expr substituteImpl(ExprSubstitutionMap smap, Analyzer analyzer) {
+    if (smap != null) {
+      Expr substExpr = smap.get(this);
+      if (substExpr != null) return substExpr.clone();
+    }
+
+    // SlotRefs must remain analyzed to support substitution across query blocks,
+    // therefore we do not call resetAnalysisState().
+    substituteImplOnChildren(smap, analyzer);
+    return this;
+  }
+
+  @Override
   public boolean isBoundByTupleIds(List<TupleId> tids) {
     Preconditions.checkState(desc_ != null);
-    for (TupleId tid: tids) {
-      if (tid.equals(desc_.getParent().getId())) return true;
+    // If this SlotRef is coming from zipping unnest then try to do a similar check as
+    // UnnestExpr does.
+    if (isZippingUnnest_ && desc_.getParent() != null &&
+        desc_.getParent().getRootDesc() != null) {
+      TupleId parentId = desc_.getParent().getRootDesc().getId();
+      for (TupleId tid: tids) {
+        if (tid.equals(parentId)) return true;
+      }
+    }
+    for (TupleDescriptor enclosingTupleDesc : desc_.getEnclosingTupleDescs()) {
+      if (tids.contains(enclosingTupleDesc.getId())) return true;
     }
     return false;
   }
@@ -374,7 +417,11 @@ public class SlotRef extends Expr {
   @Override
   public boolean isBoundBySlotIds(List<SlotId> slotIds) {
     Preconditions.checkState(isAnalyzed());
-    return slotIds.contains(desc_.getId());
+    if (slotIds.contains(desc_.getId())) return true;
+    for (SlotDescriptor enclosingSlotDesc : desc_.getEnclosingStructSlotDescs()) {
+      if (slotIds.contains(enclosingSlotDesc.getId())) return true;
+    }
+    return false;
   }
 
   @Override
@@ -383,6 +430,14 @@ public class SlotRef extends Expr {
     Preconditions.checkState(desc_ != null);
     if (slotIds != null) slotIds.add(desc_.getId());
     if (tupleIds != null) tupleIds.add(desc_.getParent().getId());
+
+    // If we are a struct, we need to add all fields recursively so they are materialised.
+    if (desc_.getType().isStructType() && slotIds != null) {
+      TupleDescriptor itemTupleDesc = desc_.getItemTupleDesc();
+      Preconditions.checkState(itemTupleDesc != null);
+      itemTupleDesc.getSlotsRecursively().stream()
+        .forEach(slotDesc -> slotIds.add(slotDesc.getId()));
+    }
   }
 
   @Override
@@ -420,12 +475,17 @@ public class SlotRef extends Expr {
   }
 
   @Override
-  protected Expr uncheckedCastTo(Type targetType) throws AnalysisException {
+  protected Expr uncheckedCastTo(Type targetType, TypeCompatibility compatibility)
+      throws AnalysisException {
     if (type_.isNull()) {
       // Hack to prevent null SlotRefs in the BE
       return NullLiteral.create(targetType);
     } else {
-      return super.uncheckedCastTo(targetType);
+      return super.uncheckedCastTo(targetType, compatibility);
     }
   }
+
+  // Return true since SlotRefs should be easy to access.
+  @Override
+  public boolean shouldConvertToCNF() { return true; }
 }

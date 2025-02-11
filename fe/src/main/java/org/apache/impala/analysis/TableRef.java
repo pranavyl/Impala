@@ -21,18 +21,19 @@ import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import org.apache.impala.analysis.TimeTravelSpec.Kind;
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeFsTable;
-import org.apache.impala.catalog.FeIcebergTable;
+import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.HdfsPartition;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.planner.JoinNode.DistributionMode;
 import org.apache.impala.rewrite.ExprRewriter;
@@ -155,12 +156,16 @@ public class TableRef extends StmtNode {
   // columns via the view.
   protected boolean exposeNestedColumnsByTableMaskView_ = false;
 
-  // Scalar columns referenced in the query. Used in resolving column mask.
-  protected Map<String, Column> scalarColumns_ = new LinkedHashMap<>();
+  // Columns referenced in the query. Used in resolving column mask.
+  protected Map<String, Column> columns_ = new HashMap<>();
 
   // Time travel spec of this table ref. It contains information specified in the
   // FOR SYSTEM_TIME AS OF <timestamp> or FOR SYSTEM_TIME AS OF <version> clause.
   protected TimeTravelSpec timeTravelSpec_;
+
+  // Iceberg data files without deletes selected for OPTIMIZE from this table ref.
+  // Used only in PARTIAL optimization mode, otherwise it is null.
+  private List<HdfsPartition.FileDescriptor> selectedDataFilesWithoutDeletesForOptimize_;
 
   // END: Members that need to be reset()
   /////////////////////////////////////////
@@ -168,6 +173,13 @@ public class TableRef extends StmtNode {
   // true if this table ref is hidden, because e.g. it was generated during statement
   // rewrite.
   private boolean isHidden_ = false;
+
+  // Value of query hint 'TABLE_NUM_ROWS' on this table. Used in constructing ScanNode if
+  // the table does not have stats, or has corrupt stats. -1 indicates no hint. Currently,
+  // this hint is valid for hdfs and kudu table.
+  private long tableNumRowsHint_ = -1;
+  // Table row hint name used in sql.
+  private static final String TABLE_ROW_HINT = "TABLE_NUM_ROWS";
 
   /**
    * Returns a new, resolved, and analyzed table ref.
@@ -254,9 +266,11 @@ public class TableRef extends StmtNode {
     correlatedTupleIds_ = Lists.newArrayList(other.correlatedTupleIds_);
     desc_ = other.desc_;
     exposeNestedColumnsByTableMaskView_ = other.exposeNestedColumnsByTableMaskView_;
-    scalarColumns_ = new LinkedHashMap<>(other.scalarColumns_);
+    columns_ = new LinkedHashMap<>(other.columns_);
     isHidden_ = other.isHidden_;
     zippingUnnestType_ = other.zippingUnnestType_;
+    selectedDataFilesWithoutDeletesForOptimize_ =
+        other.selectedDataFilesWithoutDeletesForOptimize_;
   }
 
   @Override
@@ -266,7 +280,7 @@ public class TableRef extends StmtNode {
   }
 
   /**
-   * Creates and returns a empty TupleDescriptor registered with the analyzer
+   * Creates and returns an empty TupleDescriptor registered with the analyzer
    * based on the resolvedPath_.
    * This method is called from the analyzer when registering this table reference.
    */
@@ -308,11 +322,17 @@ public class TableRef extends StmtNode {
     return convertLimitToSampleHintPercent_;
   }
 
+  public long getTableNumRowsHint() {
+    return tableNumRowsHint_;
+  }
+
   /**
    * Returns true if this table ref has a resolved path that is rooted at a registered
    * tuple descriptor, false otherwise.
    */
   public boolean isRelative() { return false; }
+
+  public boolean isCollectionInSelectList() { return false; }
 
   /**
    * Indicates if this TableRef directly or indirectly references another TableRef from
@@ -401,6 +421,9 @@ public class TableRef extends StmtNode {
   public boolean isAnalyzed() { return isAnalyzed_; }
   public boolean isResolved() { return !getClass().equals(TableRef.class); }
 
+  public boolean isFromClauseZippingUnnest() {
+    return zippingUnnestType_ == ZippingUnnestType.FROM_CLAUSE_ZIPPING_UNNEST;
+  }
   public boolean isZippingUnnest() {
     return zippingUnnestType_ != ZippingUnnestType.NONE;
   }
@@ -464,15 +487,9 @@ public class TableRef extends StmtNode {
   }
 
   protected void analyzeTimeTravel(Analyzer analyzer) throws AnalysisException {
+    // We are analyzing the time travel spec before we know the table type, so we
+    // cannot check if the table supports time travel.
     if (timeTravelSpec_ != null) {
-      if (!(getTable() instanceof FeIcebergTable)) {
-        throw new AnalysisException(String.format(
-            "FOR %s AS OF clause is only supported for Iceberg tables. " +
-            "%s is not an Iceberg table.",
-            timeTravelSpec_.getKind() == Kind.TIME_AS_OF ? "SYSTEM_TIME" :
-                                                           "SYSTEM_VERSION",
-            getTable().getFullName()));
-      }
       timeTravelSpec_.analyze(analyzer);
     }
   }
@@ -493,9 +510,10 @@ public class TableRef extends StmtNode {
     }
     // BaseTableRef will always have their path resolved at this point.
     Preconditions.checkState(getResolvedPath() != null);
+    boolean isTableHintSupported = true;
     if (getResolvedPath().destTable() != null &&
-        !(getResolvedPath().destTable() instanceof FeFsTable)) {
-      analyzer.addWarning("Table hints only supported for Hdfs tables");
+        !supportTableHint(getResolvedPath().destTable(), analyzer)) {
+      isTableHintSupported = false;
     }
     for (PlanHint hint: tableHints_) {
       if (hint.is("SCHEDULE_CACHE_LOCAL")) {
@@ -528,10 +546,38 @@ public class TableRef extends StmtNode {
             addHintWarning(hint, analyzer);
           }
         }
+      } else if (hint.is(TABLE_ROW_HINT)) {
+        List<String> args = hint.getArgs();
+        if (args == null || args.size() != 1 || !isTableHintSupported) {
+          addHintWarning(hint, analyzer);
+          return;
+        }
+        analyzer.setHasPlanHints();
+        tableNumRowsHint_ = Long.parseLong(args.get(0));
       } else {
         addHintWarning(hint, analyzer);
       }
     }
+  }
+
+  /**
+   * Returns whether the table supports hint. Currently, hdfs table support table hint
+   * usage, kudu table only support {@link this#TABLE_ROW_HINT} hint.
+   *
+   * TODO: Add other table hints for kudu table.
+   */
+  private boolean supportTableHint(FeTable table, Analyzer analyzer) {
+    if (table instanceof FeKuduTable) {
+      if (!(tableHints_.size() == 1 && tableHints_.get(0).is(TABLE_ROW_HINT))) {
+        analyzer.addWarning(String.format("Kudu table only support '%s' hint.",
+            TABLE_ROW_HINT));
+        return false;
+      }
+    } else if (!(table instanceof FeFsTable)) {
+      analyzer.addWarning("Table hints only supported for Hdfs/Kudu tables.");
+      return false;
+    }
+    return true;
   }
 
   private void addHintWarning(PlanHint hint, Analyzer analyzer) {
@@ -765,16 +811,52 @@ public class TableRef extends StmtNode {
     correlatedTupleIds_.clear();
     desc_ = null;
     if (timeTravelSpec_ != null) timeTravelSpec_.reset();
+    selectedDataFilesWithoutDeletesForOptimize_ = null;
   }
 
   public boolean isTableMaskingView() { return false; }
 
-  public void registerScalarColumn(Column column) {
-    scalarColumns_.put(column.getName(), column);
+  public void registerColumn(Column column) {
+    columns_.put(column.getName(), column);
   }
 
-  public List<Column> getScalarColumns() {
-    return new ArrayList<>(scalarColumns_.values());
+  /**
+   * @return an unmodifiable list of all columns, but with partition columns at the end of
+   * the list rather than the beginning. This is equivalent to the order in which Hive
+   * enumerates columns.
+   */
+  public List<Column> getColumnsInHiveOrder() {
+    return getTable().getColumnsInHiveOrder();
+  }
+
+  public List<Column> getSelectedColumnsInHiveOrder() {
+    // Map from column name to the Column object (null if not selected).
+    // Use LinkedHashMap to preserve the order.
+    Map<String, Column> colSelection = new LinkedHashMap<>();
+    for (Column c : getColumnsInHiveOrder()) {
+      colSelection.put(c.getName(), null);
+    }
+    // Update 'colSelection' with selected columns. Virtual columns will also be added.
+    for (String colName : columns_.keySet()) {
+      colSelection.put(colName, columns_.get(colName));
+    }
+    List<Column> res = new ArrayList<>();
+    for (Column c : colSelection.values()) {
+      if (c != null) res.add(c);
+    }
+    // Make sure not missing any columns
+    Preconditions.checkState(res.size() == columns_.size(),
+        "missing columns: " + res.size() + " != " + columns_.size());
+    return res;
+  }
+
+  public void setSelectedDataFilesForOptimize(
+      List<HdfsPartition.FileDescriptor> fileDescs) {
+    selectedDataFilesWithoutDeletesForOptimize_ = fileDescs;
+  }
+
+  public List<HdfsPartition.FileDescriptor> getSelectedDataFilesForOptimize() {
+    return selectedDataFilesWithoutDeletesForOptimize_;
   }
 
   void migratePropertiesTo(TableRef other) {
@@ -787,11 +869,11 @@ public class TableRef extends StmtNode {
     other.timeTravelSpec_ = timeTravelSpec_;
     // Clear properties. Don't clear aliases_ since it's still used in resolving slots
     // in the query block of 'other'.
+    // Don't clear timeTravelSpec_ as it is still relevant.
     onClause_ = null;
     usingColNames_ = null;
     joinOp_ = null;
     joinHints_ = new ArrayList<>();
     tableHints_ = new ArrayList<>();
-    timeTravelSpec_ = null;
   }
 }

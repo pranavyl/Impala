@@ -135,8 +135,9 @@ class Coordinator::BackendState {
 
   /// Update overall execution status, including the instances' exec status/profiles
   /// and the error log, if this backend is not already done. Updates the fragment
-  /// instances' TExecStats in exec_summary (exec_summary->nodes.exec_stats) and updates
-  /// scan_range_progress with any newly-completed scan ranges.
+  /// instances' TExecStats in exec_summary (exec_summary->nodes.exec_stats), updates
+  /// scan_range_progress with any newly-completed scan ranges and updates query_progress
+  /// with any newly-completed fragment instances.
   ///
   /// If any instance reports an error, the overall execution status becomes the first
   /// reported error status. Returns true iff this update changed IsDone() from false
@@ -145,8 +146,8 @@ class Coordinator::BackendState {
   /// FragmentInstanceExecStatusPB in backend_exec_status to the vector aux_error_info.
   bool ApplyExecStatusReport(const ReportExecStatusRequestPB& backend_exec_status,
       const TRuntimeProfileForest& thrift_profiles, ExecSummary* exec_summary,
-      ProgressUpdater* scan_range_progress, DmlExecState* dml_exec_state,
-      std::vector<AuxErrorInfoPB>* aux_error_info,
+      ProgressUpdater* scan_range_progress, ProgressUpdater* query_progress,
+      DmlExecState* dml_exec_state, std::vector<AuxErrorInfoPB>* aux_error_info,
       const std::vector<FragmentStats*>& fragment_stats);
 
   /// Merges the incoming 'thrift_profile' into this backend state's host profile.
@@ -450,8 +451,11 @@ class Coordinator::BackendState {
   void SetExecError(
       const Status& status, TypedCountingBarrier<Status>* exec_status_barrier);
 
-  /// Same as WaitOnExecRpc(), except 'l' must own 'lock_'.
-  void WaitOnExecLocked(std::unique_lock<std::mutex>* l);
+  /// Waits until the ExecQueryFInstances() rpc has completed, or been timeout.
+  /// 'l' must own 'lock_'. 'timeout_ms' specifies timeout in milli-seconds. Wait
+  /// indefinitely until rpc has completed if 'timeout_ms' is less or equal to 0.
+  /// Return true if the rpc has completed in time, return false otherwise.
+  bool WaitOnExecLocked(std::unique_lock<std::mutex>* l, int64_t timeout_ms = 0);
 
   /// Called when the ExecQueryFInstances() rpc completes. Notifies 'exec_status_barrier'
   /// with the status. 'start' is the MonotonicMillis() timestamp when the rpc was sent.
@@ -470,6 +474,9 @@ class Coordinator::BackendState {
 
   /// Logs 'msg' at the VLOG_QUERY level, along with 'query_id_' and 'krpc_host_'.
   void VLogForBackend(const std::string& msg);
+
+  /// Populates the 'by_node_filepath_to_hosts' mapping in 'request' from 'exec_params_'.
+  void CopyFilepathToHostsMappingToRequest(ExecQueryFInstancesRequestPB* request) const;
 };
 
 /// Per fragment execution statistics.

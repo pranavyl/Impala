@@ -56,15 +56,17 @@ public class ToSqlTest extends FrontendTestBase {
 
   static {
     // Exclude the NULL AWARE LEFT ANTI JOIN operator because it cannot
-    // be directly expressed via SQL.
-    joinTypes_ = new String[JoinOperator.values().length - 2];
-    int numNonSemiJoinTypes = JoinOperator.values().length - 2 -
-        leftSemiJoinTypes_.length - rightSemiJoinTypes_.length;
+    // be directly expressed via SQL, and ICEBERG DELETE JOIN, because it is not
+    // a real join.
+    joinTypes_ = new String[JoinOperator.values().length - 3];
+    int numNonSemiJoinTypes = JoinOperator.values().length - 3 - leftSemiJoinTypes_.length
+        - rightSemiJoinTypes_.length;
     nonSemiJoinTypes_ = new String[numNonSemiJoinTypes];
     int i = 0;
     int j = 0;
     for (JoinOperator op: JoinOperator.values()) {
-      if (op.isCrossJoin() || op.isNullAwareLeftAntiJoin()) continue;
+      if (op.isCrossJoin() || op.isNullAwareLeftAntiJoin() || op.isIcebergDeleteJoin())
+        continue;
       joinTypes_[i++] = op.toString();
       if (op.isSemiJoin()) continue;
       nonSemiJoinTypes_[j++] = op.toString();
@@ -472,6 +474,24 @@ public class ToSqlTest extends FrontendTestBase {
   }
 
   @Test
+  public void TestCreateBucketTable() throws AnalysisException {
+    testToSql("create table bucketed_table ( a int ) " +
+        "CLUSTERED BY ( a ) into 24 buckets", "default",
+        "CREATE TABLE default.bucketed_table ( a INT ) " +
+        "CLUSTERED BY ( a ) INTO 24 BUCKETS STORED AS TEXTFILE", true);
+    testToSql("create table bucketed_table1 ( a int ) " +
+        "partitioned by ( dt string ) CLUSTERED BY ( a ) into 24 buckets", "default",
+        "CREATE TABLE default.bucketed_table1 ( a INT ) " +
+        "PARTITIONED BY ( dt STRING ) CLUSTERED BY ( a ) INTO 24 BUCKETS " +
+        "STORED AS TEXTFILE", true);
+    testToSql("create table bucketed_table2 ( a int, s string ) partitioned " +
+        "by ( dt string ) CLUSTERED BY ( a ) sort by (s) into 24 buckets",
+        "default", "CREATE TABLE default.bucketed_table2 " +
+        "( a INT, s STRING ) PARTITIONED BY ( dt STRING ) CLUSTERED BY ( a ) SORT BY " +
+        "LEXICAL ( s ) INTO 24 BUCKETS STORED AS TEXTFILE", true);
+  }
+
+  @Test
   public void TestCreateView() throws AnalysisException {
     testToSql(
       "create view foo_new as select int_col, string_col from functional.alltypes",
@@ -503,6 +523,12 @@ public class ToSqlTest extends FrontendTestBase {
         "CREATE VIEW test_view_with_subquery AS " +
         "SELECT * FROM functional.alltypestiny t WHERE EXISTS " +
         "(SELECT * FROM functional.alltypessmall s WHERE s.id = t.id)");
+    testToSql(
+      "create view test_properties tblproperties ('a'='aa', 'b'='bb') as " +
+      "select int_col, string_col from functional.alltypes",
+      "default",
+      "CREATE VIEW test_properties TBLPROPERTIES ('a'='aa', 'b'='bb') AS " +
+      "SELECT int_col, string_col FROM functional.alltypes");
   }
 
   @Test
@@ -534,6 +560,12 @@ public class ToSqlTest extends FrontendTestBase {
         "default", "ALTER VIEW functional.alltypes_view(cnt) AS "+
         "SELECT count(DISTINCT x.int_col) FROM functional.alltypessmall x " +
         "INNER JOIN functional.alltypessmall y ON (x.id = y.id) GROUP BY x.bigint_col");
+    testToSql("alter view functional.alltypes_view set tblproperties ('a'='b')",
+        "functional",
+        "ALTER VIEW functional.alltypes_view SET TBLPROPERTIES ('a'='b')");
+    testToSql("alter view functional.alltypes_view unset tblproperties ('a', 'c')",
+        "functional",
+        "ALTER VIEW functional.alltypes_view UNSET TBLPROPERTIES ('a', 'c')");
   }
 
   @Test
@@ -972,6 +1004,10 @@ public class ToSqlTest extends FrontendTestBase {
         "VALUES(112, DATE '1970-01-01')");
     testToSql("upsert into table functional_kudu.testtbl values(1, 'a', 1)",
         "UPSERT INTO TABLE functional_kudu.testtbl VALUES(1, 'a', 1)");
+    testToSql("insert into table functional.binary_tbl " +
+        "values(1, 'a', cast('a' as binary))",
+        "INSERT INTO TABLE functional.binary_tbl " +
+        "VALUES(1, 'a', CAST('a' AS BINARY))");
   }
 
   /**
@@ -1471,6 +1507,13 @@ public class ToSqlTest extends FrontendTestBase {
     // FunctionCallExpr.
     testToSql("select pi(), (pi()), trim('a'), (trim('a'))",
         "SELECT pi(), (pi()), trim('a'), (trim('a'))");
+    // TrimFromExpr.
+    testToSql("select trim('aa' from 'abc'), (trim('aa' from 'abc')), " +
+        "trim(leading 'aa' from 'abc'), trim(string_col from 'string') " +
+        "from functional.alltypes",
+        "SELECT trim('aa' FROM 'abc'), (trim('aa' FROM 'abc')), " +
+        "trim(LEADING 'aa' FROM 'abc'), trim(string_col FROM 'string') " +
+        "FROM functional.alltypes");
     // LiteralExpr.
     testToSql("select 10, (10), 20.0, (20.0), NULL, (NULL), 'abc', ('abc')",
         "SELECT 10, (10), 20.0, (20.0), NULL, (NULL), 'abc', ('abc')");
@@ -1655,6 +1698,7 @@ public class ToSqlTest extends FrontendTestBase {
     List<String> principalTypes = Arrays.asList("USER", "ROLE", "GROUP");
     String testRole = System.getProperty("user.name");
     String testUri = "hdfs://localhost:20500/test-warehouse";
+    String testStorageHandlerUri = "kudu://localhost/tbl";
 
     for (String pt : principalTypes) {
       try {
@@ -1720,6 +1764,26 @@ public class ToSqlTest extends FrontendTestBase {
               pt, testRole));
         }
 
+        privileges = Arrays.stream(Privilege.values())
+            .filter(p -> p != Privilege.OWNER &&
+                (p == Privilege.CREATE ||
+                p == Privilege.DROP ||
+                p == Privilege.SELECT))
+            .collect(Collectors.toList());
+
+        for (Privilege p : privileges) {
+          testToSql(ctx, String.format("GRANT %s ON USER_DEFINED_FN " +
+              "functional.identity TO %s %s", p, pt, testRole));
+          testToSql(ctx, String.format("GRANT %s ON USER_DEFINED_FN " +
+              "functional.identity TO %s %s WITH GRANT OPTION", p, pt, testRole));
+          testToSql(ctx, String.format(
+              "REVOKE %s ON USER_DEFINED_FN functional.identity FROM %s %s", p, pt,
+              testRole));
+          testToSql(ctx, String.format(
+              "REVOKE GRANT OPTION FOR %s ON USER_DEFINED_FN functional.identity " +
+              "FROM %s %s", p, pt, testRole));
+        }
+
         // Uri (Only ALL is supported)
         testToSql(ctx, String.format("GRANT ALL ON URI '%s' TO %s %s", testUri, pt,
             testRole));
@@ -1729,6 +1793,17 @@ public class ToSqlTest extends FrontendTestBase {
             pt, testRole));
         testToSql(ctx, String.format("REVOKE GRANT OPTION FOR ALL ON URI '%s' FROM %s %s",
             testUri, pt, testRole));
+
+        // Storage handler URI (Only RWSTORAGE is supported)
+        testToSql(ctx, String.format(
+            "GRANT RWSTORAGE ON STORAGEHANDLER_URI '%s' TO %s %s",
+            testStorageHandlerUri, pt, testRole));
+        testToSql(ctx, String.format("GRANT RWSTORAGE ON STORAGEHANDLER_URI '%s' " +
+            "TO %s %s WITH GRANT OPTION", testStorageHandlerUri, pt, testRole));
+        testToSql(ctx, String.format("REVOKE RWSTORAGE ON STORAGEHANDLER_URI '%s' " +
+            "FROM %s %s", testStorageHandlerUri, pt, testRole));
+        testToSql(ctx, String.format("REVOKE GRANT OPTION FOR RWSTORAGE ON " +
+            "STORAGEHANDLER_URI '%s' FROM %s %s", testStorageHandlerUri, pt, testRole));
 
         // Column (Only SELECT is supported)
         testToSql(ctx, String.format(
@@ -1826,5 +1901,44 @@ public class ToSqlTest extends FrontendTestBase {
     testToSql(":shutdown('hostname')");
     testToSql(":shutdown('hostname', 1000)");
     testToSql(":shutdown(1000)");
+  }
+
+  /**
+   * Tests that SHOW TABLES statements are output correctly.
+   */
+  @Test
+  public void testShowTables() {
+    testToSql("SHOW TABLES", "default", "SHOW TABLES");
+    testToSql("SHOW TABLES IN functional");
+    testToSql("SHOW TABLES LIKE 'alltypes*'", "functional",
+        "SHOW TABLES LIKE 'alltypes*'");
+    testToSql("SHOW TABLES IN functional LIKE 'alltypes*'");
+  }
+
+  /**
+   * Tests that SHOW METADATA TABLES statements are output correctly.
+   */
+  @Test
+  public void testShowMetadataTables() {
+    String q1 = "SHOW METADATA TABLES IN iceberg_query_metadata";
+    testToSql(q1, "functional_parquet", q1);
+    String q2 = "SHOW METADATA TABLES IN iceberg_query_metadata LIKE '*file*'";
+    testToSql(q2, "functional_parquet", q2);
+
+    testToSql("SHOW METADATA TABLES IN functional_parquet.iceberg_query_metadata");
+    testToSql("SHOW METADATA TABLES IN functional_parquet.iceberg_query_metadata " +
+        "LIKE '*file*'");
+  }
+
+  /**
+   * Test SHOW VIEWS statements are output correctly.
+   */
+  @Test
+  public void testShowViews() {
+    testToSql("SHOW VIEWS", "default", "SHOW VIEWS");
+    testToSql("SHOW VIEWS IN functional");
+    testToSql("SHOW VIEWS LIKE 'alltypes*'", "functional",
+        "SHOW VIEWS LIKE 'alltypes*'");
+    testToSql("SHOW VIEWS IN functional LIKE 'alltypes*'");
   }
 }

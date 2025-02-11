@@ -17,6 +17,7 @@
 
 # Targeted tests for decimal type.
 
+from __future__ import absolute_import, division, print_function
 from copy import copy
 import pytest
 
@@ -47,7 +48,7 @@ class TestDecimalQueries(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_constraint(lambda v:\
         (v.get_value('table_format').file_format == 'text' and
          v.get_value('table_format').compression_codec == 'none') or
-         v.get_value('table_format').file_format in ['parquet', 'orc', 'kudu'])
+         v.get_value('table_format').file_format in ['parquet', 'orc', 'kudu', 'json'])
 
     # Run these queries through both beeswax and HS2 to get coverage of decimals returned
     # via both protocols.
@@ -172,7 +173,7 @@ class TestDecimalOverflowExprs(ImpalaTestSuite):
       try:
         self.execute_query_using_client(self.client, query_1, vector)
         assert False, "Query was expected to fail"
-      except ImpalaBeeswaxException, e:
+      except ImpalaBeeswaxException as e:
         assert "Decimal expression overflowed" in str(e)
 
       result = self.execute_query_expect_success(self.client,
@@ -187,7 +188,7 @@ class TestDecimalOverflowExprs(ImpalaTestSuite):
     try:
       self.execute_query_using_client(self.client, query_1, vector)
       assert False, "Query was expected to fail"
-    except ImpalaBeeswaxException, e:
+    except ImpalaBeeswaxException as e:
       assert "Decimal expression overflowed" in str(e)
 
     result = self.execute_query_expect_success(self.client,
@@ -215,7 +216,7 @@ class TestDecimalOverflowExprs(ImpalaTestSuite):
     try:
       self.execute_query_using_client(self.client, query_2, vector)
       assert False, "Query was expected to fail"
-    except ImpalaBeeswaxException, e:
+    except ImpalaBeeswaxException as e:
       assert "Decimal expression overflowed" in str(e)
 
     result = self.execute_query_expect_success(self.client,

@@ -22,12 +22,13 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Stack;
 
 import org.apache.impala.analysis.AnalyticExpr;
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.Expr;
-import org.apache.impala.analysis.FunctionCallExpr;
+import org.apache.impala.analysis.ExprSubstitutionMap;
 import org.apache.impala.analysis.JoinOperator;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotRef;
@@ -84,10 +85,10 @@ public abstract class JoinNode extends PlanNode {
   protected JoinTableId joinTableId_ = JoinTableId.INVALID;
 
   // True if this join is used to do the join between insert and delete delta files.
-  protected boolean isAcidJoin_ = false;
+  protected boolean isDeleteRowsJoin_ = false;
 
-  public void setIsAcidJoin() {
-    isAcidJoin_ = true;
+  public void setIsDeleteRowsJoin() {
+    isDeleteRowsJoin_ = true;
     displayName_ = "DELETE EVENTS " + displayName_;
   }
 
@@ -108,7 +109,8 @@ public abstract class JoinNode extends PlanNode {
   public enum DistributionMode {
     NONE("NONE"),
     BROADCAST("BROADCAST"),
-    PARTITIONED("PARTITIONED");
+    PARTITIONED("PARTITIONED"),
+    DIRECTED("DIRECTED");
 
     private final String description_;
 
@@ -118,9 +120,18 @@ public abstract class JoinNode extends PlanNode {
 
     @Override
     public String toString() { return description_; }
+
     public static DistributionMode fromThrift(TJoinDistributionMode distrMode) {
-      if (distrMode == TJoinDistributionMode.BROADCAST) return BROADCAST;
-      return PARTITIONED;
+      switch (distrMode) {
+        case BROADCAST:
+          return BROADCAST;
+        case SHUFFLE:
+          return PARTITIONED;
+        case DIRECTED:
+          return DIRECTED;
+        default:
+          throw new RuntimeException("Invalid distribution mode: " + distrMode);
+      }
     }
   }
 
@@ -151,7 +162,8 @@ public abstract class JoinNode extends PlanNode {
     switch (joinOp_) {
       case LEFT_ANTI_JOIN:
       case LEFT_SEMI_JOIN:
-      case NULL_AWARE_LEFT_ANTI_JOIN: {
+      case NULL_AWARE_LEFT_ANTI_JOIN:
+      case ICEBERG_DELETE_JOIN: {
         tupleIds_.addAll(outer.getTupleIds());
         break;
       }
@@ -183,6 +195,38 @@ public abstract class JoinNode extends PlanNode {
     }
   }
 
+  @Override
+  public ExprSubstitutionMap getOutputSmap() {
+    // Filter out illegal output for certain join nodes, including those with
+    // join operators LEFT_ANTI_JOIN, LEFT_SEMI_JOIN, NULL_AWARE_LEFT_ANTI_JOIN,
+    // and ICEBERG_DELETE_JOIN.
+    switch (joinOp_) {
+      case LEFT_ANTI_JOIN:
+      case LEFT_SEMI_JOIN:
+      case NULL_AWARE_LEFT_ANTI_JOIN:
+      case ICEBERG_DELETE_JOIN: {
+        ExprSubstitutionMap result = new ExprSubstitutionMap();
+        List<Expr> lhs = Expr.cloneList(outputSmap_.getLhs());
+        List<Expr> rhs = Expr.cloneList(outputSmap_.getRhs());
+        for (int i = 0; i < rhs.size(); i++) {
+          if (rhs.get(i) instanceof SlotRef) {
+            SlotRef slotRef = (SlotRef) rhs.get(i);
+            TupleId tid = slotRef.getDesc().getParent().getId();
+            // If the tid is not in the current node's tuple ids, skip it.
+            if (!tupleIds_.contains(tid)) {
+              continue;
+            }
+          }
+          result.put(lhs.get(i), rhs.get(i));
+        }
+        return result;
+      }
+      default: {
+        return outputSmap_;
+      }
+    }
+  }
+
   /**
    * Returns true if the join node can be inverted. Inversions are not allowed
    * in the following cases:
@@ -205,7 +249,8 @@ public abstract class JoinNode extends PlanNode {
   // Returns true if we can share a join build between multiple consuming fragment
   // instances.
   public boolean canShareBuild() {
-    return distrMode_ == JoinNode.DistributionMode.BROADCAST;
+    return distrMode_ == JoinNode.DistributionMode.BROADCAST ||
+        distrMode_ == DistributionMode.DIRECTED;
   }
 
   public JoinOperator getJoinOp() { return joinOp_; }
@@ -240,6 +285,12 @@ public abstract class JoinNode extends PlanNode {
     assignedConjuncts_ = analyzer.getAssignedConjuncts();
     otherJoinConjuncts_ = Expr.substituteList(otherJoinConjuncts_,
         getCombinedChildSmap(), analyzer, false);
+
+    List<SlotRef> slotRefs = new ArrayList<>();
+    for (Expr e : getConjuncts()) { e.collect(SlotRef.class, slotRefs); }
+    for (Expr e : getOtherJoinConjuncts()) { e.collect(SlotRef.class, slotRefs); }
+    for (Expr e : getEqJoinConjuncts()) { e.collect(SlotRef.class, slotRefs); }
+    analyzer.addJoinColumns(slotRefs);
   }
 
   /**
@@ -254,15 +305,19 @@ public abstract class JoinNode extends PlanNode {
    * estimation is very similar to the generic estimator.
    *
    * Once the estimation method has been determined we compute the final cardinality
-   * based on the single most selective join predicate. We do not attempt to estimate
-   * the joint selectivity of multiple join predicates to avoid underestimation.
+   * based on the single most selective join predicate unless the query option
+   * join_selectivity_correlation_factor is set to a value higher than 0 (up to 1). In
+   * that case, we compute the combined selectivity by taking the product of the
+   * selectivities and dividing by the correlation factor. Otherwise, for the default
+   * value of 0 we do not attempt to estimate the joint selectivity of multiple join
+   * predicates to avoid underestimation.
    * The FK/PK detection logic is based on the assumption that most joins are FK/PK. We
    * only use the generic estimation method if we have high confidence that there is no
    * FK/PK relationship. In the absence of relevant stats, we assume FK/PK with a join
    * selectivity of 1.
    *
    * In some cases where a function is involved in the join predicate - e.g c = max(d),
-   * the RHS may have relevant stats. For instance if it is s scalar subquery, the RHS
+   * the RHS may have relevant stats. For instance if it is a scalar subquery, the RHS
    * NDV = 1. Whenever such stats are available, we classify them into an 'other'
    * conjuncts list and leverage the available stats. We use the same estimation
    * formula as the generic estimator.
@@ -313,8 +368,9 @@ public abstract class JoinNode extends PlanNode {
     }
 
     if (eqJoinConjunctSlots.isEmpty()) {
-      if (!otherEqJoinStats.isEmpty() && joinOp_.isInnerJoin()) {
-        return getGenericJoinCardinality2(otherEqJoinStats, lhsCard, rhsCard);
+      if (!otherEqJoinStats.isEmpty()
+              && (joinOp_.isInnerJoin() || joinOp_.isOuterJoin())) {
+        return getGenericJoinCardinality2(otherEqJoinStats, lhsCard, rhsCard, analyzer);
       } else {
         // There are no eligible equi-join conjuncts. Optimistically assume FK/PK with a
         // join selectivity of 1.
@@ -326,7 +382,8 @@ public abstract class JoinNode extends PlanNode {
     if (fkPkEqJoinConjuncts_ != null) {
       return getFkPkJoinCardinality(fkPkEqJoinConjuncts_, lhsCard, rhsCard);
     } else {
-      return getGenericJoinCardinality(eqJoinConjunctSlots, lhsCard, rhsCard);
+      return getGenericJoinCardinality(eqJoinConjunctSlots, otherEqJoinStats, lhsCard,
+         rhsCard, analyzer);
     }
   }
 
@@ -369,8 +426,8 @@ public abstract class JoinNode extends PlanNode {
    * The returned result is >= 0.
    * The list of join conjuncts must be non-empty and the cardinalities must be >= 0.
    */
-  private long getFkPkJoinCardinality(List<EqJoinConjunctScanSlots> eqJoinConjunctSlots,
-      long lhsCard, long rhsCard) {
+  protected static long getFkPkJoinCardinality(
+      List<EqJoinConjunctScanSlots> eqJoinConjunctSlots, long lhsCard, long rhsCard) {
     Preconditions.checkState(!eqJoinConjunctSlots.isEmpty());
     Preconditions.checkState(lhsCard >= 0 && rhsCard >= 0);
 
@@ -397,35 +454,58 @@ public abstract class JoinNode extends PlanNode {
 
   /**
    * Returns the estimated join cardinality of a generic N:M inner or outer join based
-   * on the given list of equi-join conjunct slots and the join input cardinalities.
+   * on the given list of equi-join conjunct slots, other equi-join conjunct stats
+   * and the join input cardinalities.
    * The returned result is >= 0.
    * The list of join conjuncts must be non-empty and the cardinalities must be >= 0.
    */
   private long getGenericJoinCardinality(List<EqJoinConjunctScanSlots> eqJoinConjunctSlots,
-      long lhsCard, long rhsCard) {
+      List<NdvAndRowCountStats> otherEqJoinStats, long lhsCard, long rhsCard,
+      Analyzer analyzer) {
     Preconditions.checkState(joinOp_.isInnerJoin() || joinOp_.isOuterJoin());
     Preconditions.checkState(!eqJoinConjunctSlots.isEmpty());
 
-    long result = -1;
+    List<Long> joinCardList = new ArrayList<>();
+
+    // first collect all the join cardinalities
     for (EqJoinConjunctScanSlots slots: eqJoinConjunctSlots) {
-      long joinCard = getGenericJoinCardinalityInternal(slots.lhsNdv(), slots.rhsNdv(),
-          slots.lhsNumRows(), slots.rhsNumRows(), lhsCard, rhsCard);
+      joinCardList.add(computeGenericJoinCardinality(slots.lhsNdv(), slots.rhsNdv(),
+          slots.lhsNumRows(), slots.rhsNumRows(), lhsCard, rhsCard));
+    }
+
+    if (!otherEqJoinStats.isEmpty()
+            && (joinOp_.isInnerJoin() || joinOp_.isOuterJoin())) {
+      joinCardList.add(getGenericJoinCardinality2(otherEqJoinStats, lhsCard,
+        rhsCard, analyzer));
+    }
+    long result = -1;
+    double corrfactor =
+      analyzer.getQueryOptions().getJoin_selectivity_correlation_factor();
+    double cumulativeSel = 1.0;
+
+    // Apply the selectivity formulas based on the query options or use default
+    for (Long joinCard : joinCardList) {
       if (result == -1) {
         result = joinCard;
       } else {
         result = Math.min(result, joinCard);
       }
+      if (corrfactor > 0) cumulativeSel *= (((double) joinCard/lhsCard)/rhsCard);
     }
+    if (corrfactor > 0) {
+      result = (long) Math.min(result, ((cumulativeSel * lhsCard) * rhsCard)/corrfactor);
+    }
+
     Preconditions.checkState(result >= 0);
     return result;
   }
 
   /**
-   * An internal utility method to compute generic join cardinality as described
+   * A utility method to compute generic join cardinality as described
    * in the comments for {@link JoinNode#getJoinCardinality}. The input
    * cardinalities must be >= 0.
    */
-  private long getGenericJoinCardinalityInternal(double lhsNdv, double rhsNdv,
+  public static long computeGenericJoinCardinality(double lhsNdv, double rhsNdv,
       double lhsNumRows, double rhsNumRows, long lhsCard, long rhsCard) {
     Preconditions.checkState(lhsCard >= 0 && rhsCard >= 0);
     // Adjust the NDVs on both sides to account for predicates. Intuitively, the NDVs
@@ -442,27 +522,36 @@ public abstract class JoinNode extends PlanNode {
   }
 
   /**
-   * This function mirrors the logic for {@link JoinNode#getGenericJoinCardinality} except
-   * that instead of the EqJoinConjunctScanSlots, it uses the {@link NdvAndRowCountStats}
-   * to directly access stats that were pre-populated. Currently, this function is
-   * restricted to inner joins. In order to extend it to outer joins some more analysis is
-   * needed to ensure it works correctly for different types of outer joins.
+   * This function mirrors the logic for {@link JoinNode#computeGenericJoinCardinality}
+   * except that instead of the EqJoinConjunctScanSlots, it uses the {@link
+   * NdvAndRowCountStats} to directly access stats that were pre-populated. Currently,
+   * this function is restricted to inner and outer joins.
+   * TODO: check if applicable for anti and semi joins
    */
   private long getGenericJoinCardinality2(List<NdvAndRowCountStats> statsList,
-      long lhsCard, long rhsCard) {
-    Preconditions.checkState(joinOp_.isInnerJoin());
+      long lhsCard, long rhsCard, Analyzer analyzer) {
+    Preconditions.checkState(joinOp_.isInnerJoin() || joinOp_.isOuterJoin());
     Preconditions.checkState(!statsList.isEmpty());
 
     long result = -1;
+    double corrfactor =
+      analyzer.getQueryOptions().getJoin_selectivity_correlation_factor();
+    double cumulativeSel = 1.0;
     for (NdvAndRowCountStats stats: statsList) {
-      long joinCard = getGenericJoinCardinalityInternal(stats.lhsNdv(), stats.rhsNdv(),
+      long joinCard = computeGenericJoinCardinality(stats.lhsNdv(), stats.rhsNdv(),
           stats.lhsNumRows(), stats.rhsNumRows(), lhsCard, rhsCard);
       if (result == -1) {
         result = joinCard;
       } else {
         result = Math.min(result, joinCard);
       }
+      if (corrfactor > 0) cumulativeSel *= (((double) joinCard/lhsCard)/rhsCard);
     }
+
+    if (corrfactor > 0) {
+      result = (long) Math.min(result, ((cumulativeSel * lhsCard) * rhsCard)/corrfactor);
+    }
+
     Preconditions.checkState(result >= 0);
     return result;
   }
@@ -473,8 +562,8 @@ public abstract class JoinNode extends PlanNode {
    */
   public static final class EqJoinConjunctScanSlots {
     private final Expr eqJoinConjunct_;
-    private final SlotDescriptor lhs_;
-    private final SlotDescriptor rhs_;
+    protected final SlotDescriptor lhs_;
+    protected final SlotDescriptor rhs_;
 
     private EqJoinConjunctScanSlots(Expr eqJoinConjunct, SlotDescriptor lhs,
         SlotDescriptor rhs) {
@@ -686,7 +775,8 @@ public abstract class JoinNode extends PlanNode {
           break;
         }
         case LEFT_ANTI_JOIN:
-        case NULL_AWARE_LEFT_ANTI_JOIN: {
+        case NULL_AWARE_LEFT_ANTI_JOIN:
+        case ICEBERG_DELETE_JOIN: {
           selectivity = (double) Math.max(lhsNdv - rhsNdv, lhsNdv) / (double) lhsNdv;
           break;
         }
@@ -704,15 +794,11 @@ public abstract class JoinNode extends PlanNode {
   }
 
   /**
-   * Unwraps the SlotRef in expr and returns the NDVs of it.
-   * Returns -1 if the NDVs are unknown or if expr is not a SlotRef.
+   * Returns the NDVs of a given expression.
+   * Returns -1 if the NDVs are unknown.
    */
   public static long getNdv(Expr expr) {
-    SlotRef slotRef = expr.unwrapSlotRef(false);
-    if (slotRef == null) return -1;
-    SlotDescriptor slotDesc = slotRef.getDesc();
-    if (slotDesc == null) return -1;
-    ColumnStats stats = slotDesc.getStats();
+    ColumnStats stats = ColumnStats.fromExpr(expr);
     if (!stats.hasNumDistinctValues()) return -1;
     return stats.getNumDistinctValues();
   }
@@ -777,7 +863,8 @@ public abstract class JoinNode extends PlanNode {
         break;
       }
       case LEFT_ANTI_JOIN:
-      case NULL_AWARE_LEFT_ANTI_JOIN: {
+      case NULL_AWARE_LEFT_ANTI_JOIN:
+      case ICEBERG_DELETE_JOIN: {
         if (leftCard != -1) {
           cardinality_ = Math.min(leftCard, cardinality_);
         }
@@ -910,6 +997,19 @@ public abstract class JoinNode extends PlanNode {
   }
 
   @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    Pair<ProcessingCost, ProcessingCost> probeBuildCost = computeJoinProcessingCost();
+    if (hasSeparateBuild()) {
+      // All build resource consumption is accounted for in the separate builder.
+      processingCost_ = probeBuildCost.first;
+    } else {
+      // Both build and profile resources are accounted for in the node.
+      processingCost_ =
+          ProcessingCost.sumCost(probeBuildCost.first, probeBuildCost.second);
+    }
+  }
+
+  @Override
   public void computeNodeResourceProfile(TQueryOptions queryOptions) {
     Pair<ResourceProfile, ResourceProfile> profiles =
         computeJoinResourceProfile(queryOptions);
@@ -922,6 +1022,11 @@ public abstract class JoinNode extends PlanNode {
     }
   }
 
+  public PlanNode getBuildNode() {
+    Preconditions.checkState(getChildCount() == 2);
+    return getChild(1);
+  }
+
   /**
    * Helper method to compute the resource requirements for the join that can be
    * called from the builder or the join node. Returns a pair of the probe
@@ -931,10 +1036,46 @@ public abstract class JoinNode extends PlanNode {
   public abstract Pair<ResourceProfile, ResourceProfile> computeJoinResourceProfile(
       TQueryOptions queryOptions);
 
-  /* Helper to return all predicates as a string. */
-  public String getAllPredicatesAsString(TExplainLevel level) {
-    return "Conjuncts=" + Expr.getExplainString(getConjuncts(), level)
-        + ", EqJoinConjuncts=" + Expr.getExplainString(getEqJoinConjuncts(), level)
-        + ", EqJoinConjuncts=" + Expr.getExplainString(getOtherJoinConjuncts(), level);
+  /**
+   * Helper method to compute the processing cost for the join that can be
+   * called from the builder or the join node. Returns a pair of the probe
+   * processing cost and the build processing cost.
+   * Does not modify the state of this node.
+   */
+  public abstract Pair<ProcessingCost, ProcessingCost> computeJoinProcessingCost();
+
+  /**
+   * Get filtered cardinality of probe hand of join node.
+   * Sanitized unknown cardinality (-1) into 0.
+   */
+  protected long getProbeCardinalityForCosting() {
+    return Math.max(0, getChild(0).getFilteredCardinality());
+  }
+
+  @Override
+  protected void reduceCardinalityByRuntimeFilter(
+      Stack<PlanNode> nodeStack, double reductionScale) {
+    if (isSelectiveAndReducingJoin()) {
+      nodeStack.add(this);
+    } else {
+      nodeStack.clear();
+    }
+    int i = 0;
+    for (PlanNode child : getChildren()) {
+      if (i > 0) nodeStack.clear(); // not probe child
+      child.reduceCardinalityByRuntimeFilter(nodeStack, reductionScale);
+      ++i;
+    }
+  }
+
+  private boolean isSelectiveAndReducingJoin() {
+    if (eqJoinConjuncts_.isEmpty() || getChild(0).getCardinality() < 0
+        || getChild(1).getCardinality() < 0
+        || (!joinOp_.isInnerJoin() && !joinOp_.isLeftOuterJoin()
+            && !joinOp_.isLeftSemiJoin())) {
+      return false;
+    }
+    double selectivity = RuntimeFilterGenerator.getJoinNodeSelectivity(this);
+    return 0 <= selectivity && selectivity <= 1;
   }
 }

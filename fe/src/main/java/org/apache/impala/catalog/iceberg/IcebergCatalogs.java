@@ -17,9 +17,13 @@
 
 package org.apache.impala.catalog.iceberg;
 
+
+import static org.apache.impala.catalog.Table.TBL_PROP_EXTERNAL_TABLE_PURGE;
+import static org.apache.impala.catalog.Table.TBL_PROP_EXTERNAL_TABLE_PURGE_DEFAULT;
+
+import com.google.common.base.Preconditions;
 import java.util.Map;
 import java.util.Properties;
-
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.iceberg.CatalogUtil;
@@ -29,19 +33,16 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.exceptions.NoSuchTableException;
-import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.hadoop.ConfigProperties;
 import org.apache.iceberg.mr.Catalogs;
 import org.apache.iceberg.mr.InputFormatConfig;
 import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.IcebergTable;
+import org.apache.impala.catalog.IcebergTableLoadingException;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.thrift.TIcebergCatalog;
 import org.apache.impala.util.IcebergUtil;
-
-import com.google.common.base.Preconditions;
 
 /**
  * Implementation of IcebergCatalog for tables handled by Iceberg's Catalogs API.
@@ -56,7 +57,7 @@ public class IcebergCatalogs implements IcebergCatalog {
     return instance_;
   }
 
-  private Configuration configuration_;
+  private final Configuration configuration_;
 
   private IcebergCatalogs() {
     configuration_ = new HiveConf(IcebergCatalogs.class);
@@ -100,7 +101,8 @@ public class IcebergCatalogs implements IcebergCatalog {
     properties.setProperty(InputFormatConfig.TABLE_SCHEMA, SchemaParser.toJson(schema));
     properties.setProperty(InputFormatConfig.PARTITION_SPEC,
         PartitionSpecParser.toJson(spec));
-    properties.setProperty("external.table.purge", "TRUE");
+    properties.setProperty(TBL_PROP_EXTERNAL_TABLE_PURGE, tableProps.getOrDefault(
+        TBL_PROP_EXTERNAL_TABLE_PURGE, TBL_PROP_EXTERNAL_TABLE_PURGE_DEFAULT));
     return Catalogs.createTable(configuration_, properties);
   }
 
@@ -114,7 +116,7 @@ public class IcebergCatalogs implements IcebergCatalog {
 
   @Override
   public Table loadTable(TableIdentifier tableId, String tableLocation,
-      Map<String, String> tableProps) throws TableLoadingException {
+      Map<String, String> tableProps) throws IcebergTableLoadingException {
     setContextClassLoader();
     Properties properties = createPropsForCatalogs(tableId, tableLocation, tableProps);
     return Catalogs.loadTable(configuration_, properties);
@@ -129,6 +131,12 @@ public class IcebergCatalogs implements IcebergCatalog {
     Properties properties = createPropsForCatalogs(tableId, tableLocation,
         feTable.getMetaStoreTable().getParameters());
     return Catalogs.dropTable(configuration_, properties);
+  }
+
+  @Override
+  public boolean dropTable(String dbName, String tblName, boolean purge) {
+    throw new UnsupportedOperationException(
+        "'Catalogs' doesn't support dropping table by name");
   }
 
   @Override
@@ -147,8 +155,8 @@ public class IcebergCatalogs implements IcebergCatalog {
     return configuration_.get(propKey);
   }
 
-  private Properties createPropsForCatalogs(TableIdentifier tableId, String location,
-      Map<String, String> tableProps) {
+  public static Properties createPropsForCatalogs(TableIdentifier tableId,
+      String location, Map<String, String> tableProps) {
     Properties properties = new Properties();
     properties.putAll(tableProps);
     if (tableId != null) {
@@ -157,21 +165,7 @@ public class IcebergCatalogs implements IcebergCatalog {
       properties.setProperty(Catalogs.LOCATION, location);
     }
     properties.setProperty(IcebergTable.ICEBERG_CATALOG,
-                           tableProps.get(IcebergTable.ICEBERG_CATALOG));
+        tableProps.get(IcebergTable.ICEBERG_CATALOG));
     return properties;
-  }
-
-  /**
-   * Some of the above methods might be running on native threads as they might be invoked
-   * via JNI. In that case the context class loader for those threads are null. 'Catalogs'
-   * uses JNDI to load the catalog implementations, e.g. HadoopCatalog or HiveCatalog.
-   * JNDI uses the context class loader, but as it is null it falls back to the bootstrap
-   * class loader that doesn't have the Iceberg classes on its classpath.
-   * To avoid ClassNotFoundException we set the context class loader to the class loader
-   * that loaded this class.
-   */
-  private void setContextClassLoader() {
-    if (Thread.currentThread().getContextClassLoader() != null) return;
-    Thread.currentThread().setContextClassLoader(this.getClass().getClassLoader());
   }
 }

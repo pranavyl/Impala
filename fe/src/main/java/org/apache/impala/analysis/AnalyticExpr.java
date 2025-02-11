@@ -19,6 +19,7 @@ package org.apache.impala.analysis;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 import org.apache.impala.analysis.AnalyticWindow.Boundary;
 import org.apache.impala.analysis.AnalyticWindow.BoundaryType;
@@ -26,6 +27,7 @@ import org.apache.impala.catalog.AggregateFunction;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.TypeCompatibility;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.TreeNode;
@@ -125,7 +127,7 @@ public class AnalyticExpr extends Expr {
   public AnalyticWindow getWindow() { return window_; }
 
   @Override
-  public boolean localEquals(Expr that) {
+  protected boolean localEquals(Expr that) {
     if (!super.localEquals(that)) return false;
     AnalyticExpr o = (AnalyticExpr)that;
     if (!fnCall_.equals(o.getFnCall())) return false;
@@ -134,6 +136,11 @@ public class AnalyticExpr extends Expr {
       if (!window_.equals(o.window_)) return false;
     }
     return orderByElements_.equals(o.orderByElements_);
+  }
+
+  @Override
+  protected int localHash() {
+    return Objects.hash(super.localHash(), fnCall_, window_, orderByElements_);
   }
 
   /**
@@ -380,8 +387,9 @@ public class AnalyticExpr extends Expr {
           + "a RANGE window with PRECEDING/FOLLOWING: " + toSql());
     }
     Expr rangeExpr = boundary.getExpr();
-    if (!Type.isImplicitlyCastable(
-        rangeExpr.getType(), orderByElements_.get(0).getExpr().getType(), false, true)) {
+    if (!Type.isImplicitlyCastable(rangeExpr.getType(),
+            orderByElements_.get(0).getExpr().getType(),
+            TypeCompatibility.STRICT_DECIMAL)) {
       throw new AnalysisException(
           "The value expression of a PRECEDING/FOLLOWING clause of a RANGE window must "
             + "be implicitly convertable to the ORDER BY expression's type: "

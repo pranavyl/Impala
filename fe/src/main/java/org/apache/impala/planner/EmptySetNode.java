@@ -43,6 +43,8 @@ public class EmptySetNode extends PlanNode {
   @Override
   public void computeStats(Analyzer analyzer) {
     avgRowSize_ = 0;
+    rowPadSize_ = 0;
+    getFixedLenRowSize_ = 0;
     cardinality_ = 0;
     numInstances_ = numNodes_ = 1;
   }
@@ -57,6 +59,11 @@ public class EmptySetNode extends PlanNode {
     for (TupleId id: tupleIds_) analyzer.getTupleDesc(id).setIsMaterialized(true);
     computeMemLayout(analyzer);
     computeStats(analyzer);
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    processingCost_ = ProcessingCost.zero();
   }
 
   @Override

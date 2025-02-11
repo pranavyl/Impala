@@ -21,6 +21,7 @@
 #include <boost/preprocessor/seq/for_each.hpp>
 #include <boost/preprocessor/tuple/to_seq.hpp>
 
+#include "gen-cpp/Query_constants.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/runtime-filter.h"
 #include "testutil/gtest-util.h"
@@ -158,6 +159,9 @@ TEST(QueryOptions, SetByteOptions) {
       {MAKE_OPTIONDEF(scratch_limit), {-1, I64_MAX}},
       {MAKE_OPTIONDEF(max_result_spooling_mem), {-1, I64_MAX}},
       {MAKE_OPTIONDEF(max_spilled_result_spooling_mem), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(large_agg_mem_threshold), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(mem_limit_coordinators), {-1, I64_MAX}},
+      {MAKE_OPTIONDEF(hdfs_scanner_non_reserved_bytes), {-1, I64_MAX}},
   };
   vector<pair<OptionDef<int32_t>, Range<int32_t>>> case_set_i32{
       {MAKE_OPTIONDEF(runtime_filter_min_size),
@@ -227,15 +231,11 @@ TEST(QueryOptions, SetEnumOptions) {
       (THREE_LEVEL, TWO_LEVEL, TWO_LEVEL_THEN_THREE_LEVEL)), true);
   TestEnumCase(options, CASE(default_file_format, THdfsFileFormat,
       (TEXT, RC_FILE, SEQUENCE_FILE, AVRO, PARQUET, KUDU, ORC, HUDI_PARQUET, ICEBERG,
-      JSON)), true);
+      JSON, JDBC)), true);
   TestEnumCase(options, CASE(runtime_filter_mode, TRuntimeFilterMode,
       (OFF, LOCAL, GLOBAL)), true);
   TestEnumCase(options, CASE(kudu_read_mode, TKuduReadMode,
       (DEFAULT, READ_LATEST, READ_AT_SNAPSHOT)), true);
-  TestEnumCase(options,
-      CASE(enabled_runtime_filter_types, TEnabledRuntimeFilterTypes,
-          (BLOOM, MIN_MAX, ALL)),
-      true);
   TestEnumCase(options,
       CASE(kudu_replica_selection, TKuduReplicaSelection, (LEADER_ONLY, CLOSEST_REPLICA)),
       true);
@@ -247,6 +247,7 @@ TEST(QueryOptions, SetEnumOptions) {
 // Test integer options. Some of them have lower/upper bounds.
 TEST(QueryOptions, SetIntOptions) {
   TQueryOptions options;
+  QueryConstants qc;
   // List of pairs of Key and its valid range
   pair<OptionDef<int32_t>, Range<int32_t>> case_set[]{
       {MAKE_OPTIONDEF(runtime_filter_wait_time_ms),    {0, I32_MAX}},
@@ -263,6 +264,13 @@ TEST(QueryOptions, SetIntOptions) {
       {MAKE_OPTIONDEF(max_cnf_exprs),                  {-1, I32_MAX}},
       {MAKE_OPTIONDEF(max_fs_writers),                 {0, I32_MAX}},
       {MAKE_OPTIONDEF(default_ndv_scale),              {1, 10}},
+      {MAKE_OPTIONDEF(processing_cost_min_threads),
+          {1, qc.MAX_FRAGMENT_INSTANCES_PER_NODE}},
+      {MAKE_OPTIONDEF(max_fragment_instances_per_node),
+          {1, qc.MAX_FRAGMENT_INSTANCES_PER_NODE}},
+      {MAKE_OPTIONDEF(max_num_filters_aggregated_per_host),
+          {-1, I32_MAX}},
+      {MAKE_OPTIONDEF(num_nodes),                      {0, 1}},
   };
   for (const auto& test_case : case_set) {
     const OptionDef<int32_t>& option_def = test_case.first;
@@ -302,6 +310,45 @@ TEST(QueryOptions, SetBigIntOptions) {
     TestError(to_string(int64_t(range.lower_bound) - 1).c_str());
     // 2^63 is I64_MAX + 1.
     TestError("9223372036854775808");
+  }
+}
+
+// Test double options with expected value between 0 and 1 (inclusive or exclusive).
+TEST(QueryOptions, SetFractionalOptions) {
+  TQueryOptions options;
+  // List of pairs of Key and boolean flag on whether the option is inclusive of 0 and 1.
+  pair<OptionDef<double>, bool> case_set[]{
+      {MAKE_OPTIONDEF(resource_trace_ratio), true},
+      {MAKE_OPTIONDEF(runtime_filter_error_rate), false},
+      {MAKE_OPTIONDEF(minmax_filter_threshold), true},
+      {MAKE_OPTIONDEF(join_selectivity_correlation_factor), true},
+      {MAKE_OPTIONDEF(agg_mem_correlation_factor), true},
+      {MAKE_OPTIONDEF(runtime_filter_cardinality_reduction_scale), true},
+  };
+  for (const auto& test_case : case_set) {
+    const OptionDef<double>& option_def = test_case.first;
+    const bool& is_inclusive = test_case.second;
+    auto TestOk = MakeTestOkFn(options, option_def);
+    auto TestError = MakeTestErrFn(options, option_def);
+    TestOk("0.5", 0.5);
+    TestOk("0.01", 0.01);
+    TestOk("0.001", 0.001);
+    TestOk("0.0001", 0.0001);
+    TestOk("0.0000000001", 0.0000000001);
+    TestOk("0.999999999", 0.999999999);
+    TestOk(" 0.9", 0.9);
+    if (is_inclusive) {
+      TestOk("1", 1.0);
+      TestOk("0", 0.0);
+    } else {
+      TestError("1");
+      TestError("0");
+    }
+    // Out of range values
+    TestError("-1");
+    TestError("-0.1");
+    TestError("1.1");
+    TestError("Not a number!");
   }
 }
 
@@ -382,25 +429,48 @@ TEST(QueryOptions, SetSpecialOptions) {
     TestError("8191"); // default value of FLAGS_min_buffer_size is 8KB
     TestOk("64KB", 64 * 1024);
   }
+  // QUERY_CPU_COUNT_DIVISOR should be greater than 0.0.
   {
-    // RUNTIME_FILTER_ERROR_RATE is a double in range (0.0, 1.0)
-    OptionDef<double> key_def = MAKE_OPTIONDEF(runtime_filter_error_rate);
+    OptionDef<double> key_def = MAKE_OPTIONDEF(query_cpu_count_divisor);
     auto TestOk = MakeTestOkFn(options, key_def);
     auto TestError = MakeTestErrFn(options, key_def);
     TestOk("0.5", 0.5);
-    TestOk("0.01", 0.01);
-    TestOk("0.001", 0.001);
-    TestOk("0.0001", 0.0001);
     TestOk("0.0000000001", 0.0000000001);
     TestOk("0.999999999", 0.999999999);
     TestOk(" 0.9", 0.9);
-    // Out of range values
-    TestError("1");
+    TestOk("1", 1.0);
+    TestOk("1.1", 1.1);
+    TestOk("1000.00", 1000.0);
     TestError("0");
     TestError("-1");
     TestError("-0.1");
-    TestError("1.1");
     TestError("Not a number!");
+  }
+  // MAX_SORT_RUN_SIZE should not be 1.
+  {
+    OptionDef<int32_t> key_def = MAKE_OPTIONDEF(max_sort_run_size);
+    auto TestOk = MakeTestOkFn(options, key_def);
+    auto TestError = MakeTestErrFn(options, key_def);
+    TestOk("-1", -1);
+    TestOk("0", 0);
+    TestError("1");
+    TestOk("2", 2);
+  }
+}
+
+void VerifyFilterTypes(const set<TRuntimeFilterType::type>& types,
+    const std::initializer_list<TRuntimeFilterType::type>& expects) {
+  EXPECT_EQ(expects.size(), types.size());
+  for (const auto t : expects) {
+    EXPECT_NE(types.end(), types.find(t));
+  }
+}
+
+void VerifyFilterIds(
+    const set<int32_t>& types, const std::initializer_list<int32_t>& expects) {
+  EXPECT_EQ(expects.size(), types.size());
+  for (const auto t : expects) {
+    EXPECT_NE(types.end(), types.find(t));
   }
 }
 
@@ -426,6 +496,36 @@ TEST(QueryOptions, ParseQueryOptions) {
     EXPECT_EQ(options.num_nodes, 1);
     EXPECT_EQ(options.mem_limit, 42);
     EXPECT_EQ(mask, expectedMask);
+    EXPECT_FALSE(status.ok());
+    EXPECT_EQ(status.msg().details().size(), 2);
+  }
+
+  QueryOptionsMask expectedMask2;
+  expectedMask2.set(TImpalaQueryOptions::ENABLED_RUNTIME_FILTER_TYPES);
+  expectedMask2.set(TImpalaQueryOptions::RUNTIME_FILTER_IDS_TO_SKIP);
+
+  {
+    TQueryOptions options;
+    QueryOptionsMask mask;
+    Status status = ParseQueryOptions("enabled_runtime_filter_types=\"bloom,min_max\","
+                                      "runtime_filter_ids_to_skip=\"1,2\"",
+        &options, &mask);
+    VerifyFilterTypes(options.enabled_runtime_filter_types,
+        {TRuntimeFilterType::BLOOM, TRuntimeFilterType::MIN_MAX});
+    VerifyFilterIds(options.runtime_filter_ids_to_skip, {1, 2});
+    EXPECT_EQ(mask, expectedMask2);
+    EXPECT_TRUE(status.ok());
+  }
+
+  {
+    TQueryOptions options;
+    QueryOptionsMask mask;
+    Status status = ParseQueryOptions("enabled_runtime_filter_types=bloom,min_max,"
+                                      "runtime_filter_ids_to_skip=1,2",
+        &options, &mask);
+    VerifyFilterTypes(options.enabled_runtime_filter_types, {TRuntimeFilterType::BLOOM});
+    VerifyFilterIds(options.runtime_filter_ids_to_skip, {1});
+    EXPECT_EQ(mask, expectedMask2);
     EXPECT_FALSE(status.ok());
     EXPECT_EQ(status.msg().details().size(), 2);
   }
@@ -556,6 +656,116 @@ TEST(QueryOptions, CompressionCodec) {
 #undef CASE
 #undef ENTRIES
 #undef ENTRY
+}
+
+// Tests for setting of ENABLED_RUNTIME_FILTER_TYPES.
+TEST(QueryOptions, EnabledRuntimeFilterTypes) {
+  const string KEY = "enabled_runtime_filter_types";
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "all", &options, nullptr).ok());
+    VerifyFilterTypes(options.enabled_runtime_filter_types,
+        {
+            TRuntimeFilterType::BLOOM,
+            TRuntimeFilterType::MIN_MAX,
+            TRuntimeFilterType::IN_LIST
+        });
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "bloom,min_max,in_list", &options, nullptr).ok());
+    VerifyFilterTypes(options.enabled_runtime_filter_types,
+        {
+            TRuntimeFilterType::BLOOM,
+            TRuntimeFilterType::MIN_MAX,
+            TRuntimeFilterType::IN_LIST
+        });
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "bloom", &options, nullptr).ok());
+    VerifyFilterTypes(options.enabled_runtime_filter_types, {TRuntimeFilterType::BLOOM});
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "bloom,min_max", &options, nullptr).ok());
+    VerifyFilterTypes(options.enabled_runtime_filter_types,
+        {
+            TRuntimeFilterType::BLOOM,
+            TRuntimeFilterType::MIN_MAX
+        });
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "bloom , , min_max", &options, nullptr).ok());
+    VerifyFilterTypes(options.enabled_runtime_filter_types,
+        {
+            TRuntimeFilterType::BLOOM,
+            TRuntimeFilterType::MIN_MAX
+        });
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "in_list,bloom", &options, nullptr).ok());
+    VerifyFilterTypes(options.enabled_runtime_filter_types,
+                      {
+                          TRuntimeFilterType::BLOOM,
+                          TRuntimeFilterType::IN_LIST
+                      });
+  }
+}
+
+// Tests for setting of RUNTIME_FILTER_IDS_TO_SKIP.
+TEST(QueryOptions, RuntimeFilterIdsToSkip) {
+  const string KEY = "runtime_filter_ids_to_skip";
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "0", &options, nullptr).ok());
+    VerifyFilterIds(options.runtime_filter_ids_to_skip, {0});
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "0,1", &options, nullptr).ok());
+    VerifyFilterIds(options.runtime_filter_ids_to_skip, {0, 1});
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "111,2,33", &options, nullptr).ok());
+    VerifyFilterIds(options.runtime_filter_ids_to_skip, {2, 33, 111});
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "-1,0,1", &options, nullptr).ok());
+    VerifyFilterIds(options.runtime_filter_ids_to_skip, {-1, 0, 1});
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "1,6.9", &options, nullptr).ok());
+    VerifyFilterIds(options.runtime_filter_ids_to_skip, {1, 6});
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "0, 1", &options, nullptr).ok());
+    VerifyFilterIds(options.runtime_filter_ids_to_skip, {0, 1});
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "0,,1", &options, nullptr).ok());
+    VerifyFilterIds(options.runtime_filter_ids_to_skip, {0, 1});
+  }
+  {
+    TQueryOptions options;
+    EXPECT_TRUE(SetQueryOption(KEY, "0, 1, , 2", &options, nullptr).ok());
+    VerifyFilterIds(options.runtime_filter_ids_to_skip, {0, 1, 2});
+  }
+  {
+    TQueryOptions options;
+    EXPECT_FALSE(SetQueryOption(KEY, "1,b", &options, nullptr).ok());
+  }
+  {
+    TQueryOptions options;
+    EXPECT_FALSE(SetQueryOption(KEY, "1,4294967295", &options, nullptr).ok());
+  }
 }
 
 // Tests for setting of MAX_RESULT_SPOOLING_MEM and

@@ -64,8 +64,8 @@ struct THiveUdfExecutorCtorParams {
   7: required i64 output_buffer_ptr
 }
 
-// Arguments to getTableNames, which returns a list of tables that match an
-// optional pattern.
+// Arguments to getTableNames, which returns a list of tables that are of specified table
+// types and match an optional pattern.
 struct TGetTablesParams {
   // If not set, match tables in all DBs
   1: optional string db
@@ -77,6 +77,26 @@ struct TGetTablesParams {
   // enabled, only the tables this user has access to will be returned. If not
   // set, access checks will be skipped (used for internal Impala requests)
   3: optional Query.TSessionState session
+
+  // This specifies the types of tables that should be returned. If not set, all types of
+  // tables are considered when their names are matched against pattern.
+  4: optional set<CatalogService.TImpalaTableType> table_types = []
+}
+
+// Arguments to getMetadataTableNames, which returns the list of metadata tables of the
+// specified table.
+struct TGetMetadataTablesParams {
+  1: required string db
+
+  2: required string tbl
+
+  // If not set, match every table
+  3: optional string pattern
+
+  // Session state for the user who initiated this request. If authorization is
+  // enabled, only the tables this user has access to will be returned. If not
+  // set, access checks will be skipped (used for internal Impala requests)
+  4: optional Query.TSessionState session
 }
 
 // getTableNames returns a list of unqualified table names
@@ -113,6 +133,8 @@ struct TGetCatalogMetricsResult {
   12: optional double cache_hit_rate
   13: optional double cache_load_exception_rate
   14: optional double cache_miss_rate
+  15: optional double cache_entry_median_size
+  16: optional double cache_entry_99th_size
 }
 
 // Arguments to getDbs, which returns a list of dbs that match an optional pattern
@@ -181,11 +203,14 @@ struct TDescribeTableParams {
   // Set when describing a table.
   2: optional CatalogObjects.TTableName table_name
 
+  // Set for metadata tables
+  3: optional string metadata_table_name
+
   // Set when describing a path to a nested collection.
-  3: optional Types.TColumnType result_struct
+  4: optional Types.TColumnType result_struct
 
   // Session state for the user who initiated this request.
-  4: optional Query.TSessionState session
+  5: optional Query.TSessionState session
 }
 
 // Results of a call to describeDb() and describeTable()
@@ -214,6 +239,7 @@ enum TShowStatsOp {
   COLUMN_STATS = 1
   PARTITIONS = 2
   RANGE_PARTITIONS = 3
+  HASH_SCHEMA = 4
 }
 
 // Parameters for SHOW TABLE/COLUMN STATS and SHOW PARTITIONS commands
@@ -226,6 +252,9 @@ struct TShowStatsParams {
 // Parameters for DESCRIBE HISTORY command
 struct TDescribeHistoryParams {
   1: CatalogObjects.TTableName table_name
+  2: optional i64 between_start_time
+  3: optional i64 between_end_time
+  4: optional i64 from_time
 }
 
 // Parameters for SHOW FUNCTIONS commands
@@ -240,14 +269,21 @@ struct TShowFunctionsParams {
   3: optional string show_pattern
 }
 
-// Parameters for SHOW TABLES commands
+// Parameters for SHOW TABLES, SHOW METADATA TABLES and SHOW VIEWS commands
 struct TShowTablesParams {
   // Database to use for SHOW TABLES
   1: optional string db
 
+  // Set for querying the metadata tables of the given table.
+  2: optional string tbl
+
   // Optional pattern to match tables names. If not set, all tables from the given
   // database are returned.
-  2: optional string show_pattern
+  3: optional string show_pattern
+
+  // This specifies the types of tables that should be returned. If not set, all types of
+  // tables are considered when their names are matched against pattern.
+  4: optional set<CatalogService.TImpalaTableType> table_types = []
 }
 
 // Parameters for SHOW FILES commands
@@ -368,6 +404,22 @@ struct TLoadDataReq {
   // An optional partition spec. Set if this operation should apply to a specific
   // partition rather than the base table.
   4: optional list<CatalogObjects.TPartitionKeyValue> partition_spec
+
+  // True if the destination table is an Iceberg table, in this case we need to insert
+  // data to the Iceberg table based on the given files.
+  5: optional bool iceberg_tbl
+
+  // For Iceberg data load. Query template to create a temporary with table location
+  // pointing to the new files. The table location is unknown during planning, these are
+  // filled during execution.
+  6: optional string create_tmp_tbl_query_template
+
+  // For Iceberg data load. Query to insert into the destination table from the
+  // temporary table.
+  7: optional string insert_into_dst_tbl_query
+
+  // For Iceberg data load. Query to drop the temporary table.
+  8: optional string drop_tmp_tbl_query
 }
 
 // Response of a LOAD DATA statement.
@@ -375,6 +427,19 @@ struct TLoadDataResp {
   // A result row that contains information on the result of the LOAD operation. This
   // includes details like the number of files moved as part of the request.
   1: required Data.TResultRow load_summary
+
+  // The loaded file paths
+  2: required list<string> loaded_files
+
+  // This is needed to issue TUpdateCatalogRequest
+  3: string partition_name = ""
+
+  // For Iceberg data load. The query template after the required fields are substituted.
+  4: optional string create_tmp_tbl_query
+
+  // For Iceberg data load. The temporary table location, used to restore data in case of
+  // query failure.
+  5: optional string create_location
 }
 
 enum TCatalogOpType {
@@ -394,6 +459,8 @@ enum TCatalogOpType {
   SHOW_FILES = 13
   SHOW_CREATE_FUNCTION = 14
   DESCRIBE_HISTORY = 15
+  SHOW_VIEWS = 16
+  SHOW_METADATA_TABLES = 17
 }
 
 // TODO: Combine SHOW requests with a single struct that contains a field
@@ -459,13 +526,20 @@ struct TCatalogOpRequest {
   19: optional TDescribeHistoryParams describe_history_params
 }
 
+// Query options type
+enum TQueryOptionType {
+  SET_ONE = 0
+  SET_ALL = 1
+  UNSET_ALL = 2
+}
+
 // Parameters for the SET query option command
 struct TSetQueryOptionRequest {
   // Set for "SET key=value", unset for "SET" and "SET ALL" statements.
   1: optional string key
   2: optional string value
-  // Set true for "SET ALL"
-  3: optional bool is_set_all
+  // query option type
+  3: optional TQueryOptionType query_option_type
 }
 
 struct TShutdownParams {
@@ -482,6 +556,7 @@ struct TShutdownParams {
 // The type of administrative function to be executed.
 enum TAdminRequestType {
   SHUTDOWN = 0
+  EVENT_PROCESSOR = 1
 }
 
 // Parameters for administrative function statement. This is essentially a tagged union
@@ -491,6 +566,7 @@ struct TAdminRequest {
 
   // The below member corresponding to 'type' should be set.
   2: optional TShutdownParams shutdown_params
+  3: optional CatalogService.TEventProcessorCmdParams event_processor_cmd_params
 }
 
 // HiveServer2 Metadata operations (JniFrontend.hiveServer2MetadataOperation)
@@ -545,9 +621,36 @@ struct TAccessEvent {
   3: required string privilege
 }
 
+// Request for "ALTER TABLE ... CONVERT TO" statements
+struct TConvertTableRequest {
+  1: required CatalogObjects.TTableName table_name
+  2: required CatalogObjects.TTableName hdfs_table_name
+  3: required CatalogObjects.THdfsFileFormat file_format
+  4: optional map<string, string> properties
+  5: optional string set_hdfs_table_properties_query
+  6: optional string rename_hdfs_table_to_temporary_query
+  7: optional string refresh_temporary_hdfs_table_query
+  8: optional string reset_table_name_query
+  9: optional string create_iceberg_table_query
+  10: optional string invalidate_metadata_query
+  11: optional string post_create_alter_table_query
+  12: optional string drop_temporary_hdfs_table_query
+}
+
+// Request for a KILL QUERY statement.
+struct TKillQueryReq {
+  1: required Types.TUniqueId query_id
+
+  // The effective user who submitted this request.
+  2: required string requesting_user;
+
+  // True if the requesting_user is an admin.
+  3: required bool is_admin;
+}
+
 // Result of call to createExecRequest()
 struct TExecRequest {
-  1: required Types.TStmtType stmt_type
+  1: required Types.TStmtType stmt_type = TStmtType.UNKNOWN
 
   // Copied from the corresponding TClientRequest
   2: required Query.TQueryOptions query_options
@@ -598,6 +701,37 @@ struct TExecRequest {
 
   // Coordinator time when plan was submitted by external frontend
   16: optional i64 remote_submit_time
+
+  // Additional profile nodes to be displayed nested right under 'profile' field.
+  17: optional list<RuntimeProfile.TRuntimeProfileNode> profile_children
+
+  // True if request pool is set by Frontend rather than user specifically setting it via
+  // REQUEST_POOL query option.
+  18: optional bool request_pool_set_by_frontend = false
+
+  // Request for "ALTER TABLE ... CONVERT TO" statements.
+  19: optional TConvertTableRequest convert_table_request
+
+  // Tables referenced in the query.
+  20: optional list<CatalogObjects.TTableName> tables
+
+  // Columns referenced in a select list.
+  21: optional list<string> select_columns
+
+  // Columns referenced in a where clause.
+  22: optional list<string> where_columns
+
+  // Columns referenced in a join clause.
+  23: optional list<string> join_columns
+
+  // Columns referenced in an aggregation.
+  24: optional list<string> aggregate_columns
+
+  // Columns referenced in an order by clause.
+  25: optional list<string> orderby_columns
+
+  // Request for "KILL QUERY" statements.
+  26: optional TKillQueryReq kill_query_request
 }
 
 // Parameters to FeSupport.cacheJar().
@@ -725,6 +859,26 @@ struct TExecutorGroupSet {
   // Note: this will be empty when 'default' executor group is used or
   // 'expected_executor_group_sets' startup flag is not specified.
   3: string exec_group_name_prefix
+
+  // The optional max_mem_limit to determine which executor group set to run for a query.
+  // The max_mem_limit value is set to the max_query_mem_limit attribute of the group set
+  // with name prefix 'exec_group_name_prefix' from the pool service. For each query,
+  // the frontend computes the per host estimated-memory after a compilation with a
+  // number of executor nodes from this group set and compares it with this variable.
+  4: optional i64 max_mem_limit
+
+  // The optional num_cores_per_executor is used to determine which executor group set to
+  // run for a query. The num_cores_per_executor value is set to
+  // max_query_cpu_core_per_node_limit attribute of the group set with name prefix
+  // 'exec_group_name_prefix' from the pool service.
+  // The total number of CPU cores among all executors in this executor group equals
+  // num_cores_per_executor * curr_num_executors if curr_num_executors is greater than 0,
+  // otherwise it equals num_cores_per_executor * expected_num_executors.
+  // For each query, the frontend computes the estimated total CPU core count required
+  // for a query to run efficiently after a compilation with a number of executor nodes
+  // from this group set and compare it with the total number of CPU cores in this
+  // executor group.
+  5: optional i32 num_cores_per_executor
 }
 
 // Sent from the impalad BE to FE with the latest membership snapshot of the

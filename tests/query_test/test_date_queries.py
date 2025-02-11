@@ -17,14 +17,14 @@
 
 # Targeted tests for date type.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 from tests.common.file_utils import create_table_and_copy_files
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import (SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfLocal, SkipIfGCS,
-                               SkipIfCOS)
+from tests.common.skip import SkipIfFS
 from tests.common.test_dimensions import (create_exec_option_dimension_from_dict,
     create_client_protocol_dimension, hs2_parquet_constraint)
-from tests.shell.util import ImpalaShell
+from tests.shell.util import create_impala_shell_executable_dimension
 
 
 class TestDateQueries(ImpalaTestSuite):
@@ -40,9 +40,10 @@ class TestDateQueries(ImpalaTestSuite):
         'batch_size': [0, 1],
         'disable_codegen': ['false', 'true'],
         'disable_codegen_rows_threshold': [0]}))
-    # DATE type is only supported for text, parquet and avro fileformat on HDFS and HBASE.
+    # DATE type is only supported for text, parquet, avro, orc and json fileformat on HDFS
+    # and HBASE.
     cls.ImpalaTestMatrix.add_constraint(lambda v:
-        v.get_value('table_format').file_format in ('text', 'hbase', 'parquet')
+        v.get_value('table_format').file_format in ('text', 'hbase', 'parquet', 'json')
         or (v.get_value('table_format').file_format == 'avro'
             and v.get_value('table_format').compression_codec == 'snap'))
 
@@ -50,6 +51,7 @@ class TestDateQueries(ImpalaTestSuite):
     # via both protocols.
     cls.ImpalaTestMatrix.add_dimension(create_client_protocol_dimension())
     cls.ImpalaTestMatrix.add_constraint(hs2_parquet_constraint)
+    cls.ImpalaTestMatrix.add_dimension(create_impala_shell_executable_dimension())
 
   def test_queries(self, vector):
     if vector.get_value('table_format').file_format == 'avro':
@@ -57,8 +59,7 @@ class TestDateQueries(ImpalaTestSuite):
       #  - Hive2 uses Julian Calendar for writing dates before 1582-10-15, whereas Impala
       #    uses proleptic Gregorian Calendar. This affects the results Impala gets when
       #    querying avro tables written by Hive2.
-      #  - Since HIVE-22589, Hive3 also uses Julian Calendar for dates before 1582-10-15
-      #    by default.
+      #  - Hive3 on the other hand uses proleptic Gregorian Calendar to write dates.
       self.run_test_case('QueryTest/avro_date', vector)
     else:
       self.run_test_case('QueryTest/date', vector)
@@ -71,12 +72,7 @@ class TestDateQueries(ImpalaTestSuite):
       pytest.skip()
     self.run_test_case('QueryTest/date-partitioning', vector, use_db=unique_database)
 
-  @SkipIfS3.qualified_path
-  @SkipIfGCS.qualified_path
-  @SkipIfCOS.qualified_path
-  @SkipIfABFS.qualified_path
-  @SkipIfADLS.qualified_path
-  @SkipIfLocal.qualified_path
+  @SkipIfFS.qualified_path
   def test_fileformat_support(self, vector, unique_database):
     """ Test that scanning and writing DATE is supported for text and parquet tables.
         Test that scanning DATE is supported for avro tables as well.

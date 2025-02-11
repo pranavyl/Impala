@@ -18,16 +18,17 @@
 #include "util/coding-util.h"
 
 #include <cctype>
+#include <iomanip>
 #include <limits>
 #include <sstream>
+#include <unordered_set>
 
-#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string.hpp>
 #include <boost/function.hpp>
 #include <sasl/sasl.h>
 
 #include "common/compiler-util.h"
 #include "common/logging.h"
-
 #include "common/names.h"
 #include "sasl/saslutil.h"
 
@@ -37,33 +38,37 @@ using std::uppercase;
 
 namespace impala {
 
-// Hive selectively encodes characters. This is the whitelist of
-// characters it will encode.
-// See common/src/java/org/apache/hadoop/hive/common/FileUtils.java
-// in the Hive source code for the source of this list.
-static function<bool (char)> HiveShouldEscape = is_any_of("\"#%\\*/:=?\u00FF");
-
 // It is more convenient to maintain the complement of the set of
 // characters to escape when not in Hive-compat mode.
 static function<bool (char)> ShouldNotEscape = is_any_of("-_.~");
 
+// Hive selectively encodes characters. This is the whitelist of
+// characters it will encode.
+// See common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+// in the Hive source code for the source of this list.
+static const std::unordered_set<char> SpecialCharacters = {
+    '\x01', '\x02', '\x03', '\x04', '\x05', '\x06', '\x07', '\b', '\t', '\n',
+    '\v', '\f', '\r',  '\x0E', '\x0F', '\x10', '\x11', '\x12', '\x13', '\x14',
+    '\x15', '\x16', '\x17', '\x18', '\x19', '\x1A', '\x1B', '\x1C', '\x1D', '\x1E',
+    '\x1F', '\x7F', '"', '#', '%', '\'', '*', '/', ':', '=', '?', '\\', '{', '[', ']',
+    '^'};
+
 static inline void UrlEncode(const char* in, int in_len, string* out, bool hive_compat) {
-  (*out).reserve(in_len);
   stringstream ss;
-  for (int i = 0; i < in_len; ++i) {
-    const char ch = in[i];
+  // "uppercase" and "hex" only affect the insertion of integers, not that of char values.
+  ss << uppercase << hex << setfill('0');
+  for (char ch : std::string_view(in, in_len)) {
     // Escape the character iff a) we are in Hive-compat mode and the
-    // character is in the Hive whitelist or b) we are not in
-    // Hive-compat mode, and the character is not alphanumeric or one
-    // of the four commonly excluded characters.
-    if ((hive_compat && HiveShouldEscape(ch)) ||
-        (!hive_compat && !(isalnum(ch) || ShouldNotEscape(ch)))) {
-      ss << '%' << uppercase << hex << static_cast<uint32_t>(ch);
+    // character is in the Hive whitelist or b) we are not in Hive-compat mode and
+    // the character is not alphanumeric and it is not one of the characters specifically
+    // excluded from escaping (see ShouldNotEscape()).
+    if ((hive_compat && SpecialCharacters.count(ch) > 0) || (!hive_compat &&
+            !isalnum(static_cast<unsigned char>(ch)) && !ShouldNotEscape(ch))) {
+      ss << '%' << setw(2) << static_cast<uint32_t>(static_cast<unsigned char>(ch));
     } else {
       ss << ch;
     }
   }
-
   (*out) = ss.str();
 }
 
@@ -123,18 +128,18 @@ bool Base64EncodeBufLen(int64_t in_len, int64_t* out_max) {
 }
 
 bool Base64Encode(const char* in, int64_t in_len, int64_t out_max, char* out,
-    int64_t* out_len) {
+    unsigned* out_len) {
   if (UNLIKELY(in_len < 0 || in_len > std::numeric_limits<unsigned>::max() ||
         out_max < 0 || out_max > std::numeric_limits<unsigned>::max())) {
     return false;
   }
   const int encode_result = sasl_encode64(in, static_cast<unsigned>(in_len), out,
-      static_cast<unsigned>(out_max), reinterpret_cast<unsigned*>(out_len));
+      static_cast<unsigned>(out_max), out_len);
   if (UNLIKELY(encode_result != SASL_OK || *out_len != out_max - 1)) return false;
   return true;
 }
 
-static inline void Base64Encode(const char* in, int64_t in_len, stringstream* out) {
+void Base64Encode(const char* in, int64_t in_len, stringstream* out) {
   if (in_len == 0) {
     (*out) << "";
     return;
@@ -142,7 +147,7 @@ static inline void Base64Encode(const char* in, int64_t in_len, stringstream* ou
   int64_t out_max = 0;
   if (UNLIKELY(!Base64EncodeBufLen(in_len, &out_max))) return;
   string result(out_max, '\0');
-  int64_t out_len = 0;
+  unsigned out_len = 0;
   if (UNLIKELY(!Base64Encode(in, in_len, out_max, const_cast<char*>(result.c_str()),
           &out_len))) {
     return;
@@ -198,12 +203,10 @@ bool Base64DecodeBufLen(const char* in, int64_t in_len, int64_t* out_max) {
 }
 
 bool Base64Decode(const char* in, int64_t in_len, int64_t out_max, char* out,
-    int64_t* out_len) {
-  uint32_t out_len_u32 = 0;
+    unsigned* out_len) {
   if (UNLIKELY((in_len & 3) != 0)) return false;
   const int decode_result = sasl_decode64(in, static_cast<unsigned>(in_len), out,
-      static_cast<unsigned>(out_max), &out_len_u32);
-  *out_len = out_len_u32;
+      static_cast<unsigned>(out_max), out_len);
   if (UNLIKELY(decode_result != SASL_OK || *out_len != out_max - 1)) return false;
   return true;
 }

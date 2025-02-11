@@ -19,26 +19,16 @@ package org.apache.impala.catalog.local;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
-import com.google.common.base.Stopwatch;
-import com.google.common.collect.Iterables;
-import org.apache.commons.lang.NotImplementedException;
+import org.apache.commons.lang3.NotImplementedException;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
-import org.apache.hadoop.hive.metastore.api.CompactionInfoStruct;
 import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.ForeignKeysRequest;
-import org.apache.hadoop.hive.metastore.api.GetLatestCommittedCompactionInfoRequest;
-import org.apache.hadoop.hive.metastore.api.GetLatestCommittedCompactionInfoResponse;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.metastore.api.Partition;
@@ -47,8 +37,7 @@ import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.TableMeta;
 import org.apache.impala.authorization.AuthorizationPolicy;
 import org.apache.impala.catalog.CatalogException;
-import org.apache.impala.catalog.CompactionInfoLoader;
-import org.apache.impala.catalog.FeIcebergTable;
+import org.apache.impala.catalog.DataSource;
 import org.apache.impala.catalog.FileMetadataLoader;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.HdfsCachePool;
@@ -58,14 +47,15 @@ import org.apache.impala.catalog.HdfsStorageDescriptor;
 import org.apache.impala.catalog.MetaStoreClientPool;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.catalog.SqlConstraints;
+import org.apache.impala.catalog.VirtualColumn;
+import org.apache.impala.catalog.local.LocalIcebergTable.TableParams;
 import org.apache.impala.common.Pair;
-import org.apache.impala.common.PrintUtils;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TBackendGflags;
 import org.apache.impala.thrift.TBriefTableMeta;
-import org.apache.impala.thrift.TIcebergSnapshot;
 import org.apache.impala.thrift.TNetworkAddress;
+import org.apache.impala.thrift.TPartialTableInfo;
 import org.apache.impala.thrift.TValidWriteIdList;
 import org.apache.impala.util.AcidUtils;
 import org.apache.impala.util.ListMap;
@@ -128,6 +118,11 @@ class DirectMetaProvider implements MetaProvider {
   }
 
   @Override
+  public void waitForIsReady(long timeoutMs) {
+    // NOOP
+  }
+
+  @Override
   public ImmutableList<String> loadDbList() throws TException {
     try (MetaStoreClient c = msClientPool_.getClient()) {
       return ImmutableList.copyOf(c.getHiveClient().getAllDatabases());
@@ -155,6 +150,16 @@ class DirectMetaProvider implements MetaProvider {
         ret.add(briefMeta);
       }
       return ret.build();
+    }
+  }
+
+  @Override
+  public Pair<Table, TableMetaRef> getTableIfPresent(String dbName, String tblName) {
+    try {
+      return loadTable(dbName, tblName);
+    } catch (TException e) {
+      LOG.error("Failed to load table", e);
+      return null;
     }
   }
 
@@ -247,7 +252,7 @@ class DirectMetaProvider implements MetaProvider {
     List<Partition> parts;
     try (MetaStoreClient c = msClientPool_.getClient()) {
       parts = MetaStoreUtil.fetchPartitionsByName(
-          c.getHiveClient(), partNames, tableImpl.dbName_, tableImpl.tableName_);
+          c.getHiveClient(), partNames, tableImpl.msTable_);
     }
 
     // HMS may return fewer partition objects than requested, and the
@@ -347,6 +352,20 @@ class DirectMetaProvider implements MetaProvider {
   }
 
   @Override
+  public ImmutableList<DataSource> loadDataSources() throws TException {
+    // See above.
+    throw new UnsupportedOperationException(
+        "DataSource not supported by DirectMetaProvider");
+  }
+
+  @Override
+  public DataSource loadDataSource(String dsName) throws TException {
+    // See above.
+    throw new UnsupportedOperationException(
+        "DataSource not supported by DirectMetaProvider");
+  }
+
+  @Override
   public List<ColumnStatisticsObj> loadTableColumnStatistics(TableMetaRef table,
       List<String> colNames) throws TException {
     Preconditions.checkArgument(table instanceof TableMetaRefImpl);
@@ -424,7 +443,9 @@ class DirectMetaProvider implements MetaProvider {
     public Map<String, String> getHmsParameters() { return msPartition_.getParameters(); }
 
     @Override
-    public long getWriteId() { return msPartition_.getWriteId(); }
+    public long getWriteId() {
+      return MetastoreShim.getWriteIdFromMSPartition(msPartition_);
+    }
 
     @Override
     public HdfsStorageDescriptor getInputFormatDescriptor() {
@@ -521,6 +542,22 @@ class DirectMetaProvider implements MetaProvider {
     public boolean isTransactional() {
       return AcidUtils.isTransactionalTable(msTable_.getParameters());
     }
+
+    @Override
+    public List<VirtualColumn> getVirtualColumns() {
+      throw new UnsupportedOperationException("Virtual columns are not supported with " +
+          "DirectMetaProvider implementation");
+    }
+
+    @Override
+    public long getCatalogVersion() {
+      return 0;
+    }
+
+    @Override
+    public long getLoadedTimeMs() {
+      return 0;
+    }
   }
 
   @Override
@@ -537,55 +574,23 @@ class DirectMetaProvider implements MetaProvider {
       TableMetaRef table, Map<PartitionRef, PartitionMetadata> metas) throws TException {
     Preconditions.checkNotNull(table, "TableMetaRef must be non-null");
     Preconditions.checkNotNull(metas, "Partition map must be non-null");
-    Stopwatch sw = Stopwatch.createStarted();
-    List<PartitionRef> stalePartitions = new ArrayList<>();
-    if (!table.isTransactional() || metas.isEmpty()) return stalePartitions;
-    GetLatestCommittedCompactionInfoRequest request =
-        new GetLatestCommittedCompactionInfoRequest(dbName, tableName);
-    if (table.isPartitioned()) {
-      request.setPartitionnames(metas.keySet().stream()
-          .map(PartitionRef::getName).collect(Collectors.toList()));
-    }
-    GetLatestCommittedCompactionInfoResponse response;
-    try (MetaStoreClientPool.MetaStoreClient client = msClientPool_.getClient()) {
-      response = CompactionInfoLoader.getLatestCompactionInfo(client, request);
-    }
-    Map<String, Long> partNameToCompactionId = new HashMap<>();
-    // If the table is partitioned, we must set partition name, otherwise empty result
-    // will be returned.
-    if (table.isPartitioned()) {
-      for (CompactionInfoStruct ci : response.getCompactions()) {
-        partNameToCompactionId.put(
-            Preconditions.checkNotNull(ci.getPartitionname()), ci.getId());
-      }
-    } else {
-      CompactionInfoStruct ci = Iterables.getOnlyElement(response.getCompactions(),
-          null);
-      if (ci != null) {
-        partNameToCompactionId.put(PartitionRefImpl.UNPARTITIONED_NAME, ci.getId());
-      }
-    }
-    Iterator<Map.Entry<PartitionRef, PartitionMetadata>> iter =
-        metas.entrySet().iterator();
-    while (iter.hasNext()) {
-      Map.Entry<PartitionRef, PartitionMetadata> entry = iter.next();
-      long latestCompactionId = partNameToCompactionId.getOrDefault(
-          entry.getKey().getName(), -1L);
-      if (entry.getValue().getLastCompactionId() < latestCompactionId) {
-        stalePartitions.add(entry.getKey());
-        iter.remove();
-      }
-    }
-    LOG.debug("Checked the latest compaction id for {}.{} Time taken: {}", dbName,
-        tableName, PrintUtils.printTimeMs(sw.stop().elapsed(TimeUnit.MILLISECONDS)));
+
+    List<PartitionRef> stalePartitions = MetastoreShim.checkLatestCompaction(
+        msClientPool_, dbName, tableName, table, metas,
+        PartitionRefImpl.UNPARTITIONED_NAME);
     return stalePartitions;
   }
 
   @Override
-  public FeIcebergTable.Snapshot loadIcebergSnapshot(final TableMetaRef table,
-      ListMap<TNetworkAddress> hostIndex)
-      throws TException {
+  public TPartialTableInfo loadIcebergTable(final TableMetaRef table) throws TException {
     throw new NotImplementedException(
-        "loadIcebergSnapshot() is not implemented for DirectMetaProvider");
+        "loadIcebergTable() is not implemented for DirectMetaProvider");
+  }
+
+  @Override
+  public org.apache.iceberg.Table loadIcebergApiTable(final TableMetaRef table,
+      TableParams param, Table msTable) throws TException {
+    throw new NotImplementedException(
+        "loadIcebergApiTable() is not implemented for DirectMetaProvider");
   }
 }

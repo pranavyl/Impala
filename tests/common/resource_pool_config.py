@@ -20,6 +20,7 @@
 # the tests it is used for. However, it is generic enough that it can be extended if
 # more functionality is required for adding tests.
 
+from __future__ import absolute_import, division, print_function
 import os
 from time import sleep, time
 import xml.etree.ElementTree as ET
@@ -29,7 +30,10 @@ class ResourcePoolConfig(object):
 
   # Mapping of config strings used in the llama_site file with those used on the impala
   # metrics debug page. Add to this dictionary if other configs are need for tests.
-  CONFIG_TO_METRIC_STR_MAPPING = {'max-query-mem-limit': 'pool-max-query-mem-limit'}
+  CONFIG_TO_METRIC_STR_MAPPING = {
+      'max-query-mem-limit': 'pool-max-query-mem-limit',
+      'max-query-cpu-core-per-node-limit': 'pool-max-query-cpu-core-per-node-limit',
+      'max-query-cpu-core-coordinator-limit': 'pool-max-query-cpu-core-coordinator-limit'}
 
   """'impala_service' should point to an impalad to be used for running queries.
   'ac_service' should point to the service running the admission controller and is used
@@ -65,6 +69,7 @@ class ResourcePoolConfig(object):
     metric_key = "admission-controller.{0}.root.{1}".format(metric_str, pool_name)
     start_time = time()
     while (time() - start_time < timeout):
+      client.execute("set enable_trivial_query_for_admission=false")
       handle = client.execute_async("select 'wait_for_config_change'")
       client.close_query(handle)
       current_val = str(self.ac_service.get_metric_value(metric_key))
@@ -78,7 +83,9 @@ class ResourcePoolConfig(object):
     # Make sure the change to the file is atomic. Write to a temp file and replace the
     # original with it.
     temp_path = file_name + "-temp"
-    file_handle = open(temp_path, "w")
+    # ElementTree.tostring produces a bytestring on Python 3, so open the file in
+    # binary mode.
+    file_handle = open(temp_path, "wb")
     file_handle.write(ET.tostring(xml_root))
     file_handle.flush()
     os.fsync(file_handle.fileno())
@@ -94,7 +101,7 @@ class ResourcePoolConfig(object):
         if pool_name == name.split('.')[-1] and pool_attribute in name:
           return property
       except Exception as e:
-        print "Current DOM element being inspected: \n{0}".format(ET.dump(property))
+        print("Current DOM element being inspected: \n{0}".format(ET.dump(property)))
         raise e
     assert False, "{0} attribute not found for pool {1} in the config XML:\n{2}".format(
       pool_attribute, pool_name, ET.dump(xml_root))

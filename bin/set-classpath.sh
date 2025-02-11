@@ -28,11 +28,15 @@ if [ "$0" = "$BASH_SOURCE" ]; then
   exit 1
 fi
 
+# IMPALA-10057: The fe/target/classes and fe/target/test-classes
+# directory can get cleaned out / rebuilt as part of running the
+# frontend tests. This uses jars to avoid issues related to that
+# inconsistency.
 CLASSPATH=\
 "$IMPALA_HOME"/fe/src/test/resources:\
-"$IMPALA_HOME"/fe/target/classes:\
+"$IMPALA_HOME"/fe/target/impala-frontend-${IMPALA_VERSION}.jar:\
 "$IMPALA_HOME"/fe/target/dependency:\
-"$IMPALA_HOME"/fe/target/test-classes:
+"$IMPALA_HOME"/fe/target/impala-frontend-${IMPALA_VERSION}-tests.jar:
 
 FE_CP_FILE="$IMPALA_HOME/fe/target/build-classpath.txt"
 
@@ -44,7 +48,23 @@ fi
 
 CLASSPATH=$(cat $FE_CP_FILE):"$CLASSPATH"
 
-if [ "${1:-notest}" == "test" ]; then
+# Currently the Calcite planner is experimental and not included by default.
+# If the USE_CALCITE_PLANNER is explicitly set, then the jar dependencies
+# are added to the CLASSPATH
+USE_CALCITE_PLANNER=${USE_CALCITE_PLANNER:-false}
+if [ "true" = "$USE_CALCITE_PLANNER" ]; then
+
+ CALCITE_CP_FILE="$IMPALA_HOME/java/calcite-planner/target/calcite-build-classpath.txt"
+ if [ ! -s "$CALCITE_CP_FILE" ]; then
+    >&2 echo Calcite front-end classpath file $CALCITE_CP_FILE missing.
+    >&2 echo Build the Calcite front-end first.
+    return 1
+  fi
+  CLASSPATH="$CLASSPATH":$(cat $CALCITE_CP_FILE):\
+"$IMPALA_HOME"/java/calcite-planner/target/calcite-planner-${IMPALA_VERSION}.jar:
+fi
+
+if [[ "${1:-notest}" = "test" ]]; then
   FE_TEST_CP_FILE="$IMPALA_HOME/fe/target/test-classpath.txt"
   CLASSPATH=$(cat $FE_TEST_CP_FILE):"$CLASSPATH"
 fi

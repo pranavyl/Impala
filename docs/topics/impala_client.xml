@@ -250,7 +250,7 @@ under the License.
         <dlentry>
 
           <dt>
-            --idle_client_poll_time_s
+            --idle_client_poll_period_s
           </dt>
 
           <dd>
@@ -258,11 +258,11 @@ under the License.
             connection is idle and closes it if the connection is idle. A client connection is
             idle if all sessions associated with the client connection are idle.
             <p>
-              By default, <codeph>--idle_client_poll_time_s</codeph> is set to 30 seconds.
+              By default, <codeph>--idle_client_poll_period_s</codeph> is set to 30 seconds.
             </p>
 
             <p>
-              If <codeph>--idle_client_poll_time_s</codeph> is set to 0, idle client connections
+              If <codeph>--idle_client_poll_period_s</codeph> is set to 0, idle client connections
               stay open until explicitly closed by the clients.
             </p>
 
@@ -314,6 +314,22 @@ under the License.
             <p>
               On a single <codeph>impalad</codeph>, cookies are valid across sessions and
               connections.
+            </p>
+          </dd>
+
+        </dlentry>
+
+        <dlentry>
+
+          <dt>
+            --max_hs2_sessions_per_user
+          </dt>
+
+          <dd>
+            Specifies the maximum allowed number of HiveServer2 sessions that can be
+            opened by any single connected user on a coordinator.
+            <p>
+              The default is -1. Setting to -1 or 0 disables this feature.
             </p>
           </dd>
 

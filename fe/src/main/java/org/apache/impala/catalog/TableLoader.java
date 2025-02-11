@@ -20,17 +20,18 @@ package org.apache.impala.catalog;
 import com.google.common.base.Preconditions;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.HashMap;
+import java.util.Map;
 
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.metastore.api.NotificationEvent;
-import org.apache.impala.catalog.events.EventFactory;
-import org.apache.impala.catalog.events.MetastoreEvents;
 import org.apache.impala.catalog.events.MetastoreEvents.CreateTableEvent;
 import org.apache.impala.catalog.events.MetastoreEventsProcessor;
 import org.apache.impala.common.Metrics;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.service.BackendConfig;
+import org.apache.impala.util.EventSequence;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.thrift.TException;
@@ -39,6 +40,9 @@ import com.google.common.base.Stopwatch;
 
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.util.ThreadNameAnnotator;
+
+import static org.apache.impala.service.CatalogOpExecutor.FETCHED_HMS_EVENT_BATCH;
+import static org.apache.impala.service.CatalogOpExecutor.FETCHED_HMS_TABLE;
 
 /**
  * Class that implements the logic for how a table's metadata should be loaded from
@@ -69,7 +73,8 @@ public class TableLoader {
    * Returns new instance of Table, If there were any errors loading the table metadata
    * an IncompleteTable will be returned that contains details on the error.
    */
-  public Table load(Db db, String tblName, long eventId, String reason) {
+  public Table load(Db db, String tblName, long eventId, String reason,
+      EventSequence catalogTimeline) {
     Stopwatch sw = Stopwatch.createStarted();
     String fullTblName = db.getName() + "." + tblName;
     String annotation = "Loading metadata for: " + fullTblName + " (" + reason + ")";
@@ -80,12 +85,13 @@ public class TableLoader {
     // turn all exceptions into TableLoadingException
     List<NotificationEvent> events = null;
     try (ThreadNameAnnotator tna = new ThreadNameAnnotator(annotation);
-         MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+         MetaStoreClient msClient = catalog_.getMetaStoreClient(catalogTimeline)) {
       org.apache.hadoop.hive.metastore.api.Table msTbl = null;
       // All calls to getTable() need to be serialized due to HIVE-5457.
       Stopwatch hmsLoadSW = Stopwatch.createStarted();
       synchronized (metastoreAccessLock_) {
         msTbl = msClient.getHiveClient().getTable(db.getName(), tblName);
+        catalogTimeline.markEvent(FETCHED_HMS_TABLE);
       }
       if (eventId != -1 && catalog_.isEventProcessingActive()) {
         // If the eventId is not -1 it means this table was likely created by Impala.
@@ -95,11 +101,9 @@ public class TableLoader {
         // we are only interested in fetching the events if we have a valid eventId
         // for a table. For tables where eventId is unknown are not created by
         // this catalogd and hence the self-event detection logic does not apply.
-        events = MetastoreEventsProcessor.getNextMetastoreEventsInBatches(catalog_,
-            eventId, notificationEvent -> CreateTableEvent.CREATE_TABLE_EVENT_TYPE
-                .equals(notificationEvent.getEventType())
-                && notificationEvent.getDbName().equalsIgnoreCase(db.getName())
-                && notificationEvent.getTableName().equalsIgnoreCase(tblName));
+        events = MetastoreEventsProcessor.getNextMetastoreEventsInBatchesForTable(
+            catalog_, eventId, db.getName(), tblName, CreateTableEvent.EVENT_TYPE);
+        catalogTimeline.markEvent(FETCHED_HMS_EVENT_BATCH);
       }
       if (events != null && !events.isEmpty()) {
         // if the table was recreated after the table was initially created in the
@@ -115,6 +119,14 @@ public class TableLoader {
             "Unsupported table type '%s' for: %s", tableType, fullTblName));
       }
 
+      // Support for Hive JDBC storage handler
+      String val = msTbl.getParameters().get("storage_handler");
+      if (val != null && val.equals("org.apache.hive.storage.jdbc.JdbcStorageHandler")) {
+        Map<String, String> impalaTblProps = setHiveJdbcProperties(msTbl);
+        msTbl.unsetParameters();
+        msTbl.setParameters(impalaTblProps);
+      }
+
       // Create a table of appropriate type and have it load itself
       table = Table.fromMetastoreTable(db, msTbl);
       if (table == null) {
@@ -127,7 +139,7 @@ public class TableLoader {
       if (syncToLatestEventId) {
         // acquire write lock on table since MetastoreEventProcessor.syncToLatestEventId
         // expects current thread to have write lock on the table
-        if (!catalog_.tryWriteLock(table)) {
+        if (!catalog_.tryWriteLock(table, catalogTimeline)) {
           throw new CatalogException("Couldn't acquire write lock on new table object"
               + " created when doing a full table reload of " + table.getFullName());
         }
@@ -140,8 +152,7 @@ public class TableLoader {
               + "while loading table: " + table.getFullName(), e);
         }
       }
-
-      table.load(false, msClient.getHiveClient(), msTbl, reason);
+      table.load(false, msClient.getHiveClient(), msTbl, reason, catalogTimeline);
       table.validate();
       if (syncToLatestEventId) {
         LOG.debug("After full reload, table {} is synced atleast till event id {}. "
@@ -153,6 +164,7 @@ public class TableLoader {
         MetastoreEventsProcessor.syncToLatestEventId(catalog_, table,
             catalog_.getEventFactoryForSyncToLatestEvent(), metrics_);
       }
+      table.setLastRefreshEventId(latestEventId);
     } catch (TableLoadingException e) {
       table = IncompleteTable.createFailedMetadataLoadTable(db, tblName, e);
     } catch (NoSuchObjectException e) {
@@ -175,6 +187,61 @@ public class TableLoader {
     LOG.info("Loaded metadata for: " + fullTblName + " (" +
         sw.elapsed(TimeUnit.MILLISECONDS) + "ms)");
     return table;
+  }
+
+  private Map<String, String> setHiveJdbcProperties(
+      org.apache.hadoop.hive.metastore.api.Table msTbl) throws TableLoadingException {
+    Map<String, String> impala_tbl_props = new HashMap<>();
+    // Insert Impala specific JDBC storage handler properties
+    impala_tbl_props.put("__IMPALA_DATA_SOURCE_NAME", "impalajdbcdatasource");
+    String val = msTbl.getParameters().get("hive.sql.database.type");
+    if (val == null) {
+      throw new TableLoadingException("Required parameter: hive.sql.database.type" +
+          "is missing.");
+    } else {
+      impala_tbl_props.put("database.type", val);
+    }
+    val = msTbl.getParameters().get("hive.sql.dbcp.password");
+    if (val != null) {
+      impala_tbl_props.put("dbcp.password", val);
+    }
+    val = msTbl.getParameters().get("hive.sql.dbcp.password.keystore");
+    if (val != null) {
+      impala_tbl_props.put("dbcp.password.keystore", val);
+    }
+    val = msTbl.getParameters().get("hive.sql.dbcp.password.key");
+    if (val != null) {
+      impala_tbl_props.put("dbcp.password.key", val);
+    }
+    val = msTbl.getParameters().get("hive.sql.jdbc.url");
+    if (val == null) {
+      throw new TableLoadingException("Required parameter: hive.sql.jdbc.url" +
+          "is missing.");
+    } else {
+      impala_tbl_props.put("jdbc.url", val);
+    }
+    val = msTbl.getParameters().get("hive.sql.dbcp.username");
+    if (val == null) {
+      throw new TableLoadingException("Required parameter: hive.sql.dbcp.username" +
+          "is missing.");
+    } else {
+      impala_tbl_props.put("dbcp.username", val);
+    }
+    val = msTbl.getParameters().get("hive.sql.table");
+    if (val == null) {
+      throw new TableLoadingException("Required parameter: hive.sql.table" +
+          "is missing.");
+    } else {
+      impala_tbl_props.put("table", val);
+    }
+    val = msTbl.getParameters().get("hive.sql.jdbc.driver");
+    if (val == null) {
+      throw new TableLoadingException("Required parameter: hive.sql.jdbc.driver" +
+          "is missing.");
+    } else {
+      impala_tbl_props.put("jdbc.driver", val);
+    }
+    return impala_tbl_props;
   }
 
   private void initMetrics(Metrics metrics) {

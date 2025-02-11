@@ -1,4 +1,4 @@
-#!/usr/bin/env impala-python
+#!/usr/bin/env impala-env-versioned-python
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -22,6 +22,7 @@
 # executing the remaining tests in parallel. To run only some of
 # these, use --skip-serial, --skip-stress, or --skip-parallel.
 # All additional command line options are passed to py.test.
+from __future__ import absolute_import, division, print_function
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_service import ImpaladService
 from tests.conftest import configure_logging
@@ -47,7 +48,7 @@ VALID_TEST_DIRS = ['failure', 'query_test', 'stress', 'unittests', 'aux_query_te
 TEST_HELPER_DIRS = ['aux_parquet_data_load', 'comparison', 'benchmark',
                      'custom_cluster', 'util', 'experiments', 'verifiers', 'common',
                      'performance', 'beeswax', 'aux_custom_cluster_tests',
-                     'authorization']
+                     'authorization', 'test-hive-udfs', '__pycache__']
 
 TEST_DIR = os.path.join(os.environ['IMPALA_HOME'], 'tests')
 RESULT_DIR = os.path.join(os.environ['IMPALA_EE_TEST_LOGS_DIR'], 'results')
@@ -63,7 +64,7 @@ NUM_CONCURRENT_TESTS = multiprocessing.cpu_count()
 if 'NUM_CONCURRENT_TESTS' in os.environ:
   NUM_CONCURRENT_TESTS = int(os.environ['NUM_CONCURRENT_TESTS'])
 
-# Default the number of stress clinets to 4x the number of CPUs (but not exceeding the
+# Default the number of stress clients to 4x the number of CPUs (but not exceeding the
 # default max # of concurrent connections)
 # This can be overridden by setting the NUM_STRESS_CLIENTS environment variable.
 # TODO: fix the stress test so it can start more clients than available connections
@@ -165,7 +166,7 @@ def build_test_args(base_name, valid_dirs=VALID_TEST_DIRS):
 
   ignored_dirs = build_ignore_dir_arg_list(valid_dirs=valid_dirs)
   logging_args = []
-  for arg, log in LOGGING_ARGS.iteritems():
+  for arg, log in LOGGING_ARGS.items():
     logging_args.extend([arg, os.path.join(RESULT_DIR, log.format(base_name))])
 
   if valid_dirs != ['verifiers']:
@@ -226,16 +227,16 @@ def build_ignore_dir_arg_list(valid_dirs):
 def print_metrics(substring):
   """Prints metrics with the given substring in the name"""
   for impalad in ImpalaCluster.get_e2e_test_cluster().impalads:
-    print ">" * 80
+    print(">" * 80)
     port = impalad.get_webserver_port()
     cert = impalad._get_webserver_certificate_file()
-    print "connections metrics for impalad at port {0}:".format(port)
+    print("connections metrics for impalad at port {0}:".format(port))
     debug_info = json.loads(ImpaladService(impalad.hostname, webserver_port=port,
         webserver_certificate_file=cert).read_debug_webpage('metrics?json'))
     for metric in debug_info['metric_group']['metrics']:
       if substring in metric['name']:
-        print json.dumps(metric, indent=1)
-    print "<" * 80
+        print(json.dumps(metric, indent=1))
+    print("<" * 80)
 
 
 def detect_and_remove_flag(flag):
@@ -256,6 +257,7 @@ if __name__ == "__main__":
   skip_serial = detect_and_remove_flag('--skip-serial')
   skip_stress = detect_and_remove_flag('--skip-stress')
   skip_parallel = detect_and_remove_flag('--skip-parallel')
+  skip_verifiers = detect_and_remove_flag('--skip-verifiers')
   test_executor = TestExecutor(exit_on_error=exit_on_error)
 
   # If the user is just asking for --help, just print the help test and then exit.
@@ -265,7 +267,7 @@ if __name__ == "__main__":
 
   def run(args):
     """Helper to print out arguments of test_executor before invoking."""
-    print "Running TestExecutor with args: %s" % (args,)
+    print("Running TestExecutor with args: %s" % (args,))
     test_executor.run_tests(args)
 
   os.chdir(TEST_DIR)
@@ -310,7 +312,7 @@ if __name__ == "__main__":
       run(base_args + build_test_args("serial{0}".format(shard_identifier)))
       print_metrics('connections')
 
-    # Run the stress tests tests
+    # Run the stress tests
     if not skip_stress:
       base_args = ['-m', 'stress', '-n', NUM_STRESS_CLIENTS]
       run(base_args + build_test_args("stress{0}".format(shard_identifier)))
@@ -327,11 +329,12 @@ if __name__ == "__main__":
     if test_executor.total_executed == 0:
       sys.exit(1)
 
-    # Finally, validate impalad/statestored metrics.
-    args = build_test_args(base_name="verify-metrics{0}".format(shard_identifier),
-                           valid_dirs=['verifiers'])
-    args.append('verifiers/test_verify_metrics.py')
-    run(args)
+    if not skip_verifiers:
+      # Finally, validate impalad/statestored metrics.
+      args = build_test_args(base_name="verify-metrics{0}".format(shard_identifier),
+                             valid_dirs=['verifiers'])
+      args.append('verifiers/test_verify_metrics.py')
+      run(args)
 
   if test_executor.tests_failed:
     sys.exit(1)

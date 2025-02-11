@@ -40,6 +40,7 @@
 #include "util/histogram-metric.h"
 #include "util/thread.h"
 #include "util/time.h"
+#include "gutil/strings/strcat.h"
 
 #include "common/names.h"
 
@@ -59,6 +60,7 @@ DECLARE_int32(num_oss_io_threads);
 DECLARE_int32(num_remote_hdfs_file_oper_io_threads);
 DECLARE_int32(num_s3_file_oper_io_threads);
 DECLARE_int32(num_sfs_io_threads);
+DECLARE_int32(num_obs_io_threads);
 
 #ifndef NDEBUG
 DECLARE_int32(stress_disk_read_delay_ms);
@@ -74,8 +76,6 @@ const int64_t LARGE_INITIAL_RESERVATION = 128L * 1024L * 1024L;
 const int64_t BUFFER_POOL_CAPACITY = LARGE_RESERVATION_LIMIT;
 
 /// For testing spill to remote.
-static const string HDFS_LOCAL_URL = "hdfs://localhost:20500/tmp";
-static const string REMOTE_URL = HDFS_LOCAL_URL;
 static const string LOCAL_BUFFER_PATH = "/tmp/tmp-file-mgr-test-buffer";
 
 namespace impala {
@@ -95,6 +95,7 @@ class DiskIoMgrTest : public testing::Test {
     ASSERT_OK(test_env_->Init());
     metrics_.reset(new MetricGroup("disk-io-mgr-test"));
     RandTestUtil::SeedRng("DISK_IO_MGR_TEST_SEED", &rng_);
+    remote_url_ = test_env_->GetDefaultFsPath("/tmp");
   }
 
   virtual void TearDown() {
@@ -123,7 +124,7 @@ class DiskIoMgrTest : public testing::Test {
 
   void WriteValidateCallback(int num_writes, WriteRange** written_range,
       DiskIoMgr* io_mgr, RequestContext* reader, BufferPool::ClientHandle* client,
-      int32_t* data, Status expected_status, const Status& status) {
+      int32_t* data, const Status& expected_status, const Status& status) {
     if (expected_status.code() == TErrorCode::CANCELLED_INTERNALLY) {
       EXPECT_TRUE(status.ok() || status.IsCancelled()) << "Error: " << status.GetDetail();
     } else {
@@ -131,8 +132,8 @@ class DiskIoMgrTest : public testing::Test {
     }
     if (status.ok()) {
       ScanRange* scan_range = pool_.Add(new ScanRange());
-      scan_range->Reset(nullptr, (*written_range)->file(), (*written_range)->len(),
-          (*written_range)->offset(), 0, false, ScanRange::INVALID_MTIME,
+      scan_range->Reset(ScanRange::FileInfo{(*written_range)->file()},
+          (*written_range)->len(), (*written_range)->offset(), 0, false,
           BufferOpts::Uncached());
       ValidateSyncRead(io_mgr, reader, client, scan_range,
           reinterpret_cast<const char*>(data), sizeof(int32_t));
@@ -173,7 +174,7 @@ class DiskIoMgrTest : public testing::Test {
     if (io_mgr == nullptr) io_mgr = test_env_->exec_env()->disk_io_mgr();
     vector<string> tmp_dirs({LOCAL_BUFFER_PATH});
     RemoveAndCreateDirs(tmp_dirs);
-    tmp_dirs.push_back(REMOTE_URL);
+    tmp_dirs.push_back(remote_url_);
     Status status = tmp_file_mgr->InitCustom(tmp_dirs, true, "", false, metrics_.get());
     if (!status.ok()) return nullptr;
     return pool_.Add(new TmpFileGroup(tmp_file_mgr, io_mgr, NewProfile(), TUniqueId()));
@@ -247,8 +248,10 @@ class DiskIoMgrTest : public testing::Test {
 
   static void ValidateScanRange(DiskIoMgr* io_mgr, ScanRange* range,
       const char* expected, int expected_len, const Status& expected_status) {
-    char result[expected_len + 1];
-    memset(result, 0, expected_len + 1);
+    // TODO: Disentagle the offsets/expected results properly so this doesn't need to
+    // overallocate.
+    char result[range->offset() + expected_len + 1];
+    memset(result, 0, range->offset() + expected_len + 1);
     int64_t scan_range_offset = 0;
 
     while (true) {
@@ -294,14 +297,27 @@ class DiskIoMgrTest : public testing::Test {
     scan_range->SetFileReader(move(reader_stub));
   }
 
+  static bool WaitForStatus(DiskFile* disk_file, DiskFileStatus target_status) {
+    DCHECK(disk_file != nullptr);
+    // Suppose the upload should be finished in 20 seconds.
+    int max_wait_times = 20;
+    while (max_wait_times-- > 0) {
+      if (disk_file->GetFileStatus() == target_status) {
+        return true;
+      }
+      usleep(1000 * 1000); // sleep 1s each round.
+    }
+    return false;
+  }
+
   ScanRange* InitRange(ObjectPool* pool, const char* file_path, int offset, int len,
       int disk_id, int64_t mtime, void* meta_data = nullptr, bool is_hdfs_cached = false,
       std::vector<ScanRange::SubRange> sub_ranges = {}) {
     ScanRange* range = pool->Add(new ScanRange);
     int cache_options =
         is_hdfs_cached ? BufferOpts::USE_HDFS_CACHE : BufferOpts::NO_CACHING;
-    range->Reset(nullptr, file_path, len, offset, disk_id, true, mtime,
-        BufferOpts(cache_options), move(sub_ranges), meta_data);
+    range->Reset(ScanRange::FileInfo{file_path, nullptr, mtime}, len, offset, disk_id,
+        true, BufferOpts(cache_options), move(sub_ranges), meta_data);
     EXPECT_EQ(mtime, range->mtime());
     return range;
   }
@@ -320,10 +336,11 @@ class DiskIoMgrTest : public testing::Test {
       RequestContext* writer, const string& expected_output, TmpFileGroup* file_group);
 
   void SingleReaderTestBody(const char* data, const char* expected_result,
-      vector<ScanRange::SubRange> sub_ranges = {});
+      const vector<ScanRange::SubRange>& sub_ranges = {});
 
   void CachedReadsTestBody(const char* data, const char* expected,
-      bool fake_cache, vector<ScanRange::SubRange> sub_ranges = {});
+      HdfsCachingScenario scenario, int offset,
+      const vector<ScanRange::SubRange>& sub_ranges = {});
 
   /// Convenience function to get a reference to the buffer pool.
   BufferPool* buffer_pool() const { return ExecEnv::GetInstance()->buffer_pool(); }
@@ -349,6 +366,9 @@ class DiskIoMgrTest : public testing::Test {
   mutex oper_mutex_;
   ConditionVariable oper_done_;
   int num_oper_;
+
+  /// URL for remote spilling.
+  string remote_url_;
 };
 
 TEST_F(DiskIoMgrTest, TestDisk) {
@@ -678,7 +698,7 @@ TEST_F(DiskIoMgrTest, SingleWriterCancel) {
 }
 
 void DiskIoMgrTest::SingleReaderTestBody(const char* data, const char* expected_result,
-    vector<ScanRange::SubRange> sub_ranges) {
+    const vector<ScanRange::SubRange>& sub_ranges) {
   const char* tmp_file = "/tmp/disk_io_mgr_test.txt";
   int data_len = strlen(data);
   int expected_result_len = strlen(expected_result);
@@ -994,6 +1014,7 @@ TEST_F(DiskIoMgrTest, MemScarcity) {
     unique_ptr<RequestContext> reader = io_mgr.RegisterContext();
 
     vector<ScanRange*> ranges;
+    ranges.reserve(num_ranges);
     for (int i = 0; i < num_ranges; ++i) {
       ranges.push_back(InitRange(&pool_, tmp_file, 0, DATA_BYTES, 0, stat_val.st_mtime));
     }
@@ -1047,11 +1068,16 @@ TEST_F(DiskIoMgrTest, MemScarcity) {
 }
 
 void DiskIoMgrTest::CachedReadsTestBody(const char* data, const char* expected,
-    bool fake_cache, vector<ScanRange::SubRange> sub_ranges) {
+    HdfsCachingScenario scenario, int offset,
+    const vector<ScanRange::SubRange>& sub_ranges) {
+  // The data passed in is the full data with any extra initial offset. This
+  // is necessary to make the file on disk able to service the data at the
+  // appropriate offset.
   const char* tmp_file = "/tmp/disk_io_mgr_test.txt";
-  uint8_t* cached_data = reinterpret_cast<uint8_t*>(const_cast<char*>(data));
-  int len = strlen(data);
   CreateTempFile(tmp_file, data);
+  // The actual scan range data is the original test data at the appropriate offset.
+  uint8_t* cached_data = reinterpret_cast<uint8_t*>(const_cast<char*>(data)) + offset;
+  int len = strlen(data) - offset;
 
   // Get mtime for file
   struct stat stat_val;
@@ -1068,12 +1094,10 @@ void DiskIoMgrTest::CachedReadsTestBody(const char* data, const char* expected,
     unique_ptr<RequestContext> reader = io_mgr.RegisterContext();
 
     ScanRange* complete_range =
-        InitRange(&pool_, tmp_file, 0, strlen(data), 0, stat_val.st_mtime, nullptr, true,
+        InitRange(&pool_, tmp_file, offset, len, 0, stat_val.st_mtime, nullptr, true,
             sub_ranges);
-    if (fake_cache) {
-      SetReaderStub(complete_range, make_unique<CacheReaderTestStub>(
-          complete_range, cached_data, len));
-    }
+    SetReaderStub(complete_range, make_unique<CacheReaderTestStub>(complete_range,
+        cached_data, len, scenario));
 
     // Issue some reads before the async ones are issued
     ValidateSyncRead(&io_mgr, reader.get(), &read_client, complete_range, expected);
@@ -1082,12 +1106,11 @@ void DiskIoMgrTest::CachedReadsTestBody(const char* data, const char* expected,
     vector<ScanRange*> ranges;
     for (int i = 0; i < len; ++i) {
       int disk_id = i % num_disks;
-      ScanRange* range = InitRange(&pool_, tmp_file, 0, len, disk_id, stat_val.st_mtime,
-          nullptr, true, sub_ranges);
+      ScanRange* range = InitRange(&pool_, tmp_file, offset, len, disk_id,
+          stat_val.st_mtime, nullptr, true, sub_ranges);
       ranges.push_back(range);
-      if (fake_cache) {
-        SetReaderStub(range, make_unique<CacheReaderTestStub>(range, cached_data, len));
-      }
+      SetReaderStub(range, make_unique<CacheReaderTestStub>(range, cached_data,
+          len, scenario));
     }
     ASSERT_OK(reader->AddScanRanges(ranges, EnqueueLocation::TAIL));
 
@@ -1120,26 +1143,47 @@ void DiskIoMgrTest::CachedReadsTestBody(const char* data, const char* expected,
 // Test when some scan ranges are marked as being cached.
 TEST_F(DiskIoMgrTest, CachedReads) {
   InitRootReservation(LARGE_RESERVATION_LIMIT);
-  const char* data = "abcdefghijklm";
-  // Don't fake the cache, i.e. test the fallback mechanism
-  CachedReadsTestBody(data, data, false);
-  // Fake the test with a file reader stub.
-  CachedReadsTestBody(data, data, true);
+  std::string data_str = "abcdefghijklm";
+  const char* data = data_str.data();
+
+  // Test at different offsets to validate offset handling
+  for (int offset: {0, 1000}) {
+    // The full data is 'offset' copies of 0 followed by the test string above.
+    std::string full_data_str(offset, '0');
+    full_data_str += data_str;
+    const char* full_data = full_data_str.data();
+    // Test the fallback mechanism for the cache
+    CachedReadsTestBody(full_data, data, FALLBACK_NULL_BUFFER, offset);
+    CachedReadsTestBody(full_data, data, FALLBACK_INCOMPLETE_BUFFER, offset);
+    // Test the success path for the cache
+    CachedReadsTestBody(full_data, data, VALID_BUFFER, offset);
+  }
 }
 
 // Test when some scan ranges are marked as being cached and there
 // are sub-ranges as well.
 TEST_F(DiskIoMgrTest, CachedReadsSubRanges) {
   InitRootReservation(LARGE_RESERVATION_LIMIT);
-  const char* data = "abcdefghijklm";
-  int64_t data_len = strlen(data);
+  std::string data_str = "abcdefghijklm";
+  const char* data = data_str.data();
+  int64_t data_len = data_str.length();
 
   // first iteration tests the fallback mechanism with sub-ranges
   // second iteration fakes a cache
-  for (bool fake_cache : {false, true}) {
-    CachedReadsTestBody(data, data, fake_cache, {{0, data_len}});
-    CachedReadsTestBody(data, "bc", fake_cache, {{1, 2}});
-    CachedReadsTestBody(data, "abchilm", fake_cache, {{0, 3}, {7, 2}, {11, 2}});
+  for (HdfsCachingScenario scenario :
+       {VALID_BUFFER, FALLBACK_NULL_BUFFER, FALLBACK_INCOMPLETE_BUFFER}) {
+    // Test at different offsets to validate offset handling
+    for (int offset : {0, 1000}) {
+      // The full data is 'offset' copies of 0 followed by the test string above.
+      std::string full_data_str(offset, '0');
+      full_data_str += data_str;
+      const char* full_data = full_data_str.data();
+      CachedReadsTestBody(full_data, data, scenario, offset,
+          {{0 + offset, data_len}});
+      CachedReadsTestBody(full_data, "bc", scenario, offset, {{1 + offset, 2}});
+      CachedReadsTestBody(full_data, "abchilm", scenario, offset,
+          {{0 + offset, 3}, {7 + offset, 2}, {11 + offset, 2}});
+    }
   }
 }
 
@@ -1454,6 +1498,7 @@ TEST_F(DiskIoMgrTest, SkipAllocateBuffers) {
 
   // We should not read past the end of file.
   vector<ScanRange*> ranges;
+  ranges.reserve(4);
   for (int i = 0; i < 4; ++i) {
     ranges.push_back(InitRange(&pool_, tmp_file, 0, len, 0, stat_val.st_mtime));
   }
@@ -1591,7 +1636,7 @@ TEST_F(DiskIoMgrTest, ReadIntoClientBuffer) {
     vector<uint8_t> client_buffer(buffer_len);
     int scan_len = min(len, buffer_len);
     ScanRange* range = pool_.Add(new ScanRange);
-    range->Reset(nullptr, tmp_file, scan_len, 0, 0, true, ScanRange::INVALID_MTIME,
+    range->Reset(ScanRange::FileInfo{tmp_file}, scan_len, 0, 0, true,
         BufferOpts::ReadInto(client_buffer.data(), buffer_len, BufferOpts::NO_CACHING));
     bool needs_buffers;
     ASSERT_OK(reader->StartScanRange(range, &needs_buffers));
@@ -1632,18 +1677,19 @@ TEST_F(DiskIoMgrTest, ReadIntoClientBufferSubRanges) {
   // Reader doesn't need to provide client if it's providing buffers.
   unique_ptr<RequestContext> reader = io_mgr->RegisterContext();
 
-  auto test_case = [&](bool fake_cache, const char* expected_result,
+  auto test_case = [&](HdfsCachingScenario scenario, const char* expected_result,
       vector<ScanRange::SubRange> sub_ranges) {
     int result_len = strlen(expected_result);
     vector<uint8_t> client_buffer(result_len);
     ScanRange* range = pool_.Add(new ScanRange);
-    int cache_options = fake_cache ? BufferOpts::USE_HDFS_CACHE : BufferOpts::NO_CACHING;
-    range->Reset(nullptr, tmp_file, data_len, 0, 0, true, stat_val.st_mtime,
-        BufferOpts::ReadInto(cache_options, client_buffer.data(), result_len),
+    // Note: Even though this specifies HDFS caching, some scenarios will fall back
+    // to doing regular reads.
+    int cache_options = BufferOpts::USE_HDFS_CACHE;
+    range->Reset(ScanRange::FileInfo{tmp_file, nullptr, stat_val.st_mtime}, data_len, 0,
+        0, true, BufferOpts::ReadInto(cache_options, client_buffer.data(), result_len),
         move(sub_ranges));
-    if (fake_cache) {
-      SetReaderStub(range, make_unique<CacheReaderTestStub>(range, cache, data_len));
-    }
+    SetReaderStub(range, make_unique<CacheReaderTestStub>(range, cache, data_len,
+        scenario));
     bool needs_buffers;
     ASSERT_OK(reader->StartScanRange(range, &needs_buffers));
     ASSERT_FALSE(needs_buffers);
@@ -1660,11 +1706,12 @@ TEST_F(DiskIoMgrTest, ReadIntoClientBufferSubRanges) {
     range->ReturnBuffer(move(io_buffer));
   };
 
-  for (bool fake_cache : {false, true}) {
-    test_case(fake_cache, data, {{0, data_len}});
-    test_case(fake_cache, data, {{0, 15}, {15, data_len - 15}});
-    test_case(fake_cache, "quick fox", {{4, 5}, {15, 4}});
-    test_case(fake_cache, "the brown dog", {{0, 3}, {9, 6}, {data_len - 4, 4}});
+  for (HdfsCachingScenario scenario :
+       {VALID_BUFFER, FALLBACK_NULL_BUFFER, FALLBACK_INCOMPLETE_BUFFER}) {
+    test_case(scenario, data, {{0, data_len}});
+    test_case(scenario, data, {{0, 15}, {15, data_len - 15}});
+    test_case(scenario, "quick fox", {{4, 5}, {15, 4}});
+    test_case(scenario, "the brown dog", {{0, 3}, {9, 6}, {data_len - 4, 4}});
   }
 
   io_mgr->UnregisterContext(reader.get());
@@ -1688,7 +1735,7 @@ TEST_F(DiskIoMgrTest, ReadIntoClientBufferError) {
         LARGE_RESERVATION_LIMIT, LARGE_INITIAL_RESERVATION, &read_client);
     unique_ptr<RequestContext> reader = io_mgr->RegisterContext();
     ScanRange* range = pool_.Add(new ScanRange);
-    range->Reset(nullptr, tmp_file, SCAN_LEN, 0, 0, true, ScanRange::INVALID_MTIME,
+    range->Reset(ScanRange::FileInfo{tmp_file}, SCAN_LEN, 0, 0, true,
         BufferOpts::ReadInto(client_buffer.data(), SCAN_LEN, BufferOpts::NO_CACHING));
     bool needs_buffers;
     ASSERT_OK(reader->StartScanRange(range, &needs_buffers));
@@ -1721,7 +1768,8 @@ TEST_F(DiskIoMgrTest, VerifyNumThreadsParameter) {
       + FLAGS_num_remote_hdfs_file_oper_io_threads
       + FLAGS_num_s3_file_oper_io_threads + FLAGS_num_gcs_io_threads
       + FLAGS_num_cos_io_threads
-      + FLAGS_num_sfs_io_threads;
+      + FLAGS_num_sfs_io_threads
+      + FLAGS_num_obs_io_threads;
 
   // Verify num_io_threads_per_rotational_disk and num_io_threads_per_solid_state_disk.
   // Since we do not have control over which disk is used, we check for either type
@@ -1815,10 +1863,10 @@ TEST_F(DiskIoMgrTest, MetricsOfWriteSizeAndLatency) {
     string i_str = std::to_string(i);
     auto write_size_org =
         ImpaladMetrics::IO_MGR_METRICS->FindMetricForTesting<HistogramMetric>(
-            key_prefix + i_str + write_size_postfix);
+            StrCat(key_prefix, i_str, write_size_postfix));
     auto write_latency_org =
         ImpaladMetrics::IO_MGR_METRICS->FindMetricForTesting<HistogramMetric>(
-            key_prefix + i_str + write_latency_postfix);
+            StrCat(key_prefix, i_str, write_latency_postfix));
     if (write_size_org != nullptr) write_size_org->Reset();
     if (write_latency_org != nullptr) write_latency_org->Reset();
   }
@@ -1933,7 +1981,7 @@ TEST_F(DiskIoMgrTest, MetricsOfWriteIoError) {
 TEST_F(DiskIoMgrTest, WriteToRemoteSuccess) {
   InitRootReservation(LARGE_RESERVATION_LIMIT);
   num_ranges_written_ = 0;
-  string remote_file_path = REMOTE_URL + "/test";
+  string remote_file_path = remote_url_ + "/test";
   string new_file_path_local_buffer = LOCAL_BUFFER_PATH + "/test";
   int32_t file_size = 1024;
   FLAGS_remote_tmp_file_size = "1K";
@@ -1967,7 +2015,7 @@ TEST_F(DiskIoMgrTest, WriteToRemoteSuccess) {
 
   TmpFileRemote** new_tmp_file_obj = tmp_pool.Add(new TmpFileRemote*);
   *new_tmp_file_obj = tmp_pool.Add(new TmpFileRemote(tmp_file_grp, 0, remote_file_path,
-      new_file_path_local_buffer, false, REMOTE_URL.c_str()));
+      new_file_path_local_buffer, false, remote_url_.c_str()));
 
   vector<WriteRange*> ranges;
   vector<int32_t> datas;
@@ -2010,17 +2058,7 @@ TEST_F(DiskIoMgrTest, WriteToRemoteSuccess) {
       (*new_tmp_file_obj)->DiskBufferFile(), (*new_tmp_file_obj)->DiskFile(), file_size,
       disk_id, RequestType::FILE_UPLOAD, &io_mgr, u_callback));
   EXPECT_OK(io_ctx->AddRemoteOperRange(upload_range));
-
-  int wait_times = 10;
-  while (true) {
-    if ((*new_tmp_file_obj)->DiskFile()->GetFileStatus() == DiskFileStatus::PERSISTED) {
-      break;
-    }
-    // Suppose the upload should be finished in two seconds.
-    ASSERT_TRUE(wait_times-- > 0);
-    usleep(200 * 1000);
-  }
-
+  EXPECT_TRUE(WaitForStatus((*new_tmp_file_obj)->DiskFile(), DiskFileStatus::PERSISTED));
   EXPECT_TRUE(HdfsFileExist(remote_file_path));
 
   auto exam_fuc = [&](HistogramMetric* metric, const string& keyname) {
@@ -2059,8 +2097,9 @@ TEST_F(DiskIoMgrTest, WriteToRemoteSuccess) {
     auto data = datas.at(i);
     size_t buffer_len = sizeof(int32_t);
     vector<uint8_t> client_buffer(buffer_len);
-    scan_range->Reset(hdfsConnect("default", 0), range->file(), range->len(),
-        range->offset(), 0, false, mtime,
+    scan_range->Reset(
+        ScanRange::FileInfo{range->file(), hdfsConnect("default", 0), mtime},
+        range->len(), range->offset(), 0, false,
         BufferOpts::ReadInto(client_buffer.data(), buffer_len, BufferOpts::NO_CACHING),
         nullptr, (*new_tmp_file_obj)->DiskFile(), (*new_tmp_file_obj)->DiskBufferFile());
     bool needs_buffers;
@@ -2085,8 +2124,9 @@ TEST_F(DiskIoMgrTest, WriteToRemoteSuccess) {
     auto data = datas.at(i);
     size_t buffer_len = sizeof(int32_t);
     vector<uint8_t> client_buffer(buffer_len);
-    scan_range->Reset(hdfsConnect("default", 0), range->file(), range->len(),
-        range->offset(), 0, false, mtime,
+    scan_range->Reset(
+        ScanRange::FileInfo{range->file(), hdfsConnect("default", 0), mtime},
+        range->len(), range->offset(), 0, false,
         BufferOpts::ReadInto(client_buffer.data(), buffer_len, BufferOpts::NO_CACHING),
         nullptr, (*new_tmp_file_obj)->DiskFile(), (*new_tmp_file_obj)->DiskBufferFile());
     bool needs_buffers;
@@ -2111,7 +2151,7 @@ TEST_F(DiskIoMgrTest, WriteToRemoteSuccess) {
 TEST_F(DiskIoMgrTest, WriteToRemotePartialFileSuccess) {
   InitRootReservation(LARGE_RESERVATION_LIMIT);
   num_ranges_written_ = 0;
-  string remote_file_path = REMOTE_URL + "/test";
+  string remote_file_path = remote_url_ + "/test";
   string new_file_path_local_buffer = LOCAL_BUFFER_PATH + "/test";
   FLAGS_remote_tmp_file_size = "1K";
 
@@ -2136,7 +2176,7 @@ TEST_F(DiskIoMgrTest, WriteToRemotePartialFileSuccess) {
 
   TmpFileRemote** new_tmp_file_obj = tmp_pool.Add(new TmpFileRemote*);
   *new_tmp_file_obj = tmp_pool.Add(new TmpFileRemote(tmp_file_grp, 0, remote_file_path,
-      new_file_path_local_buffer, false, REMOTE_URL.c_str()));
+      new_file_path_local_buffer, false, remote_url_.c_str()));
 
   int32_t* data = tmp_pool.Add(new int32_t);
   *data = rand();
@@ -2169,8 +2209,9 @@ TEST_F(DiskIoMgrTest, WriteToRemotePartialFileSuccess) {
   ScanRange* scan_range = tmp_pool.Add(new ScanRange);
   size_t buffer_len = sizeof(int32_t);
   vector<uint8_t> client_buffer(buffer_len);
-  scan_range->Reset(hdfsConnect("default", 0), (*new_range)->file(), (*new_range)->len(),
-      (*new_range)->offset(), 0, false, mtime,
+  scan_range->Reset(
+      ScanRange::FileInfo{(*new_range)->file(), hdfsConnect("default", 0), mtime},
+      (*new_range)->len(), (*new_range)->offset(), 0, false,
       BufferOpts::ReadInto(client_buffer.data(), buffer_len, BufferOpts::NO_CACHING),
       nullptr, (*new_tmp_file_obj)->DiskFile(), (*new_tmp_file_obj)->DiskBufferFile());
   bool needs_buffers;
@@ -2183,6 +2224,7 @@ TEST_F(DiskIoMgrTest, WriteToRemotePartialFileSuccess) {
   EXPECT_EQ(*(int32_t*)client_buffer.data(), *data);
   scan_range->ReturnBuffer(move(io_buffer));
 
+  ASSERT_TRUE((*new_tmp_file_obj)->Remove().ok());
   num_ranges_written_ = 0;
   tmp_file_grp->Close();
   io_mgr.UnregisterContext(io_ctx.get());
@@ -2192,7 +2234,7 @@ TEST_F(DiskIoMgrTest, WriteToRemotePartialFileSuccess) {
 TEST_F(DiskIoMgrTest, WriteToRemoteUploadFailed) {
   InitRootReservation(LARGE_RESERVATION_LIMIT);
   num_oper_ = 0;
-  string remote_file_path = REMOTE_URL + "/test";
+  string remote_file_path = remote_url_ + "/test";
   string non_existent_dir = "/non-existent-dir/test";
   FLAGS_remote_tmp_file_size = "1K";
   int64_t file_size = 1024;
@@ -2212,7 +2254,7 @@ TEST_F(DiskIoMgrTest, WriteToRemoteUploadFailed) {
 
   TmpFileRemote** new_tmp_file_obj = tmp_pool.Add(new TmpFileRemote*);
   *new_tmp_file_obj = tmp_pool.Add(new TmpFileRemote(
-      tmp_file_grp, 0, remote_file_path, non_existent_dir, false, REMOTE_URL.c_str()));
+      tmp_file_grp, 0, remote_file_path, non_existent_dir, false, remote_url_.c_str()));
 
   DiskFile* remote_file = (*new_tmp_file_obj)->DiskFile();
   DiskFile* local_buffer_file = (*new_tmp_file_obj)->DiskBufferFile();
@@ -2250,7 +2292,7 @@ TEST_F(DiskIoMgrTest, WriteToRemoteUploadFailed) {
 TEST_F(DiskIoMgrTest, WriteToRemoteEvictLocal) {
   InitRootReservation(LARGE_RESERVATION_LIMIT);
   num_ranges_written_ = 0;
-  string remote_file_path = REMOTE_URL + "/test1";
+  string remote_file_path = remote_url_ + "/test1";
   string local_buffer_file_path = LOCAL_BUFFER_PATH + "/test1";
   int32_t file_size = 1024;
   FLAGS_remote_tmp_file_size = "1K";
@@ -2270,7 +2312,7 @@ TEST_F(DiskIoMgrTest, WriteToRemoteEvictLocal) {
   unique_ptr<RequestContext> io_ctx = io_mgr.RegisterContext();
 
   TmpFileRemote* new_tmp_file_obj = new TmpFileRemote(tmp_file_grp, 0, remote_file_path,
-      local_buffer_file_path, false, REMOTE_URL.c_str());
+      local_buffer_file_path, false, remote_url_.c_str());
   shared_ptr<TmpFileRemote> shared_tmp_file;
   shared_tmp_file.reset(move(new_tmp_file_obj));
 
@@ -2318,16 +2360,7 @@ TEST_F(DiskIoMgrTest, WriteToRemoteEvictLocal) {
       new RemoteOperRange(shared_tmp_file->DiskBufferFile(), shared_tmp_file->DiskFile(),
           file_size, 0, RequestType::FILE_UPLOAD, &io_mgr, u_callback));
   Status add_status = io_ctx->AddRemoteOperRange(upload_range);
-
-  int wait_times = 10;
-  while (true) {
-    if (shared_tmp_file->DiskFile()->GetFileStatus() == DiskFileStatus::PERSISTED) {
-      break;
-    }
-    // Suppose the upload should be finished in two seconds.
-    ASSERT_TRUE(wait_times-- > 0);
-    usleep(200 * 1000);
-  }
+  EXPECT_TRUE(WaitForStatus(shared_tmp_file->DiskFile(), DiskFileStatus::PERSISTED));
 
   // TryEvictFile and the local buffer file should be evicted for releasing local
   // scratch space.
@@ -2348,7 +2381,7 @@ TEST_F(DiskIoMgrTest, WriteToRemoteEvictLocal) {
 // Use an invalid block size to emulate the case when memory allocation failed.
 TEST_F(DiskIoMgrTest, WriteToRemoteFailMallocBlock) {
   num_ranges_written_ = 0;
-  string remote_file_path = REMOTE_URL + "/test1";
+  string remote_file_path = remote_url_ + "/test1";
   string local_buffer_file_path = LOCAL_BUFFER_PATH + "/test1";
   int64_t invalid_block_size = -1;
 
@@ -2363,7 +2396,7 @@ TEST_F(DiskIoMgrTest, WriteToRemoteFailMallocBlock) {
 
   TmpFileRemote** new_tmp_file_obj = tmp_pool.Add(new TmpFileRemote*);
   *new_tmp_file_obj = tmp_pool.Add(new TmpFileRemote(tmp_file_grp, 0, remote_file_path,
-      local_buffer_file_path, false, REMOTE_URL.c_str()));
+      local_buffer_file_path, false, remote_url_.c_str()));
 
   RemoteOperRange::RemoteOperDoneCallback u_callback = [this](
                                                            const Status& upload_status) {
@@ -2396,7 +2429,7 @@ TEST_F(DiskIoMgrTest, WriteToRemoteFailMallocBlock) {
 TEST_F(DiskIoMgrTest, WriteToRemoteDiffPagesSuccess) {
   InitRootReservation(LARGE_RESERVATION_LIMIT);
   num_ranges_written_ = 0;
-  string remote_file_path = REMOTE_URL + "/test";
+  string remote_file_path = remote_url_ + "/test";
   string new_file_path_local_buffer = LOCAL_BUFFER_PATH + "/test";
   int32_t block_size = 1024;
   FLAGS_remote_tmp_file_size = "1K";
@@ -2420,7 +2453,7 @@ TEST_F(DiskIoMgrTest, WriteToRemoteDiffPagesSuccess) {
 
   TmpFileRemote** new_tmp_file_obj = tmp_pool.Add(new TmpFileRemote*);
   *new_tmp_file_obj = tmp_pool.Add(new TmpFileRemote(tmp_file_grp, 0, remote_file_path,
-      new_file_path_local_buffer, false, REMOTE_URL.c_str()));
+      new_file_path_local_buffer, false, remote_url_.c_str()));
 
   WriteRange::WriteDoneCallback callback = [=](const Status& status) {
     ASSERT_EQ(0, status.code());
@@ -2460,22 +2493,136 @@ TEST_F(DiskIoMgrTest, WriteToRemoteDiffPagesSuccess) {
       (*new_tmp_file_obj)->DiskBufferFile(), (*new_tmp_file_obj)->DiskFile(), block_size,
       disk_id, RequestType::FILE_UPLOAD, &io_mgr, u_callback));
   EXPECT_OK(io_ctx->AddRemoteOperRange(upload_range));
-
-  int wait_times = 10;
-  while (true) {
-    if ((*new_tmp_file_obj)->DiskFile()->GetFileStatus() == DiskFileStatus::PERSISTED) {
-      break;
-    }
-    // Suppose the upload should be finished in two seconds.
-    ASSERT_TRUE(wait_times-- > 0);
-    usleep(200 * 1000);
-  }
+  EXPECT_TRUE(WaitForStatus((*new_tmp_file_obj)->DiskFile(), DiskFileStatus::PERSISTED));
 
   // Assert remote file actual size is the same as the local actual size.
   EXPECT_TRUE(HdfsFileExist(remote_file_path));
   ASSERT_EQ((*new_tmp_file_obj)->DiskFile()->actual_file_size(), actual_size);
 
   num_ranges_written_ = 0;
+  tmp_file_grp->Close();
+  io_mgr.UnregisterContext(io_ctx.get());
+}
+
+// Delete the physical remote file after upload.
+TEST_F(DiskIoMgrTest, WriteToRemoteFileDeleted) {
+  num_oper_ = 0;
+  num_ranges_written_ = 0;
+  string remote_file_path = remote_url_ + "/test";
+  string local_buffer_path = LOCAL_BUFFER_PATH + "/test";
+  FLAGS_remote_tmp_file_size = "1K";
+  int64_t file_size = 1024;
+  int64_t block_size = 1024;
+
+  // Delete the hdfs file if it exists.
+  hdfsDelete(hdfsConnect("default", 0), remote_file_path.c_str(), 1);
+
+  // Delete the file in local file system if it exists.
+  vector<string> local_buffer_path_vec;
+  local_buffer_path_vec.push_back(local_buffer_path);
+  Status rm_status = FileSystemUtil::RemovePaths(local_buffer_path_vec);
+
+  TmpFileMgr tmp_file_mgr;
+  DiskIoMgr io_mgr(1, 1, 1, 1, 10);
+  ASSERT_OK(io_mgr.Init());
+  TmpFileGroup* tmp_file_grp = NewRemoteFileGroup(&tmp_file_mgr, &io_mgr);
+  ASSERT_TRUE(tmp_file_grp != nullptr);
+
+  ObjectPool tmp_pool;
+  unique_ptr<RequestContext> io_ctx = io_mgr.RegisterContext();
+
+  TmpFileRemote tmp_file(
+      tmp_file_grp, 0, remote_file_path, local_buffer_path, false, remote_url_.c_str());
+  DiskFile* remote_file = tmp_file.DiskFile();
+  DiskFile* local_buffer_file = tmp_file.DiskBufferFile();
+  tmp_file.GetWriteFile()->SetActualFileSize(file_size);
+
+  // Write some data for testing.
+  size_t write_size_len = sizeof(int32_t);
+  vector<WriteRange*> ranges;
+  vector<int32_t> datas;
+  for (int i = 0; i < file_size / write_size_len; i++) {
+    int32_t* data = tmp_pool.Add(new int32_t);
+    *data = rand();
+    datas.push_back(*data);
+    WriteRange** new_range = tmp_pool.Add(new WriteRange*);
+    WriteRange::WriteDoneCallback callback = [=](const Status& status) {
+      ASSERT_EQ(0, status.code());
+      lock_guard<mutex> l(written_mutex_);
+      num_ranges_written_ = 1;
+      writes_done_.NotifyOne();
+    };
+
+    *new_range = tmp_pool.Add(new WriteRange(remote_file_path, 0, 0, callback));
+    (*new_range)->SetData(reinterpret_cast<uint8_t*>(data), sizeof(int32_t));
+    (*new_range)->SetDiskFile(tmp_file.GetWriteFile());
+    ranges.push_back(*new_range);
+    EXPECT_OK(io_ctx->AddWriteRange(*new_range));
+    {
+      unique_lock<mutex> lock(written_mutex_);
+      while (num_ranges_written_ < 1) writes_done_.Wait(lock);
+    }
+    num_ranges_written_ = 0;
+    if (i == file_size / write_size_len - 1) {
+      tmp_file.SetAtCapacity();
+    }
+  }
+
+  auto disk_id = io_mgr.RemoteDfsDiskFileOperId();
+  bool upload_ok = false;
+  RemoteOperRange::RemoteOperDoneCallback callback = [&](const Status& status) {
+    upload_ok = status.ok();
+    lock_guard<mutex> l(oper_mutex_);
+    num_oper_ = 1;
+    oper_done_.NotifyOne();
+  };
+
+  // Request to upload the file to the remote.
+  auto oper_range = tmp_pool.Add(new RemoteOperRange(local_buffer_file, remote_file,
+      block_size, disk_id, RequestType::FILE_UPLOAD, &io_mgr, callback));
+  Status add_status = io_ctx->AddRemoteOperRange(oper_range);
+  ASSERT_OK(add_status);
+
+  // Wait until the file is created before calling the deletion.
+  while (!HdfsFileExist(remote_file_path)) {
+    usleep(rand() % 1000);
+  }
+  // Delete the file to create the failure.
+  hdfsDelete(hdfsConnect("default", 0), remote_file_path.c_str(), 1);
+
+  {
+    unique_lock<mutex> lock(oper_mutex_);
+    while (num_oper_ < 1) oper_done_.Wait(lock);
+  }
+
+  // If any chance the file is deleted and cause an upload failure, it won't lead to a
+  // crash. Otherwise the upload succeeds, and we should meet a failure during reading
+  // due to the deletion of the remote file.
+  EXPECT_FALSE(HdfsFileExist(remote_file_path));
+  if (upload_ok) {
+    // TryEvictFile and the local buffer file should be evicted.
+    Status try_evict_status = tmp_file_mgr.TryEvictFile(&tmp_file);
+    ASSERT_TRUE(try_evict_status.ok());
+
+    // None of the files should exist.
+    EXPECT_FALSE(FileExist(local_buffer_path));
+
+    // Should fail reading the first range.
+    ScanRange* scan_range = tmp_pool.Add(new ScanRange);
+    auto range = ranges.at(0);
+    size_t buffer_len = sizeof(int32_t);
+    vector<uint8_t> client_buffer(buffer_len);
+    scan_range->Reset(
+        ScanRange::FileInfo{range->file(), hdfsConnect("default", 0), 1000000},
+        range->len(), range->offset(), 0, false,
+        BufferOpts::ReadInto(client_buffer.data(), buffer_len, BufferOpts::NO_CACHING),
+        nullptr, tmp_file.DiskFile(), tmp_file.DiskBufferFile());
+    bool needs_buffers;
+    ASSERT_OK(io_ctx->StartScanRange(scan_range, &needs_buffers));
+    unique_ptr<BufferDescriptor> io_buffer;
+    EXPECT_FALSE(scan_range->GetNext(&io_buffer).ok());
+  }
+  num_oper_ = 0;
   tmp_file_grp->Close();
   io_mgr.UnregisterContext(io_ctx.get());
 }

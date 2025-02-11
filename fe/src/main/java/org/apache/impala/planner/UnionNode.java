@@ -22,10 +22,11 @@ import java.util.List;
 
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
-import org.apache.impala.analysis.TupleDescriptor;
-import org.apache.impala.analysis.TupleId;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotRef;
+import org.apache.impala.analysis.SortInfo;
+import org.apache.impala.analysis.TupleDescriptor;
+import org.apache.impala.analysis.TupleId;
 import org.apache.impala.thrift.TExecNodePhase;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TExpr;
@@ -50,6 +51,10 @@ import com.google.common.base.Preconditions;
  */
 public class UnionNode extends PlanNode {
   private final static Logger LOG = LoggerFactory.getLogger(UnionNode.class);
+
+  // Coefficiencts for estimating Union processing cost. Derived from benchmarking
+  private static final double COST_COEFFICIENT_BYTES_MATERIALIZED = 0.00317;
+  private static final double COST_COEFFICIENT_ROWS_MATERIALIZED = 0.0257;
 
   // List of union result exprs of the originating SetOperationStmt. Used for
   // determining passthrough-compatibility of children.
@@ -99,6 +104,8 @@ public class UnionNode extends PlanNode {
    */
   public boolean isConstantUnion() { return resultExprLists_.isEmpty(); }
 
+  public int getFirstNonPassthroughChildIndex() { return firstMaterializedChildIdx_; }
+
   /**
    * Add a child tree plus its corresponding unresolved resultExprs.
    */
@@ -110,8 +117,10 @@ public class UnionNode extends PlanNode {
   @Override
   public void computeStats(Analyzer analyzer) {
     super.computeStats(analyzer);
+    analyzer.registerTupleProducingNode(tupleId_, this);
     long totalChildCardinality = 0;
     boolean haveChildWithCardinality = false;
+    hasHardEstimates_ = true;
     for (PlanNode child: children_) {
       // ignore missing child cardinality info in the hope it won't matter enough
       // to change the planning outcome
@@ -125,6 +134,7 @@ public class UnionNode extends PlanNode {
       // subsets of each other, i.e. not just partly overlapping.
       numNodes_ = Math.max(child.getNumNodes(), numNodes_);
       numInstances_ = Math.max(child.getNumInstances(), numInstances_);
+      hasHardEstimates_ &= child.hasHardEstimates_;
     }
     // Consider estimate valid if we have at least one child with known cardinality, or
     // only constant values.
@@ -144,6 +154,30 @@ public class UnionNode extends PlanNode {
     if (LOG.isTraceEnabled()) {
       LOG.trace("stats Union: cardinality=" + Long.toString(cardinality_));
     }
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    // Assume the costs of processing pass-through rows are 0.
+    long totalMaterializedCardinality = 0;
+    for (int i = firstMaterializedChildIdx_; i < resultExprLists_.size(); i++) {
+      PlanNode child = children_.get(i);
+      if (child.cardinality_ >= 0) {
+        totalMaterializedCardinality =
+            checkedAdd(totalMaterializedCardinality, Math.max(0, child.cardinality_));
+      }
+    }
+    long estBytesMaterialized =
+        (long) Math.ceil(getAvgRowSize() * (double) totalMaterializedCardinality);
+    double totalCost = (estBytesMaterialized * COST_COEFFICIENT_BYTES_MATERIALIZED)
+        + (totalMaterializedCardinality * COST_COEFFICIENT_ROWS_MATERIALIZED);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Union CPU cost estimate: " + totalCost
+          + ", estBytesMaterialized: " + estBytesMaterialized
+          + ", totalMaterializedCardinality: " + totalMaterializedCardinality
+          + ", expr list size: " + resultExprLists_.size());
+    }
+    processingCost_ = ProcessingCost.basicCost(getDisplayLabel(), totalCost);
   }
 
   @Override
@@ -245,6 +279,12 @@ public class UnionNode extends PlanNode {
 
     for (int i = 0; i < children_.size(); i++) {
       if (!isChildPassthrough(analyzer, children_.get(i), resultExprLists_.get(i))) {
+        for (Expr expr : resultExprLists_.get(i)) {
+          // TODO IMPALA-12160: Add tests for collection-in-struct.
+          Preconditions.checkState(SortInfo.isValidInSortingTuple(expr.getType()),
+              "only pass-through UNION ALL is supported for "
+              + "structs containing collections.");
+        }
         newResultExprLists.add(resultExprLists_.get(i));
         newChildren.add(children_.get(i));
       }

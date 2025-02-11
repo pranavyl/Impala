@@ -27,8 +27,10 @@
 #include "common/init.h"
 #include "common/logging.h"
 #include "common/status.h"
-#include "exec/hbase-table-scanner.h"
-#include "exec/hbase-table-writer.h"
+#include "exec/hbase/hbase-table-scanner.h"
+#include "exec/hbase/hbase-table-writer.h"
+#include "exec/iceberg-metadata/iceberg-metadata-scanner.h"
+#include "exec/iceberg-metadata/iceberg-row-reader.h"
 #include "exprs/hive-udf-call.h"
 #include "exprs/timezone_db.h"
 #include "gen-cpp/ImpalaService.h"
@@ -59,11 +61,13 @@ DECLARE_bool(is_coordinator);
 int ImpaladMain(int argc, char** argv) {
   InitCommonRuntime(argc, argv, true);
 
-  ABORT_IF_ERROR(LlvmCodeGen::InitializeLlvm());
+  ABORT_IF_ERROR(LlvmCodeGen::InitializeLlvm(argv[0]));
   JniUtil::InitLibhdfs();
   ABORT_IF_ERROR(HBaseTableScanner::Init());
   ABORT_IF_ERROR(HBaseTable::InitJNI());
   ABORT_IF_ERROR(HBaseTableWriter::InitJNI());
+  ABORT_IF_ERROR(IcebergMetadataScanner::InitJNI());
+  ABORT_IF_ERROR(IcebergRowReader::InitJNI());
   ABORT_IF_ERROR(HiveUdfCall::InitEnv());
   ABORT_IF_ERROR(JniCatalogCacheUpdateIterator::InitJNI());
   InitFeSupport();

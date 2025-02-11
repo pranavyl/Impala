@@ -19,6 +19,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from string import Template
 import os
 import shutil
@@ -217,12 +218,25 @@ ir_functions = [
   ["DECIMAL_MIN_MAX_FILTER_INSERT4", "_ZN6impala19DecimalMinMaxFilter7Insert4EPKv"],
   ["DECIMAL_MIN_MAX_FILTER_INSERT8", "_ZN6impala19DecimalMinMaxFilter7Insert8EPKv"],
   ["DECIMAL_MIN_MAX_FILTER_INSERT16", "_ZN6impala19DecimalMinMaxFilter8Insert16EPKv"],
+  ["TINYINT_IN_LIST_FILTER_INSERT",  "_ZN6impala16InListFilterImplIaLNS_13PrimitiveTypeE3EE6InsertEPKv"],
+  ["SMALLINT_IN_LIST_FILTER_INSERT", "_ZN6impala16InListFilterImplIsLNS_13PrimitiveTypeE4EE6InsertEPKv"],
+  ["INT_IN_LIST_FILTER_INSERT",      "_ZN6impala16InListFilterImplIiLNS_13PrimitiveTypeE5EE6InsertEPKv"],
+  ["BIGINT_IN_LIST_FILTER_INSERT",   "_ZN6impala16InListFilterImplIlLNS_13PrimitiveTypeE6EE6InsertEPKv"],
+  ["DATE_IN_LIST_FILTER_INSERT",     "_ZN6impala16InListFilterImplIiLNS_13PrimitiveTypeE11EE6InsertEPKv"],
+  ["STRING_IN_LIST_FILTER_INSERT",  "_ZN6impala16InListFilterImplINS_11StringValueELNS_13PrimitiveTypeE10EE6InsertEPKv"],
+  ["CHAR_IN_LIST_FILTER_INSERT",    "_ZN6impala16InListFilterImplINS_11StringValueELNS_13PrimitiveTypeE15EE6InsertEPKv"],
+  ["VARCHAR_IN_LIST_FILTER_INSERT", "_ZN6impala16InListFilterImplINS_11StringValueELNS_13PrimitiveTypeE16EE6InsertEPKv"],
   ["KRPC_DSS_GET_PART_EXPR_EVAL",
   "_ZN6impala20KrpcDataStreamSender25GetPartitionExprEvaluatorEi"],
   ["KRPC_DSS_HASH_AND_ADD_ROWS",
   "_ZN6impala20KrpcDataStreamSender14HashAndAddRowsEPNS_8RowBatchE"],
   ["GET_FUNCTION_CTX",
-  "_ZN6impala11HiveUdfCall18GetFunctionContextEPNS_19ScalarExprEvaluatorEi"],
+  "_ZN6impala19ScalarExprEvaluator18GetFunctionContextEPS0_i"],
+  ["GET_CHILD_EVALUATOR", "_ZN6impala19ScalarExprEvaluator17GetChildEvaluatorEPS0_i"],
+  ["STORE_RESULT_IN_EVALUATOR",
+  "_ZN6impala19ScalarExprEvaluator11StoreResultERKN10impala_udf6AnyValERKNS_10ColumnTypeE"],
+  ["FN_CTX_ALLOCATE_FOR_RESULTS",
+  "_Z23FnCtxAllocateForResultsPN10impala_udf15FunctionContextEl"],
   ["GET_JNI_CONTEXT",
   "_ZN6impala11HiveUdfCall13GetJniContextEPN10impala_udf15FunctionContextE"],
   ["JNI_CTX_SET_INPUT_NULL_BUFF_ELEM",
@@ -231,6 +245,13 @@ ir_functions = [
    "_ZN6impala11HiveUdfCall10JniContext28GetInputValuesBufferAtOffsetEPS1_i"],
   ["HIVE_UDF_CALL_CALL_JAVA",
    "_ZN6impala11HiveUdfCall22CallJavaAndStoreResultEPKNS_10ColumnTypeEPN10impala_udf15FunctionContextEPNS0_10JniContextE"],
+
+  ["STRING_VALUE_PTR", "_ZNK6impala11StringValue5IrPtrEv"],
+  ["STRING_VALUE_LEN", "_ZNK6impala11StringValue5IrLenEv"],
+  ["STRING_VALUE_SETLEN", "_ZN6impala11StringValue8IrSetLenEi"],
+  ["STRING_VALUE_ASSIGN", "_ZN6impala11StringValue8IrAssignEPci"],
+  ["STRING_VALUE_UNSAFE_ASSIGN", "_ZN6impala11StringValue14IrUnsafeAssignEPci"],
+  ["STRING_VALUE_CLEAR", "_ZN6impala11StringValue7IrClearEv"],
 
   ["BOOL_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala16BoolMinMaxFilter10AlwaysTrueEv"],
   ["TINYINT_MIN_MAX_FILTER_ALWAYSTRUE", "_ZNK6impala19TinyIntMinMaxFilter10AlwaysTrueEv"],
@@ -250,8 +271,10 @@ ir_functions = [
    "_ZN6impala14WriteKuduValueEiRKNS_10ColumnTypeEPKvbPN4kudu14KuduPartialRowE"],
   ["GET_KUDU_PARTITION_ROW",
    "_ZN6impala19GetKuduPartitionRowEPN4kudu6client15KuduPartitionerEPNS0_14KuduPartialRowE"],
-   ["TUPLE_SORTER_SORT_HELPER",
+  ["TUPLE_SORTER_SORT_HELPER",
    "_ZN6impala6Sorter11TupleSorter10SortHelperENS0_13TupleIteratorES2_"],
+  ["SORTED_RUN_MERGER_HEAPIFY_HELPER",
+   "_ZN6impala15SortedRunMerger13HeapifyHelperEi"]
 ]
 
 enums_preamble = '\
@@ -330,7 +353,7 @@ def move_if_different(src_file, dest_file):
   if not os.path.isfile(dest_file) or not filecmp.cmp(src_file, dest_file):
     shutil.move(src_file, dest_file)
   else:
-    print 'Retaining existing file: %s' % (dest_file)
+    print('Retaining existing file: %s' % (dest_file))
 
 BE_PATH = os.path.join(os.environ['IMPALA_HOME'], 'be/generated-sources/impala-ir/')
 IR_FUNCTIONS_FILE = 'impala-ir-functions.h'
@@ -344,7 +367,7 @@ if not os.path.exists(BE_PATH):
   os.makedirs(BE_PATH)
 
 if __name__ == "__main__":
-  print "Generating IR description files"
+  print("Generating IR description files")
   enums_file = open(TMP_IR_FUNCTIONS_PATH, 'w')
   enums_file.write(enums_preamble)
 

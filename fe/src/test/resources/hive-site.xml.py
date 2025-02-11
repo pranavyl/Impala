@@ -17,6 +17,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import os
 
 hive_major_version = int(os.environ['IMPALA_HIVE_VERSION'][0])
@@ -64,7 +65,10 @@ CONFIG.update({
   'hive.repl.bootstrap.dump.open.txn.timeout': '120s',
 
   # allow both hs2 and hs2-http protocols
-  'hive.server2.transport.mode': 'all'
+  'hive.server2.transport.mode': 'all',
+
+  # Don't filter out incremental stats of Impala. The default is "impala_intermediate_stats_chunk%".
+  'hive.metastore.partitions.parameters.exclude.pattern': '""',
 })
 
 if variant == 'changed_external_dir':
@@ -83,6 +87,11 @@ elif variant == 'events_cleanup':
   CONFIG.update({
     'hive.metastore.event.db.listener.timetolive': '60s',
     'hive.metastore.event.db.listener.clean.interval': '10s'
+  })
+elif variant == 'housekeeping_on':
+  # HMS configs needed for regression test for IMPALA-12827
+  CONFIG.update({
+    'hive.metastore.housekeeping.threads.on': 'true',
   })
 
 # HBase-related configs.
@@ -109,14 +118,16 @@ if kerberize:
   #   hive.metastore.kerberos.keytab.file
   #   hive.metastore.kerberos.principal
 
-# Enable Tez and ACID for Hive 3
+# Enable Tez, ACID and proleptic Gregorian calendar DATE types for Hive 3
 if hive_major_version >= 3:
   CONFIG.update({
+   'hive.execution.engine': 'tez',
    'hive.tez.container.size': '512',
    'hive.txn.manager': 'org.apache.hadoop.hive.ql.lockmgr.DbTxnManager',
    # We run YARN with Tez on the classpath directly
    'tez.ignore.lib.uris': 'true',
    'tez.use.cluster.hadoop-libs': 'true',
+   'tez.am.tez-ui.webservice.port-range': '32000-32100',
 
    # Some of the tests change the columns in a incompatible manner
    # (eg. string to timestamp) this is disallowed by default in Hive-3 which causes
@@ -155,7 +166,22 @@ if hive_major_version >= 3:
 
    # Due to HIVE-23102 Hive will wait for at least this amount of time for compactions
    # (the default value is 5 mins which is way too long). Setting it to 2 seconds.
-   'hive.compactor.wait.timeout': '2000'
+   'hive.compactor.wait.timeout': '2000',
+
+   # No need to automatically compute stats after compactions. It might cause failures
+   # if we trigger compaction on temp tables in tests. The stats computation is async and
+   # will fail if the temp tables are removed. See an example in IMPALA-11756.
+   'hive.compactor.gather.stats': 'false',
+
+   # Since HIVE-22589, Hive uses Julian Calendar for writing dates before 1582-10-15,
+   # whereas Impala uses proleptic Gregorian Calendar. This affects the results Impala
+   # gets when querying tables written by Hive.
+   'hive.avro.proleptic.gregorian': 'true',
+   'hive.avro.proleptic.gregorian.default': 'true',
+   'hive.parquet.date.proleptic.gregorian': 'true',
+   'hive.parquet.date.proleptic.gregorian.default': 'true',
+   'orc.proleptic.gregorian': 'true',
+   'orc.proleptic.gregorian.default': 'true'
   })
 else:
   CONFIG.update({
@@ -194,8 +220,10 @@ CONFIG.update({
   'datanucleus.autoCreateSchema': 'false',
   'datanucleus.fixedDatastore': 'false',
   'datanucleus.metadata.validate': 'false',
+  'datanucleus.connectionPool.maxPoolSize': 20,
   'javax.jdo.option.ConnectionUserName': 'hiveuser',
   'javax.jdo.option.ConnectionPassword': 'password',
+  'hikaricp.connectionTimeout': 60000,
 })
 if db_type == 'postgres':
   CONFIG.update({

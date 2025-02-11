@@ -36,6 +36,7 @@
 #pragma clang diagnostic pop
 
 #include "exec/parquet/parquet-common.h"
+#include "rpc/thrift-util.h"
 #include "runtime/mem-pool.h"
 #include "util/codec.h"
 #include "util/rle-encoding.h"
@@ -58,10 +59,10 @@ std::shared_ptr<TProtocol> CreateDeserializeProtocol(
     std::shared_ptr<TMemoryBuffer> mem, bool compact) {
   if (compact) {
     TCompactProtocolFactoryT<TMemoryBuffer> tproto_factory;
-    return tproto_factory.getProtocol(mem);
+    return tproto_factory.getProtocol(move(mem));
   } else {
     TBinaryProtocolFactoryT<TMemoryBuffer> tproto_factory;
-    return tproto_factory.getProtocol(mem);
+    return tproto_factory.getProtocol(move(mem));
   }
 }
 
@@ -72,7 +73,9 @@ template <class T>
 bool DeserializeThriftMsg(
     uint8_t* buf, uint32_t* len, bool compact, T* deserialized_msg) {
   // Deserialize msg bytes into c++ thrift msg using memory transport.
-  std::shared_ptr<TMemoryBuffer> tmem_transport(new TMemoryBuffer(buf, *len));
+  std::shared_ptr<TMemoryBuffer> tmem_transport(new TMemoryBuffer(buf, *len,
+      apache::thrift::transport::TMemoryBuffer::MemoryPolicy::OBSERVE,
+      impala::DefaultExternalTConfiguration()));
   std::shared_ptr<TProtocol> tproto =
       CreateDeserializeProtocol(tmem_transport, compact);
   try {
@@ -222,6 +225,11 @@ int main(int argc, char** argv) {
   FileMetaData file_metadata;
   bool status = DeserializeThriftMsg(metadata, &metadata_len, true, &file_metadata);
   assert(status);
+  // This code fixes a warning about status being unused. DeserializeThriftMsg already
+  // would have printed an error, so just return.
+  if (!status) {
+    return -1;
+  }
   cerr << ThriftDebugString(file_metadata) << endl;
   cerr << "Schema: " << endl << GetSchema(file_metadata) << endl;
 

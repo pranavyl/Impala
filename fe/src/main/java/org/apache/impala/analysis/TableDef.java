@@ -25,6 +25,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -42,17 +43,21 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TAccessEvent;
+import org.apache.impala.thrift.TBucketInfo;
+import org.apache.impala.thrift.TBucketType;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.THdfsFileFormat;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TSortingOrder;
 import org.apache.impala.util.AcidUtils;
+import org.apache.impala.util.KuduUtil;
 import org.apache.impala.util.MetaStoreUtil;
 import org.apache.thrift.TException;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
 /**
  * Represents the table parameters in a CREATE TABLE statement. These parameters
@@ -80,6 +85,14 @@ class TableDef {
   // Names of primary key columns. Populated by the parser. An empty value doesn't
   // mean no primary keys were specified as the columnDefs_ could contain primary keys.
   private final List<String> primaryKeyColNames_ = new ArrayList<>();
+
+  // If true, the primary key is unique. If not, and the table is a Kudu table then an
+  // auto-incrementing column will be added automatically by Kudu engine. This extra key
+  // column helps produce a unique composite primary key (primary keys +
+  // auto-incrementing construct).
+  // This is also used for Iceberg table and set to false if "NOT ENFORCED" is provided
+  // for the primary key.
+  private boolean isPrimaryKeyUnique_;
 
   // If true, the table's data will be preserved if dropped.
   private final boolean isExternal_;
@@ -150,8 +163,11 @@ class TableDef {
     // Sorting order for SORT BY queries.
     final TSortingOrder sortingOrder;
 
-    Options(Pair<List<String>, TSortingOrder> sortProperties, String comment,
-        RowFormat rowFormat, Map<String, String> serdeProperties,
+    // Bucket desc for CLUSTERED BY
+    final TBucketInfo bucketInfo;
+
+    Options(TBucketInfo bucketInfo, Pair<List<String>, TSortingOrder> sortProperties,
+        String comment, RowFormat rowFormat, Map<String, String> serdeProperties,
         THdfsFileFormat fileFormat, HdfsUri location, HdfsCachingOp cachingOp,
         Map<String, String> tblProperties, TQueryOptions queryOptions) {
       this.sortCols = sortProperties.first;
@@ -168,12 +184,13 @@ class TableDef {
       this.cachingOp = cachingOp;
       Preconditions.checkNotNull(tblProperties);
       this.tblProperties = tblProperties;
+      this.bucketInfo = bucketInfo;
     }
 
     public Options(String comment, TQueryOptions queryOptions) {
       // Passing null to file format so that it uses the file format from the query option
       // if specified, otherwise it will use the default file format, which is TEXT.
-      this(new Pair<>(ImmutableList.of(), TSortingOrder.LEXICAL), comment,
+      this(null, new Pair<>(ImmutableList.of(), TSortingOrder.LEXICAL), comment,
           RowFormat.DEFAULT_ROW_FORMAT, new HashMap<>(), /* file format */null, null,
           null, new HashMap<>(), queryOptions);
     }
@@ -350,9 +367,14 @@ class TableDef {
     return columnDefs_.stream().map(col -> col.getType()).collect(Collectors.toList());
   }
 
-  public void setPrimaryKey(TableDef.PrimaryKey primaryKey_) {
-    this.primaryKey_ = primaryKey_;
+  public void setPrimaryKey(TableDef.PrimaryKey primaryKey) {
+    this.primaryKey_ = primaryKey;
   }
+
+  public void setPrimaryKeyUnique(boolean isKeyUnique) {
+    this.isPrimaryKeyUnique_ = isKeyUnique;
+  }
+
   List<String> getPartitionColumnNames() {
     return ColumnDef.toColumnNames(getPartitionColumnDefs());
   }
@@ -365,6 +387,7 @@ class TableDef {
   boolean isIcebergTable() { return options_.fileFormat == THdfsFileFormat.ICEBERG; }
   List<String> getPrimaryKeyColumnNames() { return primaryKeyColNames_; }
   List<ColumnDef> getPrimaryKeyColumnDefs() { return primaryKeyColDefs_; }
+  boolean isPrimaryKeyUnique() { return isPrimaryKeyUnique_; }
   boolean isExternal() { return isExternal_; }
   boolean getIfNotExists() { return ifNotExists_; }
   Map<String, String> getGeneratedProperties() { return generatedProperties_; }
@@ -393,6 +416,14 @@ class TableDef {
   RowFormat getRowFormat() { return options_.rowFormat; }
   TSortingOrder getSortingOrder() { return options_.sortingOrder; }
   List<ForeignKey> getForeignKeysList() { return foreignKeysList_; }
+  TBucketInfo geTBucketInfo() { return options_.bucketInfo; }
+
+  boolean isBucketableFormat() {
+    return options_.fileFormat != THdfsFileFormat.KUDU
+        && options_.fileFormat != THdfsFileFormat.ICEBERG
+        && options_.fileFormat != THdfsFileFormat.HUDI_PARQUET
+        && options_.fileFormat != THdfsFileFormat.JDBC;
+  }
 
   /**
    * Analyzes the parameters of a CREATE TABLE statement.
@@ -404,7 +435,7 @@ class TableDef {
     fqTableName_.analyze();
     analyzeAcidProperties(analyzer);
     analyzeColumnDefs(analyzer);
-    analyzePrimaryKeys();
+    analyzePrimaryKeys(analyzer);
     analyzeForeignKeys(analyzer);
 
     if (analyzer.dbContainsTable(getTblName().getDb(), getTbl(), Privilege.CREATE)
@@ -451,28 +482,20 @@ class TableDef {
   }
 
   /**
-   * Kudu and Iceberg table has their own column option, this function will return false
-   * if we use column option incorrectly, such as use primary key for Parquet format.
+   * Kudu and Iceberg tables have their own column options, this function will return
+   * false if we use column options incorrectly, e.g. primary key column option for an
+   * Iceberg table.
    */
   private boolean analyzeColumnOption(ColumnDef columnDef) {
-    boolean flag = true;
-    // Kudu option and Iceberg option have overlap
-    if (columnDef.hasKuduOptions() && columnDef.hasIcebergOptions()) {
-      if (!isKuduTable() && !isIcebergTable()) {
-        flag = false;
-      }
-    } else if (columnDef.hasKuduOptions()) {
-      if (!isKuduTable()) {
-        flag = false;
-      }
-    } else if (columnDef.hasIcebergOptions()) {
-      // Currently Iceberg option only contains 'nullable', so we won't run into this
-      // situation.
-      if (!isIcebergTable()) {
-        flag = false;
-      }
+    if (isKuduTable()) {
+      if (columnDef.hasIncompatibleKuduOptions()) return false;
+    } else if (isIcebergTable()) {
+      if (columnDef.hasIncompatibleIcebergOptions()) return false;
+    } else if (columnDef.hasKuduOptions() || columnDef.hasIcebergOptions()) {
+      // If the table is neither Kudu or Iceberg but has some incompatible column options.
+      return false;
     }
-    return flag;
+    return true;
   }
 
   /**
@@ -480,29 +503,96 @@ class TableDef {
    * in the table column definitions and if composite primary keys are properly defined
    * using the PRIMARY KEY (col,..col) clause.
    */
-  private void analyzePrimaryKeys() throws AnalysisException {
+  private void analyzePrimaryKeys(Analyzer analyzer) throws AnalysisException {
     for (ColumnDef colDef: columnDefs_) {
-      if (colDef.isPrimaryKey()) primaryKeyColDefs_.add(colDef);
+      if (colDef.isPrimaryKey()) {
+        primaryKeyColDefs_.add(colDef);
+        if (!colDef.isPrimaryKeyUnique() && !isKuduTable()) {
+          throw new AnalysisException(
+              "Non unique primary key is only supported for Kudu.");
+        }
+      }
     }
     if (primaryKeyColDefs_.size() > 1) {
-      throw new AnalysisException("Multiple primary keys specified. " +
-          "Composite primary keys can be specified using the " +
-          "PRIMARY KEY (col1, col2, ...) syntax at the end of the column definition.");
+      String primaryKeyString =
+          KuduUtil.getPrimaryKeyString(primaryKeyColDefs_.get(0).isPrimaryKeyUnique());
+      throw new AnalysisException(String.format(
+          "Multiple %sS specified. Composite %s can be specified using the %s " +
+          "(col1, col2, ...) syntax at the end of the column definition.",
+          primaryKeyString, primaryKeyString, primaryKeyString));
     }
 
     if (primaryKeyColNames_.isEmpty()) {
       if (primaryKey_ == null || primaryKey_.getPrimaryKeyColNames().isEmpty()) {
-        return;
+        if (!isKuduTable()) return;
+
+        if (!primaryKeyColDefs_.isEmpty()) {
+          setPrimaryKeyUnique(primaryKeyColDefs_.get(0).isPrimaryKeyUnique());
+          return;
+        } else if (!getKuduPartitionParams().isEmpty()) {
+          // Promote all partition columns as non unique primary key columns if primary
+          // keys are not declared by the user for the Kudu table. Since key columns
+          // must be as the first columns in the table, only all partition columns which
+          // are the beginning columns of the table can be promoted as non unique primary
+          // key columns.
+          List<String> colNames = getColumnNames();
+          TreeMap<Integer, String> partitionCols = new TreeMap<Integer, String>();
+          for (KuduPartitionParam partitionParam: getKuduPartitionParams()) {
+            for (String colName: partitionParam.getColumnNames()) {
+              int index = colNames.indexOf(colName);
+              Preconditions.checkState(index >= 0);
+              partitionCols.put(index, colName);
+            }
+          }
+          if (partitionCols.size() > 0
+              && partitionCols.lastKey() == partitionCols.size() - 1) {
+            primaryKeyColNames_.addAll(partitionCols.values());
+            setPrimaryKeyUnique(false);
+            analyzer.addWarning(String.format(
+                "Partition columns (%s) are promoted as non unique primary key.",
+                String.join(", ", partitionCols.values())));
+          } else {
+            throw new AnalysisException(
+                "Specify primary key or non unique primary key for the Kudu table, " +
+                "or create partitions with the beginning columns of the table.");
+          }
+        }
+        if (primaryKeyColNames_.isEmpty()) return;
       } else {
         primaryKeyColNames_.addAll(primaryKey_.getPrimaryKeyColNames());
       }
     }
 
+    String primaryKeyString = KuduUtil.getPrimaryKeyString(isPrimaryKeyUnique_);
     if (!primaryKeyColDefs_.isEmpty()) {
-      throw new AnalysisException("Multiple primary keys specified. " +
-          "Composite primary keys can be specified using the " +
-          "PRIMARY KEY (col1, col2, ...) syntax at the end of the column definition.");
+      throw new AnalysisException(String.format(
+          "Multiple %sS specified. Composite %s can be specified using the %s " +
+          "(col1, col2, ...) syntax at the end of the column definition.",
+          primaryKeyString, primaryKeyString, primaryKeyString));
+    } else if (!primaryKeyColNames_.isEmpty() && !isPrimaryKeyUnique()
+        && !isKuduTable() && !isIcebergTable()) {
+      throw new AnalysisException(primaryKeyString +
+          " is only supported for Kudu and Iceberg.");
     }
+
+    if (isIcebergTable() && isPrimaryKeyUnique_) {
+      throw new AnalysisException(
+          "Iceberg tables only support NOT ENFORCED primary keys.");
+    }
+
+    Set<String> hashedPKColNames = Sets.newHashSet(primaryKeyColNames_);
+    List<IcebergPartitionSpec> icebergPartitionSpecs = getIcebergPartitionSpecs();
+    if (!icebergPartitionSpecs.isEmpty()) {
+      Preconditions.checkState(icebergPartitionSpecs.size() == 1);
+      IcebergPartitionSpec partSpec = icebergPartitionSpecs.get(0);
+      for (IcebergPartitionField partField : partSpec.getIcebergPartitionFields()) {
+        if (!hashedPKColNames.contains(partField.getFieldName())) {
+          throw new AnalysisException("Partition columns have to be part of the " +
+              "primary key for Iceberg tables.");
+        }
+      }
+    }
+
     Map<String, ColumnDef> colDefsByColName = ColumnDef.mapByColumnNames(columnDefs_);
     int keySeq = 1;
     String constraintName = null;
@@ -512,13 +602,13 @@ class TableDef {
       if (colDef == null) {
         if (ColumnDef.toColumnNames(primaryKeyColDefs_).contains(colName)) {
           throw new AnalysisException(String.format("Column '%s' is listed multiple " +
-              "times as a PRIMARY KEY.", colName));
+              "times as a %s.", colName, primaryKeyString));
         }
-        throw new AnalysisException(String.format(
-            "PRIMARY KEY column '%s' does not exist in the table", colName));
+        throw new AnalysisException(String.format("%s column '%s' does not exist in " +
+            "the table", primaryKeyString, colName));
       }
       if (colDef.isExplicitNullable()) {
-        throw new AnalysisException("Primary key columns cannot be nullable: " +
+        throw new AnalysisException(primaryKeyString + " columns cannot be nullable: " +
             colDef.toString());
       }
       // HDFS Table specific analysis.
@@ -739,6 +829,10 @@ class TableDef {
           options_.sortingOrder.toString()));
     }
 
+    // analyze bucket columns
+    analyzeBucketColumns(options_.bucketInfo, getColumnNames(),
+        getPartitionColumnNames());
+
     // Analyze sort columns.
     if (options_.sortCols == null) return;
     if (isKuduTable()) {
@@ -748,6 +842,55 @@ class TableDef {
 
     analyzeSortColumns(options_.sortCols, getColumnNames(), getPartitionColumnNames(),
         getColumnTypes(), options_.sortingOrder);
+  }
+
+  private void analyzeBucketColumns(TBucketInfo bucketInfo, List<String> tableCols,
+      List<String> partitionCols) throws AnalysisException {
+    if (bucketInfo == null || bucketInfo.getBucket_type() == TBucketType.NONE) {
+      return;
+    }
+    // Bucketed Table only support hdfs fileformat
+    if (!isBucketableFormat()) {
+      throw new AnalysisException(String.format("CLUSTERED BY not support fileformat: " +
+          "'%s'", options_.fileFormat));
+    }
+    if (bucketInfo.getNum_bucket() <= 0) {
+      throw new AnalysisException(String.format(
+          "Bucket's number must be greater than 0."));
+    }
+    if (bucketInfo.getBucket_columns() == null
+        || bucketInfo.getBucket_columns().size() == 0) {
+      throw new AnalysisException(String.format(
+          "Bucket columns must be not null."));
+    }
+
+    // The index of each bucket column in the list of table columns.
+    Set<Integer> colIdxs = new LinkedHashSet<>();
+    for (String bucketCol : bucketInfo.getBucket_columns()) {
+      // Make sure it's not a partition column.
+      if (partitionCols.contains(bucketCol)) {
+        throw new AnalysisException(String.format("CLUSTERED BY column list must not " +
+            "contain partition column: '%s'", bucketCol));
+      }
+
+      // Determine the index of each bucket column in the list of table columns.
+      boolean foundColumn = false;
+      for (int j = 0; j < tableCols.size(); ++j) {
+        if (tableCols.get(j).equalsIgnoreCase(bucketCol)) {
+          if (colIdxs.contains(j)) {
+            throw new AnalysisException(String.format("Duplicate column in CLUSTERED " +
+                "BY list: %s", bucketCol));
+          }
+          colIdxs.add(j);
+          foundColumn = true;
+          break;
+        }
+      }
+      if (!foundColumn) {
+        throw new AnalysisException(String.format("Could not find CLUSTERED BY column " +
+            "'%s' in table.", bucketCol));
+      }
+    }
   }
 
   private void analyzeRowFormat(Analyzer analyzer) throws AnalysisException {

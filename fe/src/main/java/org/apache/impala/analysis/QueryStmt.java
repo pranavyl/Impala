@@ -20,6 +20,7 @@ package org.apache.impala.analysis;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 import com.google.common.collect.Sets;
@@ -319,6 +320,9 @@ public abstract class QueryStmt extends StatementBase {
             orderingExpr.getType().toSql()));
       }
     }
+
+    checkTypeValidityForSorting(analyzer);
+
     sortInfo_.createSortTupleInfo(resultExprs_, analyzer);
 
     ExprSubstitutionMap smap = sortInfo_.getOutputSmap();
@@ -338,6 +342,18 @@ public abstract class QueryStmt extends StatementBase {
     }
 
     substituteResultExprs(smap, analyzer);
+  }
+
+  private void checkTypeValidityForSorting(Analyzer analyzer)
+      throws AnalysisException {
+    for (Expr expr: getResultExprs()) {
+      Type exprType = expr.getType();
+      if (!SortInfo.isValidInSortingTuple(exprType)) {
+        String error = "Sorting is not supported if the select list "
+            + "contains collection(s) nested in struct(s).";
+        throw new AnalysisException(error);
+      }
+    }
   }
 
   /**

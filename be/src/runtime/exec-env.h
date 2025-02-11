@@ -25,10 +25,13 @@
 #include <kudu/client/client.h>
 
 // NOTE: try not to add more headers here: exec-env.h is included in many many files.
+#include "common/atomic.h"
 #include "common/global-types.h"
 #include "common/status.h"
 #include "runtime/client-cache-types.h"
 #include "testutil/gtest-util.h"
+#include "util/jwt-util-internal.h"
+#include "util/jwt-util.h"
 #include "util/hdfs-bulk-ops-defs.h" // For declaration of HdfsOpThreadPool
 #include "util/network-util.h"
 #include "util/spinlock.h"
@@ -41,6 +44,7 @@ class KuduClient;
 
 namespace impala {
 
+class ActiveCatalogdVersionChecker;
 class AdmissionController;
 class BufferPool;
 class CallableThreadPool;
@@ -68,7 +72,10 @@ class StatestoreSubscriber;
 class SystemStateInfo;
 class ThreadResourceMgr;
 class TmpFileMgr;
+class TupleCacheMgr;
 class Webserver;
+class CodeGenCache;
+class TCatalogRegistration;
 
 namespace io {
   class DiskIoMgr;
@@ -88,12 +95,18 @@ class ExecEnv {
   ExecEnv(bool external_fe = false);
 
   ExecEnv(int krpc_port, int subscriber_port, int webserver_port,
-      const std::string& statestore_host, int statestore_port, bool external_fe = false);
+      const std::string& statestore_host, int statestore_port,
+      const std::string& statestore2_host = "", int statestore2_port = 0,
+      bool external_fe = false);
 
   /// Returns the most recently created exec env instance. In a normal impalad, this is
   /// the only instance. In test setups with multiple ExecEnv's per process,
   /// we return the most recently created instance.
   static ExecEnv* GetInstance() { return exec_env_; }
+
+  // Returns JWT and OAuth Helper instances.
+  JWTHelper* GetJWTHelperInstance() { return jwt_helper_; }
+  JWTHelper* GetOAuthHelperInstance() { return oauth_helper_; }
 
   /// Destructor - only used in backend tests that create new environment per test.
   ~ExecEnv();
@@ -120,6 +133,9 @@ class ExecEnv {
 
   CatalogServiceClientCache* catalogd_client_cache() {
     return catalogd_client_cache_.get();
+  }
+  CatalogServiceClientCache* catalogd_lightweight_req_client_cache() {
+    return catalogd_lightweight_req_client_cache_.get();
   }
   HBaseTableFactory* htable_factory() { return htable_factory_.get(); }
   io::DiskIoMgr* disk_io_mgr() { return disk_io_mgr_.get(); }
@@ -151,6 +167,10 @@ class ExecEnv {
   Scheduler* scheduler() { return scheduler_.get(); }
   AdmissionController* admission_controller() { return admission_controller_.get(); }
   StatestoreSubscriber* subscriber() { return statestore_subscriber_.get(); }
+  CodeGenCache* codegen_cache() const { return codegen_cache_.get(); }
+  bool codegen_cache_enabled() const { return codegen_cache_ != nullptr; }
+
+  TupleCacheMgr* tuple_cache_mgr() const { return tuple_cache_mgr_.get(); }
 
   const TNetworkAddress& configured_backend_address() const {
     return configured_backend_address_;
@@ -158,7 +178,7 @@ class ExecEnv {
 
   const IpAddr& ip_address() const { return ip_address_; }
 
-  const TNetworkAddress& krpc_address() const { return krpc_address_; }
+  const NetworkAddressPB& krpc_address() const { return krpc_address_; }
 
   /// Initializes the exec env for running FE tests.
   Status InitForFeSupport() WARN_UNUSED_RESULT;
@@ -182,12 +202,35 @@ class ExecEnv {
   int64_t admit_mem_limit() const { return admit_mem_limit_; }
   int64_t admission_slots() const { return admission_slots_; }
 
-  const TNetworkAddress& admission_service_address() const {
-    return admission_service_address_;
-  }
+  /// Gets the resolved IP address and port where the admission control service is
+  /// running, if enabled.
+  Status GetAdmissionServiceAddress(NetworkAddressPB& address) const;
 
   /// Returns true if the admission control service is enabled.
   bool AdmissionServiceEnabled() const;
+
+  /// Returns true if the registration with statestore is completed.
+  bool IsStatestoreRegistrationCompleted() const {
+    return statestore_registration_completed_.Load() != 0;
+  }
+
+  /// Set the flag when the registration with statestore is completed.
+  void SetStatestoreRegistrationCompleted() {
+    statestore_registration_completed_.CompareAndSwap(0, 1);
+  }
+
+  /// Callback function for receiving notification of new active catalogd.
+  /// This function is called when active catalogd is found from registration process,
+  /// or UpdateCatalogd RPC is received. The two kinds of RPCs could be received out of
+  /// sending order.
+  /// Reset 'last_active_catalogd_version_' if 'is_registration_reply' is true and
+  /// 'active_catalogd_version' is negative. In this case, 'catalogd_registration' is
+  /// invalid and should not be used.
+  void UpdateActiveCatalogd(bool is_registration_reply, int64_t active_catalogd_version,
+      const TCatalogRegistration& catalogd_registration);
+
+  /// Return the current address of Catalog service.
+  std::shared_ptr<const TNetworkAddress> GetCatalogdAddress() const;
 
  private:
   // Used to uniquely identify this impalad.
@@ -201,6 +244,7 @@ class ExecEnv {
   boost::scoped_ptr<AdmissionController> admission_controller_;
   boost::scoped_ptr<StatestoreSubscriber> statestore_subscriber_;
   boost::scoped_ptr<CatalogServiceClientCache> catalogd_client_cache_;
+  boost::scoped_ptr<CatalogServiceClientCache> catalogd_lightweight_req_client_cache_;
   boost::scoped_ptr<HBaseTableFactory> htable_factory_;
   boost::scoped_ptr<io::DiskIoMgr> disk_io_mgr_;
   boost::scoped_ptr<Webserver> webserver_;
@@ -232,6 +276,12 @@ class ExecEnv {
   /// Tracks system resource usage which we then include in profiles.
   boost::scoped_ptr<SystemStateInfo> system_state_info_;
 
+  /// Singleton cache for codegen functions.
+  boost::scoped_ptr<CodeGenCache> codegen_cache_;
+
+  /// Singleton cache for tuple caching
+  boost::scoped_ptr<TupleCacheMgr> tuple_cache_mgr_;
+
   /// Not owned by this class
   ImpalaServer* impala_server_ = nullptr;
   MetricGroup* rpc_metrics_ = nullptr;
@@ -244,9 +294,11 @@ class ExecEnv {
   friend class DataStreamTest;
 
   // For access to InitHadoopConfig().
-  FRIEND_TEST(HdfsUtilTest, CheckFilesystemsMatch);
+  FRIEND_TEST(HdfsUtilTest, CheckFilesystemsAndBucketsMatch);
 
   static ExecEnv* exec_env_;
+  JWTHelper* jwt_helper_;
+  JWTHelper* oauth_helper_;
   bool is_fe_tests_ = false;
 
   /// The network address that the backend KRPC service is listening on:
@@ -256,8 +308,8 @@ class ExecEnv {
   /// Resolved IP address of the host name.
   IpAddr ip_address_;
 
-  /// IP address of the KRPC backend service: ip_address + krpc_port.
-  TNetworkAddress krpc_address_;
+  /// Address of the KRPC backend service: ip_address + krpc_port and UDS address.
+  NetworkAddressPB krpc_address_;
 
   /// fs.defaultFs value set in core-site.xml
   std::string default_fs_;
@@ -290,12 +342,30 @@ class ExecEnv {
   /// this backend. Queries take up multiple slots only when mt_dop > 1.
   int64_t admission_slots_;
 
-  /// If the admission control service is enabled, the resolved IP address and port where
-  /// the service is running.
-  TNetworkAddress admission_service_address_;
+  /// Flag that indicate if the registration with statestore is completed.
+  AtomicInt32 statestore_registration_completed_{0};
+
+  /// Current address of Catalog service
+  std::shared_ptr<const TNetworkAddress> catalogd_address_;
+
+  /// Object to track the version of received active catalogd.
+  boost::scoped_ptr<ActiveCatalogdVersionChecker> active_catalogd_version_checker_;
+
+  /// Flag that indicate if the metric for catalogd address has been set.
+  bool is_catalogd_address_metric_set_ = false;
+
+  /// Protects catalogd_address_ and active_catalogd_version_tracker_.
+  mutable std::mutex catalogd_address_lock_;
 
   /// Initialize ExecEnv based on Hadoop config from frontend.
   Status InitHadoopConfig();
+
+  /// Set tcmalloc's aggressive_memory_decommit=1. This needs to be called before
+  /// initializing the buffer pool, because the buffer pool asserts that this
+  /// property is set and newer versions of tcmalloc do not set it by default.
+  /// InitBufferPool() calls this automatically, so this is only used directly by
+  /// TestEnv.
+  void InitTcMallocAggressiveDecommit();
 
   /// Initialise 'buffer_pool_' and 'buffer_reservation_' with given capacity.
   void InitBufferPool(int64_t min_page_len, int64_t capacity, int64_t clean_pages_limit);

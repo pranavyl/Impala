@@ -20,7 +20,6 @@ package org.apache.impala.analysis;
 import java.util.List;
 
 import org.apache.impala.authorization.Privilege;
-import org.apache.impala.authorization.PrivilegeRequestBuilder;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
 import org.apache.impala.catalog.TableLoadingException;
@@ -29,6 +28,7 @@ import org.apache.impala.thrift.TAccessEvent;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TDropTableOrViewParams;
 import org.apache.impala.thrift.TTableName;
+import org.apache.impala.util.MetaStoreUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -111,20 +111,12 @@ public class DropTableOrViewStmt extends StatementBase {
       // Fetch the table owner information, without registering any privileges.
       FeTable table = analyzer.getTableNoThrow(dbName_, tableName_.getTbl());
       String tblOwnerUser = table == null ? null : table.getOwnerUser();
-      // Notice that in isViewCreatedWithoutAuthz() we assume that 'table' is not a view
-      // whose creation was not authorized if we cannot find it currently cached in the
-      // local Catalog, i.e., when 'table' is null.
-      // TODO(IMPALA-10122): Remove the need for computing 'isViewCreatedWithoutAuthz'
-      // once we can properly process a PrivilegeRequest for a view whose creation was
-      // not authorized.
-      boolean isViewCreatedWithoutAuthz =
-          PrivilegeRequestBuilder.isViewCreatedWithoutAuthz(table);
       if (ifExists_) {
         // Start with ANY privilege in case of IF EXISTS, and register DROP privilege
         // later only if the table exists. See IMPALA-8851 for more explanation.
         analyzer.registerPrivReq(builder ->
             builder.allOf(Privilege.ANY)
-            .onTable(dbName_, getTbl(), tblOwnerUser, isViewCreatedWithoutAuthz)
+            .onTable(dbName_, getTbl(), tblOwnerUser)
             .build());
         if (table == null) return;
       }
@@ -144,7 +136,9 @@ public class DropTableOrViewStmt extends StatementBase {
         throw new AnalysisException(String.format(
             "DROP VIEW not allowed on a table: %s.%s", dbName_, getTbl()));
       }
-      if (dropTable_) {
+      // It currently supports create bucketed tables,
+      // but it should also support drop bucketed tables.
+      if (dropTable_ && !MetaStoreUtil.isBucketedTable(table.getMetaStoreTable())) {
         // To drop a view needs not write capabilities, only checks for tables.
         analyzer.checkTableCapability(table, Analyzer.OperationType.WRITE);
       }

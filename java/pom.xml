@@ -21,10 +21,15 @@ under the License.
   <modelVersion>4.0.0</modelVersion>
   <groupId>org.apache.impala</groupId>
   <artifactId>impala-parent</artifactId>
-  <version>4.0.0-SNAPSHOT</version>
+  <version>4.5.0-SNAPSHOT</version>
   <packaging>pom</packaging>
   <name>Apache Impala Parent POM</name>
 
+  <!--
+  When adding new properties to control library versions, also add them to
+  bin/impala-config.sh as environment variables so other branches can easily override
+  them in bin/impala-config-branch.sh for cleaner patches.
+  -->
   <properties>
     <surefire.reports.dir>${env.IMPALA_LOGS_DIR}/fe_tests</surefire.reports.dir>
     <jacoco.skip>true</jacoco.skip>
@@ -34,6 +39,7 @@ under the License.
     <hive.version>${env.IMPALA_HIVE_VERSION}</hive.version>
     <hive.storage.api.version>${env.IMPALA_HIVE_STORAGE_API_VERSION}</hive.storage.api.version>
     <hive.major.version>${env.IMPALA_HIVE_MAJOR_VERSION}</hive.major.version>
+    <hive.dist.type>${env.IMPALA_HIVE_DIST_TYPE}</hive.dist.type>
     <hudi.version>${env.IMPALA_HUDI_VERSION}</hudi.version>
     <ranger.version>${env.IMPALA_RANGER_VERSION}</ranger.version>
     <postgres.jdbc.version>${env.IMPALA_POSTGRES_JDBC_DRIVER_VERSION}</postgres.jdbc.version>
@@ -44,35 +50,42 @@ under the License.
     <parquet.version>${env.IMPALA_PARQUET_VERSION}</parquet.version>
     <kite.version>${env.IMPALA_KITE_VERSION}</kite.version>
     <knox.version>${env.IMPALA_KNOX_VERSION}</knox.version>
-    <gcs.version>${env.IMPALA_GCS_VERSION}</gcs.version>
     <cos.version>${env.IMPALA_COS_VERSION}</cos.version>
-    <thrift.version>0.11.0</thrift.version>
+    <obs.version>${env.IMPALA_OBS_VERSION}</obs.version>
+    <thrift.version>${env.IMPALA_THRIFT_POM_VERSION}</thrift.version>
     <impala.extdatasrc.api.version>${project.version}</impala.extdatasrc.api.version>
     <impala.query.event.hook.api.version>${project.version}</impala.query.event.hook.api.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <kudu.version>${env.IMPALA_KUDU_VERSION}</kudu.version>
-    <commons-io.version>2.6</commons-io.version>
-    <slf4j.version>1.7.30</slf4j.version>
-    <junit.version>4.12</junit.version>
+    <slf4j.version>${env.IMPALA_SLF4J_VERSION}</slf4j.version>
+    <commons-lang3.version>${env.IMPALA_COMMONS_LANG3_VERSION}</commons-lang3.version>
+    <reload4j.version>${env.IMPALA_RELOAD4j_VERSION}</reload4j.version>
+    <junit.version>${env.IMPALA_JUNIT_VERSION}</junit.version>
     <!-- Beware compatibility requirements with Thrift and
          KMS; see IMPALA-4210. -->
-    <httpcomponents.core.version>4.4.9</httpcomponents.core.version>
+    <httpcomponents.core.version>${env.IMPALA_HTTP_CORE_VERSION}</httpcomponents.core.version>
     <yarn-extras.version>${project.version}</yarn-extras.version>
     <eclipse.output.directory>eclipse-classes</eclipse.output.directory>
     <!-- hive-exec seems to leak this version of guava onto our classpath,
          so it's important to depend on the same one -->
-    <guava.version>28.1-jre</guava.version>
-    <derby.version>10.14.2.0</derby.version>
-    <jackson-databind.version>2.10.5.1</jackson-databind.version>
+    <guava.version>${env.IMPALA_GUAVA_VERSION}</guava.version>
+    <derby.version>${env.IMPALA_DERBY_VERSION}</derby.version>
+    <jackson.version>${env.IMPALA_JACKSON_VERSION}</jackson.version>
+    <jackson-databind.version>${env.IMPALA_JACKSON_DATABIND_VERSION}</jackson-databind.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <iceberg.version>${env.IMPALA_ICEBERG_VERSION}</iceberg.version>
-    <pac4j.version>4.0.3</pac4j.version>
+    <pac4j.version>${env.IMPALA_PAC4J_VERSION}</pac4j.version>
     <!-- xmlsec, bcprov-jdk15on and springframework are not used by Impala directly,
-         but needed to replace pac4j 4.0.3's unsafe versions -->
-    <xmlsec.version>2.2.1</xmlsec.version>
-    <bcprov-jdk15on.version>1.64</bcprov-jdk15on.version>
-    <springframework.version>4.3.29.RELEASE</springframework.version>
-    <json-smart.version>2.4.7</json-smart.version>
+         but they are needed by pac4j. This uses newer versions to address CVEs. -->
+    <xmlsec.version>${env.IMPALA_XMLSEC_VERSION}</xmlsec.version>
+    <bouncy-castle.version>${env.IMPALA_BOUNCY_CASTLE_VERSION}</bouncy-castle.version>
+    <springframework.version>${env.IMPALA_SPRINGFRAMEWORK_VERSION}</springframework.version>
+    <json-smart.version>${env.IMPALA_JSON_SMART_VERSION}</json-smart.version>
+    <commons-dbcp2.version>${env.IMPALA_DBCP2_VERSION}</commons-dbcp2.version>
+    <log4j2.version>${env.IMPALA_LOG4J2_VERSION}</log4j2.version>
+    <dropwizard-metrics.version>${env.IMPALA_DROPWIZARD_METRICS_VERSION}</dropwizard-metrics.version>
+    <aircompressor.version>${env.IMPALA_AIRCOMPRESSOR_VERSION}</aircompressor.version>
+    <datasketches.version>${env.IMPALA_DATASKETCHES_VERSION}</datasketches.version>
   </properties>
 
   <repositories>
@@ -171,23 +184,6 @@ under the License.
     </repository>
     <repository>
       <!--
-      This is a transitive dependency from Sentry. Disable downloading snapshots from here
-      since we only want to consume actual releases and we can save Maven from reaching
-      out to this repo unnecessarily to look for snapshot versions. Sentry has been
-      removed, so this may eventually be removed.
-      -->
-      <id>glassfish-repo-archive.repo</id>
-      <name>Glassfish repository - Transitive from Sentry</name>
-      <url>https://mvnrepository.com/artifact/org.glassfish/javax.el/</url>
-      <snapshots>
-        <enabled>false</enabled>
-      </snapshots>
-      <releases>
-        <enabled>false</enabled>
-      </releases>
-    </repository>
-    <repository>
-      <!--
       The Impala development bootstrapping depends on CDH Maven snapshots
       which transitively pull dependencies from other repositories which
       can cause the build to be non-reproducible, e.g. IMPALA-7316. This
@@ -248,16 +244,173 @@ under the License.
     </pluginRepository>
   </pluginRepositories>
 
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.google.guava</groupId>
+        <artifactId>guava</artifactId>
+        <version>${guava.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>net.minidev</groupId>
+        <artifactId>json-smart</artifactId>
+        <version>${json-smart.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.apache.avro</groupId>
+        <artifactId>avro</artifactId>
+        <version>${avro.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-lang3</artifactId>
+        <version>${commons-lang3.version}</version>
+      </dependency>
+
+      <!-- Override httpcore from libthrift to a later maintenance version. Noticed
+          certain SPNEGO auth errors when connecting to kerberized HTTP endpoints
+          using v4.4.1 pulled by libthrift. -->
+      <dependency>
+        <groupId>org.apache.httpcomponents</groupId>
+        <artifactId>httpcore</artifactId>
+        <version>${httpcomponents.core.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.apache.parquet</groupId>
+        <artifactId>parquet-avro</artifactId>
+        <version>${parquet.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.apache.santuario</groupId>
+        <artifactId>xmlsec</artifactId>
+        <version>${xmlsec.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.bouncycastle</groupId>
+        <artifactId>bcprov-jdk18on</artifactId>
+        <version>${bouncy-castle.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.bouncycastle</groupId>
+        <artifactId>bcpkix-jdk18on</artifactId>
+        <version>${bouncy-castle.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.pac4j</groupId>
+        <artifactId>pac4j-core</artifactId>
+        <version>${pac4j.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>ch.qos.reload4j</groupId>
+        <artifactId>reload4j</artifactId>
+        <version>${reload4j.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>jcl-over-slf4j</artifactId>
+        <version>${slf4j.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>${slf4j.version}</version>
+      </dependency>
+      <!-- Later versions of slf4j-log4j12 map to slf4j-reload4j. This is the simplest
+           way to ensure any instances of slf4j-log4j12 are mapped to slf4j-reload4j. -->
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-log4j12</artifactId>
+        <version>${slf4j.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-reload4j</artifactId>
+        <version>${slf4j.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.springframework</groupId>
+        <artifactId>spring-core</artifactId>
+        <version>${springframework.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+        <version>${jackson-databind.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-core</artifactId>
+        <version>${jackson.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-annotations</artifactId>
+        <version>${jackson.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.apache.logging.log4j</groupId>
+        <artifactId>log4j-api</artifactId>
+        <version>${log4j2.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.logging.log4j</groupId>
+        <artifactId>log4j-core</artifactId>
+        <version>${log4j2.version}</version>
+      </dependency>
+
+      <!-- Pin Dropwizard Metrics versions. We directly use metrics-core, and
+           metrics-jvm/metrics-json are imported via HMS. -->
+      <dependency>
+        <groupId>io.dropwizard.metrics</groupId>
+        <artifactId>metrics-core</artifactId>
+        <version>${dropwizard-metrics.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.dropwizard.metrics</groupId>
+        <artifactId>metrics-jvm</artifactId>
+        <version>${dropwizard-metrics.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.dropwizard.metrics</groupId>
+        <artifactId>metrics-json</artifactId>
+        <version>${dropwizard-metrics.version}</version>
+      </dependency>
+
+      <!-- Pin aircompressor version. Orc depends on this, but Orc upgrade will be
+          planned separately. Remove once Orc is upgraded to 1.9.4+. -->
+      <dependency>
+        <groupId>io.airlift</groupId>
+        <artifactId>aircompressor</artifactId>
+        <version>${aircompressor.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
   <modules>
     <module>datagenerator</module>
+    <module>puffin-data-generator</module>
     <module>executor-deps</module>
     <module>ext-data-source</module>
     <module>../fe</module>
+    <module>external-frontend</module>
+    <module>calcite-planner</module>
     <module>query-event-hook-api</module>
     <module>shaded-deps/hive-exec</module>
     <module>shaded-deps/s3a-aws-sdk</module>
     <module>TableFlattener</module>
     <module>test-hive-udfs</module>
+    <module>test-corrupt-hive-udfs</module>
     <module>yarn-extras</module>
   </modules>
 

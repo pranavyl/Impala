@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 #
+from __future__ import absolute_import, division, print_function
 import os
 import pytest
 import stat
@@ -65,6 +66,7 @@ class TestS3AAccess(CustomClusterTestSuite):
         "create external table if not exists {0}.tinytable_s3 like functional.tinytable \
          location '{1}/tinytable'".format(unique_database, WAREHOUSE))
 
+  @pytest.mark.xfail(run=False, reason="Incompatible with IMPALA-13156 debug attempts")
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
     "-s3a_access_key_cmd=\"%s\"\

@@ -18,19 +18,26 @@
 package org.apache.impala.catalog.events;
 
 import com.codahale.metrics.Gauge;
+import com.codahale.metrics.Snapshot;
 import com.codahale.metrics.Timer;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.annotation.Nullable;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient.NotificationFilter;
 import org.apache.hadoop.hive.metastore.api.CurrentNotificationEventId;
@@ -41,19 +48,27 @@ import org.apache.hadoop.hive.metastore.messaging.MessageDeserializer;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import org.apache.impala.catalog.MetastoreClientInstantiationException;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.IncompleteTable;
 import org.apache.impala.catalog.events.ConfigValidator.ValidationResult;
 import org.apache.impala.catalog.events.MetastoreEvents.DropDatabaseEvent;
+import org.apache.impala.catalog.events.MetastoreEvents.DropTableEvent;
 import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEvent;
 import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEventFactory;
 import org.apache.impala.common.Metrics;
+import org.apache.impala.common.PrintUtils;
 import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.CatalogOpExecutor;
+import org.apache.impala.thrift.TEventBatchProgressInfo;
 import org.apache.impala.thrift.TEventProcessorMetrics;
 import org.apache.impala.thrift.TEventProcessorMetricsSummaryResponse;
+import org.apache.impala.util.AcidUtils;
 import org.apache.impala.util.MetaStoreUtil;
+import org.apache.impala.util.NoOpEventSequence;
 import org.apache.impala.util.ThreadNameAnnotator;
 import org.apache.thrift.TException;
 import org.slf4j.Logger;
@@ -124,7 +139,7 @@ import org.slf4j.LoggerFactory;
  * Following table shows the actions to be taken when the given event type is received.
  *
  * <pre>
- *               +------------------------------------------------+ --------------------+
+ *               +------------------------------------------------+---------------------+
  *               |    Catalog object state                                              |
  * +--------------------------------------+-----------------------+---------------------+
  * | Event type  | Loaded                 | Incomplete            | Not present         |
@@ -222,13 +237,22 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   // rate of events received per unit time
   public static final String EVENTS_RECEIVED_METRIC = "events-received";
   // total number of events which are skipped because of the flag setting or
-  // in case of [CREATE|DROP] events on [DATABASE|TABLE|PARTITION] which were ignored
-  // because the [DATABASE|TABLE|PARTITION] was already [PRESENT|ABSENT] in the catalogd.
+  // in case of [CREATE|DROP|ALTER] events on [DATABASE|TABLE|PARTITION] which were
+  // ignored because the [DATABASE|TABLE|PARTITION] was already [PRESENT|ABSENT] in
+  // the catalogd.
   public static final String EVENTS_SKIPPED_METRIC = "events-skipped";
   // name of the event processor status metric
   public static final String STATUS_METRIC = "status";
   // last synced event id
   public static final String LAST_SYNCED_ID_METRIC = "last-synced-event-id";
+  // last synced event time
+  public static final String LAST_SYNCED_EVENT_TIME = "last-synced-event-time";
+  // latest event id in Hive metastore
+  public static final String LATEST_EVENT_ID = "latest-event-id";
+  // event time of the latest event in Hive metastore
+  public static final String LATEST_EVENT_TIME = "latest-event-time";
+  // delay(secs) in events processing
+  public static final String EVENT_PROCESSING_DELAY = "event-processing-delay";
   // metric name for number of tables which are refreshed by event processor so far
   public static final String NUMBER_OF_TABLE_REFRESHES = "tables-refreshed";
   // number of times events processor refreshed a partition
@@ -250,43 +274,113 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   // number of batch events generated
   public static final String NUMBER_OF_BATCH_EVENTS = "batch-events-created";
 
-  /**
-   * Wrapper around {@link
-   * MetastoreEventsProcessor#getNextMetastoreEventsInBatches(CatalogServiceCatalog,
-   * long, NotificationFilter, int)} which passes the default batch size.
-   */
-  public static List<NotificationEvent> getNextMetastoreEventsInBatches(
-      CatalogServiceCatalog catalog, long eventId, NotificationFilter filter)
-      throws MetastoreNotificationFetchException {
-    return getNextMetastoreEventsInBatches(catalog, eventId, filter,
-        EVENTS_BATCH_SIZE_PER_RPC);
+  // metric to measure the delay in msec, between the event created in metastore and time
+  // it took to be consumed by the event processor
+  public static final String AVG_DELAY_IN_CONSUMING_EVENTS = "events-consuming" +
+      "-delay";
+
+  private static final long SECOND_IN_NANOS = 1000 * 1000 * 1000L;
+
+  public static List<NotificationEvent> getNextMetastoreEventsInBatchesForDb(
+      CatalogServiceCatalog catalog, long eventId, String dbName, String eventType)
+      throws MetastoreNotificationException {
+    return getNextMetastoreEventsInBatchesForDb(catalog, eventId,
+        MetastoreShim.getDefaultCatalogName(), dbName, eventType);
   }
 
-  /**
-   * Gets the next list of {@link NotificationEvent} from Hive Metastore which are
-   * greater than the given eventId and filtered according to the provided filter.
-   * @param catalog The CatalogServiceCatalog used to get the metastore client
-   * @param eventId The eventId after which the events are needed.
-   * @param filter The {@link NotificationFilter} used to filter the list of fetched
-   *               events. Note that this is a client side filter not a server side
-   *               filter. Unfortunately, HMS doesn't provide a similar mechanism to
-   *               do server side filtering.
-   * @param eventsBatchSize the batch size for fetching the events from metastore.
-   * @return List of {@link NotificationEvent} which are all greater than eventId and
-   * satisfy the given filter.
-   * @throws MetastoreNotificationFetchException in case of RPC errors to metastore.
-   */
+  public static List<NotificationEvent> getNextMetastoreEventsInBatchesForDb(
+      CatalogServiceCatalog catalog, long eventId, String catName,
+      String dbName, String eventType) throws MetastoreNotificationException {
+    Preconditions.checkNotNull(eventType, "eventType is null in fetching db events");
+    Preconditions.checkNotNull(catName, "catName is null in fetching db events");
+    Preconditions.checkNotNull(dbName, "dbName is null in fetching db events");
+    NotificationFilter filter = notificationEvent ->
+        eventType.equals(notificationEvent.getEventType())
+            && catName.equalsIgnoreCase(notificationEvent.getCatName())
+            && dbName.equalsIgnoreCase(notificationEvent.getDbName());
+    MetaDataFilter metaDataFilter = new MetaDataFilter(filter, catName, dbName);
+    return getNextMetastoreEventsWithFilterInBatches(catalog, eventId, metaDataFilter,
+        EVENTS_BATCH_SIZE_PER_RPC, eventType);
+  }
+
+  public static List<NotificationEvent> getNextMetastoreEventsInBatchesForTable(
+      CatalogServiceCatalog catalog, long eventId, String dbName, String tblName,
+      String eventType) throws MetastoreNotificationException {
+    return getNextMetastoreEventsInBatchesForTable(catalog, eventId,
+        MetastoreShim.getDefaultCatalogName(), dbName, tblName, eventType);
+  }
+
+  public static List<NotificationEvent> getNextMetastoreEventsInBatchesForTable(
+      CatalogServiceCatalog catalog, long eventId, String catName, String dbName,
+      String tblName, String eventType) throws MetastoreNotificationException {
+    Preconditions.checkNotNull(eventType, "eventType is null in fetching table events");
+    Preconditions.checkNotNull(catName, "catName is null in fetching table events");
+    Preconditions.checkNotNull(dbName, "dbName is null in fetching table events");
+    Preconditions.checkNotNull(tblName, "tblName is null in fetching table events");
+    NotificationFilter filter = notificationEvent ->
+        eventType.equals(notificationEvent.getEventType())
+            && catName.equalsIgnoreCase(notificationEvent.getCatName())
+            && dbName.equalsIgnoreCase(notificationEvent.getDbName())
+            && tblName.equalsIgnoreCase(notificationEvent.getTableName());
+    MetaDataFilter metaDataFilter = new MetaDataFilter(filter, catName, dbName, tblName);
+    return getNextMetastoreEventsWithFilterInBatches(catalog, eventId, metaDataFilter,
+        EVENTS_BATCH_SIZE_PER_RPC, eventType);
+  }
+
+  public static List<NotificationEvent> getNextMetastoreEventsInBatches(
+      CatalogServiceCatalog catalog, long eventId, NotificationFilter filter,
+      String... eventTypes) throws MetastoreNotificationFetchException {
+    return getNextMetastoreEventsInBatches(catalog, eventId, filter,
+        EVENTS_BATCH_SIZE_PER_RPC, eventTypes);
+  }
+
   @VisibleForTesting
   public static List<NotificationEvent> getNextMetastoreEventsInBatches(
       CatalogServiceCatalog catalog, long eventId, NotificationFilter filter,
-      int eventsBatchSize) throws MetastoreNotificationFetchException {
+      int eventsBatchSize, String... eventTypes)
+      throws MetastoreNotificationFetchException {
+    MetaDataFilter metaDataFilter = new MetaDataFilter(filter);
+    return getNextMetastoreEventsWithFilterInBatches(catalog, eventId, metaDataFilter,
+        eventsBatchSize, eventTypes);
+  }
+
+      /**
+       * Gets the next list of {@link NotificationEvent} from Hive Metastore which are
+       * greater than the given eventId and filtered according to the provided filter.
+       * @param catalog The CatalogServiceCatalog used to get the metastore client
+       * @param eventId The eventId after which the events are needed.
+       * @param metaDataFilter The {@link MetaDataFilter} used to filter the list of
+       *               fetched events based on catName/dbName/tableName and then filter
+       *               by required event types. Note that this is a server side filter.
+       * @param eventsBatchSize the batch size for fetching the events from metastore.
+       * @return List of {@link NotificationEvent} which are all greater than eventId and
+       * satisfy the given filter.
+       * @throws MetastoreNotificationFetchException in case of RPC errors to metastore.
+       */
+  @VisibleForTesting
+  public static List<NotificationEvent> getNextMetastoreEventsWithFilterInBatches(
+      CatalogServiceCatalog catalog, long eventId, MetaDataFilter metaDataFilter,
+      int eventsBatchSize, String... eventTypes)
+      throws MetastoreNotificationFetchException {
     Preconditions.checkArgument(eventsBatchSize > 0);
     List<NotificationEvent> result = new ArrayList<>();
+    NotificationFilter filter = metaDataFilter.getNotificationFilter();
     try (MetaStoreClient msc = catalog.getMetaStoreClient()) {
       long toEventId = msc.getHiveClient().getCurrentNotificationEventId()
           .getEventId();
       if (toEventId <= eventId) return result;
       long currentEventId = eventId;
+      List<String> eventTypeSkipList = catalog.getDefaultSkippedHmsEventTypes();
+      String typeStr = null;
+      if (eventTypes != null && eventTypes.length > 0) {
+        eventTypeSkipList = Lists.newArrayList(catalog.getCommonHmsEventTypes());
+        eventTypeSkipList.removeIf(s -> Arrays.asList(eventTypes).contains(s));
+        typeStr = String.join(",", eventTypes) + " ";
+      }
+      LOG.info("Fetching {}events started from id {} to {}. Gap: {}",
+          typeStr == null ? "" : typeStr, eventId, toEventId,
+          toEventId - eventId);
+      int numFilteredEvents = 0;
       while (currentEventId < toEventId) {
         int batchSize = Math
             .min(eventsBatchSize, (int)(toEventId - currentEventId));
@@ -297,16 +391,34 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
         NotificationEventRequest eventRequest = new NotificationEventRequest();
         eventRequest.setMaxEvents(batchSize);
         eventRequest.setLastEvent(currentEventId);
-        NotificationEventResponse notificationEventResponse = msc.getHiveClient()
-            .getThriftClient().get_next_notification(eventRequest);
+        // Need to set table/dbnames in the request according to the filter
+        MetastoreShim.setNotificationEventRequestWithFilter(eventRequest,
+            metaDataFilter);
+        NotificationEventResponse notificationEventResponse =
+            MetastoreShim.getNextNotification(msc.getHiveClient(), eventRequest,
+                eventTypeSkipList);
+        if (notificationEventResponse.getEvents().isEmpty()) {
+          // Possible to receive empty list due to event skip list in request
+          break;
+        }
+
         for (NotificationEvent event : notificationEventResponse.getEvents()) {
           // if no filter is provided we add all the events
-          if (filter == null || filter.accept(event)) result.add(event);
+          if (filter == null || filter.accept(event)) {
+            result.add(event);
+          } else {
+            numFilteredEvents++;
+          }
           currentEventId = event.getEventId();
         }
       }
+      if (numFilteredEvents > 0) {
+        LOG.info("Got {} events and filtered out {} locally from {} events start " +
+                "from id {}",
+            result.size(), numFilteredEvents, toEventId - eventId, eventId + 1);
+      }
       return result;
-    } catch (TException e) {
+    } catch (MetastoreClientInstantiationException | TException e) {
       throw new MetastoreNotificationFetchException(String.format(
           CatalogOpExecutor.HMS_RPC_ERROR_FORMAT_STR, "getNextNotification"), e);
     }
@@ -338,8 +450,18 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
     String annotation = String.format("sync table %s to latest HMS event id",
         tbl.getFullName());
     try(ThreadNameAnnotator tna = new ThreadNameAnnotator(annotation)) {
-      List<NotificationEvent> events = getNextMetastoreEventsInBatches(catalog,
-          lastEventId, getTableNotificationEventFilter(tbl));
+      MetaDataFilter metaDataFilter;
+      // For ACID tables, events may include commit_txn and abort_txn which doesn't have
+      // db_name and table_name. So it makes sense to fetch all the events and filter
+      // them in catalogD.
+      if (AcidUtils.isTransactionalTable(tbl.getMetaStoreTable().getParameters())) {
+        metaDataFilter = new MetaDataFilter(getTableNotificationEventFilter(tbl));
+      } else {
+        metaDataFilter = new MetaDataFilter(getTableNotificationEventFilter(tbl),
+            MetastoreShim.getDefaultCatalogName(), tbl.getDb().getName(), tbl.getName());
+      }
+      List<NotificationEvent> events = getNextMetastoreEventsWithFilterInBatches(catalog,
+          lastEventId, metaDataFilter, EVENTS_BATCH_SIZE_PER_RPC);
 
       if (events.isEmpty()) {
         LOG.debug("table {} synced till event id {}. No new HMS events to process from "
@@ -400,8 +522,11 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
 
     String annotation = String.format("sync db %s to latest HMS event id", db.getName());
     try(ThreadNameAnnotator tna = new ThreadNameAnnotator(annotation)) {
-      List<NotificationEvent> events = getNextMetastoreEventsInBatches(catalog,
-          lastEventId, getDbNotificationEventFilter(db));
+      MetaDataFilter metaDataFilter = new MetaDataFilter(
+          getDbNotificationEventFilter(db), MetastoreShim.getDefaultCatalogName(),
+          db.getName());
+      List<NotificationEvent> events = getNextMetastoreEventsWithFilterInBatches(catalog,
+          lastEventId, metaDataFilter, EVENTS_BATCH_SIZE_PER_RPC);
 
       if (events.isEmpty()) {
         LOG.debug("db {} already synced till event id: {}, no new hms events from "
@@ -456,7 +581,8 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   This filter is used when syncing db to the latest HMS event id. The
   filter accepts all events except table related ones
    */
-  private static NotificationFilter getDbNotificationEventFilter(Db db) {
+  @VisibleForTesting
+  public static NotificationFilter getDbNotificationEventFilter(Db db) {
     NotificationFilter filter = new NotificationFilter() {
       @Override
       public boolean accept(NotificationEvent event) {
@@ -481,14 +607,44 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
     DISABLED // event processor is not configured to run
   }
 
+  // supported commands for :event_processor(), e.g.
+  //   :event_processor('pause');
+  //   :event_processor('start', -1);
+  public enum EventProcessorCmdType {
+    PAUSE,
+    START,
+    STATUS,
+  }
+
   // current status of this event processor
   private EventProcessorStatus eventProcessorStatus_ = EventProcessorStatus.STOPPED;
+
+  // error message when event processor comes into ERROR/NEEDS_INVALIDATE states
+  private String eventProcessorErrorMsg_ = null;
 
   // event factory which is used to get or create MetastoreEvents
   private final MetastoreEventFactory metastoreEventFactory_;
 
+  // keeps track of the current event that we are processing
+  private NotificationEvent currentEvent_;
+  private List<NotificationEvent> currentEventBatch_;
+  private MetastoreEvent currentFilteredEvent_;
+  private List<MetastoreEvent> currentFilteredEvents_;
+  private long currentBatchStartTimeMs_ = 0;
+  private long currentEventStartTimeMs_ = 0;
+  private int currentEventIndex_ = 0;
+
   // keeps track of the last event id which we have synced to
   private final AtomicLong lastSyncedEventId_ = new AtomicLong(-1);
+  private final AtomicLong lastSyncedEventTimeSecs_ = new AtomicLong(0);
+
+  // The event id and eventTime of the latest event in HMS. Only used in metrics to show
+  // how far we are lagging behind.
+  private final AtomicLong latestEventId_ = new AtomicLong(0);
+  private final AtomicLong latestEventTimeSecs_ = new AtomicLong(0);
+
+  // The duration in nanoseconds of the processing of the last event batch.
+  private final AtomicLong lastEventProcessDurationNs_ = new AtomicLong(0);
 
   // polling interval in seconds. Note this is a time we wait AFTER each fetch call
   private final long pollingFrequencyInSec_;
@@ -497,9 +653,20 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   protected final CatalogServiceCatalog catalog_;
 
   // scheduler daemon thread executor for processing events at given frequency
-  private final ScheduledExecutorService scheduler_ = Executors
-      .newSingleThreadScheduledExecutor(new ThreadFactoryBuilder().setDaemon(true)
-          .setNameFormat("MetastoreEventsProcessor").build());
+  private final ScheduledExecutorService processEventsScheduler_ =
+      Executors.newSingleThreadScheduledExecutor(
+          new ThreadFactoryBuilder()
+              .setDaemon(true)
+              .setNameFormat("MetastoreEventsProcessor-ProcessEvents")
+              .build());
+
+  // scheduler daemon thread executor to update the latest event id at given frequency
+  private final ScheduledExecutorService updateEventIdScheduler_ =
+      Executors.newSingleThreadScheduledExecutor(
+          new ThreadFactoryBuilder()
+              .setDaemon(true)
+              .setNameFormat("MetastoreEventsProcessor-UpdateEventId")
+              .build());
 
   // metrics registry to keep track of metrics related to event processing
   //TODO create a separate singleton class which wraps around this so that we don't
@@ -518,6 +685,7 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
     this.catalog_ = Preconditions.checkNotNull(catalogOpExecutor.getCatalog());
     validateConfigs();
     lastSyncedEventId_.set(startSyncFromId);
+    lastSyncedEventTimeSecs_.set(getEventTimeFromHMS(startSyncFromId));
     initMetrics();
     metastoreEventFactory_ = new MetastoreEventFactory(catalogOpExecutor);
     pollingFrequencyInSec_ = pollingFrequencyInSec;
@@ -574,10 +742,14 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
     metrics_.addTimer(EVENTS_PROCESS_DURATION_METRIC);
     metrics_.addMeter(EVENTS_RECEIVED_METRIC);
     metrics_.addCounter(EVENTS_SKIPPED_METRIC);
-    metrics_.addGauge(STATUS_METRIC,
-        (Gauge<String>) () -> getStatus().toString());
-    metrics_.addGauge(LAST_SYNCED_ID_METRIC,
-        (Gauge<Long>) () -> lastSyncedEventId_.get());
+    metrics_.addGauge(STATUS_METRIC, (Gauge<String>) () -> getStatus().toString());
+    metrics_.addGauge(LAST_SYNCED_ID_METRIC, (Gauge<Long>) lastSyncedEventId_::get);
+    metrics_.addGauge(LAST_SYNCED_EVENT_TIME,
+        (Gauge<Long>) lastSyncedEventTimeSecs_::get);
+    metrics_.addGauge(LATEST_EVENT_ID, (Gauge<Long>) latestEventId_::get);
+    metrics_.addGauge(LATEST_EVENT_TIME, (Gauge<Long>) latestEventTimeSecs_::get);
+    metrics_.addGauge(EVENT_PROCESSING_DELAY,
+        (Gauge<Long>) () -> latestEventTimeSecs_.get() - lastSyncedEventTimeSecs_.get());
     metrics_.addCounter(NUMBER_OF_TABLE_REFRESHES);
     metrics_.addCounter(NUMBER_OF_PARTITION_REFRESHES);
     metrics_.addCounter(NUMBER_OF_TABLES_ADDED);
@@ -589,6 +761,7 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
     metrics_
         .addGauge(DELETE_EVENT_LOG_SIZE, (Gauge<Integer>) deleteEventLog_::size);
     metrics_.addCounter(NUMBER_OF_BATCH_EVENTS);
+    metrics_.addTimer(AVG_DELAY_IN_CONSUMING_EVENTS);
   }
 
   /**
@@ -602,6 +775,7 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   @Override
   public synchronized void start() {
     Preconditions.checkState(eventProcessorStatus_ != EventProcessorStatus.ACTIVE);
+    resetProgressInfo();
     startScheduler();
     updateStatus(EventProcessorStatus.ACTIVE);
     LOG.info(String.format("Successfully started metastore event processing."
@@ -638,13 +812,26 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
     return lastSyncedEventId_.get();
   }
 
+  /**
+   * Returns the current value of latestEventId_. This method is not thread-safe and
+   * only to be used for testing purposes
+   */
+  @VisibleForTesting
+  public long getLatestEventId() {
+    return latestEventId_.get();
+  }
+
   @VisibleForTesting
   void startScheduler() {
     Preconditions.checkState(pollingFrequencyInSec_ > 0);
     LOG.info(String.format("Starting metastore event polling with interval %d seconds.",
         pollingFrequencyInSec_));
-    scheduler_.scheduleWithFixedDelay(this::processEvents, pollingFrequencyInSec_,
-        pollingFrequencyInSec_, TimeUnit.SECONDS);
+    processEventsScheduler_.scheduleAtFixedRate(this ::processEvents,
+        pollingFrequencyInSec_, pollingFrequencyInSec_, TimeUnit.SECONDS);
+    // Update latestEventId in another thread in case that the processEvents() thread is
+    // blocked by slow metadata reloading or waiting for table locks.
+    updateEventIdScheduler_.scheduleAtFixedRate(this ::updateLatestEventId,
+        pollingFrequencyInSec_, pollingFrequencyInSec_, TimeUnit.SECONDS);
   }
 
   /**
@@ -669,13 +856,62 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
    * Get the current notification event id from metastore
    */
   @Override
-  public long getCurrentEventId() throws CatalogException {
+  public long getCurrentEventId() throws MetastoreNotificationFetchException {
     try (MetaStoreClient metaStoreClient = catalog_.getMetaStoreClient()) {
       return metaStoreClient.getHiveClient().getCurrentNotificationEventId().getEventId();
-    } catch (TException e) {
-      throw new CatalogException("Unable to fetch the current notification event id. "
-          + "Check if metastore service is accessible");
+    } catch (MetastoreClientInstantiationException | TException e) {
+      throw new MetastoreNotificationFetchException("Unable to fetch the current " +
+          "notification event id. Check if metastore service is accessible", e);
     }
+  }
+
+  public static long getCurrentEventIdNoThrow(IMetaStoreClient client) {
+    long latestEventId = -1L;
+    try {
+      latestEventId = client.getCurrentNotificationEventId().getEventId();
+    } catch (TException exception) {
+      LOG.warn(String.format("Unable to fetch latest event id from HMS: %s",
+          exception.getMessage()));
+    }
+    return latestEventId;
+  }
+
+  /**
+   * Fetch the event from HMS specified by 'eventId'
+   * @return null if the event has been cleaned up or any error occurs.
+   */
+  private NotificationEvent getEventFromHMS(MetaStoreClient msClient, long eventId) {
+    NotificationEventRequest eventRequest = new NotificationEventRequest();
+    eventRequest.setLastEvent(eventId - 1);
+    eventRequest.setMaxEvents(1);
+    try {
+      NotificationEventResponse response = MetastoreShim.getNextNotification(
+          msClient.getHiveClient(), eventRequest, null);
+      Iterator<NotificationEvent> eventIter = response.getEventsIterator();
+      if (!eventIter.hasNext()) {
+        LOG.warn("Unable to fetch event {}. It has been cleaned up", eventId);
+        return null;
+      }
+      return eventIter.next();
+    } catch (TException e) {
+      LOG.warn("Unable to fetch event {}", eventId, e);
+    }
+    return null;
+  }
+
+  /**
+   * Get the event time by fetching the specified event from HMS.
+   * @return 0 if the event has been cleaned up or any error occurs.
+   */
+  @VisibleForTesting
+  public int getEventTimeFromHMS(long eventId) {
+    try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+      NotificationEvent event = getEventFromHMS(msClient, eventId);
+      if (event != null) return event.getEventTime();
+    } catch (MetastoreClientInstantiationException e) {
+      LOG.error("Failed to get event time from HMS for event {}", eventId, e);
+    }
+    return 0;
   }
 
   /**
@@ -695,7 +931,11 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
         return;
       }
     }
+    // Clear the error message of the last failure and reset the progress info
+    eventProcessorErrorMsg_ = null;
+    resetProgressInfo();
     lastSyncedEventId_.set(fromEventId);
+    lastSyncedEventTimeSecs_.set(getEventTimeFromHMS(fromEventId));
     updateStatus(EventProcessorStatus.ACTIVE);
     LOG.info(String.format(
         "Metastore event processing restarted. Last synced event id was updated "
@@ -711,10 +951,10 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
    */
   @Override
   public synchronized void shutdown() {
-    Preconditions.checkNotNull(scheduler_);
     Preconditions.checkState(eventProcessorStatus_ != EventProcessorStatus.STOPPED,
         "Event processing is already stopped");
-    shutdownAndAwaitTermination();
+    shutdownAndAwaitTermination(processEventsScheduler_);
+    shutdownAndAwaitTermination(updateEventIdScheduler_);
     updateStatus(EventProcessorStatus.STOPPED);
     LOG.info("Metastore event processing stopped.");
   }
@@ -723,21 +963,22 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
    * Attempts to cleanly shutdown the scheduler pool. If the pool does not shutdown
    * within timeout, does a force shutdown which might interrupt currently running tasks.
    */
-  private synchronized void shutdownAndAwaitTermination() {
-    scheduler_.shutdown(); // disable new tasks from being submitted
+  private synchronized void shutdownAndAwaitTermination(ScheduledExecutorService ses) {
+    Preconditions.checkNotNull(ses);
+    ses.shutdown(); // disable new tasks from being submitted
     try {
       // wait for 10 secs for scheduler to complete currently running tasks
-      if (!scheduler_.awaitTermination(SCHEDULER_SHUTDOWN_TIMEOUT, TimeUnit.SECONDS)) {
+      if (!ses.awaitTermination(SCHEDULER_SHUTDOWN_TIMEOUT, TimeUnit.SECONDS)) {
         // executor couldn't terminate and timed-out, force the termination
         LOG.info(String.format("Scheduler pool did not terminate within %d seconds. "
             + "Attempting to stop currently running tasks", SCHEDULER_SHUTDOWN_TIMEOUT));
-        scheduler_.shutdownNow();
+        ses.shutdownNow();
       }
     } catch (InterruptedException e) {
       // current thread interrupted while pool was waiting for termination
       // issue a shutdownNow before returning to cancel currently running tasks
       LOG.info("Received interruptedException. Terminating currently running tasks.", e);
-      scheduler_.shutdownNow();
+      ses.shutdownNow();
     }
   }
 
@@ -746,6 +987,7 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
    * NotificationEvents are filtered using the NotificationFilter provided if it is not
    * null.
    * @param eventId The returned events are all after this given event id.
+   * @param currentEventId Current event id on metastore
    * @param getAllEvents If this is true all the events since eventId are returned.
    *                     Note that Hive MetaStore can limit the response to a specific
    *                     maximum number of limit based on the value of configuration
@@ -759,22 +1001,15 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
    * @throws MetastoreNotificationFetchException In case of exceptions from HMS.
    */
   public List<NotificationEvent> getNextMetastoreEvents(final long eventId,
-      final boolean getAllEvents, @Nullable final NotificationFilter filter)
+      final long currentEventId, final boolean getAllEvents,
+      @Nullable final NotificationFilter filter)
       throws MetastoreNotificationFetchException {
+    // no new events since we last polled
+    if (currentEventId <= eventId) {
+      return Collections.emptyList();
+    }
     final Timer.Context context = metrics_.getTimer(EVENTS_FETCH_DURATION_METRIC).time();
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
-      // fetch the current notification event id. We assume that the polling interval
-      // is small enough that most of these polling operations result in zero new
-      // events. In such a case, fetching current notification event id is much faster
-      // (and cheaper on HMS side) instead of polling for events directly
-      CurrentNotificationEventId currentNotificationEventId =
-          msClient.getHiveClient().getCurrentNotificationEventId();
-      long currentEventId = currentNotificationEventId.getEventId();
-
-      // no new events since we last polled
-      if (currentEventId <= eventId) {
-        return Collections.emptyList();
-      }
       int batchSize = getAllEvents ? -1 : EVENTS_BATCH_SIZE_PER_RPC;
       // we use the thrift API directly instead of
       // HiveMetastoreClient#getNextNotification because the HMS client can throw an
@@ -782,17 +1017,20 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
       NotificationEventRequest eventRequest = new NotificationEventRequest();
       eventRequest.setLastEvent(eventId);
       eventRequest.setMaxEvents(batchSize);
-      NotificationEventResponse response = msClient.getHiveClient().getThriftClient()
-          .get_next_notification(eventRequest);
-      LOG.info(String.format("Received %d events. Start event id : %d",
-          response.getEvents().size(), eventId));
+      // Currently filter is always null. No need to set table/db in the request object
+      NotificationEventResponse response =
+          MetastoreShim.getNextNotification(msClient.getHiveClient(), eventRequest,
+              catalog_.getDefaultSkippedHmsEventTypes());
+      LOG.info("Received {} events. First event id: {}.", response.getEvents().size(),
+          (response.getEvents().size() > 0 ? response.getEvents().get(0).getEventId() :
+                                             "none"));
       if (filter == null) return response.getEvents();
       List<NotificationEvent> filteredEvents = new ArrayList<>();
       for (NotificationEvent event : response.getEvents()) {
         if (filter.accept(event)) filteredEvents.add(event);
       }
       return filteredEvents;
-    } catch (TException e) {
+    } catch (MetastoreClientInstantiationException | TException e) {
       throw new MetastoreNotificationFetchException(
           "Unable to fetch notifications from metastore. Last synced event id is "
               + eventId, e);
@@ -808,7 +1046,20 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
   @VisibleForTesting
   protected List<NotificationEvent> getNextMetastoreEvents()
       throws MetastoreNotificationFetchException {
-    return getNextMetastoreEvents(lastSyncedEventId_.get(), false, null);
+    return getNextMetastoreEvents(getCurrentEventId());
+  }
+
+  /**
+   * Fetch the next batch of NotificationEvents from metastore. The default batch size is
+   * <code>EVENTS_BATCH_SIZE_PER_RPC</code>
+   * @param currentEventId Current event id on metastore
+   * @return List of NotificationEvents from metastore since lastSyncedEventId
+   * @throws MetastoreNotificationFetchException
+   */
+  @VisibleForTesting
+  public List<NotificationEvent> getNextMetastoreEvents(long currentEventId)
+      throws MetastoreNotificationFetchException {
+    return getNextMetastoreEvents(lastSyncedEventId_.get(), currentEventId, false, null);
   }
 
   /**
@@ -819,33 +1070,105 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
    */
   @Override
   public void processEvents() {
-    NotificationEvent lastProcessedEvent = null;
     try {
       EventProcessorStatus currentStatus = eventProcessorStatus_;
       if (currentStatus != EventProcessorStatus.ACTIVE) {
         LOG.warn(String.format(
             "Event processing is skipped since status is %s. Last synced event id is %d",
             currentStatus, lastSyncedEventId_.get()));
+        tryAutoGlobalInvalidateOnFailure();
         return;
       }
-
-      List<NotificationEvent> events = getNextMetastoreEvents();
-      processEvents(events);
+      // fetch the current notification event id. We assume that the polling interval
+      // is small enough that most of these polling operations result in zero new
+      // events. In such a case, fetching current notification event id is much faster
+      // (and cheaper on HMS side) instead of polling for events directly
+      long currentEventId = getCurrentEventId();
+      List<NotificationEvent> events = getNextMetastoreEvents(currentEventId);
+      processEvents(currentEventId, events);
     } catch (MetastoreNotificationFetchException ex) {
       // No need to change the EventProcessor state to error since we want the
       // EventProcessor to continue getting new events after HMS is back up.
       LOG.error("Unable to fetch the next batch of metastore events. Hive Metastore " +
         "may be unavailable. Will retry.", ex);
-    } catch(MetastoreNotificationNeedsInvalidateException ex) {
+    } catch (MetastoreNotificationNeedsInvalidateException ex) {
       updateStatus(EventProcessorStatus.NEEDS_INVALIDATE);
-      LOG.error("Event processing needs a invalidate command to resolve the state", ex);
+      String msg = "Event processing needs a invalidate command to resolve the state";
+      LOG.error(msg, ex);
+      eventProcessorErrorMsg_ = LocalDateTime.now().toString() + '\n' + msg + '\n' +
+          ExceptionUtils.getStackTrace(ex);
+      tryAutoGlobalInvalidateOnFailure();
     } catch (Exception ex) {
       // There are lot of Preconditions which can throw RuntimeExceptions when we
       // process events this catch all exception block is needed so that the scheduler
       // thread does not die silently
       updateStatus(EventProcessorStatus.ERROR);
-      LOG.error("Unexpected exception received while processing event", ex);
-      dumpEventInfoToLog(lastProcessedEvent);
+      String msg = "Unexpected exception received while processing event";
+      LOG.error(msg, ex);
+      eventProcessorErrorMsg_ = LocalDateTime.now().toString() + '\n' + msg + '\n' +
+          ExceptionUtils.getStackTrace(ex);
+      dumpEventInfoToLog(currentEvent_);
+      tryAutoGlobalInvalidateOnFailure();
+    }
+  }
+
+  /**
+   * This method does global invalidation when
+   * invalidate_global_metadata_on_event_processing_failure flag is enabled and the
+   * event processor is in error state or need invalidate state
+   */
+  private void tryAutoGlobalInvalidateOnFailure() {
+    EventProcessorStatus currentStatus = eventProcessorStatus_;
+    if (BackendConfig.INSTANCE.isInvalidateGlobalMetadataOnEventProcessFailureEnabled()
+        && ((currentStatus == EventProcessorStatus.ERROR)
+               || (currentStatus == EventProcessorStatus.NEEDS_INVALIDATE))) {
+      try {
+        LOG.error("Triggering auto global invalidation");
+        catalog_.reset(NoOpEventSequence.INSTANCE);
+        eventProcessorErrorMsg_ = null;
+      } catch (Exception e) {
+        // Catching generic exception so that scheduler thread does not die silently
+        LOG.error("Automatic global invalidate metadata failed", e);
+      }
+    }
+  }
+
+  /**
+   * Update the latest event id regularly so we know how far we are lagging behind.
+   */
+  @VisibleForTesting
+  public void updateLatestEventId() {
+    EventProcessorStatus currentStatus = eventProcessorStatus_;
+    if (currentStatus == EventProcessorStatus.DISABLED) {
+      return;
+    }
+    try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
+      CurrentNotificationEventId currentNotificationEventId =
+          msClient.getHiveClient().getCurrentNotificationEventId();
+      long currentEventId = currentNotificationEventId.getEventId();
+      // no new events since we last polled
+      if (currentEventId <= latestEventId_.get()) {
+        return;
+      }
+      // Fetch the last event to get its eventTime.
+      NotificationEvent event = getEventFromHMS(msClient, currentEventId);
+      // Events could be empty if they are just cleaned up.
+      if (event == null) return;
+      long lastSyncedEventId = lastSyncedEventId_.get();
+      long lastSyncedEventTime = lastSyncedEventTimeSecs_.get();
+      long currentEventTime = event.getEventTime();
+      latestEventId_.set(currentEventId);
+      latestEventTimeSecs_.set(currentEventTime);
+      LOG.info("Latest event in HMS: id={}, time={}. Last synced event: id={}, time={}.",
+          currentEventId, currentEventTime, lastSyncedEventId, lastSyncedEventTime);
+      if (currentEventTime > lastSyncedEventTime) {
+        LOG.warn("Lag: {}. {} events pending to be processed.",
+            PrintUtils.printTimeMs((currentEventTime - lastSyncedEventTime) * 1000),
+            currentEventId - lastSyncedEventId);
+      }
+    } catch (Exception e) {
+      LOG.error("Unable to update current notification event id. Last value: {}",
+          latestEventId_, e);
     }
   }
 
@@ -860,25 +1183,48 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
     eventProcessorMetrics.setStatus(currentStatus.toString());
     eventProcessorMetrics.setLast_synced_event_id(getLastSyncedEventId());
     if (currentStatus != EventProcessorStatus.ACTIVE) return eventProcessorMetrics;
+    // The following counters are only updated when event-processor is active.
+    eventProcessorMetrics.setLast_synced_event_time(lastSyncedEventTimeSecs_.get());
+    eventProcessorMetrics.setLatest_event_id(latestEventId_.get());
+    eventProcessorMetrics.setLatest_event_time(latestEventTimeSecs_.get());
 
     long eventsReceived = metrics_.getMeter(EVENTS_RECEIVED_METRIC).getCount();
     long eventsSkipped = metrics_.getCounter(EVENTS_SKIPPED_METRIC).getCount();
-    double avgFetchDuration =
-        metrics_.getTimer(EVENTS_FETCH_DURATION_METRIC).getMeanRate();
-    double avgProcessDuration =
-        metrics_.getTimer(EVENTS_PROCESS_DURATION_METRIC).getMeanRate();
+    eventProcessorMetrics.setEvents_received(eventsReceived);
+    eventProcessorMetrics.setEvents_skipped(eventsSkipped);
+
+    Snapshot fetchDuration =
+        metrics_.getTimer(EVENTS_FETCH_DURATION_METRIC).getSnapshot();
+    double avgFetchDuration = fetchDuration.getMean() / SECOND_IN_NANOS;
+    double p75FetchDuration = fetchDuration.get75thPercentile() / SECOND_IN_NANOS;
+    double p95FetchDuration = fetchDuration.get95thPercentile() / SECOND_IN_NANOS;
+    double p99FetchDuration = fetchDuration.get99thPercentile() / SECOND_IN_NANOS;
+    eventProcessorMetrics.setEvents_fetch_duration_mean(avgFetchDuration);
+    eventProcessorMetrics.setEvents_fetch_duration_p75(p75FetchDuration);
+    eventProcessorMetrics.setEvents_fetch_duration_p95(p95FetchDuration);
+    eventProcessorMetrics.setEvents_fetch_duration_p99(p99FetchDuration);
+
+    Snapshot processDuration =
+        metrics_.getTimer(EVENTS_PROCESS_DURATION_METRIC).getSnapshot();
+    double avgProcessDuration = processDuration.getMean() / SECOND_IN_NANOS;
+    double p75ProcessDuration = processDuration.get75thPercentile() / SECOND_IN_NANOS;
+    double p95ProcessDuration = processDuration.get95thPercentile() / SECOND_IN_NANOS;
+    double p99ProcessDuration = processDuration.get99thPercentile() / SECOND_IN_NANOS;
+    eventProcessorMetrics.setEvents_process_duration_mean(avgProcessDuration);
+    eventProcessorMetrics.setEvents_process_duration_p75(p75ProcessDuration);
+    eventProcessorMetrics.setEvents_process_duration_p95(p95ProcessDuration);
+    eventProcessorMetrics.setEvents_process_duration_p99(p99ProcessDuration);
+
+    double lastProcessDuration = lastEventProcessDurationNs_.get() /
+        (double) SECOND_IN_NANOS;
+    eventProcessorMetrics.setLast_events_process_duration(lastProcessDuration);
+
     double avgNumberOfEventsReceived1Min =
         metrics_.getMeter(EVENTS_RECEIVED_METRIC).getOneMinuteRate();
     double avgNumberOfEventsReceived5Min =
         metrics_.getMeter(EVENTS_RECEIVED_METRIC).getFiveMinuteRate();
     double avgNumberOfEventsReceived15Min =
         metrics_.getMeter(EVENTS_RECEIVED_METRIC).getFifteenMinuteRate();
-
-
-    eventProcessorMetrics.setEvents_received(eventsReceived);
-    eventProcessorMetrics.setEvents_skipped(eventsSkipped);
-    eventProcessorMetrics.setEvents_fetch_duration_mean(avgFetchDuration);
-    eventProcessorMetrics.setEvents_process_duration_mean(avgProcessDuration);
     eventProcessorMetrics.setEvents_received_1min_rate(avgNumberOfEventsReceived1Min);
     eventProcessorMetrics.setEvents_received_5min_rate(avgNumberOfEventsReceived5Min);
     eventProcessorMetrics.setEvents_received_15min_rate(avgNumberOfEventsReceived15Min);
@@ -895,6 +1241,38 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
     TEventProcessorMetricsSummaryResponse summaryResponse =
         new TEventProcessorMetricsSummaryResponse();
     summaryResponse.setSummary(metrics_.toString());
+    if (eventProcessorErrorMsg_ != null) {
+      summaryResponse.setError_msg(eventProcessorErrorMsg_);
+    }
+    TEventBatchProgressInfo progressInfo = new TEventBatchProgressInfo();
+    progressInfo.last_synced_event_id = lastSyncedEventId_.get();
+    progressInfo.last_synced_event_time_s = lastSyncedEventTimeSecs_.get();
+    progressInfo.latest_event_id = latestEventId_.get();
+    progressInfo.latest_event_time_s = latestEventTimeSecs_.get();
+    // Assign these lists to local variables in case they are replaced concurrently.
+    // It's best effort to make the members in 'progressInfo' consistent but we can't
+    // guarantee it.
+    List<NotificationEvent> eventBatch = currentEventBatch_;
+    List<MetastoreEvent> filteredEvents = currentFilteredEvents_;
+    if (eventBatch != null && !eventBatch.isEmpty()) {
+      int numHmsEvents = eventBatch.size();
+      progressInfo.num_hms_events = numHmsEvents;
+      progressInfo.min_event_id = eventBatch.get(0).getEventId();
+      progressInfo.min_event_time_s = eventBatch.get(0).getEventTime();
+      NotificationEvent lastEvent = eventBatch.get(numHmsEvents - 1);
+      progressInfo.max_event_id = lastEvent.getEventId();
+      progressInfo.max_event_time_s = lastEvent.getEventTime();
+      progressInfo.current_batch_start_time_ms = currentBatchStartTimeMs_;
+      progressInfo.current_event_start_time_ms = currentEventStartTimeMs_;
+      if (filteredEvents != null) {
+        progressInfo.num_filtered_events = filteredEvents.size();
+      }
+      progressInfo.current_event_index = currentEventIndex_;
+      progressInfo.current_event_batch_size = currentFilteredEvent_ != null ?
+          currentFilteredEvent_.getNumberOfEvents() : 0;
+      progressInfo.current_event = currentEvent_;
+    }
+    summaryResponse.setProgress(progressInfo);
     return summaryResponse;
   }
 
@@ -903,27 +1281,53 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
     return metrics_;
   }
 
+  private void resetProgressInfo() {
+    currentEvent_ = null;
+    currentEventBatch_ = null;
+    currentFilteredEvent_ = null;
+    currentFilteredEvents_ = null;
+    currentBatchStartTimeMs_ = 0;
+    currentEventStartTimeMs_ = 0;
+    currentEventIndex_ = 0;
+  }
+
   /**
    * Process the given list of notification events. Useful for tests which provide a list
    * of events
+   * @param currentEventId Current event id on metastore
+   * @param events List of NotificationEvents
+   * @throws MetastoreNotificationException
    */
   @VisibleForTesting
-  protected void processEvents(List<NotificationEvent> events)
+  protected void processEvents(long currentEventId, List<NotificationEvent> events)
       throws MetastoreNotificationException {
-    NotificationEvent lastProcessedEvent = null;
+    currentEventBatch_ = events;
     // update the events received metric before returning
     metrics_.getMeter(EVENTS_RECEIVED_METRIC).mark(events.size());
-    if (events.isEmpty()) return;
+    if (events.isEmpty()) {
+      if (lastSyncedEventId_.get() < currentEventId) {
+        // Possible to receive empty list due to event skip list in notification event
+        // request. Update the last synced event id with current event id on metastore
+        lastSyncedEventId_.set(currentEventId);
+        lastSyncedEventTimeSecs_.set(getEventTimeFromHMS(currentEventId));
+      }
+      return;
+    }
     final Timer.Context context =
         metrics_.getTimer(EVENTS_PROCESS_DURATION_METRIC).time();
+    currentBatchStartTimeMs_ = System.currentTimeMillis();
+    Map<MetastoreEvent, Long> eventProcessingTime = new HashMap<>();
     try {
-      List<MetastoreEvent> filteredEvents =
+      currentFilteredEvents_ =
           metastoreEventFactory_.getFilteredEvents(events, metrics_);
-      if (filteredEvents.isEmpty()) {
-        lastSyncedEventId_.set(events.get(events.size() - 1).getEventId());
+      if (currentFilteredEvents_.isEmpty()) {
+        NotificationEvent e = events.get(events.size() - 1);
+        lastSyncedEventId_.set(e.getEventId());
+        lastSyncedEventTimeSecs_.set(e.getEventTime());
+        resetProgressInfo();
         return;
       }
-      for (MetastoreEvent event : filteredEvents) {
+      for (MetastoreEvent event : currentFilteredEvents_) {
         // synchronizing each event processing reduces the scope of the lock so the a
         // potential reset() during event processing is not blocked for longer than
         // necessary
@@ -931,31 +1335,101 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
           if (eventProcessorStatus_ != EventProcessorStatus.ACTIVE) {
             break;
           }
-          lastProcessedEvent = event.metastoreNotificationEvent_;
-          event.processIfEnabled();
+          currentEvent_ = event.metastoreNotificationEvent_;
+          currentFilteredEvent_ = event;
+          String targetName = event.getTargetName();
+          String desc = String.format("Processing %s on %s, eventId=%d",
+              event.getEventType(), targetName, event.getEventId());
+          try (ThreadNameAnnotator tna = new ThreadNameAnnotator(desc)) {
+            currentEventStartTimeMs_ = System.currentTimeMillis();
+            event.processIfEnabled();
+            long elapsedTimeMs = System.currentTimeMillis() - currentEventStartTimeMs_;
+            eventProcessingTime.put(event, elapsedTimeMs);
+          } catch (Exception processingEx) {
+            try {
+              if (!event.onFailure(processingEx)) {
+                event.errorLog("Unable to handle event processing failure");
+                throw processingEx;
+              }
+            } catch (Exception onFailureEx) {
+              event.errorLog("Failed to handle event processing failure", onFailureEx);
+              throw processingEx;
+            }
+          }
+          currentEventIndex_++;
           deleteEventLog_.garbageCollect(event.getEventId());
           lastSyncedEventId_.set(event.getEventId());
+          lastSyncedEventTimeSecs_.set(event.getEventTime());
+          metrics_.getTimer(AVG_DELAY_IN_CONSUMING_EVENTS).update(
+              (System.currentTimeMillis() / 1000) - event.getEventTime(),
+                  TimeUnit.SECONDS);
         }
       }
+      resetProgressInfo();
     } catch (CatalogException e) {
       throw new MetastoreNotificationException(String.format(
           "Unable to process event %d of type %s. Event processing will be stopped.",
-          lastProcessedEvent.getEventId(), lastProcessedEvent.getEventType()), e);
+          currentEvent_.getEventId(), currentEvent_.getEventType()), e);
     } finally {
-      context.stop();
+      long elapsedNs = context.stop();
+      lastEventProcessDurationNs_.set(elapsedNs);
+      logEventMetrics(eventProcessingTime, elapsedNs);
     }
+  }
+
+  private void logEventMetrics(Map<MetastoreEvent, Long> eventProcessingTime,
+      long elapsedNs) {
+    LOG.info("Time elapsed in processing event batch: {}",
+        PrintUtils.printTimeNs(elapsedNs));
+    // Only log the metrics when the processing on this batch is slow.
+    if (elapsedNs < HdfsTable.LOADING_WARNING_TIME_NS) return;
+    // Get the top-10 expensive events
+    List<Map.Entry<MetastoreEvent, Long>> eventList =
+        new ArrayList<>(eventProcessingTime.entrySet());
+    eventList.sort(Map.Entry.<MetastoreEvent, Long>comparingByValue().reversed());
+    int num = Math.min(10, eventList.size());
+    StringBuilder report = new StringBuilder("Top " + num + " expensive events: ");
+    for (Map.Entry<MetastoreEvent, Long> entry : eventList.subList(0, num)) {
+      MetastoreEvent event = entry.getKey();
+      long durationMs = entry.getValue();
+      report.append(String.format("(type=%s, id=%s, target=%s, duration_ms=%d) ",
+          event.getEventType(), event.getEventId(), event.getTargetName(), durationMs));
+    }
+    // Get the top-10 expensive targets
+    Map<String, Long> durationPerTable = new HashMap<>();
+    for (MetastoreEvent event : eventProcessingTime.keySet()) {
+      String targetName = event.getTargetName();
+      long durationMs = durationPerTable.getOrDefault(targetName, 0L) +
+          eventProcessingTime.get(event);
+      durationPerTable.put(targetName, durationMs);
+    }
+    List<Map.Entry<String, Long>> targetList =
+        new ArrayList<>(durationPerTable.entrySet());
+    targetList.sort(Map.Entry.<String, Long>comparingByValue().reversed());
+    num = Math.min(10, targetList.size());
+    report.append("\nTop ").append(num).append(" targets in event processing: ");
+    for (Map.Entry<String, Long> entry : targetList.subList(0, num)) {
+      String targetName = entry.getKey();
+      long durationMs = entry.getValue();
+      report.append(String.format("(target=%s, duration_ms=%d) ",
+          targetName, durationMs));
+    }
+    LOG.warn(report.toString());
   }
 
   /**
    * Updates the current states to the given status.
    */
-  private synchronized void updateStatus(EventProcessorStatus toStatus) {
+  @VisibleForTesting
+  public synchronized void updateStatus(EventProcessorStatus toStatus) {
     eventProcessorStatus_ = toStatus;
   }
 
   private void dumpEventInfoToLog(NotificationEvent event) {
     if (event == null) {
-      LOG.error("Notification event is null");
+      String error = "Notification event is null";
+      LOG.error(error);
+      eventProcessorErrorMsg_ += '\n' + error;
       return;
     }
     StringBuilder msg =
@@ -967,7 +1441,9 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
       msg.append("Table name: ").append(event.getTableName()).append("\n");
     }
     msg.append("Event message: ").append(event.getMessage()).append("\n");
-    LOG.error(msg.toString());
+    String msgStr = msg.toString();
+    LOG.error(msgStr);
+    eventProcessorErrorMsg_ += '\n' + msgStr;
   }
 
   /**
@@ -1000,5 +1476,49 @@ public class MetastoreEventsProcessor implements ExternalEventsProcessor {
 
   public static MessageDeserializer getMessageDeserializer() {
     return MESSAGE_DESERIALIZER;
+  }
+
+  public static class MetaDataFilter {
+    public NotificationFilter filter_;
+    public String catName_;
+    public String dbName_;
+    public String tableName_;
+
+    public MetaDataFilter(NotificationFilter notificationFilter) {
+      this.filter_ = notificationFilter; // if this null then don't build event filter
+    }
+
+    public MetaDataFilter(NotificationFilter notificationFilter, String catName,
+        String dbName) {
+      this(notificationFilter);
+      this.catName_ = Preconditions.checkNotNull(catName);
+      this.dbName_ = Preconditions.checkNotNull(dbName);
+    }
+
+    public MetaDataFilter(NotificationFilter notificationFilter, String catName,
+        String databaseName, String tblName) {
+      this(notificationFilter, catName, databaseName);
+      this.tableName_ = tblName;
+    }
+
+    public void setNotificationFilter(NotificationFilter notificationFilter) {
+      this.filter_ = notificationFilter;
+    }
+
+    public NotificationFilter getNotificationFilter() {
+      return filter_;
+    }
+
+    public String getCatName() {
+      return catName_;
+    }
+
+    public String getDbName() {
+      return dbName_;
+    }
+
+    public String getTableName() {
+      return tableName_;
+    }
   }
 }

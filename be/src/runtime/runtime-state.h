@@ -104,6 +104,9 @@ class RuntimeState {
   bool strict_mode() const { return query_options().strict_mode; }
   bool utf8_mode() const { return query_options().utf8_mode; }
   bool decimal_v2() const { return query_options().decimal_v2; }
+  bool abort_java_udf_on_exception() const {
+     return query_options().abort_java_udf_on_exception;
+  }
   const TQueryCtx& query_ctx() const;
   const TPlanFragment& fragment() const { return *fragment_; }
   const TPlanFragmentInstanceCtx& instance_ctx() const { return *instance_ctx_; }
@@ -120,9 +123,6 @@ class RuntimeState {
   const Timezone* local_time_zone() const { return local_time_zone_; }
   const Timezone* time_zone_for_unix_time_conversions() const {
     return time_zone_for_unix_time_conversions_;
-  }
-  const Timezone* time_zone_for_legacy_parquet_time_conversions() const {
-    return time_zone_for_legacy_parquet_time_conversions_;
   }
   const TUniqueId& query_id() const { return query_ctx().query_id; }
   const TUniqueId& fragment_instance_id() const {
@@ -161,6 +161,15 @@ class RuntimeState {
       return query_status_;
     }
     return Status::OK();
+  }
+
+  /// Return maximum number of non-fatal error to report to client through coordinator.
+  /// max_errors does not indicate how many errors in total have been recorded, but rather
+  /// how many are distinct. It is defined as the sum of the number of generic errors and
+  /// the number of distinct other errors. Default to 100 if non-positive number is
+  /// specified in max_errors query option.
+  inline int max_errors() const {
+    return query_options().max_errors <= 0 ? 100 : query_options().max_errors;
   }
 
   /// Log an error that will be sent back to the coordinator based on an instance of the
@@ -315,6 +324,9 @@ class RuntimeState {
   /// Logs error messages.
   ErrorLogMap error_log_;
 
+  /// Track how many error has been printed to VLOG(1).
+  int64_t vlog_1_errors = 0;
+
   /// Global QueryState and original thrift descriptors for this fragment instance.
   QueryState* const query_state_;
   const TPlanFragment* const fragment_;
@@ -343,11 +355,6 @@ class RuntimeState {
   /// if use_local_tz_for_unix_timestamp_conversions=1, then the local_time_zone_ is used
   /// instead.
   const Timezone* time_zone_for_unix_time_conversions_;
-
-  /// Query-global timezone used to read INT96 timestamps written by Hive. UTC by default,
-  /// but if convert_legacy_hive_parquet_utc_timestamps=1, then the local_time_zone_ is
-  /// used instead.
-  const Timezone* time_zone_for_legacy_parquet_time_conversions_;
 
   /// Thread resource management object for this fragment's execution.  The runtime
   /// state is responsible for returning this pool to the thread mgr.

@@ -63,7 +63,8 @@ static bool IndicateTimestampParseFailure(date* d, time_duration* t) {
 }
 
 bool TimestampParser::ParseSimpleDateFormat(const char* str, int len,
-    boost::gregorian::date* d, boost::posix_time::time_duration* t) {
+    boost::gregorian::date* d, boost::posix_time::time_duration* t,
+    bool accept_time_toks_only) {
   DCHECK(d != nullptr);
   DCHECK(t != nullptr);
   if (UNLIKELY(str == nullptr)) return IndicateTimestampParseFailure(d, t);
@@ -100,7 +101,8 @@ bool TimestampParser::ParseSimpleDateFormat(const char* str, int len,
       SimpleDateFormatTokenizer::DEFAULT_DATE_TIME_FMT_LEN);
   // Determine the default formatting context that's required for parsing.
   const DateTimeFormatContext* dt_ctx =
-      SimpleDateFormatTokenizer::GetDefaultFormatContext(str, default_fmt_len, true);
+      SimpleDateFormatTokenizer::GetDefaultFormatContext(
+          str, default_fmt_len, true, accept_time_toks_only);
   if (dt_ctx != nullptr) {
     return ParseSimpleDateFormat(str, default_fmt_len, *dt_ctx, d, t);
   }
@@ -223,6 +225,33 @@ bool TimestampParser::ParseIsoSqlFormat(const char* str, int len,
     return IndicateTimestampParseFailure(d, t);
   }
   return true;
+}
+
+// Formats date and time into dst using the default format
+// Short:   yyyy-MM-dd HH:mm:ss
+//  Long:   yyyy-MM-dd HH:mm:ss.SSSSSSSSS
+// Offsets: 01234567890123456789012345678
+
+int TimestampParser::FormatDefault(const date& d, const time_duration& t, char* dst) {
+  if (UNLIKELY(d.is_special() || t.is_special())) return -1;
+  const auto ymd = d.year_month_day();
+  ZeroPad(dst, ymd.year, 4);
+  ZeroPad(dst + 5, ymd.month, 2);
+  ZeroPad(dst + 8, ymd.day, 2);
+  const auto tot_sec = t.total_seconds();
+  ZeroPad(dst + 11, tot_sec / 3600, 2);
+  ZeroPad(dst + 14, (tot_sec / 60) % 60, 2);
+  ZeroPad(dst + 17, tot_sec % 60, 2);
+  dst[7] = dst[4] = '-';
+  dst[10] = ' ';
+  dst[16] = dst[13] = ':';
+
+  if (LIKELY(t.fractional_seconds() > 0)) {
+    dst[19] = '.';
+    ZeroPad(dst + 20, t.fractional_seconds(), 9);
+    return SimpleDateFormatTokenizer::DEFAULT_DATE_TIME_FMT_LEN;
+  }
+  return SimpleDateFormatTokenizer::DEFAULT_SHORT_DATE_TIME_FMT_LEN;
 }
 
 int TimestampParser::Format(const DateTimeFormatContext& dt_ctx, const date& d,

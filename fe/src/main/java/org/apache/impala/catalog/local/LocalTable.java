@@ -27,6 +27,7 @@ import com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.hive.common.ValidWriteIdList;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
+import org.apache.hadoop.hive.metastore.api.PrincipalType;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.catalog.ArrayType;
@@ -41,22 +42,30 @@ import org.apache.impala.catalog.IcebergColumn;
 import org.apache.impala.catalog.IcebergStructField;
 import org.apache.impala.catalog.IcebergTable;
 import org.apache.impala.catalog.KuduTable;
+import org.apache.impala.catalog.SideloadTableStats;
 import org.apache.impala.catalog.SqlConstraints;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
+import org.apache.impala.catalog.SystemTable;
 import org.apache.impala.catalog.TableLoadingException;
+import org.apache.impala.catalog.VirtualColumn;
 import org.apache.impala.catalog.local.MetaProvider.TableMetaRef;
 import org.apache.impala.common.Pair;
+import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.service.MetadataOp;
 import org.apache.impala.thrift.TCatalogObjectType;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TTableStats;
 import org.apache.impala.util.AcidUtils;
-import org.apache.log4j.Logger;
 import org.apache.thrift.TException;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Table instance loaded from {@link LocalCatalog}.
@@ -65,17 +74,28 @@ import com.google.common.collect.Lists;
  * each catalog instance.
  */
 abstract class LocalTable implements FeTable {
-  private static final Logger LOG = Logger.getLogger(LocalTable.class);
+  private static final Logger LOG = LoggerFactory.getLogger(LocalTable.class);
 
   protected final LocalDb db_;
   /** The lower-case name of the table. */
   protected final String name_;
+  protected final TImpalaTableType tableType_;
+  protected final String tableComment_;
 
   private final ColumnMap cols_;
 
   protected final Table msTable_;
 
   private final TTableStats tableStats_;
+
+  // Virtual columns of this table.
+  protected final ArrayList<VirtualColumn> virtualCols_ = new ArrayList<>();
+
+  // Test only stats that will be injected in place of stats obtained from HMS.
+  protected SideloadTableStats testStats_ = null;
+
+  // Scale factor to multiply table stats with. Only used for testing.
+  protected double testMetadataScale_ = 1.0;
 
   /**
    * Table reference as provided by the initial call to the metadata provider.
@@ -91,10 +111,15 @@ abstract class LocalTable implements FeTable {
   protected final TableMetaRef ref_;
 
   public static LocalTable load(LocalDb db, String tblName) throws TableLoadingException {
+    Pair<Table, TableMetaRef> tableMeta = loadTableMetadata(db, tblName);
+    return load(db, tableMeta);
+  }
+
+  public static LocalTable load(LocalDb db, Pair<Table, TableMetaRef> tableMeta)
+      throws TableLoadingException {
     // In order to know which kind of table subclass to instantiate, we need
     // to eagerly grab and parse the top-level Table object from the HMS.
     LocalTable t = null;
-    Pair<Table, TableMetaRef> tableMeta = loadTableMetadata(db, tblName);
     Table msTbl = tableMeta.first;
     TableMetaRef ref = tableMeta.second;
     if (TableType.valueOf(msTbl.getTableType()) == TableType.VIRTUAL_VIEW) {
@@ -104,9 +129,11 @@ abstract class LocalTable implements FeTable {
     } else if (KuduTable.isKuduTable(msTbl)) {
       t = LocalKuduTable.loadFromKudu(db, msTbl, ref);
     } else if (IcebergTable.isIcebergTable(msTbl)) {
-      t = LocalIcebergTable.loadFromIceberg(db, msTbl, ref);
+      t = LocalIcebergTable.loadIcebergTableViaMetaProvider(db, msTbl, ref);
     } else if (DataSourceTable.isDataSourceTable(msTbl)) {
-      // TODO(todd) support datasource table
+      t = LocalDataSourceTable.load(db, msTbl, ref);
+    } else if (SystemTable.isSystemTable(msTbl)) {
+      t = LocalSystemTable.load(db, msTbl, ref);
     } else if (HdfsFileFormat.isHdfsInputFormatClass(
         msTbl.getSd().getInputFormat())) {
       t = LocalFsTable.load(db, msTbl, ref);
@@ -114,7 +141,7 @@ abstract class LocalTable implements FeTable {
 
     if (t == null) {
       throw new LocalCatalogException("Unknown table type for table " +
-          db.getName() + "." + tblName);
+          db.getName() + "." + msTbl.getTableName());
     }
 
     // TODO(todd): it would be preferable to only load stats for those columns
@@ -145,14 +172,27 @@ abstract class LocalTable implements FeTable {
   public LocalTable(LocalDb db, Table msTbl, TableMetaRef ref, ColumnMap cols) {
     this.db_ = Preconditions.checkNotNull(db);
     this.name_ = msTbl.getTableName();
+    this.tableType_ = MetastoreShim.mapToInternalTableType(msTbl.getTableType());
+    this.tableComment_ = MetadataOp.getTableComment(msTbl);
     this.cols_ = cols;
     this.ref_ = ref;
     this.msTable_ = msTbl;
 
-    tableStats_ = new TTableStats(
-        FeCatalogUtils.getRowCount(msTable_.getParameters()));
-    tableStats_.setTotal_file_bytes(
-        FeCatalogUtils.getTotalSize(msTable_.getParameters()));
+    if (RuntimeEnv.INSTANCE.hasSideloadStats(db.getName(), name_)) {
+      testStats_ = RuntimeEnv.INSTANCE.getSideloadStats(db.getName(), name_);
+    }
+
+    tableStats_ = new TTableStats(-1);
+    long rowCount = FeCatalogUtils.getRowCount(msTable_.getParameters());
+    if (testStats_ != null) {
+      tableStats_.setTotal_file_bytes(testStats_.getTotalSize());
+      testMetadataScale_ = (double) testStats_.getNumRows() / rowCount;
+      rowCount = testStats_.getNumRows();
+    } else {
+      tableStats_.setTotal_file_bytes(
+          FeCatalogUtils.getTotalSize(msTable_.getParameters()));
+    }
+    tableStats_.setNum_rows(rowCount);
   }
 
   public LocalTable(LocalDb db, Table msTbl, TableMetaRef ref) {
@@ -162,12 +202,21 @@ abstract class LocalTable implements FeTable {
   protected LocalTable(LocalDb db, String tblName) {
     this.db_ = Preconditions.checkNotNull(db);
     this.name_ = tblName;
+    this.tableType_ = TImpalaTableType.TABLE;
+    this.tableComment_ = null;
     this.ref_ = null;
     this.msTable_ = null;
     this.cols_ = null;
     this.tableStats_ = null;
   }
 
+  protected void addVirtualColumns(List<VirtualColumn> virtualColumns) {
+    for (VirtualColumn virtCol : virtualColumns) addVirtualColumn(virtCol);
+  }
+
+  protected void addVirtualColumn(VirtualColumn col) {
+    virtualCols_.add(col);
+  }
 
   @Override
   public boolean isLoaded() {
@@ -181,8 +230,11 @@ abstract class LocalTable implements FeTable {
 
   @Override
   public String getOwnerUser() {
-    if (msTable_ == null) return null;
-    return msTable_.getOwner();
+    if (msTable_ == null) {
+      LOG.warn("Owner of {} is unknown due to msTable is unloaded", getFullName());
+      return null;
+    }
+    return msTable_.getOwnerType() == PrincipalType.USER ? msTable_.getOwner() : null;
   }
 
   @Override
@@ -212,6 +264,16 @@ abstract class LocalTable implements FeTable {
   }
 
   @Override
+  public TImpalaTableType getTableType() {
+    return tableType_;
+  }
+
+  @Override
+  public String getTableComment() {
+    return tableComment_;
+  }
+
+  @Override
   public List<Column> getColumns() {
     return cols_ == null ? Collections.emptyList() : cols_.colsByPos_;
   }
@@ -224,8 +286,9 @@ abstract class LocalTable implements FeTable {
   @Override
   public List<Column> getColumnsInHiveOrder() {
     List<Column> columns = Lists.newArrayList(getNonClusteringColumns());
+    columns = filterColumnsNotStoredInHms(columns);
     columns.addAll(getClusteringColumns());
-    return columns;
+    return Collections.unmodifiableList(columns);
   }
 
   @Override
@@ -242,6 +305,9 @@ abstract class LocalTable implements FeTable {
   public List<Column> getNonClusteringColumns() {
     return cols_ == null ? Collections.emptyList() : cols_.getNonClusteringColumns();
   }
+
+  @Override
+  public List<VirtualColumn> getVirtualColumns() { return virtualCols_; }
 
   @Override
   public int getNumClusteringCols() {
@@ -288,15 +354,29 @@ abstract class LocalTable implements FeTable {
     return null;
   }
 
+  @Override
+  public long getCatalogVersion() {
+    if (ref_ == null) return 0;
+    return ref_.getCatalogVersion();
+  }
+
+  @Override
+  public long getLastLoadedTimeMs() {
+    if (ref_ == null) return 0;
+    return ref_.getLoadedTimeMs();
+  }
+
   protected void loadColumnStats() {
     try {
       List<ColumnStatisticsObj> stats = db_.getCatalog().getMetaProvider()
           .loadTableColumnStatistics(ref_, getColumnNames());
-      FeCatalogUtils.injectColumnStats(stats, this);
+      FeCatalogUtils.injectColumnStats(stats, this, testStats_);
     } catch (TException e) {
       LOG.warn("Could not load column statistics for: " + getFullName(), e);
     }
   }
+
+  protected double getDebugMetadataScale() { return testMetadataScale_; }
 
   protected static class ColumnMap {
     private final ArrayType type_;
@@ -315,9 +395,8 @@ abstract class LocalTable implements FeTable {
       // then all other columns.
       List<Column> cols;
       try {
+        cols = FeCatalogUtils.fieldSchemasToColumns(msTbl);
         boolean isFullAcidTable = AcidUtils.isFullAcidTable(msTbl.getParameters());
-        cols = FeCatalogUtils.fieldSchemasToColumns(msTbl.getPartitionKeys(),
-            msTbl.getSd().getCols(), msTbl.getTableName(), isFullAcidTable);
         return new ColumnMap(cols, numClusteringCols, fullName, isFullAcidTable);
       } catch (TableLoadingException e) {
         throw new LocalCatalogException(e);

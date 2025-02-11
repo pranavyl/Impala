@@ -45,7 +45,7 @@ Status ChildQuery::ExecAndFetch() {
   ImpalaServer::TUniqueIdToTHandleIdentifier(session_id, session_secret,
       &exec_stmt_req.sessionHandle.sessionId);
   exec_stmt_req.__set_statement(query_);
-  SetQueryOptions(parent_request_state_->exec_request().query_options, &exec_stmt_req);
+  SetQueryOptions(&exec_stmt_req);
   exec_stmt_req.confOverlay[PARENT_QUERY_OPT] =
       PrintId(parent_request_state_->query_id());
 
@@ -126,36 +126,18 @@ Status ChildQuery::ExecAndFetch() {
   return status;
 }
 
-template <typename T>
-void PrintQueryOptionValue (const T& option, stringstream& val) {
-  val << option;
-}
-
-void PrintQueryOptionValue(const impala::TCompressionCodec& compression_codec,
-    stringstream& val) {
-  if (compression_codec.codec != THdfsCompression::ZSTD) {
-    val << compression_codec.codec;
-  } else {
-    val << compression_codec.codec << ":" << compression_codec.compression_level;
-  }
-}
-
-void ChildQuery::SetQueryOptions(const TQueryOptions& parent_options,
-    TExecuteStatementReq* exec_stmt_req) {
+void ChildQuery::SetQueryOptions(TExecuteStatementReq* exec_stmt_req) {
   map<string, string> conf;
-#define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
-  if (parent_options.__isset.NAME) {\
-    stringstream val;\
-    PrintQueryOptionValue(parent_options.NAME, val);\
-    conf[#ENUM] = val.str();\
-  }
-#define REMOVED_QUERY_OPT_FN(NAME, ENUM)
-  QUERY_OPTS_TABLE
-#undef QUERY_OPT_FN
-#undef REMOVED_QUERY_OPT_FN
+  TQueryOptionsToMap(parent_request_state_->exec_request().query_options, &conf);
   // Ignore debug actions on child queries because they may cause deadlock.
   map<string, string>::iterator it = conf.find("DEBUG_ACTION");
   if (it != conf.end()) conf.erase(it);
+
+  if (parent_request_state_->exec_request().request_pool_set_by_frontend) {
+    // Remove REQUEST_POOL if this option was set by Frontend auto-scaling.
+    it = conf.find("REQUEST_POOL");
+    if (it != conf.end()) conf.erase(it);
+  }
   exec_stmt_req->__set_confOverlay(conf);
 }
 
@@ -167,26 +149,28 @@ void ChildQuery::Cancel() {
     if (!is_running_) return;
     is_running_ = false;
   }
-  TUniqueId session_id;
+  TUniqueId query_id;
   TUniqueId secret_unused;
   // Ignore return statuses because they are not actionable.
-  Status status = ImpalaServer::THandleIdentifierToTUniqueId(hs2_handle_.operationId,
-      &session_id, &secret_unused);
+  Status status = ImpalaServer::THandleIdentifierToTUniqueId(
+      hs2_handle_.operationId, &query_id, &secret_unused);
   if (status.ok()) {
-    VLOG_QUERY << "Cancelling and closing child query with operation id: " <<
-        PrintId(session_id);
+    VLOG_QUERY << "Cancelling and closing child query with operation id: "
+               << PrintId(query_id);
   } else {
-    VLOG_QUERY << "Cancelling and closing child query. Failed to get query id: " <<
-        status;
+    VLOG_QUERY << "Cancelling and closing child query. Failed to get query id: "
+               << status;
   }
-  TCancelOperationResp cancel_resp;
-  TCancelOperationReq cancel_req;
-  cancel_req.operationHandle = hs2_handle_;
-  parent_server_->CancelOperation(cancel_resp, cancel_req);
-  TCloseOperationResp close_resp;
-  TCloseOperationReq close_req;
-  close_req.operationHandle = hs2_handle_;
-  parent_server_->CloseOperation(close_resp, close_req);
+  // Bypass the HS2 layer so that the session of the child query will not be added to
+  // the connection of the caller of ChildQuery::Cancel().
+  status = parent_server_->CancelInternal(query_id);
+  if (!status.ok()) {
+    LOG(ERROR) << "Failed to cancel child query: " << status.GetDetail();
+  }
+  status = parent_server_->UnregisterQuery(query_id, true, &Status::CANCELLED);
+  if (!status.ok()) {
+    LOG(ERROR) << "Failed to unregister child query: " << status.GetDetail();
+  }
 }
 
 Status ChildQuery::IsCancelled() {

@@ -17,6 +17,8 @@
 
 # This module is used for common utilities related to parsing test files
 
+from __future__ import absolute_import, division, print_function
+from builtins import map
 import codecs
 import collections
 import logging
@@ -32,6 +34,8 @@ LOG = logging.getLogger('impala_test_suite')
 # constants
 SECTION_DELIMITER = "===="
 SUBSECTION_DELIMITER = "----"
+ALLOWED_TABLE_FORMATS = ['kudu', 'parquet', 'orc']
+
 
 # The QueryTestSectionReader provides utility functions that help to parse content
 # from a query test file
@@ -71,16 +75,18 @@ class QueryTestSectionReader(object):
     elif table_format.compression_codec == 'none':
       suffix = '_%s' % (table_format.file_format)
     elif table_format.compression_type == 'record':
-      suffix =  '_%s_record_%s' % (table_format.file_format,
+      suffix = '_%s_record_%s' % (table_format.file_format,
                                    table_format.compression_codec)
     else:
-      suffix =  '_%s_%s' % (table_format.file_format, table_format.compression_codec)
+      suffix = '_%s_%s' % (table_format.file_format, table_format.compression_codec)
     dataset = table_format.dataset.replace('-', '')
     return dataset + scale_factor + suffix
 
 
 def remove_comments(section_text):
-  return '\n'.join([l for l in section_text.split('\n') if not l.strip().startswith('#')])
+  lines = [line for line in section_text.split('\n') if not line.strip().startswith('#')]
+  return '\n'.join(lines)
+
 
 def parse_query_test_file(file_name, valid_section_names=None, encoding=None):
   """
@@ -96,9 +102,10 @@ def parse_query_test_file(file_name, valid_section_names=None, encoding=None):
   if section_names is None:
     section_names = ['QUERY', 'HIVE_QUERY', 'RESULTS', 'TYPES', 'LABELS', 'SETUP',
         'CATCH', 'ERRORS', 'USER', 'RUNTIME_PROFILE', 'SHELL', 'DML_RESULTS',
-        'HS2_TYPES', 'HIVE_MAJOR_VERSION', 'LINEAGE']
+        'HS2_TYPES', 'HIVE_MAJOR_VERSION', 'LINEAGE', 'IS_HDFS_ONLY']
   return parse_test_file(file_name, section_names, encoding=encoding,
       skip_unknown_sections=False)
+
 
 def parse_table_constraints(constraints_file):
   """Reads a table constraints file, if one exists"""
@@ -108,7 +115,7 @@ def parse_table_constraints(constraints_file):
   if not os.path.isfile(constraints_file):
     LOG.info('No schema constraints file file found')
   else:
-    with open(constraints_file, 'rb') as constraints_file:
+    with open(constraints_file, 'r') as constraints_file:
       for line in constraints_file.readlines():
         line = line.strip()
         if not line or line.startswith('#'):
@@ -124,18 +131,20 @@ def parse_table_constraints(constraints_file):
             schema_only[f].append(table_name.lower())
         elif constraint_type == 'restrict_to':
           schema_include[table_name.lower()] +=\
-              map(parse_table_format_constraint, table_formats.split(','))
+              list(map(parse_table_format_constraint, table_formats.split(',')))
         elif constraint_type == 'exclude':
           schema_exclude[table_name.lower()] +=\
-              map(parse_table_format_constraint, table_formats.split(','))
+              list(map(parse_table_format_constraint, table_formats.split(',')))
         else:
-          raise ValueError, 'Unknown constraint type: %s' % constraint_type
+          raise ValueError('Unknown constraint type: %s' % constraint_type)
   return schema_include, schema_exclude, schema_only
+
 
 def parse_table_format_constraint(table_format_constraint):
   # TODO: Expand how we parse table format constraints to support syntax such as
   # a table format string with a wildcard character. Right now we don't do anything.
   return table_format_constraint
+
 
 def parse_test_file(test_file_name, valid_section_names, skip_unknown_sections=True,
     encoding=None):
@@ -155,9 +164,38 @@ def parse_test_file(test_file_name, valid_section_names, skip_unknown_sections=T
   """
   with open(test_file_name, 'rb') as test_file:
     file_data = test_file.read()
-    if encoding: file_data = file_data.decode(encoding)
+    if encoding:
+      file_data = file_data.decode(encoding)
+    else:
+      file_data = file_data.decode('utf-8')
+    if os.environ["USE_APACHE_HIVE"] == "true":
+      # Remove Hive 4.0 feature for tpcds_schema_template.sql
+      if "tpcds_schema_template" in test_file_name:
+        # HIVE-20703
+        file_data = file_data.replace(
+          'set hive.optimize.sort.dynamic.partition.threshold=1;', '')
+        # HIVE-18284
+        file_data = file_data.replace('distribute by ss_sold_date_sk', '')
     return parse_test_file_text(file_data, valid_section_names,
                                 skip_unknown_sections)
+
+
+def parse_runtime_profile_table_formats(subsection_comment):
+  prefix = "table_format="
+  if not subsection_comment.startswith(prefix):
+    raise RuntimeError('RUNTIME_PROFILE comment (%s) must be of the form '
+                       '"table_format=FORMAT[,FORMAT2,...]"' % subsection_comment)
+
+  parsed_formats = subsection_comment[len(prefix):].split(',')
+  table_formats = list()
+  for table_format in parsed_formats:
+    if table_format not in ALLOWED_TABLE_FORMATS:
+      raise RuntimeError('RUNTIME_PROFILE table format (%s) must be in: %s' %
+                         (table_format, ALLOWED_TABLE_FORMATS))
+    else:
+      table_formats.append(table_format)
+  return table_formats
+
 
 def parse_test_file_text(text, valid_section_names, skip_unknown_sections=True):
   sections = list()
@@ -169,11 +207,11 @@ def parse_test_file_text(text, valid_section_names, skip_unknown_sections=True):
     # with what looks like a subsection.
     header = text[:match.start()]
     if re.match(r'^%s' % SUBSECTION_DELIMITER, header):
-      raise RuntimeError, dedent("""
+      raise RuntimeError(dedent("""
           Header must not start with '%s'. Everything before the first line matching '%s'
           is considered header information and will be ignored. However a header must not
           start with '%s' to prevent test cases from accidentally being ignored.""" %
-          (SUBSECTION_DELIMITER, SECTION_DELIMITER, SUBSECTION_DELIMITER))
+          (SUBSECTION_DELIMITER, SECTION_DELIMITER, SUBSECTION_DELIMITER)))
     text = text[match.start():]
 
   # Split the test file up into sections. For each section, parse all subsections.
@@ -189,8 +227,11 @@ def parse_test_file_text(text, valid_section_names, skip_unknown_sections=True):
       subsection_comment = None
 
       subsection_info = [s.strip() for s in subsection_name.split(':')]
-      if(len(subsection_info) == 2):
+      if len(subsection_info) == 2:
         subsection_name, subsection_comment = subsection_info
+        if subsection_comment == "":
+          # ignore empty subsection_comment
+          subsection_comment = None
 
       lines_content = lines[1:-1]
 
@@ -198,15 +239,18 @@ def parse_test_file_text(text, valid_section_names, skip_unknown_sections=True):
       if len(lines_content) != 0:
         # Add trailing newline to last line if present. This disambiguates between the
         # case of no lines versus a single line with no text.
+        # This extra newline is needed only for the verification of the subsections of
+        # RESULTS, DML_RESULTS and ERRORS and will be removed in write_test_file()
+        # when '--update_results' is added to output the updated golden file.
         subsection_str += "\n"
 
       if subsection_name not in valid_section_names:
         if skip_unknown_sections or not subsection_name:
-          print sub_section
-          print 'Unknown section \'%s\'' % subsection_name
+          print(sub_section)
+          print('Unknown section \'%s\'' % subsection_name)
           continue
         else:
-          raise RuntimeError, 'Unknown subsection: %s' % subsection_name
+          raise RuntimeError('Unknown subsection: %s' % subsection_name)
 
       if subsection_name == 'QUERY' and subsection_comment:
         parsed_sections['QUERY_NAME'] = subsection_comment
@@ -220,16 +264,16 @@ def parse_test_file_text(text, valid_section_names, skip_unknown_sections=True):
           elif comment.startswith('VERIFY'):
             parsed_sections['VERIFIER'] = comment
           else:
-            raise RuntimeError, 'Unknown subsection comment: %s' % comment
+            raise RuntimeError('Unknown subsection comment: %s' % comment)
 
       if subsection_name == 'CATCH':
         parsed_sections['CATCH'] = list()
-        if subsection_comment == None:
+        if subsection_comment is None:
           parsed_sections['CATCH'].append(subsection_str)
         elif subsection_comment == 'ANY_OF':
           parsed_sections['CATCH'].extend(lines_content)
         else:
-          raise RuntimeError, 'Unknown subsection comment: %s' % subsection_comment
+          raise RuntimeError('Unknown subsection comment: %s' % subsection_comment)
         for exception_str in parsed_sections['CATCH']:
           assert exception_str.strip(), "Empty exception string."
         continue
@@ -241,34 +285,31 @@ def parse_test_file_text(text, valid_section_names, skip_unknown_sections=True):
       # will be verified against the DML_RESULTS. Using both DML_RESULTS and RESULTS is
       # not supported.
       if subsection_name == 'DML_RESULTS':
-        if subsection_comment is None or subsection_comment == '':
-          raise RuntimeError, 'DML_RESULTS requires that the table is specified ' \
-              'in the comment.'
+        if subsection_comment is None:
+          raise RuntimeError('DML_RESULTS requires that the table is specified '
+              'in the comment.')
         parsed_sections['DML_RESULTS_TABLE'] = subsection_comment
         parsed_sections['VERIFIER'] = 'VERIFY_IS_EQUAL_SORTED'
 
       # The RUNTIME_PROFILE section is used to specify lines of text that should be
       # present in the query runtime profile. It takes an option comment containing a
-      # table format. RUNTIME_PROFILE secions with a comment are only evaluated for the
+      # table format. RUNTIME_PROFILE sections with a comment are only evaluated for the
       # specified format. If there is a RUNTIME_PROFILE section without a comment, it is
       # evaluated for all formats that don't have a commented section for this query.
       if subsection_name == 'RUNTIME_PROFILE':
-        if subsection_comment is not None and subsection_comment is not "":
-          allowed_formats = ['kudu']
-          if not subsection_comment.startswith("table_format="):
-            raise RuntimeError, 'RUNTIME_PROFILE comment (%s) must be of the form ' \
-              '"table_format=FORMAT"' % subsection_comment
-          table_format = subsection_comment[13:]
-          if table_format not in allowed_formats:
-            raise RuntimeError, 'RUNTIME_PROFILE table format (%s) must be in: %s' % \
-                (table_format, allowed_formats)
-          subsection_name = 'RUNTIME_PROFILE_%s' % table_format
+        if subsection_comment:
+          table_formats = parse_runtime_profile_table_formats(subsection_comment)
+          for table_format in table_formats:
+            subsection_name_for_format = 'RUNTIME_PROFILE_%s' % table_format
+            parsed_sections[subsection_name_for_format] = subsection_str
+          continue
 
       parsed_sections[subsection_name] = subsection_str
 
     if parsed_sections:
       sections.append(parsed_sections)
   return sections
+
 
 def split_section_lines(section_str):
   """
@@ -281,11 +322,16 @@ def split_section_lines(section_str):
   # Trim off the trailing newline and split into lines.
   return section_str[:-1].split('\n')
 
+
 def join_section_lines(lines):
   """
   The inverse of split_section_lines().
+  The extra newline at the end will be removed in write_test_file() so that when the
+  actual contents of a subsection do not match the expected contents, we won't see
+  extra newlines in those subsections (ERRORS, TYPES, LABELS, RESULTS and DML_RESULTS).
   """
   return '\n'.join(lines) + '\n'
+
 
 def write_test_file(test_file_name, test_file_sections, encoding=None):
   """
@@ -313,11 +359,15 @@ def write_test_file(test_file_name, test_file_sections, encoding=None):
         if section_name == 'RESULTS' and test_case.get('VERIFIER'):
           full_section_name = '%s: %s' % (section_name, test_case['VERIFIER'])
         test_file_text.append("%s %s" % (SUBSECTION_DELIMITER, full_section_name))
-        section_value = ''.join(test_case[section_name])
-        if section_value.strip():
+        # We remove the extra newlines added in parse_test_file_text() so that in the
+        # updated golden file we will not see an extra newline at the end of each
+        # subsection.
+        section_value = ''.join(test_case[section_name]).strip()
+        if section_value:
           test_file_text.append(section_value)
     test_file_text.append(SECTION_DELIMITER)
     test_file.write(('\n').join(test_file_text))
+    test_file.write('\n')  # end file with a newline
 
 
 def load_tpc_queries(workload, include_stress_queries=False, query_name_filters=[]):
@@ -347,7 +397,7 @@ def load_tpc_queries(workload, include_stress_queries=False, query_name_filters=
   # find. Both workload directories contain other queries that are not part of the TPC
   # spec.
   file_workload = workload
-  if workload == "tpcds":
+  if workload in ["tpcds", "tpcds_partitioned"]:
     # TPCDS is assumed to always use decimal_v2, which is the default since 3.0
     file_workload = "tpcds-decimal_v2"
   if include_stress_queries:
@@ -355,7 +405,11 @@ def load_tpc_queries(workload, include_stress_queries=False, query_name_filters=
   else:
     file_name_pattern = re.compile(r"^{0}-(q.*).test$".format(file_workload))
 
-  query_name_pattern = re.compile(r"^{0}-(.*)$".format(workload.upper()))
+  query_name_prefix = workload.upper()
+  if workload == "tpcds_partitioned":
+    # 'tpcds_partitioned' symlink to the same queries set of 'tpcds'.
+    query_name_prefix = "TPCDS"
+  query_name_pattern = re.compile(r"^{0}-(.*)$".format(query_name_prefix))
   if workload == "tpch_nested":
     query_name_pattern = re.compile(r"^TPCH-(.*)$")
 
@@ -364,7 +418,10 @@ def load_tpc_queries(workload, include_stress_queries=False, query_name_filters=
     file_name_pattern = re.compile(r"(.*)")
     query_name_pattern = re.compile(r"(.*)")
 
-  query_name_filters = map(str.strip, query_name_filters) if query_name_filters else []
+  if query_name_filters:
+    query_name_filters = list(map(str.strip, query_name_filters))
+  else:
+    query_name_filters = []
   filter_regex = re.compile(r'|'.join(['^%s$' % n for n in query_name_filters]), re.I)
 
   for query_file in os.listdir(query_dir):
@@ -390,3 +447,56 @@ def load_tpc_queries(workload, include_stress_queries=False, query_name_filters=
       raise Exception("Expected exactly 1 query to be in file %s but got %s"
           % (file_path, len(test_cases)))
   return queries
+
+
+def tpc_sort_key(s):
+    """
+    Sorting key for sorting strings in the format "tpch-qxX-yY".
+    The valid format is expected to be split into parts by '-'.
+    If the format doesn't match, 0 or an empty string will be returned
+    as appropriate.
+    Args:
+        s (str): Input string to be sorted.
+    Returns:
+        tuple: A tuple of (int, int, str, str):
+            - The first integer is the value of "x", if present, otherwise 0.
+            - The second integer is the value of "y",
+              included only if "x" is present, otherwise returns an 0.
+            - The third element is the character "X", not numeric,
+              included only if "x" is present, otherwise returns an empty string ('').
+            - The fourth element is the character "Y", not numeric,
+              included only if "y" is present, otherwise returns an empty string ('').
+    """
+    x, y = 0, 0
+    x_char, y_char = '', ''
+    parts = s.split("-")
+    if len(parts) < 2:
+      return x, y, x_char, y_char
+    match = re.search(r"^q(\d+)(\D)?", parts[1])
+    if match:
+      x = int(match.group(1)) if match.group(1) else 0
+      x_char = match.group(2) if match.group(2) else ''
+    if len(parts) == 3 and match:
+      match = re.search(r"^(\d+)(\D)?", parts[2])
+      if match:
+        y = int(match.group(1)) if match.group(1) else 0
+        y_char = match.group(2) if match.group(2) else ''
+    return x, y, x_char, y_char
+
+
+def load_tpc_queries_name_sorted(workload):
+    """
+    Returns a list of queries for the given workload. Only tpch and tpcds are supported,
+    and only the name of the queries will be returned. The names are be sorted and
+    converted to lowercase before being returned.
+    Args:
+        workload (str): tpch or tpcds.
+    """
+    queries = list(load_tpc_queries(workload).keys())
+    queries = [s.lower() for s in queries]
+    queries = sorted(queries, key=tpc_sort_key)
+    if workload == 'tpcds':
+      # TPCDS is assumed to always use decimal_v2, in alignment with load_tpc_queries()
+      substring = "tpcds-decimal_v2"
+      queries = [x.replace(workload, substring) for x in queries]
+    return queries

@@ -27,16 +27,18 @@ import org.apache.impala.authorization.ranger.RangerAuthorizationFactory;
 import org.apache.impala.authorization.ranger.RangerCatalogdAuthorizationManager;
 import org.apache.impala.authorization.ranger.RangerImpalaPlugin;
 import org.apache.impala.authorization.ranger.RangerImpalaResourceBuilder;
-import org.apache.impala.catalog.Role;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.service.Frontend;
+import org.apache.impala.testutil.CatalogServiceTestCatalog;
 import org.apache.impala.testutil.ImpaladTestCatalog;
 import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TDescribeOutputStyle;
 import org.apache.impala.thrift.TDescribeResult;
+import org.apache.impala.thrift.TDescribeTableParams;
 import org.apache.impala.thrift.TFunctionBinaryType;
 import org.apache.impala.thrift.TPrivilege;
 import org.apache.impala.thrift.TPrivilegeLevel;
@@ -111,6 +113,8 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
   protected final RangerImpalaPlugin rangerImpalaPlugin_;
   protected final RangerRESTClient rangerRestClient_;
 
+  protected final CatalogServiceTestCatalog testCatalog_;
+
   public AuthorizationTestBase(AuthorizationProvider authzProvider)
       throws ImpalaException {
     authzProvider_ = authzProvider;
@@ -121,7 +125,8 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
             SERVER_NAME, null, null, null);
         authzFactory_ = createAuthorizationFactory(authzProvider);
         authzCtx_ = createAnalysisCtx(authzFactory_, user_.getName());
-        authzCatalog_ = new ImpaladTestCatalog(authzFactory_);
+        testCatalog_ = CatalogServiceTestCatalogWithRanger.createWithAuth(authzFactory_);
+        authzCatalog_ = new ImpaladTestCatalog(testCatalog_);
         authzFrontend_ = new Frontend(authzFactory_, authzCatalog_);
         rangerImpalaPlugin_ =
             ((RangerAuthorizationChecker) authzFrontend_.getAuthzChecker())
@@ -202,7 +207,8 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
           // owner of the resource.
           getName(),
           Collections.emptyList(), Collections.emptyList(),
-          rangerImpalaPlugin_.getClusterName(), "127.0.0.1", privileges);
+          rangerImpalaPlugin_.getClusterName(), "127.0.0.1", privileges,
+          /*resourceOwner*/ null);
     }
   }
 
@@ -216,7 +222,8 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
           // owner of the resource.
           (as_owner_ ? OWNER_GROUPS : GROUPS), Collections.emptyList(),
           // groups,
-          rangerImpalaPlugin_.getClusterName(), "127.0.0.1", privileges);
+          rangerImpalaPlugin_.getClusterName(), "127.0.0.1", privileges,
+          /*resourceOwner*/ null);
     }
   }
 
@@ -268,8 +275,11 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
       Preconditions.checkArgument(includedStrings_.length != 0 ||
               excludedStrings_.length != 0,
           "One or both of included or excluded strings must be defined.");
-      List<String> result = resultToStringList(authzFrontend_.describeTable(table,
-          outputStyle_, user_));
+      TDescribeTableParams testParams = new TDescribeTableParams();
+      testParams.setTable_name(table);
+      testParams.setOutput_style(outputStyle_);
+      List<String> result = resultToStringList(authzFrontend_.describeTable(testParams,
+          user_));
       for (String str: includedStrings_) {
         assertTrue(String.format("\"%s\" is not in the describe output.\n" +
                 "Expected : %s\n Actual   : %s", str, Arrays.toString(includedStrings_),
@@ -319,13 +329,22 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
      */
     public AuthzTest ok(TPrivilege[]... privileges)
         throws ImpalaException {
+      ok(/* expectAnalysisOk */ true, privileges);
+      return this;
+    }
+
+    /**
+     * This method runs with the specified privileges.
+     */
+    public AuthzTest ok(boolean expectAnalysisOk, TPrivilege[]... privileges)
+        throws ImpalaException {
       for (WithPrincipal withPrincipal: buildWithPrincipals()) {
         try {
           withPrincipal.init(privileges);
           if (context_ != null) {
-            authzOk(context_, stmt_, withPrincipal);
+            authzOk(context_, stmt_, withPrincipal, expectAnalysisOk);
           } else {
-            authzOk(stmt_, withPrincipal);
+            authzOk(stmt_, withPrincipal, expectAnalysisOk);
           }
         } finally {
           withPrincipal.cleanUp();
@@ -481,12 +500,58 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
     return privileges;
   }
 
+  protected TPrivilege[] onStorageHandlerUri(String storageType, String storageUri,
+      TPrivilegeLevel... levels) {
+    return onStorageHandlerUri(false, storageType, storageUri, levels);
+  }
+
+  protected TPrivilege[] onStorageHandlerUri(boolean grantOption, String storageType,
+      String storageUri, TPrivilegeLevel... levels) {
+    TPrivilege[] privileges = new TPrivilege[levels.length];
+    for (int i = 0; i < levels.length; i++) {
+      privileges[i] = new TPrivilege(levels[i], TPrivilegeScope.STORAGEHANDLER_URI,
+          false);
+      privileges[i].setServer_name(SERVER_NAME);
+      privileges[i].setStorage_type(storageType);
+      privileges[i].setStorage_url(storageUri);
+      privileges[i].setHas_grant_opt(grantOption);
+    }
+    return privileges;
+  }
+
+  protected TPrivilege[] onUdf(String db, String fn, TPrivilegeLevel... levels) {
+    return onUdf(false, db, fn, levels);
+  }
+
+  protected TPrivilege[] onUdf(boolean grantOption, String db, String fn,
+      TPrivilegeLevel... levels) {
+    TPrivilege[] privileges = new TPrivilege[levels.length];
+    for (int i = 0; i < levels.length; i++) {
+      privileges[i] = new TPrivilege(levels[i], TPrivilegeScope.USER_DEFINED_FN, false);
+      privileges[i].setServer_name(SERVER_NAME);
+      privileges[i].setDb_name(db);
+      privileges[i].setFn_name(fn);
+      privileges[i].setHas_grant_opt(grantOption);
+    }
+    return privileges;
+  }
+
   private void authzOk(String stmt, WithPrincipal withPrincipal) throws ImpalaException {
-    authzOk(authzCtx_, stmt, withPrincipal);
+    authzOk(authzCtx_, stmt, withPrincipal, /* expectAnalysisOk */ true);
+  }
+
+  private void authzOk(String stmt, WithPrincipal withPrincipal,
+      boolean expectAnalysisOk) throws ImpalaException {
+    authzOk(authzCtx_, stmt, withPrincipal, expectAnalysisOk);
   }
 
   private void authzOk(AnalysisContext context, String stmt, WithPrincipal withPrincipal)
       throws ImpalaException {
+    authzOk(context, stmt, withPrincipal, /* expectAnalysisOk */ true);
+  }
+
+  private void authzOk(AnalysisContext context, String stmt, WithPrincipal withPrincipal,
+      boolean expectAnalysisOk) throws ImpalaException {
     try {
       LOG.info("Testing authzOk for {}", stmt);
       parseAndAnalyze(stmt, context, authzFrontend_);
@@ -496,6 +561,13 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
       throw new AuthorizationException(String.format(
           "\nPrincipal: %s\nStatement: %s\nError: %s", withPrincipal.getName(),
           stmt, e.getMessage(), e));
+    } catch (AnalysisException e) {
+      // We throw an AnalysisException only if we did not expect query analysis to fail.
+      if (expectAnalysisOk) {
+        throw new AnalysisException(String.format(
+            "\nPrincipal: %s\nStatement: %s\nError: %s", withPrincipal.getName(),
+            stmt, e.getMessage(), e));
+      }
     }
   }
 
@@ -606,6 +678,10 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
     return "User '%s' does not have privileges to execute 'CREATE' on: " + object;
   }
 
+  protected static String rwstorageError(String object) {
+    return "User '%s' does not have privileges to execute 'RWSTORAGE' on: " + object;
+  }
+
   protected static String alterError(String object) {
     return "User '%s' does not have privileges to execute 'ALTER' on: " + object;
   }
@@ -649,6 +725,10 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
     return "User '%s' does not have privileges to ANY functions in: " + object;
   }
 
+  protected static String selectFunctionError(String object) {
+    return "User '%s' does not have privileges to SELECT functions in: " + object;
+  }
+
   protected static String columnMaskError(String object) {
     return "Column masking is disabled by --enable_column_masking flag. Can't access " +
         "column " + object + " that has column masking policy.";
@@ -657,6 +737,11 @@ public abstract class AuthorizationTestBase extends FrontendTestBase {
   protected static String rowFilterError(String object) {
     return "Row filtering is disabled by --enable_row_filtering flag. Can't access " +
         "table " + object + " that has row filtering policy.";
+  }
+
+  protected static String mvSelectError(String object) {
+    return "Materialized view " +  object +
+        " references tables with column masking or row filtering policies.";
   }
 
   protected ScalarFunction addFunction(String db, String fnName, List<Type> argTypes,

@@ -23,6 +23,7 @@
 
 #include <gtest/gtest_prod.h> // for FRIEND_TEST
 
+#include "common/atomic.h"
 #include "common/names.h"
 #include "common/logging.h"
 
@@ -46,9 +47,9 @@ class SystemStateInfo {
 
   /// Ratios use basis points as their unit (1/100th of a percent, i.e. 0.0001).
   struct CpuUsageRatios {
-    int32_t user;
-    int32_t system;
-    int32_t iowait;
+    AtomicInt32 user;
+    AtomicInt32 system;
+    AtomicInt32 iowait;
   };
 
   /// Returns a struct containing the CPU usage ratios for the interval between the last
@@ -57,8 +58,8 @@ class SystemStateInfo {
 
   /// Network usage rates in bytes per second.
   struct NetworkUsage {
-    int64_t rx_rate;
-    int64_t tx_rate;
+    AtomicInt64 rx_rate;
+    AtomicInt64 tx_rate;
   };
 
   /// Returns a struct containing the network usage for the interval between the last two
@@ -67,8 +68,8 @@ class SystemStateInfo {
 
   /// Disk statistics rates in bytes per second
   struct DiskStats {
-    int64_t read_rate;
-    int64_t write_rate;
+    AtomicInt64 read_rate;
+    AtomicInt64 write_rate;
   };
 
   /// Returns a struct containing the disk throughput for the interval between the last

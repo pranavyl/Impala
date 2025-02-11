@@ -95,6 +95,8 @@ public class AnalysisContext {
     public boolean isQueryStmt() { return stmt_ instanceof QueryStmt; }
     public boolean isSetOperationStmt() { return stmt_ instanceof SetOperationStmt; }
     public boolean isInsertStmt() { return stmt_ instanceof InsertStmt; }
+    public boolean isMergeStmt() { return stmt_ instanceof MergeStmt; }
+    public boolean isOptimizeStmt() { return stmt_ instanceof OptimizeStmt; }
     public boolean isDropDbStmt() { return stmt_ instanceof DropDbStmt; }
     public boolean isDropTableOrViewStmt() {
       return stmt_ instanceof DropTableOrViewStmt;
@@ -118,6 +120,10 @@ public class AnalysisContext {
     public boolean isUseStmt() { return stmt_ instanceof UseStmt; }
     public boolean isSetStmt() { return stmt_ instanceof SetStmt; }
     public boolean isShowTablesStmt() { return stmt_ instanceof ShowTablesStmt; }
+    public boolean isShowMetadataTablesStmt() {
+      return stmt_ instanceof ShowMetadataTablesStmt;
+    }
+    public boolean isShowViewsStmt() { return stmt_ instanceof ShowViewsStmt; }
     public boolean isDescribeHistoryStmt() {
       return stmt_ instanceof DescribeHistoryStmt;
     }
@@ -175,11 +181,11 @@ public class AnalysisContext {
     }
 
     private boolean isViewMetadataStmt() {
-      return isShowFilesStmt() || isShowTablesStmt() || isShowDbsStmt() ||
-          isShowFunctionsStmt() || isShowRolesStmt() || isShowGrantPrincipalStmt() ||
-          isShowCreateTableStmt() || isShowDataSrcsStmt() || isShowStatsStmt() ||
-          isDescribeTableStmt() || isDescribeDbStmt() || isShowCreateFunctionStmt() ||
-          isDescribeHistoryStmt();
+      return isShowFilesStmt() || isShowTablesStmt() || isShowMetadataTablesStmt() ||
+          isShowViewsStmt() || isShowDbsStmt() || isShowFunctionsStmt() ||
+          isShowRolesStmt() || isShowGrantPrincipalStmt() || isShowCreateTableStmt() ||
+          isShowDataSrcsStmt() || isShowStatsStmt() || isDescribeTableStmt() ||
+          isDescribeDbStmt() || isShowCreateFunctionStmt() || isDescribeHistoryStmt();
     }
 
     private boolean isGrantRevokeStmt() {
@@ -187,7 +193,8 @@ public class AnalysisContext {
     }
 
     public boolean isDmlStmt() {
-      return isInsertStmt() || isUpdateStmt() || isDeleteStmt();
+      return isInsertStmt() || isUpdateStmt() || isDeleteStmt()
+          || isOptimizeStmt() || isMergeStmt();
     }
 
     /**
@@ -197,7 +204,7 @@ public class AnalysisContext {
     public boolean isHierarchicalAuthStmt() {
       return isQueryStmt() || isInsertStmt() || isUpdateStmt() || isDeleteStmt()
           || isCreateTableAsSelectStmt() || isCreateViewStmt() || isAlterViewStmt()
-          || isTestCaseStmt();
+          || isOptimizeStmt() || isTestCaseStmt() || isMergeStmt();
     }
 
     /**
@@ -209,7 +216,16 @@ public class AnalysisContext {
      */
     public boolean isSingleColumnPrivStmt() {
       return isDescribeTableStmt() || isResetMetadataStmt() || isUseStmt()
-          || isShowTablesStmt() || isAlterTableStmt() || isShowFunctionsStmt();
+          || isShowTablesStmt() || isShowMetadataTablesStmt() || isShowViewsStmt()
+          || isAlterTableStmt() || isShowFunctionsStmt();
+    }
+
+    public boolean isConvertTableToIcebergStmt() {
+      return stmt_ instanceof ConvertTableToIcebergStmt;
+    }
+
+    public boolean isKillQueryStmt() {
+      return stmt_ instanceof KillQueryStmt;
     }
 
     public AlterTableStmt getAlterTableStmt() {
@@ -292,6 +308,16 @@ public class AnalysisContext {
       return (QueryStmt) stmt_;
     }
 
+    public OptimizeStmt getOptimizeStmt() {
+      Preconditions.checkState(isOptimizeStmt());
+      return (OptimizeStmt) stmt_;
+    }
+
+    public MergeStmt getMergeStmt() {
+      Preconditions.checkState(isMergeStmt());
+      return (MergeStmt) stmt_;
+    }
+
     public InsertStmt getInsertStmt() {
       if (isCreateTableAsSelectStmt()) {
         return getCreateTableAsSelectStmt().getInsertStmt();
@@ -314,6 +340,16 @@ public class AnalysisContext {
     public ShowTablesStmt getShowTablesStmt() {
       Preconditions.checkState(isShowTablesStmt());
       return (ShowTablesStmt) stmt_;
+    }
+
+    public ShowMetadataTablesStmt getShowMetadataTablesStmt() {
+      Preconditions.checkState(isShowMetadataTablesStmt());
+      return (ShowMetadataTablesStmt) stmt_;
+    }
+
+    public ShowViewsStmt getShowViewsStmt() {
+      Preconditions.checkState(isShowViewsStmt());
+      return (ShowViewsStmt) stmt_;
     }
 
     public ShowDbsStmt getShowDbsStmt() {
@@ -381,6 +417,16 @@ public class AnalysisContext {
       return (AdminFnStmt) stmt_;
     }
 
+    public ConvertTableToIcebergStmt getConvertTableToIcebergStmt() {
+      Preconditions.checkState(isConvertTableToIcebergStmt());
+      return (ConvertTableToIcebergStmt) stmt_;
+    }
+
+    public KillQueryStmt getKillQueryStmt() {
+      Preconditions.checkState(isKillQueryStmt());
+      return (KillQueryStmt) stmt_;
+    }
+
     public StatementBase getStmt() { return stmt_; }
     public Analyzer getAnalyzer() { return analyzer_; }
     public Set<TAccessEvent> getAccessEvents() { return analyzer_.getAccessEvents(); }
@@ -398,7 +444,7 @@ public class AnalysisContext {
     }
     public boolean requiresExprRewrite() {
       return isQueryStmt() || isInsertStmt() || isCreateTableAsSelectStmt()
-          || isUpdateStmt() || isDeleteStmt();
+          || isUpdateStmt() || isDeleteStmt() || isOptimizeStmt() || isMergeStmt();
     }
     public boolean requiresSetOperationRewrite() {
       return analyzer_.containsSetOperation() && !isCreateViewStmt() && !isAlterViewStmt()
@@ -435,6 +481,13 @@ public class AnalysisContext {
     return result;
   }
 
+  public AnalysisResult analyzeAndAuthorize(StatementBase stmt,
+      StmtTableCache stmtTableCache, AuthorizationChecker authzChecker)
+      throws ImpalaException {
+    return analyzeAndAuthorize(
+        stmt, stmtTableCache, authzChecker, false /*disableAuthorization*/);
+  }
+
   /**
    * Analyzes and authorizes the given statement using the provided table cache and
    * authorization checker.
@@ -442,8 +495,8 @@ public class AnalysisContext {
    * reveal the existence/absence of objects the user is not authorized to see.
    */
   public AnalysisResult analyzeAndAuthorize(StatementBase stmt,
-      StmtTableCache stmtTableCache, AuthorizationChecker authzChecker)
-      throws ImpalaException {
+      StmtTableCache stmtTableCache, AuthorizationChecker authzChecker,
+      boolean disableAuthorization) throws ImpalaException {
     // TODO: Clean up the creation/setting of the analysis result.
     analysisResult_ = new AnalysisResult();
     analysisResult_.stmt_ = stmt;
@@ -464,17 +517,34 @@ public class AnalysisContext {
     } finally {
       authzChecker.postAnalyze(authzCtx);
     }
-    timeline_.markEvent("Analysis finished");
+    // A statement that returns at most one row does not need to spool query results.
+    if (analysisException == null && analysisResult_.stmt_ instanceof SelectStmt &&
+        ((SelectStmt)analysisResult_.stmt_).returnsAtMostOneRow()) {
+      clientRequest.query_options.setSpool_query_results(false);
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("Result spooling is disabled due to the statement returning at most "
+            + "one row.");
+      }
+    }
+    long durationMs = timeline_.markEvent("Analysis finished") / 1000000;
+    LOG.info("Analysis took {} ms", durationMs);
 
     // Authorize statement and record exception. Authorization relies on information
     // collected during analysis.
     AuthorizationException authException = null;
-    try {
-      authzChecker.authorize(authzCtx, analysisResult_, catalog_);
-    } catch (AuthorizationException e) {
-      authException = e;
-    } finally {
-      authzChecker.postAuthorize(authzCtx, authException == null);
+    if (!disableAuthorization) {
+      try {
+        if (analysisResult_.getAnalyzer().encounteredMVAuthException()) {
+          throw new AuthorizationException(
+            analysisResult_.getAnalyzer().getMVAuthExceptionMsg());
+        }
+        authzChecker.authorize(authzCtx, analysisResult_, catalog_);
+      } catch (AuthorizationException e) {
+        authException = e;
+      } finally {
+        authzChecker.postAuthorize(authzCtx, authException == null,
+            analysisException == null);
+      }
     }
 
     // AuthorizationExceptions take precedence over AnalysisExceptions so as not
@@ -556,12 +626,15 @@ public class AnalysisContext {
     if (!shouldReAnalyze) return;
 
     // For SetOperationStmt we must replace the query statement with the rewritten version
-    // before re-analysis.
+    // before re-analysis and set the explain flag of the rewritten version if the
+    // original is explain statement.
     if (analysisResult_.requiresSetOperationRewrite()) {
       if (analysisResult_.isSetOperationStmt()) {
         if (((SetOperationStmt) analysisResult_.getStmt()).hasRewrittenStmt()) {
+          boolean isExplain = analysisResult_.isExplainStmt();
           analysisResult_.stmt_ =
             ((SetOperationStmt) analysisResult_.getStmt()).getRewrittenStmt();
+          if (isExplain) analysisResult_.stmt_.setIsExplain();
         }
       }
     }
@@ -595,10 +668,9 @@ public class AnalysisContext {
       analysisResult_.stmt_.analyze(analysisResult_.analyzer_);
       analysisResult_.analyzer_.setEnablePrivChecks(true); // Always restore
     } catch (AnalysisException e) {
-      LOG.error(String.format("Error analyzing the rewritten query.\n" +
-          "Original SQL: %s\nRewritten SQL: %s", analysisResult_.stmt_.toSql(),
-          analysisResult_.stmt_.toSql(REWRITTEN)), e);
-      throw e;
+      logRewriteErrorNoThrow(analysisResult_.stmt_, e);
+      throw new AnalysisException("An error occurred after query rewrite: " +
+          e.getMessage(), e);
     }
     // Restore the original result types and column labels.
     analysisResult_.stmt_.castResultExprs(origResultTypes);
@@ -607,6 +679,18 @@ public class AnalysisContext {
       LOG.trace("Rewritten SQL: " + analysisResult_.stmt_.toSql(REWRITTEN));
     }
     if (isExplain) analysisResult_.stmt_.setIsExplain();
+  }
+
+  private void logRewriteErrorNoThrow(StatementBase stmt,
+      AnalysisException analysisException) {
+    try {
+      LOG.error(String.format("Error analyzing the rewritten query.\n" +
+          "Original SQL: %s\nRewritten SQL: %s", stmt.toSql(),
+          stmt.toSql(REWRITTEN)), analysisException);
+    } catch (Exception e) {
+      LOG.error("An exception occurred during printing out " +
+          "the rewritten SQL statement.", e);
+    }
   }
 
   public Analyzer getAnalyzer() { return analysisResult_.getAnalyzer(); }

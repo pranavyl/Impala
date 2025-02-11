@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+if (BUILD_WITH_NO_TESTS)
+  return()
+endif()
 
 # where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/benchmarks")
@@ -38,6 +41,7 @@ ADD_BE_BENCHMARK(bitmap-benchmark)
 ADD_BE_BENCHMARK(bit-packing-benchmark)
 ADD_BE_BENCHMARK(bloom-filter-benchmark)
 ADD_BE_BENCHMARK(bswap-benchmark)
+ADD_BE_BENCHMARK(decimal-util-benchmark)
 ADD_BE_BENCHMARK(expr-benchmark)
 ADD_BE_BENCHMARK(free-lists-benchmark)
 ADD_BE_BENCHMARK(hash-benchmark)
@@ -48,6 +52,7 @@ ADD_BE_BENCHMARK(multiint-benchmark)
 ADD_BE_BENCHMARK(network-perf-benchmark)
 ADD_BE_BENCHMARK(overflow-benchmark)
 ADD_BE_BENCHMARK(parse-timestamp-benchmark)
+ADD_BE_BENCHMARK(parquet-delta-benchmark)
 ADD_BE_BENCHMARK(process-wide-locks-benchmark)
 ADD_BE_BENCHMARK(rle-benchmark)
 ADD_BE_BENCHMARK(row-batch-serialize-benchmark)

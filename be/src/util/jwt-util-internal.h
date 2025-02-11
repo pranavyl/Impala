@@ -53,7 +53,7 @@ class JsonWebKeySet;
 class JWTPublicKey {
  public:
   JWTPublicKey(std::string algorithm, std::string pub_key)
-    : verifier_(jwt::verify()), algorithm_(algorithm), public_key_(pub_key) {}
+    : verifier_(jwt::verify()), algorithm_(move(algorithm)), public_key_(move(pub_key)) {}
 
   /// Verify the given decoded token.
   Status Verify(const DecodedJWT& decoded_jwt, const std::string& algorithm) const;
@@ -83,8 +83,8 @@ class HS256JWTPublicKey : public JWTPublicKey {
  public:
   /// Throw JWT exception if failed to initialize the verifier.
   HS256JWTPublicKey(std::string algorithm, std::string pub_key)
-    : JWTPublicKey(algorithm, pub_key) {
-    verifier_.allow_algorithm(jwt::algorithm::hs256(pub_key));
+    : JWTPublicKey(move(algorithm), move(pub_key)) {
+    verifier_.allow_algorithm(jwt::algorithm::hs256(get_key()));
   }
 };
 
@@ -94,8 +94,8 @@ class HS384JWTPublicKey : public JWTPublicKey {
  public:
   /// Throw exception if failed to initialize the JWT verifier.
   HS384JWTPublicKey(std::string algorithm, std::string pub_key)
-    : JWTPublicKey(algorithm, pub_key) {
-    verifier_.allow_algorithm(jwt::algorithm::hs384(pub_key));
+    : JWTPublicKey(move(algorithm), move(pub_key)) {
+    verifier_.allow_algorithm(jwt::algorithm::hs384(get_key()));
   }
 };
 
@@ -105,8 +105,8 @@ class HS512JWTPublicKey : public JWTPublicKey {
  public:
   /// Throw JWT exception if failed to initialize the verifier.
   HS512JWTPublicKey(std::string algorithm, std::string pub_key)
-    : JWTPublicKey(algorithm, pub_key) {
-    verifier_.allow_algorithm(jwt::algorithm::hs512(pub_key));
+    : JWTPublicKey(move(algorithm), move(pub_key)) {
+    verifier_.allow_algorithm(jwt::algorithm::hs512(get_key()));
   }
 };
 
@@ -116,8 +116,8 @@ class RS256JWTPublicKey : public JWTPublicKey {
  public:
   /// Throw JWT exception if failed to initialize the verifier.
   RS256JWTPublicKey(std::string algorithm, std::string pub_key)
-    : JWTPublicKey(algorithm, pub_key) {
-    verifier_.allow_algorithm(jwt::algorithm::rs256(pub_key, "", "", ""));
+    : JWTPublicKey(move(algorithm), move(pub_key)) {
+    verifier_.allow_algorithm(jwt::algorithm::rs256(get_key(), "", "", ""));
   }
 };
 
@@ -127,8 +127,8 @@ class RS384JWTPublicKey : public JWTPublicKey {
  public:
   /// Throw exception if failed to initialize the JWT verifier.
   RS384JWTPublicKey(std::string algorithm, std::string pub_key)
-    : JWTPublicKey(algorithm, pub_key) {
-    verifier_.allow_algorithm(jwt::algorithm::rs384(pub_key, "", "", ""));
+    : JWTPublicKey(move(algorithm), move(pub_key)) {
+    verifier_.allow_algorithm(jwt::algorithm::rs384(get_key(), "", "", ""));
   }
 };
 
@@ -138,8 +138,8 @@ class RS512JWTPublicKey : public JWTPublicKey {
  public:
   /// Throw JWT exception if failed to initialize the verifier.
   RS512JWTPublicKey(std::string algorithm, std::string pub_key)
-    : JWTPublicKey(algorithm, pub_key) {
-    verifier_.allow_algorithm(jwt::algorithm::rs512(pub_key, "", "", ""));
+    : JWTPublicKey(move(algorithm), move(pub_key)) {
+    verifier_.allow_algorithm(jwt::algorithm::rs512(get_key(), "", "", ""));
   }
 };
 
@@ -150,8 +150,8 @@ class PS256JWTPublicKey : public JWTPublicKey {
  public:
   /// Throw JWT exception if failed to initialize the verifier.
   PS256JWTPublicKey(std::string algorithm, std::string pub_key)
-    : JWTPublicKey(algorithm, pub_key) {
-    verifier_.allow_algorithm(jwt::algorithm::ps256(pub_key, "", "", ""));
+    : JWTPublicKey(move(algorithm), move(pub_key)) {
+    verifier_.allow_algorithm(jwt::algorithm::ps256(get_key(), "", "", ""));
   }
 };
 
@@ -161,8 +161,8 @@ class PS384JWTPublicKey : public JWTPublicKey {
  public:
   /// Throw exception if failed to initialize the JWT verifier.
   PS384JWTPublicKey(std::string algorithm, std::string pub_key)
-    : JWTPublicKey(algorithm, pub_key) {
-    verifier_.allow_algorithm(jwt::algorithm::ps384(pub_key, "", "", ""));
+    : JWTPublicKey(move(algorithm), move(pub_key)) {
+    verifier_.allow_algorithm(jwt::algorithm::ps384(get_key(), "", "", ""));
   }
 };
 
@@ -172,8 +172,8 @@ class PS512JWTPublicKey : public JWTPublicKey {
  public:
   /// Throw JWT exception if failed to initialize the verifier.
   PS512JWTPublicKey(std::string algorithm, std::string pub_key)
-    : JWTPublicKey(algorithm, pub_key) {
-    verifier_.allow_algorithm(jwt::algorithm::ps512(pub_key, "", "", ""));
+    : JWTPublicKey(move(algorithm), move(pub_key)) {
+    verifier_.allow_algorithm(jwt::algorithm::ps512(get_key(), "", "", ""));
   }
 };
 
@@ -183,8 +183,8 @@ class ES256JWTPublicKey : public JWTPublicKey {
  public:
   /// Throw JWT exception if failed to initialize the verifier.
   ES256JWTPublicKey(std::string algorithm, std::string pub_key)
-    : JWTPublicKey(algorithm, pub_key) {
-    verifier_.allow_algorithm(jwt::algorithm::es256(pub_key, "", "", ""));
+    : JWTPublicKey(move(algorithm), move(pub_key)) {
+    verifier_.allow_algorithm(jwt::algorithm::es256(get_key(), "", "", ""));
   }
 };
 
@@ -194,8 +194,8 @@ class ES384JWTPublicKey : public JWTPublicKey {
  public:
   /// Throw exception if failed to initialize the JWT verifier.
   ES384JWTPublicKey(std::string algorithm, std::string pub_key)
-    : JWTPublicKey(algorithm, pub_key) {
-    verifier_.allow_algorithm(jwt::algorithm::es384(pub_key, "", "", ""));
+    : JWTPublicKey(move(algorithm), move(pub_key)) {
+    verifier_.allow_algorithm(jwt::algorithm::es384(get_key(), "", "", ""));
   }
 };
 
@@ -205,8 +205,8 @@ class ES512JWTPublicKey : public JWTPublicKey {
  public:
   /// Throw JWT exception if failed to initialize the verifier.
   ES512JWTPublicKey(std::string algorithm, std::string pub_key)
-    : JWTPublicKey(algorithm, pub_key) {
-    verifier_.allow_algorithm(jwt::algorithm::es512(pub_key, "", "", ""));
+    : JWTPublicKey(move(algorithm), move(pub_key)) {
+    verifier_.allow_algorithm(jwt::algorithm::es512(get_key(), "", "", ""));
   }
 };
 
@@ -262,7 +262,9 @@ class JWKSSnapshot {
   /// checksum of JWKS object is changed. If no keys were given in the URL, the internal
   /// maps will be empty.
   Status LoadKeysFromUrl(
-      const std::string& jwks_url, uint64_t cur_jwks_hash, bool* is_changed);
+      const std::string& jwks_url, bool jwks_verify_server_certificate,
+      const std::string& jwks_ca_certificate, uint64_t cur_jwks_hash,
+      bool* is_changed);
 
   /// Look up the key ID in the internal key maps and returns the key if the lookup was
   /// successful, otherwise return nullptr.
@@ -296,11 +298,11 @@ class JWKSSnapshot {
 
   /// Following two functions are called inside Init().
   /// Add a RSA public key.
-  void AddRSAPublicKey(std::string key_id, JWTPublicKey* jwk_pub_key);
+  void AddRSAPublicKey(const std::string& key_id, JWTPublicKey* jwk_pub_key);
   /// Add a HS key.
-  void AddHSKey(std::string key_id, JWTPublicKey* jwk_pub_key);
+  void AddHSKey(const std::string& key_id, JWTPublicKey* jwk_pub_key);
   /// Add a EC public key.
-  void AddECPublicKey(std::string key_id, JWTPublicKey* jwk_pub_key);
+  void AddECPublicKey(const std::string& key_id, JWTPublicKey* jwk_pub_key);
 
   /// Note: According to section 4.5 of RFC 7517 (JSON Web Key), different keys might use
   /// the same "kid" value is if they have different "kty" (key type) values but are
@@ -343,7 +345,8 @@ class JWKSMgr {
   /// the internal maps will be empty.
   /// If the given jwks_uri is a URL, start a working thread which will periodically
   /// checks the JWKS URL for updates. This provides support for key rotation.
-  Status Init(const std::string& jwks_uri, bool is_local_file);
+  Status Init(const std::string& jwks_uri, bool jwks_verify_server_certificate,
+      const std::string& jwks_ca_certificate, bool is_local_file);
 
   /// Returns a read only snapshot of the current JWKS. This function should be called
   /// after calling Init().
@@ -364,6 +367,13 @@ class JWKSMgr {
 
   /// JWKS URI.
   std::string jwks_uri_;
+
+  /// JWKS insecure TLS
+  bool jwks_verify_server_certificate_;
+
+  /// File path to PEM certificate bundle of certs to trust when retrieving the JWKS
+  /// from the specified URL.
+  std::string jwks_ca_certificate_;
 
   /// The snapshot of the current JWKS. When the checksum of downloaded JWKS json object
   /// has been changed, the public keys will be reloaded and the content of this pointer

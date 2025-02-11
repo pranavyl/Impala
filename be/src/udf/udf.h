@@ -61,6 +61,24 @@ struct BigIntVal;
 struct StringVal;
 struct TimestampVal;
 struct DateVal;
+class FunctionContext;
+
+/// Built-in functions exposed to UDFs
+struct BuiltInFunctions {
+ public:
+  /// Sends a prompt to the default endpoint and uses the default model, default
+  /// auth credentials and default platform params and impala options.
+  StringVal (*ai_generate_text_default)(
+      FunctionContext* context, const StringVal& prompt);
+  /// Sends a prompt to the input AI endpoint using the input model, authentication
+  /// credential and optional platform params and impala options.
+  /// The authentication credential can be a jceks api_key secret or plain text
+  /// depending on the specific scenario.
+  StringVal (*ai_generate_text)(FunctionContext* context, const StringVal& endpoint,
+      const StringVal& prompt, const StringVal& model,
+      const StringVal& api_auth_credential, const StringVal& platform_params,
+      const StringVal& impala_options);
+};
 
 /// A FunctionContext is passed to every UDF/UDA and is the interface for the UDF to the
 /// rest of the system. It contains APIs to examine the system state, report errors and
@@ -147,8 +165,10 @@ class FunctionContext {
   /// Returns the query_id for the current query.
   UniqueId query_id() const;
 
-  /// Sets an error for this UDF. If this is called, this will trigger the
-  /// query to fail.
+  /// Sets an error for this UDF. The error message is copied and the copy is owned by
+  /// this object.
+  ///
+  /// If this is called, this will trigger the query to fail.
   void SetError(const char* error_msg);
 
   /// Adds a warning that is returned to the user. This can include things like
@@ -245,6 +265,8 @@ class FunctionContext {
   /// Returns the underlying opaque implementation object. The UDF/UDA should not
   /// use this. This is used internally.
   impala::FunctionContextImpl* impl() const { return impl_; }
+
+  const BuiltInFunctions* Functions() const;
 
   ~FunctionContext();
 
@@ -691,6 +713,10 @@ struct StringVal : public AnyVal {
     return ptr == other.ptr || memcmp(ptr, other.ptr, len) == 0;
   }
   bool operator!=(const StringVal& other) const { return !(*this == other); }
+
+ private:
+  static void AllocateStringValWithLenCheck(FunctionContext* ctx, uint64_t str_len,
+      StringVal* res);
 };
 
 struct DecimalVal : public impala_udf::AnyVal {

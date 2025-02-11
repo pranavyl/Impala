@@ -22,7 +22,7 @@
 #include "rpc/TAcceptQueueServer.h"
 
 #include <gutil/walltime.h>
-#include <thrift/concurrency/PlatformThreadFactory.h>
+#include <thrift/concurrency/ThreadFactory.h>
 #include <thrift/transport/TSocket.h>
 
 #include "util/histogram-metric.h"
@@ -81,15 +81,24 @@ class TAcceptQueueServer::Task : public Runnable {
         }
         // Setting a socket timeout for process() may lead to false positive
         // and prematurely closes a slow client's connection.
-        if (!processor_->process(input_, output_, connectionContext) ||
-            !Peek(input_, connectionContext, eventHandler)) {
+        if (!processor_->process(input_, output_, connectionContext)
+            || !Peek(connectionContext, eventHandler.get())) {
           break;
         }
       }
     } catch (const TTransportException& ttx) {
-      if (ttx.getType() != TTransportException::END_OF_FILE) {
+      // IMPALA-13020: Thrift throws an END_OF_FILE exception when it hits the
+      // max message size. That is always interesting to us, so we specifically
+      // detect "MaxMessageSize" and print it along with advice on how to address it.
+      bool hit_max_message_size =
+          std::string(ttx.what()).find("MaxMessageSize") != std::string::npos;
+      if (ttx.getType() != TTransportException::END_OF_FILE || hit_max_message_size) {
         string errStr = string("TAcceptQueueServer client died: ") + ttx.what();
         GlobalOutput(errStr.c_str());
+        if (hit_max_message_size) {
+          GlobalOutput("MaxMessageSize errors can be addressed by increasing "
+              "thrift_rpc_max_message_size on the receiving nodes.");
+        }
       }
     } catch (const std::exception& x) {
       GlobalOutput.printf(
@@ -136,8 +145,7 @@ class TAcceptQueueServer::Task : public Runnable {
   // if the sessions associated with the connection have all expired
   // due to inactivity. If so, it will return false and the connection
   // will be closed by the caller.
-  bool Peek(shared_ptr<TProtocol> input, void* connectionContext,
-      shared_ptr<TServerEventHandler> eventHandler) {
+  bool Peek(void* connectionContext, TServerEventHandler* eventHandler) {
     // Set a timeout on input socket if idle_poll_period_ms_ is non-zero.
     TSocket* socket = static_cast<TSocket*>(transport_.get());
     if (server_.idle_poll_period_ms_ > 0) {
@@ -151,12 +159,15 @@ class TAcceptQueueServer::Task : public Runnable {
         bytes_pending = input_->getTransport()->peek();
         break;
       } catch (const TTransportException& ttx) {
-        // Implementaion of the underlying transport's peek() may call either
+        // Implementation of the underlying transport's peek() may call either
         // read() or peek() of the socket.
         if (eventHandler != nullptr && server_.idle_poll_period_ms_ > 0 &&
             (IsReadTimeoutTException(ttx) || IsPeekTimeoutTException(ttx))) {
+          VLOG(2) << Substitute("Socket read or peek timeout encountered "
+                                "(idle_poll_period_ms_=$0). $1",
+              server_.idle_poll_period_ms_, ttx.what());
           ThriftServer::ThriftServerEventProcessor* thriftServerHandler =
-              static_cast<ThriftServer::ThriftServerEventProcessor*>(eventHandler.get());
+              static_cast<ThriftServer::ThriftServerEventProcessor*>(eventHandler);
           if (thriftServerHandler->IsIdleContext(connectionContext)) {
             const string& client = socket->getSocketInfo();
             GlobalOutput.printf(
@@ -189,27 +200,25 @@ TAcceptQueueServer::TAcceptQueueServer(const shared_ptr<TProcessor>& processor,
     const shared_ptr<TTransportFactory>& transportFactory,
     const shared_ptr<TProtocolFactory>& protocolFactory,
     const shared_ptr<ThreadFactory>& threadFactory, const string& name,
-    int32_t maxTasks, int64_t queue_timeout_ms, int64_t idle_poll_period_ms)
+    int32_t maxTasks, int64_t queue_timeout_ms, int64_t idle_poll_period_ms,
+    bool is_external_facing)
     : TServer(processor, serverTransport, transportFactory, protocolFactory),
       threadFactory_(threadFactory), name_(name), maxTasks_(maxTasks),
-      queue_timeout_ms_(queue_timeout_ms), idle_poll_period_ms_(idle_poll_period_ms) {
+      queue_timeout_ms_(queue_timeout_ms), idle_poll_period_ms_(idle_poll_period_ms),
+      is_external_facing_(is_external_facing) {
   init();
 }
 
 void TAcceptQueueServer::init() {
   if (!threadFactory_) {
-    threadFactory_.reset(new PlatformThreadFactory);
+    threadFactory_.reset(new ThreadFactory);
   }
 }
 
 void TAcceptQueueServer::CleanupAndClose(const string& error,
-    shared_ptr<TTransport> input, shared_ptr<TTransport> output,
-    shared_ptr<TTransport> client) {
-  if (input != nullptr) {
-    input->close();
-  }
-  if (output != nullptr) {
-    output->close();
+    const shared_ptr<TTransport>& io_transport, const shared_ptr<TTransport>& client) {
+  if (io_transport != nullptr) {
+    io_transport->close();
   }
   if (client != nullptr) {
     client->close();
@@ -218,11 +227,14 @@ void TAcceptQueueServer::CleanupAndClose(const string& error,
 }
 
 // New.
-void TAcceptQueueServer::SetupConnection(shared_ptr<TAcceptQueueEntry> entry) {
+void TAcceptQueueServer::SetupConnection(TAcceptQueueEntry* entry) {
+  DCHECK(entry != nullptr);
   if (metrics_enabled_) queue_size_metric_->Increment(-1);
-  shared_ptr<TTransport> inputTransport;
-  shared_ptr<TTransport> outputTransport;
+  shared_ptr<TTransport> io_transport;
   shared_ptr<TTransport> client = entry->client_;
+  int64_t max_message_size = is_external_facing_ ? ThriftExternalRpcMaxMessageSize() :
+      ThriftInternalRpcMaxMessageSize();
+  SetMaxMessageSize(client.get(), max_message_size);
   const string& socket_info = reinterpret_cast<TSocket*>(client.get())->getSocketInfo();
   VLOG(2) << Substitute("TAcceptQueueServer: $0 started connection setup for client $1",
       name_, socket_info);
@@ -230,12 +242,28 @@ void TAcceptQueueServer::SetupConnection(shared_ptr<TAcceptQueueEntry> entry) {
     MonotonicStopWatch timer;
     // Start timing for connection setup.
     timer.Start();
-    inputTransport = inputTransportFactory_->getTransport(client);
-    outputTransport = outputTransportFactory_->getTransport(client);
+
+    // Since THRIFT-5237, it is necessary for Impala to have the same TTransport object
+    // for both input and output transport. The detailed reasoning on why this TTransport
+    // object sharing requirement is as follow:
+    // - Thrift decrements the max message size counter as messages arrive.
+    // - Thrift resets the max message size counter with a flush.
+    // - If the input and output transport are distinct, the decrement is happening on
+    //   one object while the reset is happening on a different object, so it eventually
+    //   throws an error.
+    // Using same transport fixes the counter logic. This also helps with simplifying
+    // Impala's custom TSaslTransport since its caching algorithm in
+    // TSaslServerTransport::Factory is not required anymore.
+    DCHECK(inputTransportFactory_ == outputTransportFactory_);
+    io_transport = inputTransportFactory_->getTransport(client);
+    DCHECK_EQ(io_transport->getConfiguration()->getMaxMessageSize(),
+        client->getConfiguration()->getMaxMessageSize());
+    DCHECK_EQ(max_message_size, io_transport->getConfiguration()->getMaxMessageSize());
+
     shared_ptr<TProtocol> inputProtocol =
-        inputProtocolFactory_->getProtocol(inputTransport);
+        inputProtocolFactory_->getProtocol(io_transport);
     shared_ptr<TProtocol> outputProtocol =
-        outputProtocolFactory_->getProtocol(outputTransport);
+        outputProtocolFactory_->getProtocol(io_transport);
     shared_ptr<TProcessor> processor =
         getProcessor(inputProtocol, outputProtocol, client);
 
@@ -278,7 +306,7 @@ void TAcceptQueueServer::SetupConnection(shared_ptr<TAcceptQueueEntry> entry) {
           }
           LOG(INFO) << name_ << ": Server busy. Timing out connection request.";
           string errStr = "TAcceptQueueServer: " + name_ + " server busy";
-          CleanupAndClose(errStr, inputTransport, outputTransport, client);
+          CleanupAndClose(errStr, io_transport, client);
           return;
         }
       }
@@ -293,11 +321,11 @@ void TAcceptQueueServer::SetupConnection(shared_ptr<TAcceptQueueEntry> entry) {
   } catch (const TException& tx) {
     string errStr = Substitute("TAcceptQueueServer: $0 connection setup failed for "
         "client $1. Caught TException: $2", name_, socket_info, string(tx.what()));
-    CleanupAndClose(errStr, inputTransport, outputTransport, client);
+    CleanupAndClose(errStr, io_transport, client);
   } catch (const string& s) {
     string errStr = Substitute("TAcceptQueueServer: $0 connection setup failed for "
         "client $1. Unknown exception: $2", name_, socket_info, s);
-    CleanupAndClose(errStr, inputTransport, outputTransport, client);
+    CleanupAndClose(errStr, io_transport, client);
   }
 }
 
@@ -320,7 +348,7 @@ void TAcceptQueueServer::serve() {
       "setup-worker", FLAGS_accepted_cnxn_setup_thread_pool_size,
       FLAGS_accepted_cnxn_queue_depth,
       [this](int tid, const shared_ptr<TAcceptQueueEntry>& item) {
-        this->SetupConnection(item);
+        this->SetupConnection(item.get());
       });
   // Initialize the thread pool
   Status status = connection_setup_pool.Init();

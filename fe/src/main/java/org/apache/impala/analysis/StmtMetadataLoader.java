@@ -34,11 +34,14 @@ import org.apache.impala.catalog.FeDb;
 import org.apache.impala.catalog.FeIncompleteTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
+import org.apache.impala.catalog.MaterializedViewHdfsTable;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.compat.MetastoreShim;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.Frontend;
+import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.util.AcidUtils;
 import org.apache.impala.util.EventSequence;
 import org.apache.impala.util.TUniqueIdUtil;
@@ -64,6 +67,7 @@ public class StmtMetadataLoader {
   private final String sessionDb_;
   private final EventSequence timeline_;
   private final User user_;
+  private final TUniqueId queryId_;
 
   // Results of the loading process. See StmtTableCache.
   private final Set<String> dbs_ = new HashSet<>();
@@ -109,11 +113,12 @@ public class StmtMetadataLoader {
    * column-masking/row-filtering policies.
    */
   public StmtMetadataLoader(Frontend fe, String sessionDb, EventSequence timeline,
-      User user) {
+      User user, TUniqueId queryId) {
     fe_ = Preconditions.checkNotNull(fe);
     sessionDb_ = Preconditions.checkNotNull(sessionDb);
     timeline_ = timeline;
     user_ = user;
+    queryId_ = queryId;
   }
 
   /**
@@ -122,7 +127,7 @@ public class StmtMetadataLoader {
    * keys, cross reference of a table.
    */
   public StmtMetadataLoader(Frontend fe, String sessionDb, EventSequence timeline) {
-    this(fe, sessionDb, timeline, null);
+    this(fe, sessionDb, timeline, null, null);
   }
 
   // Getters for testing
@@ -161,7 +166,14 @@ public class StmtMetadataLoader {
     Preconditions.checkState(numLoadRequestsSent_ == 0);
     Preconditions.checkState(numCatalogUpdatesReceived_ == 0);
     FeCatalog catalog = fe_.getCatalog();
-    Set<TableName> missingTbls = getMissingTables(catalog, tbls);
+    // missingTblsSnapshot builds tableName to table in the db mapping for tables that
+    // are either not loaded or have failed to load due to recoverable error in the
+    // previous queries. It is used to detect change of table in db since the time it is
+    // added to missingTblsSnapshot when the table is loaded.
+    Map<TableName, FeTable> missingTblsSnapshot = new HashMap<>();
+    // TableName is added to missingTbls set as long as table is not loaded or the table
+    // in db has not changed(i.e., table in db is same as table in missingTblsSnapshot).
+    Set<TableName> missingTbls = getMissingTables(catalog, tbls, missingTblsSnapshot);
     // There are no missing tables. Return to avoid making an RPC to the CatalogServer
     // and adding events to the timeline.
     if (missingTbls.isEmpty()) {
@@ -194,7 +206,7 @@ public class StmtMetadataLoader {
     // on-demand in the first recursive call to 'getMissingTables' above.
     while (!missingTbls.isEmpty()) {
       if (issueLoadRequest) {
-        catalog.prioritizeLoad(missingTbls);
+        catalog.prioritizeLoad(missingTbls, queryId_);
         ++numLoadRequestsSent_;
         requestedTbls.addAll(missingTbls);
       }
@@ -226,7 +238,8 @@ public class StmtMetadataLoader {
 
       // Wait for the next catalog update and then revise the loaded/missing tables.
       catalog.waitForCatalogUpdate(Frontend.MAX_CATALOG_UPDATE_WAIT_TIME_MS);
-      Set<TableName> newMissingTbls = getMissingTables(catalog, missingTbls);
+      Set<TableName> newMissingTbls =
+          getMissingTables(catalog, missingTbls, missingTblsSnapshot);
       // Issue a load request for the new missing tables in these cases:
       // 1) Catalog has restarted so all in-flight loads have been lost
       // 2) There are new missing tables due to view expansion
@@ -298,7 +311,8 @@ public class StmtMetadataLoader {
    * Path.getCandidateTables(). Non-existent tables are ignored and not returned or
    * added to 'loadedOrFailedTbls_'.
    */
-  private Set<TableName> getMissingTables(FeCatalog catalog, Set<TableName> tbls) {
+  private Set<TableName> getMissingTables(FeCatalog catalog, Set<TableName> tbls,
+      Map<TableName, FeTable> missingTblsSnapshot) {
     Set<TableName> missingTbls = new HashSet<>();
     Set<TableName> viewTbls = new HashSet<>();
     for (TableName tblName: tbls) {
@@ -308,13 +322,25 @@ public class StmtMetadataLoader {
       dbs_.add(tblName.getDb());
       FeTable tbl = db.getTable(tblName.getTbl());
       if (tbl == null) continue;
-      if (!tbl.isLoaded()) {
+      if (!tbl.isLoaded()
+          || (tbl instanceof FeIncompleteTable
+                 && ((FeIncompleteTable) tbl).isLoadFailedByRecoverableError())) {
+        // Add table to missingTblsSnapshot only for the first time(putIfAbsent) if the
+        // table is not loaded or the previous load has failed due to recoverable error.
+        missingTblsSnapshot.putIfAbsent(tblName, tbl);
+      }
+      if (!tbl.isLoaded() || missingTblsSnapshot.get(tblName) == tbl) {
         missingTbls.add(tblName);
         continue;
       }
       loadedOrFailedTbls_.put(tblName, tbl);
       if (tbl instanceof FeView) {
         viewTbls.addAll(collectTableCandidates(((FeView) tbl).getQueryStmt()));
+      } else if (tbl instanceof MaterializedViewHdfsTable) {
+        Set<TableName> mvSrcTableNames = collectTableCandidates(
+            ((MaterializedViewHdfsTable) tbl).getQueryStmt());
+        ((MaterializedViewHdfsTable) tbl).addSrcTables(mvSrcTableNames);
+        viewTbls.addAll(mvSrcTableNames);
       }
       // Adds tables/views introduced by column-masking/row-filtering policies.
       if (!(tbl instanceof FeIncompleteTable)
@@ -328,7 +354,9 @@ public class StmtMetadataLoader {
       }
     }
     // Recursively collect loaded/missing tables from loaded views.
-    if (!viewTbls.isEmpty()) missingTbls.addAll(getMissingTables(catalog, viewTbls));
+    if (!viewTbls.isEmpty()) {
+      missingTbls.addAll(getMissingTables(catalog, viewTbls, missingTblsSnapshot));
+    }
     return missingTbls;
   }
 
@@ -341,7 +369,19 @@ public class StmtMetadataLoader {
   private Set<TableName> collectTableCandidates(StatementBase stmt) {
     Preconditions.checkNotNull(stmt);
     List<TableRef> tblRefs = new ArrayList<>();
-    stmt.collectTableRefs(tblRefs);
+    // The information about whether table masking is supported is not available to
+    // ResetMetadataStmt so we collect the TableRef for ResetMetadataStmt whenever
+    // applicable. Skip this if allow_catalog_cache_op_from_masked_users=true because
+    // we don't need column info for fetching column-masking policies.
+    if (stmt instanceof ResetMetadataStmt
+        && fe_.getAuthzFactory().getAuthorizationConfig().isEnabled()
+        && fe_.getAuthzFactory().supportsTableMasking()
+        && !BackendConfig.INSTANCE.allowCatalogCacheOpFromMaskedUsers()) {
+      TableName tableName = ((ResetMetadataStmt) stmt).getTableName();
+      if (tableName != null) tblRefs.add(new TableRef(tableName.toPath(), null));
+    } else {
+      stmt.collectTableRefs(tblRefs);
+    }
     Set<TableName> tableNames = new HashSet<>();
     for (TableRef ref: tblRefs) {
       tableNames.addAll(Path.getCandidateTables(ref.getPath(), sessionDb_));
@@ -361,7 +401,6 @@ public class StmtMetadataLoader {
         user_);
     if (tableMask.needsMaskingOrFiltering()) {
       for (Column col : columns) {
-        if (col.getType().isComplexType()) continue;
         // Use authzCtx=null to avoid audits and privilege checks.
         SelectStmt stmt = tableMask.createColumnMaskStmt(
             col.getName(), col.getType(), /*authzCtx*/ null);

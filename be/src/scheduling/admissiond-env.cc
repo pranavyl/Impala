@@ -38,8 +38,11 @@ DEFINE_int32(
 
 DECLARE_string(state_store_host);
 DECLARE_int32(state_store_port);
+DECLARE_string(state_store_2_host);
+DECLARE_int32(state_store_2_port);
 DECLARE_int32(state_store_subscriber_port);
 DECLARE_string(hostname);
+DECLARE_string(cluster_membership_topic_id);
 
 namespace impala {
 
@@ -58,9 +61,16 @@ AdmissiondEnv::AdmissiondEnv()
       MakeNetworkAddress(FLAGS_hostname, FLAGS_state_store_subscriber_port);
   TNetworkAddress statestore_address =
       MakeNetworkAddress(FLAGS_state_store_host, FLAGS_state_store_port);
-  statestore_subscriber_.reset(new StatestoreSubscriber(
-      Substitute("admissiond@$0", TNetworkAddressToString(admission_service_addr)),
-      subscriber_address, statestore_address, metrics));
+  TNetworkAddress statestore2_address =
+      MakeNetworkAddress(FLAGS_state_store_2_host, FLAGS_state_store_2_port);
+  string subscriber_id = Substitute("admissiond@$0",
+      TNetworkAddressToString(admission_service_addr));
+  if (!FLAGS_cluster_membership_topic_id.empty()) {
+    subscriber_id = FLAGS_cluster_membership_topic_id + '-' + subscriber_id;
+  }
+  statestore_subscriber_.reset(new StatestoreSubscriber(subscriber_id, subscriber_address,
+      statestore_address, statestore2_address, metrics,
+      TStatestoreSubscriberType::ADMISSIOND));
 
   scheduler_.reset(new Scheduler(metrics, request_pool_service()));
   cluster_membership_mgr_.reset(new ClusterMembershipMgr(
@@ -87,20 +97,25 @@ Status AdmissiondEnv::Init() {
       DaemonEnv::GetInstance()->metrics(), "mem-tracker.process");
 
   http_handler_->RegisterHandlers(DaemonEnv::GetInstance()->webserver());
+  if (DaemonEnv::GetInstance()->metrics_webserver() != nullptr) {
+    http_handler_->RegisterHandlers(
+        DaemonEnv::GetInstance()->metrics_webserver(), /* metrics_only */ true);
+  }
 
-  string ip_address;
+  IpAddr ip_address;
   RETURN_IF_ERROR(HostnameToIpAddr(FLAGS_hostname, &ip_address));
-  TNetworkAddress ip_addr_port;
-  ip_addr_port.__set_hostname(ip_address);
-  ip_addr_port.__set_port(FLAGS_admission_service_port);
-  RETURN_IF_ERROR(rpc_mgr_->Init(ip_addr_port));
+  // TODO: advertise BackendId of admissiond to coordinators via heartbeats.
+  // Use admissiond's IP address as unique ID for UDS now.
+  krpc_address_ = MakeNetworkAddressPB(
+      ip_address, FLAGS_admission_service_port, UdsAddressUniqueIdPB::IP_ADDRESS);
+  RETURN_IF_ERROR(rpc_mgr_->Init(krpc_address_));
   admission_control_svc_.reset(
       new AdmissionControlService(DaemonEnv::GetInstance()->metrics()));
   RETURN_IF_ERROR(admission_control_svc_->Init());
 
   RETURN_IF_ERROR(cluster_membership_mgr_->Init());
   cluster_membership_mgr_->RegisterUpdateCallbackFn(
-      [&](ClusterMembershipMgr::SnapshotPtr snapshot) {
+      [&](const ClusterMembershipMgr::SnapshotPtr& snapshot) {
         std::unordered_set<BackendIdPB> current_backends;
         for (const auto& it : snapshot->current_backends) {
           current_backends.insert(it.second.backend_id());
@@ -125,6 +140,10 @@ Status AdmissiondEnv::StartServices() {
   LOG(INFO) << "Starting KRPC service.";
   RETURN_IF_ERROR(rpc_mgr_->StartServices());
 
+  // Mark service as started.
+  // Should be called only after the statestore subscriber service and KRPC service
+  // has started.
+  admission_control_svc_->service_started_ = true;
   return Status::OK();
 }
 

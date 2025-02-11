@@ -119,14 +119,14 @@ fi
 TIMEOUT_PID=$!
 
 SCHEMA_MISMATCH_ERROR="A schema change has been detected in the metadata, "
-SCHEMA_MISMATCH_ERROR+="but it cannot be loaded on Isilon, s3, gcs, cos or local "
-SCHEMA_MISMATCH_ERROR+="filesystem, and the filesystem is ${TARGET_FILESYSTEM}".
+SCHEMA_MISMATCH_ERROR+="but it cannot be loaded on Isilon, s3, gcs, cos, oss, obs or "
+SCHEMA_MISMATCH_ERROR+="local filesystem, and the filesystem is ${TARGET_FILESYSTEM}".
 
 if [[ $SKIP_METADATA_LOAD -eq 0  && "$SNAPSHOT_FILE" = "" ]]; then
   run-step "Generating HBase data" create-hbase.log \
       ${IMPALA_HOME}/testdata/bin/create-hbase.sh
   run-step "Creating /test-warehouse HDFS directory" create-test-warehouse-dir.log \
-      hadoop fs -mkdir /test-warehouse
+      hadoop fs -mkdir -p /test-warehouse
 elif [ $SKIP_SNAPSHOT_LOAD -eq 0 ]; then
   run-step "Loading HDFS data from snapshot: $SNAPSHOT_FILE" \
       load-test-warehouse-snapshot.log \
@@ -135,10 +135,11 @@ elif [ $SKIP_SNAPSHOT_LOAD -eq 0 ]; then
   if ! ${IMPALA_HOME}/testdata/bin/check-schema-diff.sh; then
     if [[ "${TARGET_FILESYSTEM}" == "isilon" || "${TARGET_FILESYSTEM}" == "s3" || \
           "${TARGET_FILESYSTEM}" == "local" || "${TARGET_FILESYSTEM}" == "gs" || \
-          "${TARGET_FILESYSTEM}" == "cosn" ]] ; then
+          "${TARGET_FILESYSTEM}" == "cosn" || "${TARGET_FILESYSTEM}" == "oss" || \
+          "${TARGET_FILESYSTEM}" == "obs" || "${TARGET_FILESYSTEM}" == "ozone" ]] ; then
       echo "ERROR in $0 at line $LINENO: A schema change has been detected in the"
-      echo "metadata, but it cannot be loaded on isilon, s3, gcs, cos or local and the"
-      echo "target file system is ${TARGET_FILESYSTEM}.  Exiting."
+      echo "metadata, but it cannot be loaded on isilon, s3, gcs, cos, oss, obs, ozone,"
+      echo "or local and the target file system is ${TARGET_FILESYSTEM}.  Exiting."
       # Generate an explicit JUnitXML symptom report here for easier triaging
       ${IMPALA_HOME}/bin/generate_junitxml.py --phase=dataload \
           --step=check-schema-diff.sh --error "${SCHEMA_MISMATCH_ERROR}"
@@ -164,14 +165,13 @@ function start-impala {
   : ${START_CLUSTER_ARGS=""}
   # Use a fast statestore update so that DDL operations run faster.
   START_CLUSTER_ARGS_INT="--state_store_args=--statestore_update_frequency_ms=50"
+  # Disable strict datafile location checks for Iceberg tables
+  DATAFILE_LOCATION_CHECK="-iceberg_allow_datafiles_in_table_location_only=false"
+  START_CLUSTER_ARGS_INT+=("--catalogd_args=$DATAFILE_LOCATION_CHECK")
   if [[ "${TARGET_FILESYSTEM}" == "local" ]]; then
     START_CLUSTER_ARGS_INT+=("--impalad_args=--abort_on_config_error=false -s 1")
   else
     START_CLUSTER_ARGS_INT+=("-s 3")
-  fi
-  if [[ "${ERASURE_CODING}" == true ]]; then
-    START_CLUSTER_ARGS="${START_CLUSTER_ARGS} \
-      --impalad_args=--default_query_options=allow_erasure_coded_files=true"
   fi
   START_CLUSTER_ARGS_INT+=("${START_CLUSTER_ARGS}")
   ${IMPALA_HOME}/bin/start-impala-cluster.py --log_dir=${IMPALA_DATA_LOADING_LOGS_DIR} \
@@ -214,12 +214,14 @@ function load-custom-schemas {
   mkdir -p ${TMP_DIR}/chars_formats_avro_snap \
    ${TMP_DIR}/chars_formats_parquet \
    ${TMP_DIR}/chars_formats_text \
-   ${TMP_DIR}/chars_formats_orc_def
+   ${TMP_DIR}/chars_formats_orc_def \
+   ${TMP_DIR}/chars_formats_json
 
   ln -s ${IMPALA_HOME}/testdata/data/chars-formats.avro ${TMP_DIR}/chars_formats_avro_snap
   ln -s ${IMPALA_HOME}/testdata/data/chars-formats.parquet ${TMP_DIR}/chars_formats_parquet
   ln -s ${IMPALA_HOME}/testdata/data/chars-formats.orc ${TMP_DIR}/chars_formats_orc_def
   ln -s ${IMPALA_HOME}/testdata/data/chars-formats.txt ${TMP_DIR}/chars_formats_text
+  ln -s ${IMPALA_HOME}/testdata/data/chars-formats.json ${TMP_DIR}/chars_formats_json
 
   # File used by CreateTableLikeOrc tests
   ln -s ${IMPALA_HOME}/testdata/data/alltypes_non_acid.orc ${SCHEMA_TMP_DIR}
@@ -235,12 +237,12 @@ function load-data {
   TABLE_FORMATS=${3:-}
   FORCE_LOAD=${4:-}
 
-  MSG="Loading workload '$WORKLOAD'"
+  LOAD_MSG="Loading workload '$WORKLOAD'"
   ARGS=("--workloads $WORKLOAD")
-  MSG+=" using exploration strategy '$EXPLORATION_STRATEGY'"
+  LOAD_MSG+=" using exploration strategy '$EXPLORATION_STRATEGY'"
   ARGS+=("-e $EXPLORATION_STRATEGY")
   if [ $TABLE_FORMATS ]; then
-    MSG+=" in table formats '$TABLE_FORMATS'"
+    LOAD_MSG+=" in table formats '$TABLE_FORMATS'"
     ARGS+=("--table_formats $TABLE_FORMATS")
   fi
   if [ $LOAD_DATA_ARGS ]; then
@@ -283,13 +285,18 @@ function load-data {
   fi
 
   LOG_FILE=${IMPALA_DATA_LOADING_LOGS_DIR}/${LOG_BASENAME}
-  echo "$MSG. Logging to ${LOG_FILE}"
+  echo "$LOAD_MSG. Logging to ${LOG_FILE}"
   # Use unbuffered logging by executing with -u
   if ! impala-python -u ${IMPALA_HOME}/bin/load-data.py ${ARGS[@]} &> ${LOG_FILE}; then
     echo Error loading data. The end of the log file is:
     tail -n 50 $LOG_FILE
     return 1
   fi
+}
+
+function load-tpcds-data {
+  load-data "tpcds" "core"
+  load-data "tpcds_partitioned" "core"
 }
 
 function cache-test-tables {
@@ -325,70 +332,6 @@ function load-aux-workloads {
   else
     echo "Skipping load of auxilary workloads because directories do not exist"
   fi
-}
-
-function setup-ranger {
-  echo "SETTING UP RANGER"
-
-  RANGER_SETUP_DIR="${IMPALA_HOME}/testdata/cluster/ranger/setup"
-
-  perl -wpl -e 's/\$\{([^}]+)\}/defined $ENV{$1} ? $ENV{$1} : $&/eg' \
-    "${RANGER_SETUP_DIR}/impala_group_owner.json.template" > \
-    "${RANGER_SETUP_DIR}/impala_group_owner.json"
-
-  GROUP_ID_OWNER=$(wget -qO - --auth-no-challenge --user=admin --password=admin \
-    --post-file="${RANGER_SETUP_DIR}/impala_group_owner.json" \
-    --header="accept:application/json" \
-    --header="Content-Type:application/json" \
-    http://localhost:6080/service/xusers/secure/groups |
-    python -c "import sys, json; print json.load(sys.stdin)['id']")
-  export GROUP_ID_OWNER
-
-  GROUP_ID_NON_OWNER=$(wget -qO - --auth-no-challenge --user=admin \
-    --password=admin --post-file="${RANGER_SETUP_DIR}/impala_group_non_owner.json" \
-    --header="accept:application/json" \
-    --header="Content-Type:application/json" \
-    http://localhost:6080/service/xusers/secure/groups |
-    python -c "import sys, json; print json.load(sys.stdin)['id']")
-  export GROUP_ID_NON_OWNER
-
-  perl -wpl -e 's/\$\{([^}]+)\}/defined $ENV{$1} ? $ENV{$1} : $&/eg' \
-    "${RANGER_SETUP_DIR}/impala_user_owner.json.template" > \
-    "${RANGER_SETUP_DIR}/impala_user_owner.json"
-
-  perl -wpl -e 's/\$\{([^}]+)\}/defined $ENV{$1} ? $ENV{$1} : $&/eg' \
-    "${RANGER_SETUP_DIR}/impala_user_non_owner.json.template" > \
-    "${RANGER_SETUP_DIR}/impala_user_non_owner.json"
-
-  if grep "\${[A-Z_]*}" "${RANGER_SETUP_DIR}/impala_user_owner.json"; then
-    echo "Found undefined variables in ${RANGER_SETUP_DIR}/impala_user_owner.json."
-    exit 1
-  fi
-
-  if grep "\${[A-Z_]*}" "${RANGER_SETUP_DIR}/impala_user_non_owner.json"; then
-    echo "Found undefined variables in ${RANGER_SETUP_DIR}/impala_user_non_owner.json."
-    exit 1
-  fi
-
-  wget -O /dev/null --auth-no-challenge --user=admin --password=admin \
-    --post-file="${RANGER_SETUP_DIR}/impala_user_owner.json" \
-    --header="Content-Type:application/json" \
-    http://localhost:6080/service/xusers/secure/users
-
-  wget -O /dev/null --auth-no-challenge --user=admin --password=admin \
-    --post-file="${RANGER_SETUP_DIR}/impala_user_non_owner.json" \
-    --header="Content-Type:application/json" \
-    http://localhost:6080/service/xusers/secure/users
-
-  wget -O /dev/null --auth-no-challenge --user=admin --password=admin \
-    --post-file="${RANGER_SETUP_DIR}/impala_service.json" \
-    --header="Content-Type:application/json" \
-    http://localhost:6080/service/public/v2/api/service
-
-  curl -f -u admin:admin -H "Accept: application/json" \
-    -H "Content-Type: application/json" \
-    -X PUT http://localhost:6080/service/public/v2/api/policy/5 \
-    -d @"${RANGER_SETUP_DIR}/policy_5_revised.json"
 }
 
 function copy-and-load-dependent-tables {
@@ -439,8 +382,15 @@ function copy-and-load-dependent-tables {
 
   # For tables that rely on loading data from local fs test-wareload-house
   # TODO: Find a good way to integrate this with the normal data loading scripts
-  beeline -n $USER -u "${JDBC_URL}" -f\
-    ${IMPALA_HOME}/testdata/bin/load-dependent-tables.sql
+  SQL_FILE=${IMPALA_HOME}/testdata/bin/load-dependent-tables.sql
+  if $USE_APACHE_HIVE; then
+    # Apache Hive 3.1 doesn't support "STORED AS JSONFILE" (HIVE-19899)
+    NEW_SQL_FILE=${IMPALA_HOME}/testdata/bin/load-dependent-tables-hive3.sql
+    sed "s/STORED AS JSONFILE/ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.JsonSerDe'"\
+      $SQL_FILE > $NEW_SQL_FILE
+    SQL_FILE=$NEW_SQL_FILE
+  fi
+  beeline -n $USER -u "${JDBC_URL}" -f $SQL_FILE
 }
 
 function create-internal-hbase-table {
@@ -513,7 +463,8 @@ function custom-post-load-steps {
 
   hadoop fs -mkdir -p ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_multiblock_parquet \
     ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_sixblocks_parquet \
-    ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_multiblock_one_row_group_parquet
+    ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_multiblock_one_row_group_parquet \
+    ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_multiblock_variable_num_rows_parquet
 
   #IMPALA-1881: data file produced by hive with multiple blocks.
   hadoop fs -Ddfs.block.size=1048576 -put -f \
@@ -530,6 +481,11 @@ function custom-post-load-steps {
     ${IMPALA_HOME}/testdata/LineItemMultiBlock/lineitem_one_row_group.parquet \
     ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_multiblock_one_row_group_parquet
 
+  # IMPALA-11350: Add tests for row groups with variable num rows.
+  hadoop fs -Ddfs.block.size=1048576 -put -f \
+    ${IMPALA_HOME}/testdata/LineItemMultiBlock/lineitem_multiblock_variable_num_rows.parquet \
+    ${FILESYSTEM_PREFIX}/test-warehouse/lineitem_multiblock_variable_num_rows_parquet
+
   # IMPALA-3307: Upload test time-zone database
   hadoop fs -Ddfs.block.size=1048576 -put -f ${IMPALA_HOME}/testdata/tzdb \
     ${FILESYSTEM_PREFIX}/test-warehouse/
@@ -537,10 +493,17 @@ function custom-post-load-steps {
 
 function copy-and-load-ext-data-source {
   # Copy the test data source library into HDFS
-  ${IMPALA_HOME}/testdata/bin/copy-data-sources.sh
+  ${IMPALA_HOME}/testdata/bin/copy-ext-data-sources.sh
+  # Load the underlying data of the data source
+  ${IMPALA_HOME}/testdata/bin/load-ext-data-sources.sh
   # Create data sources table.
   ${IMPALA_HOME}/bin/impala-shell.sh -i ${IMPALAD} -f\
-    ${IMPALA_HOME}/testdata/bin/create-data-source-table.sql
+      ${IMPALA_HOME}/testdata/bin/create-ext-data-source-table.sql
+  # Create external JDBC tables for TPCH/TPCDS queries.
+  ${IMPALA_HOME}/testdata/bin/create-tpc-jdbc-tables.py --jdbc_db_name=tpch_jdbc \
+      --workload=tpch --database_type=impala --clean
+  ${IMPALA_HOME}/testdata/bin/create-tpc-jdbc-tables.py --jdbc_db_name=tpcds_jdbc \
+      --workload=tpcds --database_type=impala --clean
 }
 
 function check-hdfs-health {
@@ -595,6 +558,16 @@ function warm-up-hive {
   $HIVE_CMD -e "insert overwrite table hive_warm_up_tbl values (1);"
 }
 
+# IMPALA-13015, IMPALA-13026: This should be called during serial phase of data load.
+function create-hadoop-credential {
+  rm -f ${IMPALA_HOME}/testdata/jceks/test.jceks
+  hadoop credential create "openai-api-key-secret" -value "secret" -provider \
+    "localjceks://file/${IMPALA_HOME}/testdata/jceks/test.jceks"
+}
+
+run-step "Creating hadoop credential" create-hadoop-credential.log \
+    create-hadoop-credential
+
 # For kerberized clusters, use kerberos
 if ${CLUSTER_DIR}/admin is_kerberized; then
   LOAD_DATA_ARGS="${LOAD_DATA_ARGS} --use_kerberos --principal=${MINIKDC_PRINC_HIVE}"
@@ -627,7 +600,7 @@ if [ $SKIP_METADATA_LOAD -eq 0 ]; then
   run-step-backgroundable "Loading functional-query data" load-functional-query.log \
       load-data "functional-query" "exhaustive"
   run-step-backgroundable "Loading TPC-H data" load-tpch.log load-data "tpch" "core"
-  run-step-backgroundable "Loading TPC-DS data" load-tpcds.log load-data "tpcds" "core"
+  run-step-backgroundable "Loading TPC-DS data" load-tpcds.log load-tpcds-data
   run-step-wait-all
   # Load tpch nested data.
   # TODO: Hacky and introduces more complexity into the system, but it is expedient.
@@ -671,11 +644,6 @@ if [ "${TARGET_FILESYSTEM}" = "hdfs" ]; then
   # Caching tables in s3 returns an IllegalArgumentException, see IMPALA-1714
   run-step "Caching test tables" cache-test-tables.log cache-test-tables
 
-  # TODO: Modify the .sql file that creates the table to take an alternative location into
-  # account.
-  run-step "Loading external data sources" load-ext-data-source.log \
-      copy-and-load-ext-data-source
-
   run-step "Creating internal HBase table" create-internal-hbase-table.log \
       create-internal-hbase-table
 
@@ -683,6 +651,14 @@ if [ "${TARGET_FILESYSTEM}" = "hdfs" ]; then
 
   # Saving the list of created files can help in debugging missing files.
   run-step "Logging created files" created-files.log hdfs dfs -ls -R /test-warehouse
+fi
+
+if [[ "${TARGET_FILESYSTEM}" = "hdfs" || "${TARGET_FILESYSTEM}" = "ozone" || \
+      "${TARGET_FILESYSTEM}" = "s3" ]]; then
+  # TODO: Modify the .sql file that creates the table to take an alternative location into
+  # account.
+  run-step "Loading external data sources" load-ext-data-source.log \
+      copy-and-load-ext-data-source
 fi
 
 # TODO: Investigate why all stats are not preserved. Theoretically, we only need to
@@ -697,7 +673,8 @@ if [[ -z "$REMOTE_LOAD" ]]; then
 fi
 
 if [[ $SKIP_RANGER -eq 0 ]]; then
-  run-step "Setting up Ranger" setup-ranger.log setup-ranger
+  run-step "Setting up Ranger" setup-ranger.log \
+      ${IMPALA_HOME}/testdata/bin/setup-ranger.sh
 fi
 
 # Restart the minicluster. This is strictly to provide a sanity check that

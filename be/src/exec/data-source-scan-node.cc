@@ -49,6 +49,9 @@ DEFINE_int32(data_source_batch_size, 1024, "Batch size for calls to GetNext() on
 
 namespace impala {
 
+PROFILE_DEFINE_COUNTER(NumExternalDataSourceGetNext, DEBUG, TUnit::UNIT,
+    "The total number of calls to ExternalDataSource::GetNext()");
+
 // $0 = num expected cols, $1 = actual num columns
 const string ERROR_NUM_COLUMNS = "Data source returned unexpected number of columns. "
     "Expected $0 but received $1. This likely indicates a problem with the data source "
@@ -93,6 +96,8 @@ Status DataSourceScanNode::Prepare(RuntimeState* state) {
       data_src_node_.init_string));
 
   cols_next_val_idx_.resize(tuple_desc_->slots().size(), 0);
+  num_ext_data_source_get_next_ =
+      PROFILE_NumExternalDataSourceGetNext.Instantiate(runtime_profile_);
   return Status::OK();
 }
 
@@ -122,6 +127,7 @@ Status DataSourceScanNode::Open(RuntimeState* state) {
   params.__set_row_schema(row_schema);
   params.__set_batch_size(FLAGS_data_source_batch_size);
   params.__set_predicates(data_src_node_.accepted_predicates);
+  params.__set_clean_dbcp_ds_cache(state->query_options().clean_dbcp_ds_cache);
   TOpenResult result;
   RETURN_IF_ERROR(data_source_executor_->Open(params, &result));
   RETURN_IF_ERROR(Status(result.status));
@@ -137,6 +143,10 @@ Status DataSourceScanNode::ValidateRowBatchSize() {
         Substitute(ERROR_NUM_COLUMNS, tuple_desc_->slots().size(), cols.size()));
   }
 
+  // The capacity of output RowBatch is defined as a 4-byte integer. Making sure that
+  // the number of rows in input batch does not exceed the maximum capacity of output
+  // RowBatch.
+  DCHECK_LE(input_batch_->rows.num_rows, std::numeric_limits<int32_t>::max());
   num_rows_ = -1;
   // If num_rows was set, use that, otherwise we set it to be the number of rows in
   // the first TColumnData and then ensure the number of rows in other columns are
@@ -157,6 +167,7 @@ Status DataSourceScanNode::GetNextInputBatch() {
   Ubsan::MemSet(cols_next_val_idx_.data(), 0, sizeof(int) * cols_next_val_idx_.size());
   TGetNextParams params;
   params.__set_scan_handle(scan_handle_);
+  COUNTER_ADD(num_ext_data_source_get_next_, 1);
   RETURN_IF_ERROR(data_source_executor_->GetNext(params, input_batch_.get()));
   RETURN_IF_ERROR(Status(input_batch_->status));
   RETURN_IF_ERROR(ValidateRowBatchSize());
@@ -240,8 +251,7 @@ Status DataSourceScanNode::MaterializeNextRow(const Timezone* local_tz,
             return tuple_pool->mem_tracker()->MemLimitExceeded(NULL, details, val_size);
           }
           memcpy(buffer, val.data(), val_size);
-          reinterpret_cast<StringValue*>(slot)->ptr = buffer;
-          reinterpret_cast<StringValue*>(slot)->len = val_size;
+          reinterpret_cast<StringValue*>(slot)->Assign(buffer, val_size);
           break;
         }
       case TYPE_TINYINT:
@@ -348,27 +358,40 @@ Status DataSourceScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, boo
   while (true) {
     {
       SCOPED_TIMER(materialize_tuple_timer());
-      // copy rows until we hit the limit/capacity or until we exhaust input_batch_
-      while (!ReachedLimit() && !row_batch->AtCapacity() && InputBatchHasNext()) {
-        // TODO The timezone depends on flag use_local_tz_for_unix_timestamp_conversions.
-        //      Check if this is the intended behaviour.
-        RETURN_IF_ERROR(MaterializeNextRow(
-            state->time_zone_for_unix_time_conversions(), tuple_pool, tuple));
-        ++rows_read;
-        int row_idx = row_batch->AddRow();
-        TupleRow* tuple_row = row_batch->GetRow(row_idx);
-        tuple_row->SetTuple(tuple_idx_, tuple);
+      if (tuple_desc_->slots().size() > 0) {
+        // Copy rows until we hit the limit/capacity or until we exhaust input_batch_
+        while (!ReachedLimit() && !row_batch->AtCapacity() && InputBatchHasNext()) {
+          // TODO Timezone depends on flag use_local_tz_for_unix_timestamp_conversions.
+          //      Check if this is the intended behaviour.
+          RETURN_IF_ERROR(MaterializeNextRow(
+              state->time_zone_for_unix_time_conversions(), tuple_pool, tuple));
+          ++rows_read;
+          int row_idx = row_batch->AddRow();
+          TupleRow* tuple_row = row_batch->GetRow(row_idx);
+          tuple_row->SetTuple(tuple_idx_, tuple);
 
-        if (ExecNode::EvalConjuncts(evals, num_conjuncts, tuple_row)) {
-          row_batch->CommitLastRow();
-          tuple = reinterpret_cast<Tuple*>(
-              reinterpret_cast<uint8_t*>(tuple) + tuple_desc_->byte_size());
-          IncrementNumRowsReturned(1);
+          if (ExecNode::EvalConjuncts(evals, num_conjuncts, tuple_row)) {
+            row_batch->CommitLastRow();
+            tuple = reinterpret_cast<Tuple*>(
+                reinterpret_cast<uint8_t*>(tuple) + tuple_desc_->byte_size());
+            IncrementNumRowsReturned(1);
+          }
+          ++next_row_idx_;
         }
-        ++next_row_idx_;
+      } else {
+        // For count(*)
+        if (InputBatchHasNext()) {
+          // Generate one output RowBatch for one input batch
+          rows_read += num_rows_;
+          next_row_idx_ += num_rows_;
+          IncrementNumRowsReturned(num_rows_);
+          row_batch->limit_capacity(rows_read);
+          row_batch->CommitRows(rows_read);
+        }
       }
-      if (row_batch->AtCapacity() || input_batch_->eos || ReachedLimit()) {
-        *eos = input_batch_->eos || ReachedLimit();
+      if (row_batch->AtCapacity() || ReachedLimit()
+          || (input_batch_->eos && !InputBatchHasNext())) {
+        *eos = (input_batch_->eos && !InputBatchHasNext()) || ReachedLimit();
         COUNTER_SET(rows_returned_counter_, rows_returned());
         COUNTER_ADD(rows_read_counter_, rows_read);
         return Status::OK();

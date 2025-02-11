@@ -25,9 +25,13 @@ import base64
 import operator
 import re
 import sasl
+import socket
 import ssl
 import sys
 import time
+import traceback
+from datetime import datetime
+import uuid
 
 from beeswaxd import BeeswaxService
 from beeswaxd.BeeswaxService import QueryState
@@ -42,6 +46,7 @@ from TCLIService.TCLIService import (TExecuteStatementReq, TOpenSessionReq,
     TOperationState, TFetchResultsReq, TFetchOrientation, TGetLogReq,
     TGetResultSetMetadataReq, TTypeId, TCancelOperationReq, TCloseOperationReq)
 from ImpalaHttpClient import ImpalaHttpClient
+from kerberos_util import get_kerb_host_from_kerberos_host_fqdn
 from thrift.protocol import TBinaryProtocol
 from thrift_sasl import TSaslClientTransport
 from thrift.transport.TSocket import TSocket
@@ -50,35 +55,33 @@ from thrift.Thrift import TApplicationException, TException
 from shell_exceptions import (RPCException, QueryStateException, DisconnectedException,
     QueryCancelledByShellException, MissingThriftMethodException, HttpError)
 
+from value_converter import HS2ValueConverter
+from thrift_printer import ThriftPrettyPrinter
 
-# Helpers to extract and convert HS2's representation of values to the display version.
+# Getters to extract HS2's representation of values to the display version.
 # An entry must be added to this map for each supported type. HS2's TColumn has many
-# different typed field, each of which has a 'values' and a 'nulls' field. The first
-# element of each tuple is a "getter" function that extracts the appropriate member from
-# TColumn for the given TTypeId. The second element is a "stringifier" function that
-# converts a single value to its display representation. If the value is already a
-# string and does not need conversion for display, the stringifier can be None.
-HS2_VALUE_CONVERTERS = {
-    TTypeId.BOOLEAN_TYPE: (operator.attrgetter('boolVal'),
-     lambda b: 'true' if b else 'false'),
-    TTypeId.TINYINT_TYPE: (operator.attrgetter('byteVal'), str),
-    TTypeId.SMALLINT_TYPE: (operator.attrgetter('i16Val'), str),
-    TTypeId.INT_TYPE: (operator.attrgetter('i32Val'), str),
-    TTypeId.BIGINT_TYPE: (operator.attrgetter('i64Val'), str),
-    TTypeId.TIMESTAMP_TYPE: (operator.attrgetter('stringVal'), None),
-    TTypeId.FLOAT_TYPE: (operator.attrgetter('doubleVal'), str),
-    TTypeId.DOUBLE_TYPE: (operator.attrgetter('doubleVal'), str),
-    TTypeId.STRING_TYPE: (operator.attrgetter('stringVal'), None),
-    TTypeId.DECIMAL_TYPE: (operator.attrgetter('stringVal'), None),
-    TTypeId.BINARY_TYPE: (operator.attrgetter('binaryVal'), str),
-    TTypeId.VARCHAR_TYPE: (operator.attrgetter('stringVal'), None),
-    TTypeId.CHAR_TYPE: (operator.attrgetter('stringVal'), None),
-    TTypeId.MAP_TYPE: (operator.attrgetter('stringVal'), None),
-    TTypeId.ARRAY_TYPE: (operator.attrgetter('stringVal'), None),
-    TTypeId.STRUCT_TYPE: (operator.attrgetter('stringVal'), None),
-    TTypeId.UNION_TYPE: (operator.attrgetter('stringVal'), None),
-    TTypeId.NULL_TYPE: (operator.attrgetter('stringVal'), None),
-    TTypeId.DATE_TYPE: (operator.attrgetter('stringVal'), None)
+# different typed field, each of which has a 'values' and a 'nulls' field. These getters
+# extract the appropriate member from TColumn for the given TTypeId.
+HS2_VALUE_GETTERS = {
+    TTypeId.BOOLEAN_TYPE: operator.attrgetter('boolVal'),
+    TTypeId.TINYINT_TYPE: operator.attrgetter('byteVal'),
+    TTypeId.SMALLINT_TYPE: operator.attrgetter('i16Val'),
+    TTypeId.INT_TYPE: operator.attrgetter('i32Val'),
+    TTypeId.BIGINT_TYPE: operator.attrgetter('i64Val'),
+    TTypeId.TIMESTAMP_TYPE: operator.attrgetter('stringVal'),
+    TTypeId.FLOAT_TYPE: operator.attrgetter('doubleVal'),
+    TTypeId.DOUBLE_TYPE: operator.attrgetter('doubleVal'),
+    TTypeId.STRING_TYPE: operator.attrgetter('stringVal'),
+    TTypeId.DECIMAL_TYPE: operator.attrgetter('stringVal'),
+    TTypeId.BINARY_TYPE: operator.attrgetter('binaryVal'),
+    TTypeId.VARCHAR_TYPE: operator.attrgetter('stringVal'),
+    TTypeId.CHAR_TYPE: operator.attrgetter('stringVal'),
+    TTypeId.MAP_TYPE: operator.attrgetter('stringVal'),
+    TTypeId.ARRAY_TYPE: operator.attrgetter('stringVal'),
+    TTypeId.STRUCT_TYPE: operator.attrgetter('stringVal'),
+    TTypeId.UNION_TYPE: operator.attrgetter('stringVal'),
+    TTypeId.NULL_TYPE: operator.attrgetter('stringVal'),
+    TTypeId.DATE_TYPE: operator.attrgetter('stringVal')
 }
 
 
@@ -95,15 +98,168 @@ def utf8_encode_if_needed(val):
     val = val.encode('utf-8', errors='replace')
   return val
 
+
 # Regular expression that matches the progress line added to HS2 logs by
 # the Impala server.
-HS2_LOG_PROGRESS_REGEX = re.compile("Query.*Complete \([0-9]* out of [0-9]*\)\n")
+HS2_LOG_PROGRESS_REGEX = re.compile(r"Query.*Complete \([0-9]* out of [0-9]*\)\n")
 
 # Exception types to differentiate between the different RPCExceptions.
 # RPCException raised when TApplicationException is caught.
 RPC_EXCEPTION_TAPPLICATION = "TAPPLICATION_EXCEPTION"
 # RPCException raised when impala server sends a TStatusCode.ERROR_STATUS status code.
 RPC_EXCEPTION_SERVER = "SERVER_ERROR"
+
+
+def build_exec_summary_table(summary, idx, indent_level, new_indent_level, output,
+                             is_prettyprint=True, separate_prefix_column=False):
+  """Direct translation of Coordinator::PrintExecSummary() to recursively build a list
+  of rows of summary statistics, one per exec node
+
+  summary: the TExecSummary object that contains all the summary data
+
+  idx: the index of the node to print
+
+  indent_level: the number of spaces to print before writing the node's label, to give
+  the appearance of a tree. The 0th child of a node has the same indent_level as its
+  parent. All other children have an indent_level of one greater than their parent.
+
+  new_indent_level: If true, this indent level is different from the previous row's.
+
+  output: the list of rows into which to append the rows produced for this node and its
+  children.
+
+  is_prettyprint: Optional. If True, print time, units, and bytes columns in pretty
+  printed format.
+
+  separate_prefix_column: Optional. If True, the prefix and operator name will be
+  returned as separate column. Otherwise, prefix and operater name will be concatenated
+  into single column.
+
+  Returns the index of the next exec node in summary.exec_nodes that should be
+  processed, used internally to this method only.
+  """
+  attrs = ["latency_ns", "cpu_time_ns", "cardinality", "memory_used"]
+
+  # Initialise aggregate and maximum stats
+  agg_stats, max_stats = TExecStats(), TExecStats()
+  for attr in attrs:
+    setattr(agg_stats, attr, 0)
+    setattr(max_stats, attr, 0)
+
+  node = summary.nodes[idx]
+  if node.exec_stats is not None:
+    for stats in node.exec_stats:
+      for attr in attrs:
+        val = getattr(stats, attr)
+        if val is not None:
+          setattr(agg_stats, attr, getattr(agg_stats, attr) + val)
+          setattr(max_stats, attr, max(getattr(max_stats, attr), val))
+
+  if node.exec_stats is not None and node.exec_stats:
+    avg_time = agg_stats.latency_ns / len(node.exec_stats)
+  else:
+    avg_time = 0
+
+  is_sink = node.node_id == -1
+  # If the node is a broadcast-receiving exchange node, the cardinality of rows produced
+  # is the max over all instances (which should all have received the same number of
+  # rows). Otherwise, the cardinality is the sum over all instances which process
+  # disjoint partitions.
+  if is_sink:
+    cardinality = -1
+  elif node.is_broadcast:
+    cardinality = max_stats.cardinality
+  else:
+    cardinality = agg_stats.cardinality
+
+  est_stats = node.estimated_stats
+  label_prefix = ""
+  if indent_level > 0:
+    label_prefix = "|"
+    label_prefix += "  |" * (indent_level - 1)
+    if new_indent_level:
+      label_prefix += "--"
+    else:
+      label_prefix += "  "
+
+  def prettyprint(val, units, divisor):
+    for unit in units:
+      if val < divisor:
+        if unit == units[0]:
+          return "%d%s" % (val, unit)
+        else:
+          return "%3.2f%s" % (val, unit)
+      val /= divisor
+
+  def prettyprint_bytes(byte_val):
+    return prettyprint(byte_val, [' B', ' KB', ' MB', ' GB', ' TB'], 1024.0)
+
+  def prettyprint_units(unit_val):
+    return prettyprint(unit_val, ["", "K", "M", "B"], 1000.0)
+
+  def prettyprint_time(time_val):
+    return prettyprint(time_val, ["ns", "us", "ms", "s"], 1000.0)
+
+  instances = 0
+  if node.exec_stats is not None:
+    instances = len(node.exec_stats)
+  latency = max_stats.latency_ns
+  cardinality_est = est_stats.cardinality
+  memory_used = max_stats.memory_used
+  memory_est = est_stats.memory_used
+  if (is_prettyprint):
+    avg_time = prettyprint_time(avg_time)
+    latency = prettyprint_time(latency)
+    cardinality = "" if is_sink else prettyprint_units(cardinality)
+    cardinality_est = "" if is_sink else prettyprint_units(cardinality_est)
+    memory_used = prettyprint_bytes(memory_used)
+    memory_est = prettyprint_bytes(memory_est)
+
+  row = list()
+  if separate_prefix_column:
+    row.append(label_prefix)
+    row.append(node.label)
+  else:
+    row.append(label_prefix + node.label)
+
+  row.extend([
+    node.num_hosts,
+    instances,
+    avg_time,
+    latency,
+    cardinality,
+    cardinality_est,
+    memory_used,
+    memory_est,
+    node.label_detail])
+
+  output.append(row)
+  try:
+    sender_idx = summary.exch_to_sender_map[idx]
+    # This is an exchange node or a join node with a separate builder, so the source
+    # is a fragment root, and should be printed next.
+    sender_indent_level = indent_level + node.num_children
+    sender_new_indent_level = node.num_children > 0
+    build_exec_summary_table(summary, sender_idx, sender_indent_level,
+                             sender_new_indent_level, output, is_prettyprint,
+                             separate_prefix_column)
+  except (KeyError, TypeError):
+    # Fall through if idx not in map, or if exch_to_sender_map itself is not set
+    pass
+
+  idx += 1
+  if node.num_children > 0:
+    first_child_output = []
+    idx = build_exec_summary_table(summary, idx, indent_level, False, first_child_output,
+                                   is_prettyprint, separate_prefix_column)
+    for child_idx in xrange(1, node.num_children):
+      # All other children are indented (we only have 0, 1 or 2 children for every exec
+      # node at the moment)
+      idx = build_exec_summary_table(summary, idx, indent_level + 1, True, output,
+                                     is_prettyprint, separate_prefix_column)
+    output += first_child_output
+  return idx
+
 
 class QueryOptionLevels:
   """These are the levels used when displaying query options.
@@ -132,7 +288,9 @@ class ImpalaClient(object):
                kerberos_service_name="impala", use_ssl=False, ca_cert=None, user=None,
                ldap_password=None, use_ldap=False, client_connect_timeout_ms=60000,
                verbose=True, use_http_base_transport=False, http_path=None,
-               http_cookie_names=None):
+               http_cookie_names=None, http_socket_timeout_s=None, value_converter=None,
+               connect_max_tries=4, rpc_stdout=False, rpc_file=None, http_tracing=True,
+               jwt=None, oauth=None, hs2_x_forward=None):
     self.connected = False
     self.impalad_host = impalad[0]
     self.impalad_port = int(impalad[1])
@@ -146,12 +304,17 @@ class ImpalaClient(object):
     self.user, self.ldap_password = user, ldap_password
     self.use_ldap = use_ldap
     self.client_connect_timeout_ms = int(client_connect_timeout_ms)
+    self.http_socket_timeout_s = http_socket_timeout_s
+    self.connect_max_tries = connect_max_tries
     self.default_query_options = {}
     self.query_option_levels = {}
     self.fetch_size = fetch_size
     self.use_http_base_transport = use_http_base_transport
     self.http_path = http_path
     self.http_cookie_names = http_cookie_names
+    self.http_tracing = http_tracing
+    self.jwt = jwt
+    self.oauth = oauth
     # This is set from ImpalaShell's signal handler when a query is cancelled
     # from command line via CTRL+C. It is used to suppress error messages of
     # query cancellation.
@@ -160,6 +323,11 @@ class ImpalaClient(object):
     # This is set in connect(). It's used in constructing the retried query link after
     # we parse the retried query id.
     self.webserver_address = None
+    self.value_converter = value_converter
+    self.rpc_stdout = rpc_stdout
+    self.rpc_file = rpc_file
+    # In h2s-http clients only, the value of the X-Forwarded-For http header.
+    self.hs2_x_forward = hs2_x_forward
 
   def connect(self):
     """Creates a connection to an Impalad instance. Returns a tuple with the impala
@@ -182,7 +350,7 @@ class ImpalaClient(object):
     try:
       self._open_session()
       return self._ping_impala_service()
-    except:
+    except Exception:
       # Ensure we are in a disconnected state if we failed above.
       self.close_connection()
       raise
@@ -257,7 +425,9 @@ class ImpalaClient(object):
     If 'periodic_callback' is provided, it is called periodically with no arguments."""
     loop_start = time.time()
     while True:
+      start_rpc_time = time.time()
       query_state = self.get_query_state(last_query_handle)
+      rpc_time = time.time() - start_rpc_time
       if query_state == self.FINISHED_STATE:
         break
       elif query_state in (self.ERROR_STATE, self.CANCELED_STATE):
@@ -268,7 +438,9 @@ class ImpalaClient(object):
           raise DisconnectedException("Not connected to impalad.")
 
       if periodic_callback is not None: periodic_callback()
-      time.sleep(self._get_sleep_interval(loop_start))
+      sleep_time = self._get_sleep_interval(loop_start)
+      if rpc_time < sleep_time:
+        time.sleep(sleep_time - rpc_time)
 
   def get_query_state(self, last_query_handle):
     """Return the query state string for 'last_query_handle'. Returns self.ERROR_STATE
@@ -299,9 +471,10 @@ class ImpalaClient(object):
   # differentiate between DML and non-DML.
   def close_dml(self, last_query_handle):
     """Fetches the results of a DML query. Returns a tuple containing the
-       number of rows modified and the number of row errors, in that order. If the DML
-       operation doesn't return 'num_row_errors', then the second element in the tuple
-       is None. Returns None if the query was not closed successfully. Not idempotent."""
+       number of rows modified, the number of rows deleted, and the number of row errors,
+       in that order. If the DML operation doesn't return 'rows_deleted' or
+       'num_row_errors', then the respective element in the tuple is None.
+       Returns None if the query was not closed successfully. Not idempotent."""
     raise NotImplementedError()
 
   def close_query(self, last_query_handle):
@@ -380,13 +553,12 @@ class ImpalaClient(object):
       print("Warning: --connect_timeout_ms is currently ignored with HTTP transport.",
             file=sys.stderr)
 
-    # HTTP server implemententations do not support SPNEGO yet.
-    # TODO: when we add support for Kerberos+HTTP, we need to re-enable the automatic
-    # kerberos retry logic in impala_shell.py that was disabled for HTTP because of
-    # IMPALA-8932.
-    if self.use_kerberos or self.kerberos_host_fqdn:
-      print("Kerberos not supported with HTTP endpoints.", file=sys.stderr)
-      raise NotImplementedError()
+    # Notes on http socket timeout:
+    # https://docs.python.org/3/library/socket.html#socket-timeouts
+    # Having a default timeout of 'None' (blocking mode) could result in hang like
+    # symptoms in case of a problematic remote endpoint. It's better to have a finite
+    # timeout so that in case of any connection errors, the client retries have a better
+    # chance of succeeding.
 
     host_and_port = "{0}:{1}".format(self.impalad_host, self.impalad_port)
     assert self.http_path
@@ -401,16 +573,40 @@ class ImpalaClient(object):
         ssl_ctx.verify_mode = ssl.CERT_NONE
       url = "https://{0}/{1}".format(host_and_port, self.http_path)
       transport = ImpalaHttpClient(url, ssl_context=ssl_ctx,
-                                   http_cookie_names=self.http_cookie_names)
+                                   http_cookie_names=self.http_cookie_names,
+                                   socket_timeout_s=self.http_socket_timeout_s,
+                                   verbose=self.verbose)
     else:
       url = "http://{0}/{1}".format(host_and_port, self.http_path)
-      transport = ImpalaHttpClient(url, http_cookie_names=self.http_cookie_names)
+      transport = ImpalaHttpClient(url, http_cookie_names=self.http_cookie_names,
+                                   socket_timeout_s=self.http_socket_timeout_s,
+                                   verbose=self.verbose)
 
     if self.use_ldap:
-      # Set the BASIC auth header
+      # Set the BASIC authorization
       user_passwd = "{0}:{1}".format(self.user, self.ldap_password)
-      auth = base64.encodestring(user_passwd.encode()).decode().strip('\n')
-      transport.setCustomHeaders({"Authorization": "Basic {0}".format(auth)})
+      if sys.version_info.major < 3 or \
+          sys.version_info.major == 3 and sys.version_info.minor == 0:
+        auth = base64.encodestring(user_passwd.encode()).decode().strip('\n')
+      else:
+        auth = base64.encodebytes(user_passwd.encode()).decode().strip('\n')
+      transport.setLdapAuth(auth)
+    elif self.jwt is not None:
+      transport.setJwtAuth(self.jwt)
+    elif self.oauth is not None:
+      transport.setOAuthAuth(self.oauth)
+    elif self.use_kerberos or self.kerberos_host_fqdn:
+      # Set the Kerberos service
+      if self.kerberos_host_fqdn is not None:
+        kerb_host = get_kerb_host_from_kerberos_host_fqdn(self.kerberos_host_fqdn)
+      else:
+        kerb_host = self.impalad_host
+      kerb_service = "{0}@{1}".format(self.kerberos_service_name, kerb_host)
+      transport.setKerberosAuth(kerb_service)
+    else:
+      transport.setNoneAuth()
+
+    transport.addCustomHeaderFunc(self.get_custom_http_headers)
 
     # Without buffering Thrift would call socket.recv() each time it deserializes
     # something (e.g. a member in a struct).
@@ -433,14 +629,13 @@ class ImpalaClient(object):
       # Systems. Only attempt to import TSSLSocket if the user wants an SSL connection.
       from TSSLSocketWithWildcardSAN import TSSLSocketWithWildcardSAN
 
-    # sasl does not accept unicode strings, explicitly encode the string into ascii.
     # The kerberos_host_fqdn option exposes the SASL client's hostname attribute to
     # the user. impala-shell checks to ensure this host matches the host in the kerberos
     # principal. So when a load balancer is configured to be used, its hostname is
     # expected by impala-shell. Setting this option to the load balancer hostname allows
     # impala-shell to connect directly to an impalad.
     if self.kerberos_host_fqdn is not None:
-      sasl_host = self.kerberos_host_fqdn.split(':')[0].encode('ascii', 'ignore')
+      sasl_host = get_kerb_host_from_kerberos_host_fqdn(self.kerberos_host_fqdn)
     else:
       sasl_host = self.impalad_host
 
@@ -486,130 +681,9 @@ class ImpalaClient(object):
     sock.setTimeout(None)
     return transport
 
-  def build_summary_table(self, summary, idx, is_fragment_root, indent_level,
-      new_indent_level, output):
-    """Direct translation of Coordinator::PrintExecSummary() to recursively build a list
-    of rows of summary statistics, one per exec node
-
-    summary: the TExecSummary object that contains all the summary data
-
-    idx: the index of the node to print
-
-    is_fragment_root: true if the node to print is the root of a fragment (and therefore
-    feeds into an exchange)
-
-    indent_level: the number of spaces to print before writing the node's label, to give
-    the appearance of a tree. The 0th child of a node has the same indent_level as its
-    parent. All other children have an indent_level of one greater than their parent.
-
-    output: the list of rows into which to append the rows produced for this node and its
-    children.
-
-    Returns the index of the next exec node in summary.exec_nodes that should be
-    processed, used internally to this method only.
-
-    NOTE: This is duplicated in impala_beeswax.py, and changes made here should also be
-    made there. TODO: refactor into a shared library. (IMPALA-5792)
-    """
-    attrs = ["latency_ns", "cpu_time_ns", "cardinality", "memory_used"]
-
-    # Initialise aggregate and maximum stats
-    agg_stats, max_stats = TExecStats(), TExecStats()
-    for attr in attrs:
-      setattr(agg_stats, attr, 0)
-      setattr(max_stats, attr, 0)
-
-    node = summary.nodes[idx]
-    if node.exec_stats is not None:
-      for stats in node.exec_stats:
-        for attr in attrs:
-          val = getattr(stats, attr)
-          if val is not None:
-            setattr(agg_stats, attr, getattr(agg_stats, attr) + val)
-            setattr(max_stats, attr, max(getattr(max_stats, attr), val))
-
-    if node.exec_stats is not None and node.exec_stats:
-      avg_time = agg_stats.latency_ns / len(node.exec_stats)
-    else:
-      avg_time = 0
-
-    # If the node is a broadcast-receiving exchange node, the cardinality of rows produced
-    # is the max over all instances (which should all have received the same number of
-    # rows). Otherwise, the cardinality is the sum over all instances which process
-    # disjoint partitions.
-    if node.is_broadcast:
-      cardinality = max_stats.cardinality
-    else:
-      cardinality = agg_stats.cardinality
-
-    est_stats = node.estimated_stats
-    label_prefix = ""
-    if indent_level > 0:
-      label_prefix = "|"
-      label_prefix += "  |" * (indent_level - 1)
-      if new_indent_level:
-        label_prefix += "--"
-      else:
-        label_prefix += "  "
-
-    def prettyprint(val, units, divisor):
-      for unit in units:
-        if val < divisor:
-          if unit == units[0]:
-            return "%d%s" % (val, unit)
-          else:
-            return "%3.2f%s" % (val, unit)
-        val /= divisor
-
-    def prettyprint_bytes(byte_val):
-      return prettyprint(byte_val, [' B', ' KB', ' MB', ' GB', ' TB'], 1024.0)
-
-    def prettyprint_units(unit_val):
-      return prettyprint(unit_val, ["", "K", "M", "B"], 1000.0)
-
-    def prettyprint_time(time_val):
-      return prettyprint(time_val, ["ns", "us", "ms", "s"], 1000.0)
-
-    instances = 0
-    if node.exec_stats is not None:
-      instances = len(node.exec_stats)
-    is_sink = node.node_id == -1
-    row = [ label_prefix + node.label,
-            node.num_hosts, instances,
-            prettyprint_time(avg_time),
-            prettyprint_time(max_stats.latency_ns),
-            "" if is_sink else prettyprint_units(cardinality),
-            "" if is_sink else prettyprint_units(est_stats.cardinality),
-            prettyprint_bytes(max_stats.memory_used),
-            prettyprint_bytes(est_stats.memory_used),
-            node.label_detail ]
-
-    output.append(row)
-    try:
-      sender_idx = summary.exch_to_sender_map[idx]
-      # This is an exchange node or a join node with a separate builder, so the source
-      # is a fragment root, and should be printed next.
-      sender_indent_level = indent_level + node.num_children
-      sender_new_indent_level = node.num_children > 0
-      self.build_summary_table(
-          summary, sender_idx, True, sender_indent_level, sender_new_indent_level, output)
-    except (KeyError, TypeError):
-      # Fall through if idx not in map, or if exch_to_sender_map itself is not set
-      pass
-
-    idx += 1
-    if node.num_children > 0:
-      first_child_output = []
-      idx = \
-        self.build_summary_table(
-            summary, idx, False, indent_level, False, first_child_output)
-      for child_idx in xrange(1, node.num_children):
-        # All other children are indented (we only have 0, 1 or 2 children for every exec
-        # node at the moment)
-        idx = self.build_summary_table(
-            summary, idx, False, indent_level + 1, True, output)
-      output += first_child_output
-    return idx
+  def build_summary_table(self, summary, output):
+    build_exec_summary_table(summary, 0, 0, False, output, is_prettyprint=True,
+                             separate_prefix_column=False)
 
   def _get_sleep_interval(self, start_time):
     """Returns a step function of time to sleep in seconds before polling
@@ -626,6 +700,18 @@ class ImpalaClient(object):
     if not self.connected:
       raise DisconnectedException("Not connected (use CONNECT to establish a connection)")
 
+  def get_custom_http_headers(self):
+    # When the transport is http, subclasses can override this function
+    # to add arbitrary http headers.
+    return None
+
+  def _process_dml_result(self, dml_result):
+    num_rows = sum([int(k) for k in dml_result.rows_modified.values()])
+    num_deleted_rows = None
+    if dml_result.rows_deleted:
+      num_deleted_rows = sum([int(k) for k in dml_result.rows_deleted.values()])
+    return (num_rows, num_deleted_rows, dml_result.num_row_errors)
+
 
 class ImpalaHS2Client(ImpalaClient):
   """Impala client. Uses the HS2 protocol plus Impala-specific extensions."""
@@ -634,6 +720,7 @@ class ImpalaHS2Client(ImpalaClient):
     self.FINISHED_STATE = TOperationState._NAMES_TO_VALUES["FINISHED_STATE"]
     self.ERROR_STATE = TOperationState._NAMES_TO_VALUES["ERROR_STATE"]
     self.CANCELED_STATE = TOperationState._NAMES_TO_VALUES["CANCELED_STATE"]
+    self._clear_current_query_handle()
 
     # If connected, this is the handle returned by the OpenSession RPC that needs
     # to be passed into most HS2 RPCs.
@@ -641,11 +728,22 @@ class ImpalaHS2Client(ImpalaClient):
     # Enable retries only for hs2-http protocol.
     if self.use_http_base_transport:
       # Maximum number of tries for idempotent rpcs.
-      self.max_tries = 4
+      self.max_tries = self.connect_max_tries
     else:
       self.max_tries = 1
     # Minimum sleep interval between retry attempts.
     self.min_sleep_interval = 1
+
+    # In case of direct instantiation of the client where the converter is
+    # not set, there should be a default value converter assigned
+    if self.value_converter is None:
+      self.value_converter = HS2ValueConverter()
+
+    if self.rpc_stdout or self.rpc_stdout is not None:
+      self.thrift_printer = ThriftPrettyPrinter()
+
+    self._base_request_id = str(uuid.uuid1())
+    self._request_num = 0
 
   def _get_thrift_client(self, protocol):
     return ImpalaHiveServer2Service.Client(protocol)
@@ -656,22 +754,41 @@ class ImpalaHS2Client(ImpalaClient):
     return self.min_sleep_interval * (num_tries - 1)
 
   def _open_session(self):
-    open_session_req = TOpenSessionReq(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V6,
-        username=self.user)
-
-    def OpenSession():
-      return self.imp_service.OpenSession(open_session_req)
+    def OpenSession(req):
+      return self.imp_service.OpenSession(req)
     # OpenSession rpcs are idempotent and so ok to retry. If the client gets disconnected
     # and the server successfully opened a session, the client will retry and rely on
     # server to clean up the session.
-    resp = self._do_hs2_rpc(OpenSession, retry_on_error=True)
+    req = TOpenSessionReq(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V6,
+                          username=self.user)
+    resp = self._do_hs2_rpc(OpenSession, req, retry_on_error=True)
     self._check_hs2_rpc_status(resp.status)
-    assert (resp.serverProtocolVersion ==
-            TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V6), resp.serverProtocolVersion
+    assert (resp.serverProtocolVersion
+            == TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V6), resp.serverProtocolVersion
     # TODO: ensure it's closed if needed
     self.session_handle = resp.sessionHandle
 
     self._populate_query_options()
+
+  def get_custom_http_headers(self):
+    headers = {}
+
+    if self.http_tracing:
+      session_id = self.get_session_id()
+      if session_id is not None:
+        headers["X-Impala-Session-Id"] = session_id
+
+      current_query_id = self.get_query_id_str(self._current_query_handle)
+      if current_query_id is not None:
+        headers["X-Impala-Query-Id"] = current_query_id
+
+      assert getattr(self, "_current_request_id", None) is not None, \
+        "request id was not set"
+      headers["X-Request-Id"] = self._current_request_id
+    if self.hs2_x_forward:
+      headers["X-Forwarded-For"] = self.hs2_x_forward
+
+    return headers
 
   def close_connection(self):
     if self.session_handle is not None:
@@ -679,16 +796,16 @@ class ImpalaHS2Client(ImpalaClient):
       # doing so. We still need to close the transport and we can rely on the
       # server to clean up the session.
       try:
-        req = TCloseSessionReq(self.session_handle)
-
-        def CloseSession():
+        def CloseSession(req):
           return self.imp_service.CloseSession(req)
         # CloseSession rpcs don't need retries since we catch all exceptions and close
         # transport.
-        resp = self._do_hs2_rpc(CloseSession)
+        req = TCloseSessionReq(self.session_handle)
+        resp = self._do_hs2_rpc(CloseSession, req)
         self._check_hs2_rpc_status(resp.status)
       except Exception as e:
-        print("Warning: close session RPC failed: {0}, {1}".format(str(e), type(e)))
+        log_exception_with_timestamp(e, "Warning",
+           "close session RPC failed: {0}".format(type(e)), stderr_flag=False)
       self.session_handle = None
     self._close_transport()
 
@@ -716,16 +833,16 @@ class ImpalaHS2Client(ImpalaClient):
         QueryStateException):
         raise
       except RPCException as r:
-        if (r.exception_type == RPC_EXCEPTION_TAPPLICATION or
-          r.exception_type == RPC_EXCEPTION_SERVER):
+        if (r.exception_type == RPC_EXCEPTION_TAPPLICATION
+            or r.exception_type == RPC_EXCEPTION_SERVER):
           raise
-        print('Caught exception {0}, type={1} when listing query options. {2}'
-          .format(str(r), type(r), retry_msg), file=sys.stderr)
+        log_exception_with_timestamp(r, "Exception",
+           "type={0} when listing query options. {1}".format(type(r), retry_msg))
         if raise_error:
           raise
       except Exception as e:
-        print('Caught exception {0}, type={1} when listing query options. {2}'
-          .format(str(e), type(e), retry_msg), file=sys.stderr)
+        log_exception_with_timestamp(e, "Exception",
+           "type={0} when listing query options. {1}".format(type(e), retry_msg))
         if raise_error:
           raise
       finally:
@@ -736,12 +853,11 @@ class ImpalaHS2Client(ImpalaClient):
       num_tries += 1
 
   def _ping_impala_service(self):
-    req = TPingImpalaHS2ServiceReq(self.session_handle)
-
-    def PingImpalaHS2Service():
+    def PingImpalaHS2Service(req):
       return self.imp_service.PingImpalaHS2Service(req)
     # PingImpalaHS2Service rpc is idempotent and so safe to retry.
-    resp = self._do_hs2_rpc(PingImpalaHS2Service, retry_on_error=True)
+    req = TPingImpalaHS2ServiceReq(self.session_handle)
+    resp = self._do_hs2_rpc(PingImpalaHS2Service, req, retry_on_error=True)
     self._check_hs2_rpc_status(resp.status)
     self.webserver_address = resp.webserver_address
     return (resp.version, resp.webserver_address)
@@ -763,42 +879,65 @@ class ImpalaHS2Client(ImpalaClient):
     """Execute the query 'query_str' asynchronously on the server with options dictionary
     'set_query_options' and return a query handle that can be used for subsequent
     ImpalaClient method calls for the query."""
-    query = self._create_query_req(query_str, set_query_options)
+    self._clear_current_query_handle()
     self.is_query_cancelled = False
 
-    def ExecuteStatement():
-      return self.imp_service.ExecuteStatement(query)
+    def ExecuteStatement(req):
+      return self.imp_service.ExecuteStatement(req)
     # Read queries should be idempotent but most dml queries are not. Also retrying
     # query execution from client could be expensive and so likely makes sense to do
     # it if server is also aware of the retries.
-    resp = self._do_hs2_rpc(ExecuteStatement)
+    req = self._create_query_req(query_str, set_query_options)
+    resp = self._do_hs2_rpc(ExecuteStatement, req)
     if resp.status.statusCode != TStatusCode.SUCCESS_STATUS:
       msg = utf8_decode_if_needed(resp.status.errorMessage)
       raise QueryStateException("ERROR: {0}".format(msg))
     handle = resp.operationHandle
-    if handle.hasResultSet:
-      req = TGetResultSetMetadataReq(handle)
 
-      def GetResultSetMetadata():
-        return self.imp_service.GetResultSetMetadata(req)
-      # GetResultSetMetadata rpc is idempotent and should be safe to retry.
-      resp = self._do_hs2_rpc(GetResultSetMetadata, retry_on_error=True)
-      self._check_hs2_rpc_status(resp.status)
-      assert resp.schema is not None, resp
-      # Attach the schema to the handle for convenience.
-      handle.schema = resp.schema
-    handle.is_closed = False
-    return handle
+    try:
+      self._set_current_query_handle(handle)
+      if handle.hasResultSet:
+        def GetResultSetMetadata(req):
+          return self.imp_service.GetResultSetMetadata(req)
+        # GetResultSetMetadata rpc is idempotent and should be safe to retry.
+        req = TGetResultSetMetadataReq(handle)
+        resp = self._do_hs2_rpc(GetResultSetMetadata, req, retry_on_error=True)
+        self._check_hs2_rpc_status(resp.status)
+        assert resp.schema is not None, resp
+        # Attach the schema to the handle for convenience.
+        handle.schema = resp.schema
+      handle.is_closed = False
+      return handle
+    finally:
+      self._clear_current_query_handle()
 
   def get_query_id_str(self, last_query_handle):
+    if last_query_handle is None:
+      return None
+
+    guid_bytes = last_query_handle.operationId.guid
+    return self._convert_id_to_str(guid_bytes)
+
+  def _set_current_query_handle(self, query_handle):
+    self._current_query_handle = query_handle
+
+  def _clear_current_query_handle(self):
+    self._current_query_handle = None
+
+  def get_session_id(self):
+    if self.session_handle is None:
+      return None
+
+    return self._convert_id_to_str(self.session_handle.sessionId.guid)
+
+  def _convert_id_to_str(self, id_bytes):
     # The binary representation is present in the query handle but we need to
     # massage it into the expected string representation. C++ and Java code
     # treats the low and high half as two 64-bit little-endian integers and
     # as a result prints the hex representation in the reverse order to how
     # bytes are laid out in guid.
-    guid_bytes = last_query_handle.operationId.guid
-    low_bytes_reversed = guid_bytes[7::-1]
-    high_bytes_reversed = guid_bytes[16:7:-1]
+    low_bytes_reversed = id_bytes[7::-1]
+    high_bytes_reversed = id_bytes[16:7:-1]
 
     if sys.version_info.major < 3:
       low_hex = low_bytes_reversed.encode('hex_codec')
@@ -810,42 +949,52 @@ class ImpalaHS2Client(ImpalaClient):
     return "{low}:{high}".format(low=low_hex, high=high_hex)
 
   def fetch(self, query_handle):
-    assert query_handle.hasResultSet
-    prim_types = [column.typeDesc.types[0].primitiveEntry.type
-                  for column in query_handle.schema.columns]
-    col_value_converters = [HS2_VALUE_CONVERTERS[prim_type]
-                        for prim_type in prim_types]
-    while True:
-      req = TFetchResultsReq(query_handle, TFetchOrientation.FETCH_NEXT,
-          self.fetch_size)
+    try:
+      self._set_current_query_handle(query_handle)
+      assert query_handle.hasResultSet
+      prim_types = [column.typeDesc.types[0].primitiveEntry.type
+                    for column in query_handle.schema.columns]
+      column_value_getters = [HS2_VALUE_GETTERS[prim_type]
+                          for prim_type in prim_types]
+      column_value_converters = [self.value_converter.get_converter(prim_type)
+                          for prim_type in prim_types]
+      while True:
+        def FetchResults(req):
+          return self.imp_service.FetchResults(req)
+        # FetchResults rpc is not idempotent unless the client and server communicate and
+        # results are kept around for retry to be successful.
+        req = TFetchResultsReq(query_handle,
+                               TFetchOrientation.FETCH_NEXT,
+                               self.fetch_size)
+        resp = self._do_hs2_rpc(FetchResults, req)
+        self._check_hs2_rpc_status(resp.status)
 
-      def FetchResults():
-        return self.imp_service.FetchResults(req)
-      # FetchResults rpc is not idempotent unless the client and server communicate and
-      # results are kept around for retry to be successful.
-      resp = self._do_hs2_rpc(FetchResults)
-      self._check_hs2_rpc_status(resp.status)
+        # Transpose the columns into a row-based format for more convenient processing
+        # for the display code. This is somewhat inefficient, but performance is
+        # comparable to the old Beeswax code.
+        yield self._transpose(column_value_getters, column_value_converters,
+                              resp.results.columns)
+        if not self._hasMoreRows(resp, column_value_getters):
+          return
+    finally:
+      self._clear_current_query_handle()
 
-      # Transpose the columns into a row-based format for more convenient processing
-      # for the display code. This is somewhat inefficient, but performance is comparable
-      # to the old Beeswax code.
-      yield self._transpose(col_value_converters, resp.results.columns)
-      if not resp.hasMoreRows:
-        return
+  def _hasMoreRows(self, resp, column_value_getters):
+    return resp.hasMoreRows
 
-  def _transpose(self, col_value_converters, columns):
+  def _transpose(self, column_value_getters, column_value_converters, columns):
     """Transpose the columns from a TFetchResultsResp into the row format returned
     by fetch() with all the values converted into their string representations for
-    display. Uses the getters and stringifiers provided in col_value_converters[i]
-    for column i."""
-    tcols = [col_value_converters[i][0](col) for i, col in enumerate(columns)]
+    display. Uses the getters and convertes provided in column_value_getters[i] and
+    column_value_converters[i] for column i."""
+    tcols = [column_value_getters[i](col) for i, col in enumerate(columns)]
     num_rows = len(tcols[0].values)
     # Preallocate rows for efficiency.
     rows = [[None] * len(tcols) for i in xrange(num_rows)]
     for col_idx, tcol in enumerate(tcols):
       is_null = bitarray(endian='little')
       is_null.frombytes(tcol.nulls)
-      stringifier = col_value_converters[col_idx][1]
+      stringifier = column_value_converters[col_idx]
       # Skip stringification if not needed. This makes large extracts of tpch.orders
       # ~8% faster according to benchmarks.
       if stringifier is None:
@@ -865,83 +1014,107 @@ class ImpalaHS2Client(ImpalaClient):
     return rows
 
   def close_dml(self, last_query_handle):
-    req = TCloseImpalaOperationReq(last_query_handle)
+    try:
+      self._set_current_query_handle(last_query_handle)
 
-    def CloseImpalaOperation():
-      return self.imp_service.CloseImpalaOperation(req)
-    # CloseImpalaOperation rpc is not idempotent for dmls.
-    resp = self._do_hs2_rpc(CloseImpalaOperation)
-    self._check_hs2_rpc_status(resp.status)
-    if not resp.dml_result:
-      raise RPCException("Impala DML operation did not return DML statistics.")
-
-    num_rows = sum([int(k) for k in resp.dml_result.rows_modified.values()])
-    last_query_handle.is_closed = True
-    return (num_rows, resp.dml_result.num_row_errors)
+      def CloseImpalaOperation(req):
+        return self.imp_service.CloseImpalaOperation(req)
+      # CloseImpalaOperation rpc is not idempotent for dmls.
+      req = TCloseImpalaOperationReq(last_query_handle)
+      resp = self._do_hs2_rpc(CloseImpalaOperation, req)
+      self._check_hs2_rpc_status(resp.status)
+      if not resp.dml_result:
+        raise RPCException("Impala DML operation did not return DML statistics.")
+      last_query_handle.is_closed = True
+      return self._process_dml_result(resp.dml_result)
+    finally:
+      self._clear_current_query_handle()
 
   def close_query(self, last_query_handle):
-    # Set a member in the handle to make sure that it is idempotent
-    if last_query_handle.is_closed:
-      return True
-    req = TCloseImpalaOperationReq(last_query_handle)
+    try:
+      self._set_current_query_handle(last_query_handle)
+      # Set a member in the handle to make sure that it is idempotent
+      if last_query_handle.is_closed:
+        return True
 
-    def CloseImpalaOperation():
-      return self.imp_service.CloseImpalaOperation(req)
-    # CloseImpalaOperation rpc is idempotent for non dml queries and so safe to retry.
-    resp = self._do_hs2_rpc(CloseImpalaOperation, retry_on_error=True)
-    last_query_handle.is_closed = True
-    return self._is_hs2_nonerror_status(resp.status.statusCode)
+      def CloseImpalaOperation(req):
+        return self.imp_service.CloseImpalaOperation(req)
+      # CloseImpalaOperation rpc is idempotent for non dml queries and so safe to retry.
+      req = TCloseImpalaOperationReq(last_query_handle)
+      resp = self._do_hs2_rpc(CloseImpalaOperation, req, retry_on_error=True)
+      last_query_handle.is_closed = True
+      return self._is_hs2_nonerror_status(resp.status.statusCode)
+    finally:
+      self._clear_current_query_handle()
 
   def cancel_query(self, last_query_handle):
     # Cancel sets query_state to ERROR_STATE before calling cancel() in the
     # co-ordinator, so we don't need to wait.
-    if last_query_handle.is_closed:
-      return True
-    req = TCancelOperationReq(last_query_handle)
+    try:
+      self._set_current_query_handle(last_query_handle)
+      if last_query_handle.is_closed:
+        return True
 
-    def CancelOperation():
-      return self.imp_service.CancelOperation(req)
-    # CancelOperation rpc is idempotent and so safe to retry.
-    resp = self._do_hs2_rpc(CancelOperation, retry_on_error=True)
-    return self._is_hs2_nonerror_status(resp.status.statusCode)
+      def CancelOperation(req):
+        return self.imp_service.CancelOperation(req)
+      # CancelOperation rpc is idempotent and so safe to retry.
+      req = TCancelOperationReq(last_query_handle)
+      resp = self._do_hs2_rpc(CancelOperation, req, retry_on_error=True)
+      return self._is_hs2_nonerror_status(resp.status.statusCode)
+    finally:
+      self._clear_current_query_handle()
 
   def get_query_state(self, last_query_handle):
-    req = TGetOperationStatusReq(last_query_handle)
+    try:
+      self._set_current_query_handle(last_query_handle)
 
-    def GetOperationStatus():
-      return self.imp_service.GetOperationStatus(req)
-    # GetOperationStatus rpc is idempotent and so safe to retry.
-    resp = self._do_hs2_rpc(GetOperationStatus, retry_on_error=True)
-    self._check_hs2_rpc_status(resp.status)
-    return resp.operationState
+      def GetOperationStatus(req):
+        return self.imp_service.GetOperationStatus(req)
+      # GetOperationStatus rpc is idempotent and so safe to retry.
+      req = TGetOperationStatusReq(last_query_handle)
+      resp = self._do_hs2_rpc(GetOperationStatus, req, retry_on_error=True)
+      self._check_hs2_rpc_status(resp.status)
+      return resp.operationState
+    finally:
+      self._clear_current_query_handle()
 
   def get_runtime_profile(self, last_query_handle):
-    req = TGetRuntimeProfileReq(last_query_handle, self.session_handle,
-        include_query_attempts=True)
+    try:
+      self._set_current_query_handle(last_query_handle)
 
-    def GetRuntimeProfile():
-      return self.imp_service.GetRuntimeProfile(req)
-    # GetRuntimeProfile rpc is idempotent and so safe to retry.
-    resp = self._do_hs2_rpc(GetRuntimeProfile, retry_on_error=True)
-    self._check_hs2_rpc_status(resp.status)
-    failed_profile = None
-    if resp.failed_profiles and len(resp.failed_profiles) >= 1:
-      failed_profile = resp.failed_profiles[0]
-    return resp.profile, failed_profile
+      def GetRuntimeProfile(req):
+        return self.imp_service.GetRuntimeProfile(req)
+      # GetRuntimeProfile rpc is idempotent and so safe to retry.
+      profile_req = TGetRuntimeProfileReq(last_query_handle,
+                                          self.session_handle,
+                                          include_query_attempts=True)
+      resp = self._do_hs2_rpc(GetRuntimeProfile, profile_req, retry_on_error=True)
+      self._check_hs2_rpc_status(resp.status)
+      failed_profile = None
+      if resp.failed_profiles and len(resp.failed_profiles) >= 1:
+        failed_profile = resp.failed_profiles[0]
+      return resp.profile, failed_profile
+    finally:
+      self._clear_current_query_handle()
 
   def get_summary(self, last_query_handle):
-    req = TGetExecSummaryReq(last_query_handle, self.session_handle,
-        include_query_attempts=True)
+    try:
+      self._set_current_query_handle(last_query_handle)
 
-    def GetExecSummary():
-      return self.imp_service.GetExecSummary(req)
-    # GetExecSummary rpc is idempotent and so safe to retry.
-    resp = self._do_hs2_rpc(GetExecSummary, retry_on_error=True)
-    self._check_hs2_rpc_status(resp.status)
-    failed_summary = None
-    if resp.failed_summaries and len(resp.failed_summaries) >= 1:
-      failed_summary = resp.failed_summaries[0]
-    return resp.summary, failed_summary
+      def GetExecSummary(req):
+        return self.imp_service.GetExecSummary(req)
+      # GetExecSummary rpc is idempotent and so safe to retry.
+      req = TGetExecSummaryReq(last_query_handle,
+                           self.session_handle,
+                           include_query_attempts=True)
+      resp = self._do_hs2_rpc(GetExecSummary, req, retry_on_error=True)
+      self._check_hs2_rpc_status(resp.status)
+      failed_summary = None
+      if resp.failed_summaries and len(resp.failed_summaries) >= 1:
+        failed_summary = resp.failed_summaries[0]
+      return resp.summary, failed_summary
+    finally:
+      self._clear_current_query_handle()
 
   def get_column_names(self, last_query_handle):
     # The handle has the schema embedded in it.
@@ -956,28 +1129,33 @@ class ImpalaHS2Client(ImpalaClient):
     """Returns all messages from the error log prepended with 'WARNINGS:' or 'ERROR:' for
     last_query_handle, depending on whether warn is True or False. Note that the error
     log may contain messages that are not errors (e.g. warnings)."""
-    if last_query_handle is None:
-      return "Query could not be executed"
-    req = TGetLogReq(last_query_handle)
+    try:
+      self._set_current_query_handle(last_query_handle)
+      if last_query_handle is None:
+        return "Query could not be executed"
 
-    def GetLog():
-      return self.imp_service.GetLog(req)
-    # GetLog rpc is idempotent and so safe to retry.
-    resp = self._do_hs2_rpc(GetLog, retry_on_error=True)
-    self._check_hs2_rpc_status(resp.status)
+      def GetLog(req):
+        return self.imp_service.GetLog(req)
+      # GetLog rpc is idempotent and so safe to retry.
+      req = TGetLogReq(last_query_handle)
+      resp = self._do_hs2_rpc(GetLog, req, retry_on_error=True)
+      self._check_hs2_rpc_status(resp.status)
 
-    log = utf8_decode_if_needed(resp.log)
+      log = utf8_decode_if_needed(resp.log)
 
-    # Strip progress message out of HS2 log.
-    log = HS2_LOG_PROGRESS_REGEX.sub("", log)
-    if log and log.strip():
-      log = self._append_retried_query_link(log)
-      type_str = "WARNINGS" if warn is True else "ERROR"
-      return "%s: %s" % (type_str, log)
-    return ""
+      # Strip progress message out of HS2 log.
+      log = HS2_LOG_PROGRESS_REGEX.sub("", log)
+      if log and log.strip():
+        log = self._append_retried_query_link(log)
+        type_str = "WARNINGS" if warn is True else "ERROR"
+        return "%s: %s" % (type_str, log)
+      return ""
+    finally:
+      self._clear_current_query_handle()
 
-  def _do_hs2_rpc(self, rpc, suppress_error_on_cancel=True, retry_on_error=False):
-    """Executes the provided 'rpc' callable and tranlates any exceptions in the
+  def _do_hs2_rpc(self, rpc, rpc_input,
+                  suppress_error_on_cancel=True, retry_on_error=False):
+    """Executes the provided 'rpc' callable and translates any exceptions in the
     appropriate exception for the shell. The input 'rpc' must be a python function
     with the __name__ attribute and not a lambda function. Exceptions raised include:
     * DisconnectedException if the client cannot communicate with the server.
@@ -988,12 +1166,16 @@ class ImpalaHS2Client(ImpalaClient):
     If 'retry_on_error' is true, the rpc is retried if an exception is raised. The maximum
     number of tries is determined by 'self.max_tries'. Retries, if enabled, are attempted
     for all exceptions other than TApplicationException."""
+
+    self._request_num += 1
+    self._current_request_id = "{0}-{1}".format(self._base_request_id, self._request_num)
     self._check_connected()
     num_tries = 1
     max_tries = num_tries
     if retry_on_error:
       max_tries = self.max_tries
     while num_tries <= max_tries:
+      start_time = self._print_rpc_start(rpc, rpc_input, num_tries)
       raise_error = (num_tries == max_tries)
       # Generate a retry message, only if retries and supported.
       will_retry = False
@@ -1005,14 +1187,23 @@ class ImpalaHS2Client(ImpalaClient):
       else:
         retry_msg = ''
       try:
-        return rpc()
+        rpc_output = rpc(rpc_input)
+        self._print_rpc_end(rpc, rpc_output, start_time, "SUCCESS")
+        return rpc_output
       except TTransportException as e:
+        # Unwrap socket.error so we can handle it directly.
+        if isinstance(e.inner, socket.error):
+          e = e.inner
         # issue with the connection with the impalad
-        print('Caught exception {0}, type={1} in {2}. {3}'
-          .format(str(e), type(e), rpc.__name__, retry_msg), file=sys.stderr)
+        log_exception_with_timestamp(e, "Exception",
+           "type={0} in {1}. {2}".format(type(e), rpc.__name__, retry_msg))
+        self._print_rpc_end(rpc, None, start_time, "Error - TTransportException")
         if raise_error:
-          raise DisconnectedException("Error communicating with impalad: %s" % e)
+          if isinstance(e, TTransportException):
+            raise DisconnectedException("Error communicating with impalad: %s" % e)
+          raise e
       except TApplicationException as t:
+        self._print_rpc_end(rpc, None, start_time, "Error - TApplicationException")
         # Suppress the errors from cancelling a query that is in waiting_to_finish state
         if suppress_error_on_cancel and self.is_query_cancelled:
           raise QueryCancelledByShellException()
@@ -1029,17 +1220,19 @@ class ImpalaHS2Client(ImpalaClient):
             except ValueError:
               retry_secs = None
         if retry_secs:
-          print('Caught exception {0}, type={1} in {2}. {3}, retry after {4} secs'
-                .format(str(h), type(h), rpc.__name__, retry_msg, retry_secs),
-                file=sys.stderr)
+          log_exception_with_timestamp(h, "Exception",
+              "type={0} in {1}. {2}, retry after {3} secs"
+              .format(type(h), rpc.__name__, retry_msg, retry_secs))
         else:
-          print('Caught exception {0}, type={1} in {2}. {3}'
-                .format(str(h), type(h), rpc.__name__, retry_msg), file=sys.stderr)
+          log_exception_with_timestamp(h, "Exception", "type={0} in {1}. {2}"
+                .format(type(h), rpc.__name__, retry_msg))
+        self._print_rpc_end(rpc, None, start_time, "Error - HttpError")
         if raise_error:
           raise
       except Exception as e:
-        print('Caught exception {0}, type={1} in {2}. {3}'
-          .format(str(e), type(e), rpc.__name__, retry_msg), file=sys.stderr)
+        log_exception_with_timestamp(e, "Exception", "type={0} in {1}. {2}"
+          .format(type(e), rpc.__name__, retry_msg))
+        self._print_rpc_end(rpc, None, start_time, "Error")
         if raise_error:
           raise
       if retry_secs:
@@ -1075,6 +1268,66 @@ class ImpalaHS2Client(ImpalaClient):
                            TStatusCode.SUCCESS_WITH_INFO_STATUS,
                            TStatusCode.STILL_EXECUTING_STATUS)
 
+  def _print_line_separator(self, fh):
+    """Prints out a visible separator suitable for outputting debug and
+    trace information to the screen or a file"""
+    fh.write("------------------------------------------------")
+    fh.write("------------------------------------------------\n")
+
+  def _print_rpc_start(self, rpc_func, rpc_input, num_tries):
+    """Prints out a nicely formatted detailed breakdown of the request to
+    a rpc call.  Handles both the 'rpc_stdout' and 'rpc_file' command line arguments."""
+    if self.rpc_stdout or self.rpc_file is not None:
+      start_time = datetime.now()
+
+      def print_start_to_file(fh):
+        self._print_line_separator(fh)
+        fh.write("[{0}] RPC CALL STARTED:\n".format(start_time))
+        fh.write("OPERATION: {0}\nDETAILS:\n".format(rpc_func.__name__))
+        fh.write("  * Impala Session Id: {0}\n".format(self.get_session_id()))
+        fh.write("  * Impala Query Id:   {0}\n"
+                  .format(self.get_query_id_str(self._current_query_handle)))
+        fh.write("  * Attempt Count:     {0}\n".format(num_tries))
+        fh.write("\nRPC REQUEST:\n")
+        self.thrift_printer.print_obj(rpc_input, fh)
+        self._print_line_separator(fh)
+
+      if self.rpc_stdout:
+        print_start_to_file(sys.stdout)
+
+      if self.rpc_file:
+        with open(self.rpc_file, "a") as f:
+          print_start_to_file(f)
+
+      return start_time
+
+    return None
+
+  def _print_rpc_end(self, rpc_func, rpc_output, start_time, result):
+    """Prints out a nicely formatted detailed breakdown of the response from
+    a rpc call.  Handles both the 'rpc_stdout' and 'rpc_file' command line arguments."""
+    if self.rpc_stdout or self.rpc_file is not None:
+      end_time = datetime.now()
+      duration = end_time - start_time
+
+      def print_end_to_file(fh):
+        self._print_line_separator(fh)
+        fh.write("[{0}] RPC CALL FINISHED:\n".format(end_time))
+        fh.write("OPERATION: {0}\nDETAILS:\n".format(rpc_func.__name__))
+        fh.write("  * Time:   {0}ms\n".format(duration.total_seconds() * 1000))
+        fh.write("  * Result: {0}\n".format(result))
+        if rpc_output is not None:
+          fh.write("\nRPC RESPONSE:\n")
+          self.thrift_printer.print_obj(rpc_output, fh)
+        self._print_line_separator(fh)
+
+      if self.rpc_stdout:
+        print_end_to_file(sys.stdout)
+
+      if self.rpc_file:
+        with open(self.rpc_file, "a") as f:
+          print_end_to_file(f)
+
 
 class RpcStatus:
   """Convenience enum used in ImpalaBeeswaxClient to describe Rpc return statuses"""
@@ -1089,19 +1342,25 @@ class StrictHS2Client(ImpalaHS2Client):
     super(StrictHS2Client, self).__init__(*args, **kwargs)
 
   def close_dml(self, last_query_handle):
-    return self.close_query(last_query_handle)
+    self.close_query(last_query_handle)
+    return (None, None, None)
 
   def close_query(self, last_query_handle):
     # Set a member in the handle to make sure that it is idempotent
     if last_query_handle.is_closed:
       return True
-    req = TCloseOperationReq(last_query_handle)
 
-    def CloseOperation():
-      return self.imp_service.CloseOperation(req)
-    resp = self._do_hs2_rpc(CloseOperation, retry_on_error=False)
-    last_query_handle.is_closed = True
-    return self._is_hs2_nonerror_status(resp.status.statusCode)
+    try:
+      self._set_current_query_handle(last_query_handle)
+
+      def CloseOperation(req):
+        return self.imp_service.CloseOperation(req)
+      req = TCloseOperationReq(last_query_handle)
+      resp = self._do_hs2_rpc(CloseOperation, req, retry_on_error=False)
+      last_query_handle.is_closed = True
+      return self._is_hs2_nonerror_status(resp.status.statusCode)
+    finally:
+      self._clear_current_query_handle()
 
   def _ping_impala_service(self):
     return ("N/A", "N/A")
@@ -1117,6 +1376,11 @@ class StrictHS2Client(ImpalaHS2Client):
 
   def _populate_query_options(self):
     return
+
+  def _hasMoreRows(self, resp, column_value_getters):
+    tcol = column_value_getters[0](resp.results.columns[0])
+    return len(tcol.values)
+
 
 class ImpalaBeeswaxClient(ImpalaClient):
   """Legacy Beeswax client. Uses the Beeswax protocol plus Impala-specific extensions.
@@ -1176,6 +1440,9 @@ class ImpalaBeeswaxClient(ImpalaClient):
         raise MissingThriftMethodException(t.message)
       raise
     except TTransportException as e:
+      # Unwrap socket.error so we can handle it directly.
+      if isinstance(e.inner, socket.error):
+        raise e.inner
       raise DisconnectedException("Error communicating with impalad: %s" % e)
     self.webserver_address = resp.webserver_address
     return (resp.version, resp.webserver_address)
@@ -1228,13 +1495,12 @@ class ImpalaBeeswaxClient(ImpalaClient):
         return
 
   def close_dml(self, last_query_handle):
-    insert_result, rpc_status = self._do_beeswax_rpc(
+    dml_result, rpc_status = self._do_beeswax_rpc(
         lambda: self.imp_service.CloseInsert(last_query_handle))
     if rpc_status != RpcStatus.OK:
-       raise RPCException()
-    num_rows = sum([int(k) for k in insert_result.rows_modified.values()])
+      raise RPCException()
     last_query_handle.is_closed = True
-    return (num_rows, insert_result.num_row_errors)
+    return self._process_dml_result(dml_result)
 
   def close_query(self, last_query_handle):
     # Set a member in the handle to make sure that it is idempotent
@@ -1333,6 +1599,9 @@ class ImpalaBeeswaxClient(ImpalaClient):
         raise QueryCancelledByShellException()
       raise RPCException(utf8_encode_if_needed("ERROR: %s") % b.message)
     except TTransportException as e:
+      # Unwrap socket.error so we can handle it directly.
+      if isinstance(e.inner, socket.error):
+        raise e.inner
       # issue with the connection with the impalad
       raise DisconnectedException("Error communicating with impalad: %s" % e)
     except TApplicationException as t:
@@ -1377,3 +1646,25 @@ class ImpalaBeeswaxClient(ImpalaClient):
           raise RPCException("ERROR: %s" % e.message)
         if "QueryNotFoundException" in str(e):
           raise QueryStateException('Error: Stale query handle')
+        # Print more details for other kinds of exceptions
+        log_exception_with_timestamp(e, "Exception", "type={0}".format(type(e)))
+        traceback.print_exc()
+        raise Exception("Encountered unknown exception")
+
+
+def log_exception_with_timestamp(e, type="Exception", msg="", stderr_flag=True):
+  # method log_exception_with_timestamp prints timestamp with exception trace
+  # and accepts custom message before timestamp. stderr_flag controls print statement
+  # to be logged in stderr, by default it is true.
+  if(stderr_flag):
+      print("%s [%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), type,
+      msg), e, file=sys.stderr)
+  else:
+      print("%s [%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), type,
+       msg), e)
+
+
+def log_timestamp(type="Exception", msg=""):
+  # method log_timestamp prints timestamp with custom message
+  print("%s [%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), type, msg),
+      file=sys.stderr)

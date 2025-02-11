@@ -174,6 +174,7 @@ bool ColumnStatsReader::ReadFromString(StatsField stats_field,
               static_cast<Decimal16Value*>(slot));
         }
       DCHECK(false) << "Unknown decimal byte size: " << col_type_.GetByteSize();
+      break;
     case TYPE_DATE:
       return ColumnStats<DateValue>::DecodePlainValue(encoded_value, slot, element_.type);
     default:
@@ -414,10 +415,11 @@ bool ColumnStatsReader::AllNulls(bool* all_nulls) const {
 }
 
 Status ColumnStatsBase::CopyToBuffer(StringBuffer* buffer, StringValue* value) {
-  if (value->ptr == buffer->buffer()) return Status::OK();
+  StringValue::SimpleString value_s = value->ToSimpleString();
+  if (value_s.ptr == buffer->buffer()) return Status::OK();
   buffer->Clear();
-  RETURN_IF_ERROR(buffer->Append(value->ptr, value->len));
-  value->ptr = buffer->buffer();
+  RETURN_IF_ERROR(buffer->Append(value_s.ptr, value_s.len));
+  value->SetPtr(buffer->buffer());
   return Status::OK();
 }
 

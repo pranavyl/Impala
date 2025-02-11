@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import os
 import pytest
 from copy import deepcopy
@@ -65,6 +66,15 @@ class TestMtDopFlags(CustomClusterTestSuite):
     self.run_test_case('QueryTest/runtime_filters_mt_dop', vector,
         test_file_vars={'$RUNTIME_FILTER_WAIT_TIME_MS': str(WAIT_TIME_MS)})
 
+  @CustomClusterTestSuite.with_args(cluster_size=1)
+  def test_mt_dop_union_empty_table(self, unique_database):
+    """ Regression test for IMPALA-11803: When used in DEBUG build,
+    impalad crashed while running union on an empty table with MT_DOP>1.
+    This test verifies the fix on the same."""
+    self.client.execute("set mt_dop=2")
+    self.client.execute("select count(*) from (select f2 from"
+                        " functional.emptytable union all select id from"
+                        " functional.alltypestiny) t")
 
 class TestMaxMtDop(CustomClusterTestSuite):
   @classmethod

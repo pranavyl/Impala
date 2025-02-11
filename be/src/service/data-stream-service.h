@@ -18,6 +18,7 @@
 #ifndef IMPALA_SERVICE_DATA_STREAM_SERVICE_H
 #define IMPALA_SERVICE_DATA_STREAM_SERVICE_H
 
+#include "gen-cpp/common.pb.h"
 #include "gen-cpp/data_stream_service.service.h"
 
 #include "common/status.h"
@@ -41,6 +42,8 @@ class MetricGroup;
 /// appropriate receivers. Metrics exposed by the service will be added to 'metric_group'.
 class DataStreamService : public DataStreamServiceIf {
  public:
+  static constexpr std::string_view END_DATA_STREAM = "EndDataStream";
+
   DataStreamService(MetricGroup* metric_group);
 
   /// Initializes the service by registering it with the singleton RPC manager.
@@ -68,6 +71,11 @@ class DataStreamService : public DataStreamServiceIf {
   virtual void UpdateFilter(const UpdateFilterParamsPB* req, UpdateFilterResultPB* resp,
       kudu::rpc::RpcContext* context);
 
+  /// Called by fragment instances that produce local runtime filters to deliver them to
+  /// the aggregator backend for intermediate aggregation.
+  virtual void UpdateFilterFromRemote(const UpdateFilterParamsPB* req,
+      UpdateFilterResultPB* resp, kudu::rpc::RpcContext* context);
+
   /// Called by the coordinator to deliver global runtime filters to fragments for
   /// application at plan nodes.
   virtual void PublishFilter(const PublishFilterParamsPB* req,
@@ -88,7 +96,7 @@ class DataStreamService : public DataStreamServiceIf {
 
   /// Gets a DataStreamService proxy to a server with 'address' and 'hostname'.
   /// The newly created proxy is returned in 'proxy'. Returns error status on failure.
-  static Status GetProxy(const TNetworkAddress& address, const std::string& hostname,
+  static Status GetProxy(const NetworkAddressPB& address, const std::string& hostname,
       std::unique_ptr<DataStreamServiceProxy>* proxy);
 
  private:

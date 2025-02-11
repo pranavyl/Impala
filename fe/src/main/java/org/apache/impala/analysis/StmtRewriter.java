@@ -68,6 +68,8 @@ public class StmtRewriter {
       queryStmt = ((UpdateStmt) analysisResult.getStmt()).getQueryStmt();
     } else if (analysisResult.isDeleteStmt()) {
       queryStmt = ((DeleteStmt) analysisResult.getStmt()).getQueryStmt();
+    } else if (analysisResult.isMergeStmt()) {
+      queryStmt = ((MergeStmt) analysisResult.getStmt()).getQueryStmt();
     } else if (analysisResult.isTestCaseStmt()) {
       queryStmt = ((CopyTestCaseStmt) analysisResult.getStmt()).getQueryStmt();
     } else {
@@ -1828,9 +1830,12 @@ public class StmtRewriter {
       newCollPath.add(0, alias);
       // Remove the alias of the old collection ref from the analyzer. We need to add
       // the new collection ref with the same old alias.
-      analyzer.removeAlias(collTblRef.getUniqueAlias());
-      TableRef newCollTblRef =
-          TableRef.newTableRef(analyzer, newCollPath, collTblRef.getUniqueAlias());
+      String[] old_aliases = collTblRef.getAliases();
+      for (String old_alias: old_aliases) {
+        analyzer.removeAlias(old_alias);
+      }
+      TableRef newCollTblRef = TableRef.newTableRef(
+          analyzer, newCollPath, old_aliases[old_aliases.length - 1]);
       // Set JOIN attributes. Please note that we cannot use TableRef.setJoinAttrs()
       // because we only want to copy the ON clause and the plan hints. The col names
       // in USING have been already converted to an ON clause. We let the analyzer/

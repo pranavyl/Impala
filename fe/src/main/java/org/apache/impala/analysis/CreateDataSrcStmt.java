@@ -19,6 +19,7 @@ package org.apache.impala.analysis;
 
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.impala.authorization.Privilege;
+import org.apache.impala.catalog.DataSourceTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.extdatasource.ApiVersion;
@@ -44,7 +45,6 @@ public class CreateDataSrcStmt extends StatementBase {
     Preconditions.checkNotNull(dataSrcName);
     Preconditions.checkNotNull(className);
     Preconditions.checkNotNull(apiVersionString);
-    Preconditions.checkNotNull(location);
     dataSrcName_ = dataSrcName.toLowerCase();
     location_ = location;
     className_ = className;
@@ -54,7 +54,9 @@ public class CreateDataSrcStmt extends StatementBase {
 
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
-    if (!MetastoreShim.validateName(dataSrcName_)) {
+    if (dataSrcName_.equalsIgnoreCase(DataSourceTable.IMPALA_BUILTIN_JDBC_DATASOURCE)) {
+      throw new AnalysisException("Built-in data source name: " + dataSrcName_);
+    } else if (!MetastoreShim.validateName(dataSrcName_)) {
       throw new AnalysisException("Invalid data source name: " + dataSrcName_);
     }
     if (!ifNotExists_ && analyzer.getCatalog().getDataSource(dataSrcName_) != null) {
@@ -68,7 +70,9 @@ public class CreateDataSrcStmt extends StatementBase {
           "'. Valid API versions: " + Joiner.on(", ").join(ApiVersion.values()));
     }
 
-    location_.analyze(analyzer, Privilege.ALL, FsAction.READ);
+    if (location_ != null) {
+      location_.analyze(analyzer, Privilege.ALL, FsAction.READ);
+    }
     // TODO: Check class exists and implements API version
     // TODO: authorization check
   }
@@ -80,7 +84,7 @@ public class CreateDataSrcStmt extends StatementBase {
     if (ifNotExists_) sb.append("IF NOT EXISTS ");
     sb.append(dataSrcName_);
     sb.append(" LOCATION '");
-    sb.append(location_.getLocation());
+    sb.append(location_ != null ? location_.getLocation() : "");
     sb.append("' CLASS '");
     sb.append(className_);
     sb.append("' API_VERSION '");
@@ -91,7 +95,7 @@ public class CreateDataSrcStmt extends StatementBase {
 
   public TCreateDataSourceParams toThrift() {
     return new TCreateDataSourceParams(
-        new TDataSource(dataSrcName_, location_.toString(), className_,
-            apiVersion_.name())).setIf_not_exists(ifNotExists_);
+        new TDataSource(dataSrcName_, location_ != null ? location_.toString() : "",
+            className_, apiVersion_.name())).setIf_not_exists(ifNotExists_);
   }
 }

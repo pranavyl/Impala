@@ -147,7 +147,8 @@ inline bool RawValue::Eq(const void* v1, const void* v2, const ColumnType& type)
           return reinterpret_cast<const Decimal16Value*>(v1)->value()
               == reinterpret_cast<const Decimal16Value*>(v2)->value();
         default:
-          break;
+          DCHECK(false) << "Unknown decimal byte size: " << type.GetByteSize();
+          return 0;
       }
     default:
       DCHECK(false) << type;
@@ -224,10 +225,11 @@ inline uint32_t RawValue::GetHashValueNonNull<impala::StringValue>(
     return HashUtil::MurmurHash2_64(v, type.len, seed);
   } else {
     DCHECK(type.type == TYPE_STRING || type.type == TYPE_VARCHAR);
-    if (v->len == 0) {
+    StringValue::SimpleString s = v->ToSimpleString();
+    if (s.len == 0) {
       return HashUtil::HashCombine32(HASH_VAL_EMPTY, seed);
     }
-    return HashUtil::MurmurHash2_64(v->ptr, v->len, seed);
+    return HashUtil::MurmurHash2_64(s.ptr, s.len, seed);
   }
 }
 
@@ -348,10 +350,11 @@ inline uint64_t RawValue::GetHashValueFastHashNonNull<impala::StringValue>(
     return HashUtil::FastHash64(v, type.len, seed);
   } else {
     DCHECK(type.type == TYPE_STRING || type.type == TYPE_VARCHAR);
-    if (v->len == 0) {
+    StringValue::SimpleString s = v->ToSimpleString();
+    if (s.len == 0) {
       return HashUtil::FastHash64(&HASH_VAL_EMPTY, sizeof(HASH_VAL_EMPTY), seed);
     }
-    return HashUtil::FastHash64(v->ptr, static_cast<size_t>(v->len), seed);
+    return HashUtil::FastHash64(s.ptr, static_cast<size_t>(s.len), seed);
   }
 }
 

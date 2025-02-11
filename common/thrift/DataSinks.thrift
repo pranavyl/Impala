@@ -32,6 +32,9 @@ enum TDataSinkType {
   HASH_JOIN_BUILDER = 2
   PLAN_ROOT_SINK = 3
   NESTED_LOOP_JOIN_BUILDER = 4
+  ICEBERG_DELETE_BUILDER = 5
+  MULTI_DATA_SINK = 6
+  MERGE_SINK = 7
 }
 
 enum TSinkAction {
@@ -39,6 +42,13 @@ enum TSinkAction {
   UPDATE = 1
   UPSERT = 2
   DELETE = 3
+  MERGE = 4
+}
+
+enum TIcebergMergeSinkAction{
+  DATA = 1
+  DELETE = 2
+  BOTH = 3
 }
 
 enum TTableSinkType {
@@ -103,6 +113,14 @@ struct THdfsTableSink {
   11: optional map<string, i64> parquet_bloom_filter_col_info;
 }
 
+// Structure to encapsulate specific options that are passed down to the
+// IcebergBufferedDeleteSink.
+struct TIcebergDeleteSink {
+  // Partition expressions of this sink. In case of Iceberg DELETEs these are the
+  // partition spec id and the serialized partition data.
+  1: required list<Exprs.TExpr> partition_key_exprs
+}
+
 // Structure to encapsulate specific options that are passed down to the KuduTableSink
 struct TKuduTableSink {
   // The position in this vector is equal to the position in the output expressions of the
@@ -151,6 +169,7 @@ struct TTableSink {
   3: required TSinkAction action
   4: optional THdfsTableSink hdfs_table_sink
   5: optional TKuduTableSink kudu_table_sink
+  6: optional TIcebergDeleteSink iceberg_delete_sink
 }
 
 struct TDataSink {
@@ -173,4 +192,7 @@ struct TDataSink {
 
   // Resource profile for this data sink. Always set.
   9: optional ResourceProfile.TBackendResourceProfile resource_profile
+
+  // Child data sinks if this is a MULTI_DATA_SINK.
+  10: optional list<TDataSink> child_data_sinks
 }

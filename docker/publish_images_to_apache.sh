@@ -20,8 +20,7 @@
 set -euo pipefail
 
 usage() {
-  echo "publish_container_to_apache.sh -v <version string> [-d] [-r <repo>"
-  echo "  -d: if specified, upload debug images instead of release images"
+  echo "publish_container_to_apache.sh -v <version string> [-r <repo>]"
   echo "  -r: docker repository to upload to (defaults to apache/impala)"
   echo "  -v: version string to tag upload with, e.g. git hash or release version"
 }
@@ -73,6 +72,10 @@ do
   # with a prefix, e.g. IMPALA_QUICKSTART_IMAGE_PREFIX in the quickstart docker compose.
   DST="${TARGET_REPO}:${VERSION}-${IMAGE}"
   DIGEST=$(docker images --no-trunc --quiet "${IMAGE}")
+  if [[ -z $DIGEST ]]; then
+    echo "${IMAGE} image not found"
+    continue
+  fi
   echo "Publishing ${IMAGE} (${DIGEST}) to ${DST}"
   docker tag $IMAGE "$DST"
   docker push "$DST"

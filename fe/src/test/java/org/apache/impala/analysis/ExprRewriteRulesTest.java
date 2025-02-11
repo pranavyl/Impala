@@ -405,6 +405,8 @@ public class ExprRewriteRulesTest extends FrontendTestBase {
     RewritesOk("repeat('A', 65536)", rule, repeat("A", 65_536));
     RewritesOk("repeat('A', 4294967296)", rule, null);
 
+    // Check that constant folding can handle binary results.
+    RewritesOk("cast(concat('a', 'b') as binary)", rule, "'ab'");
   }
 
   @Test
@@ -438,12 +440,52 @@ public class ExprRewriteRulesTest extends FrontendTestBase {
 
   @Test
   public void testCompoundPredicate() throws ImpalaException {
-    ExprRewriteRule rule = SimplifyConditionalsRule.INSTANCE;
+    List<ExprRewriteRule> rules = Lists.newArrayList(NormalizeExprsRule.INSTANCE,
+        SimplifyConditionalsRule.INSTANCE);
 
-    RewritesOk("false OR id = 0", rule, "id = 0");
-    RewritesOk("true OR id = 0", rule, "TRUE");
-    RewritesOk("false && id = 0", rule, "FALSE");
-    RewritesOk("true && id = 0", rule, "id = 0");
+    RewritesOk("id = 0 OR false", rules, "id = 0");
+    RewritesOk("id = 0 OR true", rules, "TRUE");
+    RewritesOk("id = 0 && false", rules, "FALSE");
+    RewritesOk("id = 0 && true", rules, "id = 0");
+    RewritesOk("false OR id = 0 AND true", rules, "id = 0");
+    RewritesOk("true AND id = 0 OR false", rules, "id = 0");
+  }
+
+  /**
+   * Sets up a framework for re-analysis that triggers conjunct ID conflicts if rewrite
+   * rules don't analyze new predicates. It requires a union of SELECT WHERE clauses,
+   * with one of the clauses requiring multiple rewrite passes.
+   */
+  private String rewriteTemplate(String whereClause) {
+    return "SELECT 1 FROM functional.alltypes t WHERE t.id = 1 UNION ALL " +
+        "SELECT 1 FROM functional.alltypes t WHERE " + whereClause;
+  }
+
+  /**
+   * IMPALA-13302: Test that compound predicate rewrites - combined with rewrites that
+   * produce a simplifiable predicate - don't leave unanalyzed conjuncts for re-analysis.
+   */
+  @Test
+  public void testCompoundPredicateWithRewriteAndReanalyze() throws ImpalaException {
+    AnalysisContext ctx = createAnalysisCtx();
+    ctx.getQueryOptions().setEnable_expr_rewrites(true);
+
+    String[] cases = {
+      // NormalizeExprsRule should simplify to FALSE AND ...
+      rewriteTemplate("t.id = 1 AND t.id = 1 AND false"),
+      // ExtractCommonConjunctRule subset should simplify to FALSE AND ...
+      rewriteTemplate("((t.id = 1 AND false) or (t.id = 1 AND false)) AND t.id = 1"),
+      // ExtractCommonConjunctRule distjunct should simplify to FALSE AND ...
+      rewriteTemplate("((t.id = 1 AND false) or (t.id = 2 AND false)) AND t.id = 1"),
+      // BetweenToCompoundRule should simplify to FALSE AND ...
+      rewriteTemplate("(1 BETWEEN 2 AND 3) AND t.id = 1 AND t.id = 1"),
+      // SimplifyDistinctFromRule should simplify to FALSE AND ...
+      rewriteTemplate("t.id IS DISTINCT FROM t.id AND t.id = 1")
+    };
+
+    for (String sql : cases) {
+      AnalyzesOk(sql, ctx);
+    }
   }
 
   @Test
@@ -473,6 +515,18 @@ public class ExprRewriteRulesTest extends FrontendTestBase {
     RewritesOk("case 0 when null then id else 1 end", rule, "1");
     // All non-constant, don't rewrite.
     RewritesOk("case id when 1 then 1 when 2 then 2 else 3 end", rule, null);
+    // IMPALA-12770: Fix infinite loop for nested Case expressions.
+    // Case NULL, don't rewrite.
+    RewritesOk("case NULL when id then id else 1 end", rule, null);
+    // Nested Case expressions.
+    RewritesOk("case case 1 when 0 then 0 when 1 then id end "
+        + "when 2 then id + 2 else id + 3 end",
+        rule, "CASE id WHEN 2 THEN id + 2 ELSE id + 3 END");
+    // 'when' are all FALSE for inner Case expression, set 'case' expr as NULL for outer
+    // Case expression.
+    RewritesOk("case case 3 when 0 then id when 1 then id + 1 end "
+        + "when 2 then id + 2 end",
+        rule, "CASE NULL WHEN 2 THEN id + 2 END");
   }
 
   @Test

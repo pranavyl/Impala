@@ -18,7 +18,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import httplib
+from __future__ import absolute_import, division, print_function
+import http.client
+import http.server
 import logging
 import os
 import pexpect
@@ -26,6 +28,7 @@ import pytest
 import re
 import signal
 import socket
+import socketserver
 import sys
 import threading
 from time import sleep
@@ -40,13 +43,14 @@ from tempfile import NamedTemporaryFile
 from tests.common.impala_service import ImpaladService
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.skip import SkipIfLocal
-from tests.common.test_dimensions import create_client_protocol_dimension
-from tests.common.test_dimensions import create_client_protocol_strict_dimension
-from tests.shell.util import get_unused_port
-from util import (assert_var_substitution, ImpalaShell, get_impalad_port, get_shell_cmd,
-                  get_open_sessions_metric, IMPALA_SHELL_EXECUTABLE, spawn_shell)
-import SimpleHTTPServer
-import SocketServer
+from tests.common.test_dimensions import (
+  create_client_protocol_dimension, create_client_protocol_strict_dimension,
+  create_uncompressed_text_dimension, create_single_exec_option_dimension)
+from tests.common.test_result_verifier import error_msg_expected
+from tests.shell.util import (assert_var_substitution, ImpalaShell, get_impalad_port,
+  get_shell_cmd, get_open_sessions_metric, spawn_shell, get_unused_port,
+  create_impala_shell_executable_dimension, get_impala_shell_executable,
+  stderr_get_first_error_msg)
 
 QUERY_FILE_PATH = os.path.join(os.environ['IMPALA_HOME'], 'tests', 'shell')
 
@@ -77,32 +81,30 @@ def tmp_history_file(request):
   return tmp.name
 
 
-class RequestHandler503(SimpleHTTPServer.SimpleHTTPRequestHandler):
+class RequestHandler503(http.server.SimpleHTTPRequestHandler):
   """A custom http handler that checks for duplicate 'Host' headers from the most
   recent http request, and always returns a 503 http code."""
 
   def __init__(self, request, client_address, server):
-    SimpleHTTPServer.SimpleHTTPRequestHandler.__init__(self, request, client_address,
-                                                       server)
+    http.server.SimpleHTTPRequestHandler.__init__(self, request, client_address,
+                                                   server)
 
   def should_send_body_text(self):
     # in RequestHandler503 we do not send any body text
     return False
 
   def do_POST(self):
-    # The unfortunately named self.headers here is an instance of mimetools.Message that
-    # contains the request headers.
-    request_headers = self.headers.headers
-
-    # Ensure that only one 'Host' header is contained in the request before responding.
-    host_hdr_count = sum([header.startswith('Host:') for header in request_headers])
-    assert host_hdr_count == 1, "duplicate 'Host:' headers in %s" % request_headers
+    # Ensure that a 'Host' header is contained in the request before responding.
+    assert "Host" in self.headers
 
     # Respond with 503.
-    self.send_response(code=httplib.SERVICE_UNAVAILABLE, message="Service Unavailable")
+    self.send_response(code=http.client.SERVICE_UNAVAILABLE,
+                       message="Service Unavailable")
+    # The Python 3 version of SimpleHTTPRequestHandler requires this to be called
+    # explicitly
+    self.end_headers()
     if self.should_send_body_text():
-      # Optionally send ody text with 503 message.
-      self.end_headers()
+      # Optionally send body text with 503 message.
       self.wfile.write("EXTRA")
 
 
@@ -121,7 +123,7 @@ class TestHTTPServer503(object):
   def __init__(self, clazz):
     self.HOST = "localhost"
     self.PORT = get_unused_port()
-    self.httpd = SocketServer.TCPServer((self.HOST, self.PORT), clazz)
+    self.httpd = socketserver.TCPServer((self.HOST, self.PORT), clazz)
 
     self.http_server_thread = threading.Thread(target=self.httpd.serve_forever)
     self.http_server_thread.start()
@@ -165,11 +167,18 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
 
   @classmethod
   def add_test_dimensions(cls):
+    super(TestImpalaShellInteractive, cls).add_test_dimensions()
+    # Limit to uncompressed text with default exec options
+    cls.ImpalaTestMatrix.add_dimension(
+        create_uncompressed_text_dimension(cls.get_workload()))
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
     # Run with both beeswax and HS2 to ensure that behaviour is the same.
     cls.ImpalaTestMatrix.add_dimension(create_client_protocol_dimension())
     cls.ImpalaTestMatrix.add_dimension(create_client_protocol_strict_dimension())
     cls.ImpalaTestMatrix.add_constraint(lambda v:
-          v.get_value('protocol') != 'beeswax' or not v.get_value('strict_hs2_protocol'))
+        v.get_value('protocol') != 'beeswax' or not v.get_value('strict_hs2_protocol'))
+    # Test combination of Python versions and tarball/PyPI
+    cls.ImpalaTestMatrix.add_dimension(create_impala_shell_executable_dimension())
 
   def _expect_with_cmd(self, proc, cmd, vector, expectations=(), db="default"):
     """Executes a command on the expect process instance and verifies a set of
@@ -194,14 +203,24 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
     """Test that setting the local shell options works"""
     proc = spawn_shell(get_shell_cmd(vector))
     proc.expect(":{0}] default>".format(get_impalad_port(vector)))
-    self._expect_with_cmd(proc, "set", vector,
-        ("LIVE_PROGRESS: True", "LIVE_SUMMARY: False"))
-    self._expect_with_cmd(proc, "set live_progress=true", vector)
-    self._expect_with_cmd(proc, "set", vector,
-        ("LIVE_PROGRESS: True", "LIVE_SUMMARY: False"))
-    self._expect_with_cmd(proc, "set live_summary=1", vector)
-    self._expect_with_cmd(proc, "set", vector,
-        ("LIVE_PROGRESS: True", "LIVE_SUMMARY: True"))
+    if vector.get_value('strict_hs2_protocol'):
+      self._expect_with_cmd(proc, "set", vector,
+          ("LIVE_PROGRESS: False", "LIVE_SUMMARY: False"))
+      self._expect_with_cmd(proc, "set live_progress=true", vector)
+      self._expect_with_cmd(proc, "set", vector,
+          ("LIVE_PROGRESS: False", "LIVE_SUMMARY: False"))
+      self._expect_with_cmd(proc, "set live_summary=1", vector)
+      self._expect_with_cmd(proc, "set", vector,
+          ("LIVE_PROGRESS: False", "LIVE_SUMMARY: False"))
+    else:
+      self._expect_with_cmd(proc, "set", vector,
+          ("LIVE_PROGRESS: True", "LIVE_SUMMARY: False"))
+      self._expect_with_cmd(proc, "set live_progress=true", vector)
+      self._expect_with_cmd(proc, "set", vector,
+          ("LIVE_PROGRESS: True", "LIVE_SUMMARY: False"))
+      self._expect_with_cmd(proc, "set live_summary=1", vector)
+      self._expect_with_cmd(proc, "set", vector,
+          ("LIVE_PROGRESS: True", "LIVE_SUMMARY: True"))
     self._expect_with_cmd(proc, "set", vector,
         ("WRITE_DELIMITED: False", "VERBOSE: True"))
     self._expect_with_cmd(proc, "set", vector,
@@ -237,6 +256,19 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
     p.send_cmd("select * from nation")
     result = p.get_result()
     assert "21,VIETNAM,2" in result.stdout
+
+  def test_vertical(self, vector):
+    """Test output rows in vertical mode"""
+    p = ImpalaShell(vector)
+    p.send_cmd("use tpch")
+    p.send_cmd("set vertical=true")
+    p.send_cmd("select N_NATIONKEY, N_NAME from nation limit 1")
+    result = p.get_result()
+    assert "+----------------+" not in result.stdout
+    assert "************************************** " \
+      "1.row **************************************" in result.stdout, result.stdout
+    assert "n_nationkey: " in result.stdout, result.stdout
+    assert "n_name: " in result.stdout, result.stdout
 
   @pytest.mark.execute_serially
   def test_print_to_file(self, vector):
@@ -316,6 +348,25 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
     result = p.get_result()
     assert "^C" in result.stderr
 
+  def test_sigusr1_stacktraces(self, vector):
+    if vector.get_value('strict_hs2_protocol'):
+      pytest.skip("Strict HS2 mode doesn't support sleep() function")
+    if vector.get_value('impala_shell') in ['dev', 'python2']:
+      pytest.skip("Python 2 doesn't support faulthandler")
+    command = "select sleep(5000); quit;"
+    p = ImpalaShell(vector)
+    p.send_cmd(command)
+    sleep(2)
+    os.kill(p.pid(), signal.SIGUSR1)
+    result = p.get_result()
+    # The stacktrace is printed to stderr. The main thread starts in impala_shell_main,
+    # so we expect that to be present.
+    assert "Current thread" in result.stderr, result.stderr
+    assert "impala_shell_main" in result.stderr, result.stderr
+    # The SIGUSR1 doesn't harm the running query.
+    assert "Fetched 1 row(s)" in result.stderr, result.stderr
+    assert result.rc == 0, result.stderr
+
   @pytest.mark.execute_serially
   def test_cancellation_mid_command(self, vector):
     """Test that keyboard interrupt cancels multiline query strings"""
@@ -363,13 +414,37 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
     # IMPALA-10415: Multiline query with history enabled and unicode chars.
     # readline gets its input from tty, so using stdin does not work.
     shell_cmd = get_shell_cmd(vector)
-    child_proc = pexpect.spawn(shell_cmd[0], shell_cmd[1:])
+    child_proc = spawn_shell(shell_cmd)
     child_proc.expect(PROMPT_REGEX)
     child_proc.sendline("select '{0}'\n;".format(unicode_bytes))
     child_proc.expect("Fetched 1 row\(s\) in [0-9]+\.?[0-9]*s")
     child_proc.expect(PROMPT_REGEX)
     child_proc.sendline('quit;')
     child_proc.wait()
+
+  def test_unicode_column(self, vector, unique_database):
+    """Tests unicode column name support"""
+    if vector.get_value('strict_hs2_protocol'):
+      pytest.skip("IMPALA-10827: Failed, need to investigate.")
+    args = ("create table {0}.test_tbl(`세율중분류구분코드` int, s string COMMENT 'String col')"
+            " STORED AS TEXTFILE;".format(unique_database))
+    result = run_impala_shell_interactive(vector, args)
+    assert "Fetched 1 row(s)" in result.stderr, result.stderr
+    args = ("describe {0}.test_tbl;"
+            .format(unique_database))
+    result = run_impala_shell_interactive(vector, args)
+    assert "Fetched 2 row(s)" in result.stderr, result.stderr
+    assert "세율중분류구분코드" in result.stdout
+    args = ("insert into table {0}.test_tbl values(1, 'Alice');"
+            .format(unique_database))
+    result = run_impala_shell_interactive(vector, args)
+    assert "Modified 1 row(s)" in result.stderr, result.stderr
+    args = ("select * from {0}.test_tbl;"
+            .format(unique_database))
+    result = run_impala_shell_interactive(vector, args)
+    assert "Fetched 1 row(s)" in result.stderr, result.stderr
+    assert "세율중분류구분코드" in result.stdout
+
 
   def test_welcome_string(self, vector):
     """Test that the shell's welcome message is only printed once
@@ -594,7 +669,7 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
       self._expect_with_cmd(child_proc, "select 'hi'", vector, ('hi'))
       child_proc.sendline('exit;')
       child_proc.expect(pexpect.EOF)
-      history_contents = file(new_hist.name).read()
+      history_contents = open(new_hist.name).read()
       assert "select 'hi'" in history_contents
 
   def test_rerun(self, vector, tmp_history_file):
@@ -669,8 +744,20 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
     # Verify that query options under [impala] override those under [impala.query_options]
     assert "\tDEFAULT_FILE_FORMAT: avro" in result.stdout
 
+    # unset all query options
+    cmds = "unset all;set all;"
+    result = run_impala_shell_interactive(vector, cmds, shell_args=args)
+    assert "\tMT_DOP: " in result.stdout
+    assert "\tMAX_ERRORS: [100]" in result.stdout
+    assert "\tEXPLAIN_LEVEL: [STANDARD]" in result.stdout
+    assert "INVALID_QUERY_OPTION is not supported for the impalad being connected to, "\
+           "ignoring." in result.stdout
+    assert "\tDEFAULT_FILE_FORMAT: [TEXT]" in result.stdout
+
   def test_commandline_flag_disable_live_progress(self, vector):
     """Test the command line flag disable_live_progress with live_progress."""
+    if vector.get_value('strict_hs2_protocol'):
+      pytest.skip("Live option not supported in strict hs2 mode.")
     # By default, shell option live_progress is set to True in the interactive mode.
     cmds = "set all;"
     result = run_impala_shell_interactive(vector, cmds)
@@ -686,8 +773,23 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
     result = run_impala_shell_interactive(vector, cmds, shell_args=args)
     assert "\tLIVE_PROGRESS: False" in result.stdout
 
+  def test_commandline_flag_strict_hs2_protocol(self, vector):
+    """Test the command line flag strict_hs2_protocol that it disables
+       live_progress and live_summary"""
+    if not vector.get_value('strict_hs2_protocol'):
+      pytest.skip("Test only applies to strict_hs2_protocol.")
+
+    cmds = "set all;"
+    # override the default option through command line argument.
+    args = ['--strict_hs2_protocol']
+    result = run_impala_shell_interactive(vector, cmds, shell_args=args)
+    assert "\tLIVE_PROGRESS: False" in result.stdout
+    assert "\tLIVE_SUMMARY: False" in result.stdout
+
   def test_live_option_configuration(self, vector):
     """Test the optional configuration file with live_progress and live_summary."""
+    if vector.get_value('strict_hs2_protocol'):
+      pytest.skip("Live option not supported in strict hs2 mode.")
     # Positive tests
     # set live_summary and live_progress as True with config file
     rcfile_path = os.path.join(QUERY_FILE_PATH, 'good_impalarc3')
@@ -838,14 +940,14 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
       os.chdir("%s/tests/shell/" % os.environ['IMPALA_HOME'])
       result = run_impala_shell_interactive(vector,
         "sOuRcE shell_case_sensitive.cmds; SeLeCt 'second command'")
-      print result.stderr
+      print(result.stderr)
 
       assert "Query: uSe FUNCTIONAL" in result.stderr
       assert "Query: ShOw TABLES" in result.stderr
       assert "alltypes" in result.stdout
       # This is from shell_case_sensitive2.cmds, the result of sourcing a file
       # from a sourced file.
-      print result.stderr
+      print(result.stderr)
       assert "SeLeCt 'second command'" in result.stderr
     finally:
       os.chdir(cwd)
@@ -853,7 +955,7 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
   def test_line_with_leading_comment(self, vector, unique_database):
     # IMPALA-2195: A line with a comment produces incorrect command.
     if vector.get_value('strict_hs2_protocol'):
-      pytest.skip("Leading omments not supported in strict hs2 mode.")
+      pytest.skip("Leading comments not supported in strict hs2 mode.")
     table = "{0}.leading_comment".format(unique_database)
     run_impala_shell_interactive(vector, 'create table {0} (i int);'.format(table))
     result = run_impala_shell_interactive(vector, '-- comment\n'
@@ -937,30 +1039,6 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
 
   def test_fix_infinite_loop(self, vector):
     # IMPALA-6337: Fix infinite loop.
-
-    # In case of TL;DR:
-    # - see IMPALA-9362 for details
-    # - see tests/shell/util.py for explanation of IMPALA_SHELL_EXECUTABLE
-    if os.getenv("IMPALA_HOME") not in IMPALA_SHELL_EXECUTABLE:
-      # The fix for IMPALA-6337 involved patching our internal verison of
-      # sqlparse 0.1.19 in ${IMPALA_HOME}/shell/ext-py. However, when we
-      # create the the stand-alone python package of the impala-shell for PyPI,
-      # we don't include the bundled 3rd party libs -- we expect users to
-      # install 3rd upstream libraries from PyPI.
-      #
-      # We could try to bundle sqlparse with the PyPI package, but there we
-      # run into the issue that the our bundled version is not python 3
-      # compatible. The real fix for this would be to upgrade to sqlparse 0.3.0,
-      # but that's not without complications. See IMPALA-9362 for details.
-      #
-      # For the time being, what this means is that IMPALA-6337 is fixed for
-      # people who are running the shell locally from any host/node that's part
-      # of a cluster where Impala is installed, but if they are running a
-      # standalone version of the shell on a client outside of a cluster, then
-      # they will still be relying on the upstream version of sqlparse 0.1.19,
-      # and so they may still be affected by the IMPALA-6337.
-      #
-      pytest.skip("Test will fail if shell is not part of dev environment.")
 
     result = run_impala_shell_interactive(vector, "select 1 + 1; \"\n;\";")
     if vector.get_value('strict_hs2_protocol'):
@@ -1085,8 +1163,10 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
       assert "ParseException" in result.stderr,\
              result.stderr
     else:
-      assert "ERROR: ParseException: Unmatched string literal" in result.stderr,\
-             result.stderr
+      assert error_msg_expected(
+          stderr_get_first_error_msg(result.stderr),
+          "ParseException: Unmatched string literal"
+      )
 
   def test_utf8_error_message(self, vector):
     if vector.get_value('strict_hs2_protocol'):
@@ -1096,8 +1176,11 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
     query = "select cast(now() as string format 'yyyy年MM月dd日')"
     shell.send_cmd(query)
     result = shell.get_result()
-    assert "ERROR: Bad date/time conversion format: yyyy年MM月dd日" in result.stderr,\
-           result.stderr
+    assert error_msg_expected(
+        stderr_get_first_error_msg(result.stderr),
+        "Bad date/time conversion format: yyyy年MM月dd日"
+    )
+
 
   def test_timezone_validation(self, vector):
     """Test that query option TIMEZONE is validated when executing a query.
@@ -1148,9 +1231,10 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
       pytest.skip()
 
     # Check that we get a message about the 503 error when we try to connect.
+    impala_shell_executable = get_impala_shell_executable(vector)
     shell_args = ["--protocol={0}".format(protocol),
                   "-i{0}:{1}".format(http_503_server.HOST, http_503_server.PORT)]
-    shell_proc = spawn_shell([IMPALA_SHELL_EXECUTABLE] + shell_args)
+    shell_proc = spawn_shell(impala_shell_executable + shell_args)
     shell_proc.expect("HTTP code 503", timeout=10)
 
   def test_http_interactions_extra(self, vector, http_503_server_extra):
@@ -1162,10 +1246,11 @@ class TestImpalaShellInteractive(ImpalaTestSuite):
       pytest.skip()
 
     # Check that we get a message about the 503 error when we try to connect.
+    impala_shell_executable = get_impala_shell_executable(vector)
     shell_args = ["--protocol={0}".format(protocol),
                   "-i{0}:{1}".format(http_503_server_extra.HOST,
                                      http_503_server_extra.PORT)]
-    shell_proc = spawn_shell([IMPALA_SHELL_EXECUTABLE] + shell_args)
+    shell_proc = spawn_shell(impala_shell_executable + shell_args)
     shell_proc.expect("HTTP code 503: Service Unavailable \[EXTRA\]", timeout=10)
 
 

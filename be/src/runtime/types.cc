@@ -18,10 +18,9 @@
 #include "runtime/types.h"
 
 #include <ostream>
-#include <sstream>
 
-#include "gen-cpp/TCLIService_constants.h"
 #include "codegen/llvm-codegen.h"
+#include "gutil/strings/substitute.h"
 
 #include "common/names.h"
 
@@ -39,7 +38,7 @@ const int ColumnType::MAX_DECIMAL8_PRECISION;
 const char* ColumnType::LLVM_CLASS_NAME = "struct.impala::ColumnType";
 
 ColumnType::ColumnType(const std::vector<TTypeNode>& types, int* idx)
-  : len(-1), precision(-1), scale(-1) {
+  : len(-1), precision(-1), scale(-1), is_binary_(false) {
   DCHECK_GE(*idx, 0);
   DCHECK_LT(*idx, types.size());
   const TTypeNode& node = types[*idx];
@@ -52,6 +51,8 @@ ColumnType::ColumnType(const std::vector<TTypeNode>& types, int* idx)
           || type == TYPE_FIXED_UDA_INTERMEDIATE) {
         DCHECK(scalar_type.__isset.len);
         len = scalar_type.len;
+      } else if (type == TYPE_STRING) {
+        is_binary_ = scalar_type.type == TPrimitiveType::BINARY;
       } else if (type == TYPE_DECIMAL) {
         DCHECK(scalar_type.__isset.precision);
         DCHECK(scalar_type.__isset.scale);
@@ -106,7 +107,8 @@ PrimitiveType ThriftToType(TPrimitiveType::type ttype) {
     case TPrimitiveType::TIMESTAMP: return TYPE_TIMESTAMP;
     case TPrimitiveType::STRING: return TYPE_STRING;
     case TPrimitiveType::VARCHAR: return TYPE_VARCHAR;
-    case TPrimitiveType::BINARY: return TYPE_BINARY;
+    // BINARY is generally handled the same way as STRING by the backend.
+    case TPrimitiveType::BINARY: return TYPE_STRING;
     case TPrimitiveType::DECIMAL: return TYPE_DECIMAL;
     case TPrimitiveType::CHAR: return TYPE_CHAR;
     case TPrimitiveType::FIXED_UDA_INTERMEDIATE: return TYPE_FIXED_UDA_INTERMEDIATE;
@@ -114,7 +116,7 @@ PrimitiveType ThriftToType(TPrimitiveType::type ttype) {
   }
 }
 
-TPrimitiveType::type ToThrift(PrimitiveType ptype) {
+TPrimitiveType::type ToThrift(PrimitiveType ptype, bool is_binary) {
   switch (ptype) {
     case INVALID_TYPE: return TPrimitiveType::INVALID_TYPE;
     case TYPE_NULL: return TPrimitiveType::NULL_TYPE;
@@ -128,9 +130,12 @@ TPrimitiveType::type ToThrift(PrimitiveType ptype) {
     case TYPE_DATE: return TPrimitiveType::DATE;
     case TYPE_DATETIME: return TPrimitiveType::DATETIME;
     case TYPE_TIMESTAMP: return TPrimitiveType::TIMESTAMP;
-    case TYPE_STRING: return TPrimitiveType::STRING;
+    case TYPE_STRING:
+      return is_binary ? TPrimitiveType::BINARY : TPrimitiveType::STRING;
     case TYPE_VARCHAR: return TPrimitiveType::VARCHAR;
-    case TYPE_BINARY: return TPrimitiveType::BINARY;
+    case TYPE_BINARY:
+      DCHECK(false) << "STRING should be used instead of BINARY in the backend.";
+      return TPrimitiveType::INVALID_TYPE;
     case TYPE_DECIMAL: return TPrimitiveType::DECIMAL;
     case TYPE_CHAR: return TPrimitiveType::CHAR;
     case TYPE_FIXED_UDA_INTERMEDIATE: return TPrimitiveType::FIXED_UDA_INTERMEDIATE;
@@ -138,6 +143,7 @@ TPrimitiveType::type ToThrift(PrimitiveType ptype) {
     case TYPE_ARRAY:
     case TYPE_MAP:
       DCHECK(false) << "NYI: " << ptype;
+      [[fallthrough]];
     default: return TPrimitiveType::INVALID_TYPE;
   }
 }
@@ -169,9 +175,14 @@ string TypeToString(PrimitiveType t) {
   return "";
 }
 
-string TypeToOdbcString(PrimitiveType t) {
+string TypeToOdbcString(const TColumnType& type) {
+  DCHECK_EQ(1, type.types.size());
+  DCHECK_EQ(TTypeNodeType::SCALAR, type.types[0].type);
+  DCHECK(type.types[0].__isset.scalar_type);
+  TPrimitiveType::type col_type = type.types[0].scalar_type.type;
+  PrimitiveType primitive_type = ThriftToType(col_type);
   // ODBC driver requires types in lower case
-  switch (t) {
+  switch (primitive_type) {
     case INVALID_TYPE: return "invalid";
     case TYPE_NULL: return "null";
     case TYPE_BOOLEAN: return "boolean";
@@ -184,14 +195,20 @@ string TypeToOdbcString(PrimitiveType t) {
     case TYPE_DATE: return "date";
     case TYPE_DATETIME: return "datetime";
     case TYPE_TIMESTAMP: return "timestamp";
-    case TYPE_STRING: return "string";
+    case TYPE_STRING:
+      if(col_type == TPrimitiveType::BINARY) {
+        return "binary";
+      } else {
+        return "string";
+      }
     case TYPE_VARCHAR: return "string";
-    case TYPE_BINARY: return "binary";
+
     case TYPE_DECIMAL: return "decimal";
     case TYPE_CHAR: return "char";
     case TYPE_STRUCT: return "struct";
     case TYPE_ARRAY: return "array";
     case TYPE_MAP: return "map";
+    case TYPE_BINARY:
     case TYPE_FIXED_UDA_INTERMEDIATE:
       // This type is not exposed to clients and should not be returned.
       DCHECK(false);
@@ -226,7 +243,7 @@ void ColumnType::ToThrift(TColumnType* thrift_type) const {
     node.type = TTypeNodeType::SCALAR;
     node.__set_scalar_type(TScalarType());
     TScalarType& scalar_type = node.scalar_type;
-    scalar_type.__set_type(impala::ToThrift(type));
+    scalar_type.__set_type(impala::ToThrift(type, is_binary_));
     if (type == TYPE_CHAR || type == TYPE_VARCHAR
         || type == TYPE_FIXED_UDA_INTERMEDIATE) {
       DCHECK_NE(len, -1);
@@ -240,102 +257,18 @@ void ColumnType::ToThrift(TColumnType* thrift_type) const {
   }
 }
 
-TTypeEntry ColumnType::ToHs2Type() const {
-  TPrimitiveTypeEntry type_entry;
-  switch (type) {
-    // Map NULL_TYPE to BOOLEAN, otherwise Hive's JDBC driver won't
-    // work for queries like "SELECT NULL" (IMPALA-914).
-    case TYPE_NULL:
-      type_entry.__set_type(TTypeId::BOOLEAN_TYPE);
-      break;
-    case TYPE_BOOLEAN:
-      type_entry.__set_type(TTypeId::BOOLEAN_TYPE);
-      break;
-    case TYPE_TINYINT:
-      type_entry.__set_type(TTypeId::TINYINT_TYPE);
-      break;
-    case TYPE_SMALLINT:
-      type_entry.__set_type(TTypeId::SMALLINT_TYPE);
-      break;
-    case TYPE_INT:
-      type_entry.__set_type(TTypeId::INT_TYPE);
-      break;
-    case TYPE_BIGINT:
-      type_entry.__set_type(TTypeId::BIGINT_TYPE);
-      break;
-    case TYPE_FLOAT:
-      type_entry.__set_type(TTypeId::FLOAT_TYPE);
-      break;
-    case TYPE_DOUBLE:
-      type_entry.__set_type(TTypeId::DOUBLE_TYPE);
-      break;
-    case TYPE_DATE:
-      type_entry.__set_type(TTypeId::DATE_TYPE);
-      break;
-    case TYPE_TIMESTAMP:
-      type_entry.__set_type(TTypeId::TIMESTAMP_TYPE);
-      break;
-    case TYPE_STRING:
-      type_entry.__set_type(TTypeId::STRING_TYPE);
-      break;
-    case TYPE_BINARY:
-      type_entry.__set_type(TTypeId::BINARY_TYPE);
-      break;
-    case TYPE_DECIMAL: {
-      TTypeQualifierValue tprecision;
-      tprecision.__set_i32Value(precision);
-      TTypeQualifierValue tscale;
-      tscale.__set_i32Value(scale);
-
-      TTypeQualifiers type_quals;
-      type_quals.qualifiers[g_TCLIService_constants.PRECISION] = tprecision;
-      type_quals.qualifiers[g_TCLIService_constants.SCALE] = tscale;
-      type_entry.__set_typeQualifiers(type_quals);
-      type_entry.__set_type(TTypeId::DECIMAL_TYPE);
-      break;
-    }
-    case TYPE_CHAR:
-    case TYPE_VARCHAR: {
-      TTypeQualifierValue tmax_len;
-      tmax_len.__set_i32Value(len);
-
-      TTypeQualifiers type_quals;
-      type_quals.qualifiers[g_TCLIService_constants.CHARACTER_MAXIMUM_LENGTH] = tmax_len;
-      type_entry.__set_typeQualifiers(type_quals);
-      type_entry.__set_type(
-          (type == TYPE_CHAR) ? TTypeId::CHAR_TYPE : TTypeId::VARCHAR_TYPE);
-      break;
-    }
-    case TYPE_STRUCT:
-      type_entry.__set_type(TTypeId::STRING_TYPE);
-      break;
-    default:
-      // HiveServer2 does not have a type for invalid, date, datetime or
-      // fixed_uda_intermediate.
-      DCHECK(false) << "bad TypeToTValueType() type: " << DebugString();
-      type_entry.__set_type(TTypeId::STRING_TYPE);
-  };
-
-  TTypeEntry result;
-  result.__set_primitiveEntry(type_entry);
-  return result;
-}
-
 string ColumnType::DebugString() const {
-  stringstream ss;
   switch (type) {
+    case TYPE_STRING:
+      return is_binary_ ? "BINARY" : "STRING";
     case TYPE_CHAR:
-      ss << "CHAR(" << len << ")";
-      return ss.str();
+      return Substitute("CHAR($0)", len);
     case TYPE_DECIMAL:
-      ss << "DECIMAL(" << precision << "," << scale << ")";
-      return ss.str();
+      return Substitute("DECIMAL($0,$1)", precision, scale);
     case TYPE_VARCHAR:
-      ss << "VARCHAR(" << len << ")";
-      return ss.str();
+      return Substitute("VARCHAR($0)", len);
     case TYPE_FIXED_UDA_INTERMEDIATE:
-      ss << "FIXED_UDA_INTERMEDIATE(" << len << ")";
-      return ss.str();
+      return Substitute("FIXED_UDA_INTERMEDIATE($0)", len);
     default:
       return TypeToString(type);
   }
@@ -343,6 +276,7 @@ string ColumnType::DebugString() const {
 
 vector<ColumnType> ColumnType::FromThrift(const vector<TColumnType>& ttypes) {
   vector<ColumnType> types;
+  types.reserve(ttypes.size());
   for (const TColumnType& ttype : ttypes) types.push_back(FromThrift(ttype));
   return types;
 }
@@ -353,11 +287,12 @@ ostream& operator<<(ostream& os, const ColumnType& type) {
 }
 
 llvm::ConstantStruct* ColumnType::ToIR(LlvmCodeGen* codegen) const {
-  // ColumnType = { i32, i32, i32, i32, <vector>, <vector> }
+  // ColumnType = { i32, i8, i32, i32, i32, <vector>, <vector>, <vector> }
   llvm::StructType* column_type_type = codegen->GetStructType<ColumnType>();
 
   DCHECK_EQ(sizeof(type), sizeof(int32_t));
   llvm::Constant* type_field = codegen->GetI32Constant(type);
+
   DCHECK_EQ(sizeof(len), sizeof(int32_t));
   llvm::Constant* len_field = codegen->GetI32Constant(len);
   DCHECK_EQ(sizeof(precision), sizeof(int32_t));
@@ -365,7 +300,7 @@ llvm::ConstantStruct* ColumnType::ToIR(LlvmCodeGen* codegen) const {
   DCHECK_EQ(sizeof(scale), sizeof(int32_t));
   llvm::Constant* scale_field = codegen->GetI32Constant(scale);
 
-  // Create empty 'children' and 'field_names' vectors
+  // Create empty 'children', 'field_names' and 'field_ids' vectors
   DCHECK(children.empty()) << "Nested types NYI";
   DCHECK(field_names.empty()) << "Nested types NYI";
   DCHECK(field_ids.empty()) << "Nested types NYI";
@@ -376,9 +311,16 @@ llvm::ConstantStruct* ColumnType::ToIR(LlvmCodeGen* codegen) const {
   llvm::Constant* field_ids_field =
       llvm::Constant::getNullValue(column_type_type->getElementType(6));
 
+  DCHECK_EQ(sizeof(is_binary_), sizeof(uint8_t));
+  llvm::Constant* is_binary_field = codegen->GetI8Constant(is_binary_);
+
+  llvm::Constant* padding =
+      llvm::Constant::getNullValue(column_type_type->getElementType(8));
+
   return llvm::cast<llvm::ConstantStruct>(
       llvm::ConstantStruct::get(column_type_type, type_field, len_field, precision_field,
-          scale_field, children_field, field_names_field, field_ids_field));
+        scale_field, children_field, field_names_field, field_ids_field,
+        is_binary_field, padding));
 }
 
 }

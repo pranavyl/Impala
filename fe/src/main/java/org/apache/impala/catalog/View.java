@@ -27,10 +27,12 @@ import org.apache.impala.analysis.QueryStmt;
 import org.apache.impala.analysis.StatementBase;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TCatalogObjectType;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableStats;
 import org.apache.impala.thrift.TTableType;
+import org.apache.impala.util.EventSequence;
 
 import com.google.common.collect.Lists;
 
@@ -82,9 +84,10 @@ public class View extends Table implements FeView {
 
   @Override
   public void load(boolean reuseMetadata, IMetaStoreClient client,
-      org.apache.hadoop.hive.metastore.api.Table msTbl, String reason)
-      throws TableLoadingException {
+      org.apache.hadoop.hive.metastore.api.Table msTbl, String reason,
+      EventSequence catalogTimeline) throws TableLoadingException {
     try {
+      Table.LOADING_TABLES.incrementAndGet();
       clearColumns();
       msTable_ = msTbl;
       // Load columns.
@@ -105,6 +108,8 @@ public class View extends Table implements FeView {
       throw e;
     } catch (Exception e) {
       throw new TableLoadingException("Failed to load metadata for view: " + name_, e);
+    } finally {
+      Table.LOADING_TABLES.decrementAndGet();
     }
   }
 
@@ -162,6 +167,11 @@ public class View extends Table implements FeView {
 
   @Override // FeView
   public boolean isLocalView() { return isLocalView_; }
+
+  @Override
+  public TImpalaTableType getTableType() {
+    return TImpalaTableType.VIEW;
+  }
 
   /**
    * Returns the column labels the user specified in the WITH-clause.

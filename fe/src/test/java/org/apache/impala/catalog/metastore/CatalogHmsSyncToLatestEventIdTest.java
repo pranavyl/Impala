@@ -36,6 +36,7 @@ import org.apache.impala.catalog.events.NoOpEventProcessor;
 import org.apache.impala.catalog.events.SynchronousHMSEventProcessorForTests;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.CatalogOpExecutor;
+import org.apache.impala.service.MetadataOp;
 import org.apache.impala.testutil.CatalogServiceTestCatalog;
 import org.apache.impala.testutil.CatalogTestMetastoreServer;
 import org.apache.thrift.TException;
@@ -128,9 +129,8 @@ public class CatalogHmsSyncToLatestEventIdTest extends AbstractCatalogMetastoreT
     public static void cleanUp() throws Exception {
         // in cleanup, set flag's values to previous value
         BackendConfig.INSTANCE.setEnableCatalogdHMSCache(flagEnableCatalogCache);
-        BackendConfig.INSTANCE.setEnableSyncToLatestEventOnDdls(flagInvalidateCache);
-        BackendConfig.INSTANCE.setInvalidateCatalogdHMSCacheOnDDLs(
-            flagSyncToLatestEventId);
+        BackendConfig.INSTANCE.setEnableSyncToLatestEventOnDdls(flagSyncToLatestEventId);
+        BackendConfig.INSTANCE.setInvalidateCatalogdHMSCacheOnDDLs(flagInvalidateCache);
         if (eventsProcessor_ != null) {
             eventsProcessor_.shutdown();
         }
@@ -459,7 +459,7 @@ public class CatalogHmsSyncToLatestEventIdTest extends AbstractCatalogMetastoreT
     @Test
     public void testAlterTableRename() throws Exception {
         LOG.info("Executing testALterTableRename");
-        String tblName = "test_alter_table_rename_" + tableType_ + "_tbl";
+        String tblName = ("test_alter_table_rename_" + tableType_ + "_tbl").toLowerCase();
         String newTblName = tblName + "_new";
         try {
             createDatabaseInCatalog(TEST_DB_NAME);
@@ -541,7 +541,7 @@ public class CatalogHmsSyncToLatestEventIdTest extends AbstractCatalogMetastoreT
             createTableInHms(TEST_DB_NAME, tblName, true);
             IncompleteTable tbl =
                 IncompleteTable.createUninitializedTable(catalog_.getDb(TEST_DB_NAME),
-                    tblName);
+                    tblName, MetadataOp.getImpalaTableType(tableType_), null);
             tbl.setCreateEventId(getLatestEventIdFromHMS());
             catalog_.addTable(catalog_.getDb(TEST_DB_NAME), tbl);
             long prevLastSyncedEventId =

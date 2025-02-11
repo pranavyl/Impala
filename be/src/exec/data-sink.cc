@@ -21,18 +21,22 @@
 #include <map>
 
 #include "common/logging.h"
-#include "exec/exec-node.h"
-#include "exec/hbase-table-sink.h"
-#include "exec/hdfs-table-sink.h"
-#include "exec/kudu-table-sink.h"
-#include "exec/kudu-util.h"
 #include "exec/blocking-plan-root-sink.h"
 #include "exec/buffered-plan-root-sink.h"
+#include "exec/exec-node.h"
+#include "exec/hbase/hbase-table-sink.h"
+#include "exec/hdfs-table-sink.h"
+#include "exec/iceberg-delete-builder.h"
+#include "exec/iceberg-delete-sink-config.h"
+#include "exec/iceberg-merge-sink.h"
+#include "exec/kudu/kudu-table-sink.h"
+#include "exec/kudu/kudu-util.h"
+#include "exec/multi-table-sink.h"
 #include "exec/nested-loop-join-builder.h"
 #include "exec/partitioned-hash-join-builder.h"
 #include "exec/plan-root-sink.h"
-#include "exprs/scalar-expr.h"
 #include "exprs/scalar-expr-evaluator.h"
+#include "exprs/scalar-expr.h"
 #include "gen-cpp/ImpalaInternalService_constants.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
 #include "gutil/strings/substitute.h"
@@ -83,7 +87,12 @@ Status DataSinkConfig::CreateConfig(const TDataSink& thrift_sink,
       if (!thrift_sink.__isset.table_sink) return Status("Missing table sink.");
       switch (thrift_sink.table_sink.type) {
         case TTableSinkType::HDFS:
-          *data_sink = pool->Add(new HdfsTableSinkConfig());
+          if (thrift_sink.table_sink.action == TSinkAction::INSERT) {
+            *data_sink = pool->Add(new HdfsTableSinkConfig());
+          } else if (thrift_sink.table_sink.action == TSinkAction::DELETE) {
+            // Currently only Iceberg tables support DELETE operations for FS tables.
+            *data_sink = pool->Add(new IcebergDeleteSinkConfig());
+          }
           break;
         case TTableSinkType::KUDU:
           RETURN_IF_ERROR(CheckKuduAvailability());
@@ -112,6 +121,18 @@ Status DataSinkConfig::CreateConfig(const TDataSink& thrift_sink,
     }
     case TDataSinkType::NESTED_LOOP_JOIN_BUILDER: {
       *data_sink = pool->Add(new NljBuilderConfig());
+      break;
+    }
+    case TDataSinkType::ICEBERG_DELETE_BUILDER: {
+      *data_sink = pool->Add(new IcebergDeleteBuilderConfig());
+      break;
+    }
+    case TDataSinkType::MULTI_DATA_SINK: {
+      *data_sink = pool->Add(new MultiTableSinkConfig());
+      break;
+    }
+    case TDataSinkType::MERGE_SINK: {
+      *data_sink = pool->Add(new IcebergMergeSinkConfig());
       break;
     }
     default:
@@ -165,9 +186,6 @@ Status DataSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
 
 Status DataSink::Open(RuntimeState* state) {
   DCHECK_EQ(output_exprs_.size(), output_expr_evals_.size());
-  for (const string& codegen_msg : sink_config_.codegen_status_msgs_) {
-    profile_->AppendExecOption(codegen_msg);
-  }
   return ScalarExprEvaluator::Open(output_expr_evals_, state);
 }
 
@@ -178,6 +196,9 @@ void DataSink::Close(RuntimeState* state) {
   if (expr_results_pool_.get() != nullptr) expr_results_pool_->FreeAll();
   if (expr_mem_tracker_ != nullptr) expr_mem_tracker_->Close();
   if (mem_tracker_ != nullptr) mem_tracker_->Close();
+  for (const string& codegen_msg : sink_config_.codegen_status_msgs_) {
+    profile_->AppendExecOption(codegen_msg);
+  }
   closed_ = true;
 }
 

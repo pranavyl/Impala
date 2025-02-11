@@ -15,11 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.test_vector import ImpalaTestDimension
-from tests.common.skip import SkipIfABFS, SkipIfADLS, SkipIfS3, SkipIfGCS, SkipIfCOS
+from tests.common.skip import SkipIfFS
 from tests.common.test_dimensions import create_exec_option_dimension
 
 class TestLocalTzConversion(CustomClusterTestSuite):
@@ -47,11 +47,7 @@ class TestLocalTzConversion(CustomClusterTestSuite):
   def get_workload(self):
     return 'functional-query'
 
-  @SkipIfABFS.hbase
-  @SkipIfADLS.hbase
-  @SkipIfS3.hbase
-  @SkipIfGCS.hbase
-  @SkipIfCOS.hbase
+  @SkipIfFS.hbase
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args("--use_local_tz_for_unix_timestamp_conversions=true")
   def test_timestamp_functions(self, vector):

@@ -54,6 +54,7 @@
 #define VLOG_FILE       VLOG(2)
 #define VLOG_ROW        VLOG(3)
 #define VLOG_PROGRESS   VLOG(2)
+#define VLOG_FILTER     VLOG(3)
 
 #define VLOG_CONNECTION_IS_ON VLOG_IS_ON(1)
 #define VLOG_RPC_IS_ON VLOG_IS_ON(2)
@@ -61,6 +62,7 @@
 #define VLOG_FILE_IS_ON VLOG_IS_ON(2)
 #define VLOG_ROW_IS_ON VLOG_IS_ON(3)
 #define VLOG_PROGRESS_IS_ON VLOG_IS_ON(2)
+#define VLOG_FILTER_IS_ON VLOG_IS_ON(3)
 
 // Define a range check macro to test x in the inclusive range from low to high.
 #define DCHECK_IN_RANGE(x, low, high) \
@@ -125,15 +127,19 @@ void CheckAndRotateLogFiles(int max_log_files);
 void AttachStdoutStderr();
 
 /// Check whether INFO or ERROR log size has exceed FLAGS_max_log_size.
-/// If error encountered during individual log size check, print error message to ERROR
-/// log and return false.
-bool CheckLogSize();
+/// Return false if error encountered during individual log size check.
+/// 'log_error' controls whether to log any error occurrence to ERROR log or not.
+bool CheckLogSize(bool log_error);
 
 /// Force glog to do the log rotation.
 void ForceRotateLog();
 
 /// Return true if FLAGS_redirect_stdout_stderr is true and TestInfo::is_test() is false.
 bool RedirectStdoutStderr();
+
+/// Return true if we have log for given 'severity' in file system.
+/// Only used in testing.
+bool HasLog(google::LogSeverity severity);
 
 #endif // IR_COMPILE
 

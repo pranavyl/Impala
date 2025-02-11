@@ -17,6 +17,8 @@
 
 package org.apache.impala.analysis;
 
+import java.util.Objects;
+
 import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.Function;
@@ -25,7 +27,9 @@ import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.TypeCompatibility;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.ThriftSerializationCtx;
 import org.apache.impala.thrift.TCastExpr;
 import org.apache.impala.thrift.TExpr;
 import org.apache.impala.thrift.TExprNode;
@@ -47,14 +51,20 @@ public class CastExpr extends Expr {
 
   // Prefix for naming cast functions.
   protected final static String CAST_FUNCTION_PREFIX = "castto";
+  private final static String CAST_TO_CHAR_FN = "impala::CastFunctions::CastToChar";
+  private final static String CAST_TO_VARCHAR_FN = "impala::CastFunctions::CastToVarchar";
 
   // Stores the value of the FORMAT clause.
   private final String castFormat_;
 
+  // Stores the compatibility level with which the cast was defined.
+  private final TypeCompatibility compatibility_;
+
   /**
    * C'tor for "pre-analyzed" implicit casts.
    */
-  public CastExpr(Type targetType, Expr e, String format) {
+  public CastExpr(
+      Type targetType, Expr e, String format, TypeCompatibility compatibility) {
     super();
     Preconditions.checkState(targetType.isValid());
     Preconditions.checkNotNull(e);
@@ -62,6 +72,7 @@ public class CastExpr extends Expr {
     targetTypeDef_ = null;
     isImplicit_ = true;
     castFormat_ = format;
+    compatibility_ = compatibility;
     // replace existing implicit casts
     if (e instanceof CastExpr) {
       CastExpr castExpr = (CastExpr) e;
@@ -84,7 +95,11 @@ public class CastExpr extends Expr {
   }
 
   public CastExpr(Type targetType, Expr e) {
-    this(targetType, e, null);
+    this(targetType, e, null, TypeCompatibility.DEFAULT);
+  }
+
+  public CastExpr(Type targetType, Expr e, TypeCompatibility compatibility) {
+    this(targetType, e, null, compatibility);
   }
 
   /**
@@ -101,6 +116,7 @@ public class CastExpr extends Expr {
     targetTypeDef_ = targetTypeDef;
     children_.add(e);
     castFormat_ = format;
+    compatibility_ = TypeCompatibility.DEFAULT;
   }
 
   /**
@@ -112,6 +128,7 @@ public class CastExpr extends Expr {
     isImplicit_ = other.isImplicit_;
     noOp_ = other.noOp_;
     castFormat_ = other.castFormat_;
+    compatibility_ = other.compatibility_;
   }
 
   private static String getFnName(Type targetType) {
@@ -140,50 +157,63 @@ public class CastExpr extends Expr {
         if (fromType.getPrimitiveType() == PrimitiveType.STRING
             && toType.getPrimitiveType() == PrimitiveType.CHAR) {
           // Allow casting from String to Char(N)
-          String beSymbol = "impala::CastFunctions::CastToChar";
           db.addBuiltin(ScalarFunction.createBuiltin(getFnName(ScalarType.CHAR),
               Lists.newArrayList((Type) ScalarType.STRING), false, ScalarType.CHAR,
-              beSymbol, null, null, true));
+              CAST_TO_CHAR_FN, null, null, true));
           continue;
         }
         if (fromType.getPrimitiveType() == PrimitiveType.CHAR
             && toType.getPrimitiveType() == PrimitiveType.CHAR) {
           // Allow casting from CHAR(N) to Char(N)
-          String beSymbol = "impala::CastFunctions::CastToChar";
           db.addBuiltin(ScalarFunction.createBuiltin(getFnName(ScalarType.CHAR),
               Lists.newArrayList((Type) ScalarType.createCharType(-1)), false,
-              ScalarType.CHAR, beSymbol, null, null, true));
+              ScalarType.CHAR, CAST_TO_CHAR_FN, null, null, true));
           continue;
         }
         if (fromType.getPrimitiveType() == PrimitiveType.VARCHAR
             && toType.getPrimitiveType() == PrimitiveType.VARCHAR) {
           // Allow casting from VARCHAR(N) to VARCHAR(M)
-          String beSymbol = "impala::CastFunctions::CastToStringVal";
           db.addBuiltin(ScalarFunction.createBuiltin(getFnName(ScalarType.VARCHAR),
               Lists.newArrayList((Type) ScalarType.VARCHAR), false, ScalarType.VARCHAR,
-              beSymbol, null, null, true));
+              CAST_TO_VARCHAR_FN, null, null, true));
           continue;
         }
         if (fromType.getPrimitiveType() == PrimitiveType.VARCHAR
             && toType.getPrimitiveType() == PrimitiveType.CHAR) {
           // Allow casting from VARCHAR(N) to CHAR(M)
-          String beSymbol = "impala::CastFunctions::CastToChar";
           db.addBuiltin(ScalarFunction.createBuiltin(getFnName(ScalarType.CHAR),
               Lists.newArrayList((Type) ScalarType.VARCHAR), false, ScalarType.CHAR,
-              beSymbol, null, null, true));
+              CAST_TO_CHAR_FN, null, null, true));
           continue;
         }
         if (fromType.getPrimitiveType() == PrimitiveType.CHAR
             && toType.getPrimitiveType() == PrimitiveType.VARCHAR) {
           // Allow casting from CHAR(N) to VARCHAR(M)
-          String beSymbol = "impala::CastFunctions::CastToStringVal";
           db.addBuiltin(ScalarFunction.createBuiltin(getFnName(ScalarType.VARCHAR),
               Lists.newArrayList((Type) ScalarType.CHAR), false, ScalarType.VARCHAR,
-              beSymbol, null, null, true));
+              CAST_TO_VARCHAR_FN, null, null, true));
+          continue;
+        }
+       if (fromType.getPrimitiveType() == PrimitiveType.STRING
+            && toType.getPrimitiveType() == PrimitiveType.VARCHAR) {
+          // Allow casting from STRING to VARCHAR(M)
+          db.addBuiltin(ScalarFunction.createBuiltin(getFnName(ScalarType.VARCHAR),
+              Lists.newArrayList((Type) ScalarType.STRING), false, ScalarType.VARCHAR,
+              CAST_TO_VARCHAR_FN, null, null, true));
+          continue;
+        }
+        // Disable binary<->non-string casts.
+        // TODO(IMPALA-7998): invalid cases could be identified in ScalarType's
+        //                    compatibility matrix
+        if (fromType.isBinary() && !toType.isString()) {
+          continue;
+        }
+        if (toType.isBinary() && !fromType.isString()) {
           continue;
         }
         // Disable no-op casts
         if (fromType.equals(toType) && !fromType.isDecimal()) continue;
+
         String beClass = toType.isDecimal() || fromType.isDecimal() ?
             "DecimalOperators" : "CastFunctions";
         String beSymbol = "impala::" + beClass + "::CastTo" + Function.getUdfType(toType);
@@ -235,12 +265,12 @@ public class CastExpr extends Expr {
   }
 
   @Override
-  protected void treeToThriftHelper(TExpr container) {
+  protected void treeToThriftHelper(TExpr container, ThriftSerializationCtx serialCtx) {
     if (noOp_) {
-      getChild(0).treeToThriftHelper(container);
+      getChild(0).treeToThriftHelper(container, serialCtx);
       return;
     }
-    super.treeToThriftHelper(container);
+    super.treeToThriftHelper(container, serialCtx);
   }
 
   @Override
@@ -266,6 +296,8 @@ public class CastExpr extends Expr {
   }
 
   public boolean isImplicit() { return isImplicit_; }
+
+  public TypeCompatibility getCompatibility() { return compatibility_; }
 
   @Override
   protected void analyzeImpl(Analyzer analyzer) throws AnalysisException {
@@ -312,7 +344,8 @@ public class CastExpr extends Expr {
       // for every type since it is redundant with STRING. Casts to go through 2 casts:
       // (1) cast to string, to stringify the value
       // (2) cast to CHAR, to truncate or pad with spaces
-      CastExpr tostring = new CastExpr(ScalarType.STRING, children_.get(0), castFormat_);
+      CastExpr tostring =
+          new CastExpr(ScalarType.STRING, children_.get(0), castFormat_, compatibility_);
       tostring.analyze();
       children_.set(0, tostring);
     }
@@ -330,10 +363,23 @@ public class CastExpr extends Expr {
     }
 
     if (children_.get(0) instanceof NumericLiteral && type_.isFloatingPointType()) {
-      // Special case casting a decimal literal to a floating point number. The
-      // decimal literal can be interpreted as either and we want to avoid casts
-      // since that can result in loss of accuracy.
-      ((NumericLiteral)children_.get(0)).explicitlyCastToFloat(type_);
+      // Special case casting a decimal literal to a floating point number. The decimal
+      // literal can be interpreted as either and we want to avoid casts since that can
+      // result in loss of accuracy. However, if 'type_' is FLOAT and the value does not
+      // fit in a FLOAT, we do not do an unchecked conversion
+      // ('NumericLiteral.explicitlyCastToFloat()') here but let the conversion fail in
+      // the BE.
+      NumericLiteral child = (NumericLiteral) children_.get(0);
+      final boolean isOverflow = NumericLiteral.isOverflow(child.getValue(), type_);
+      if (type_.isScalarType(PrimitiveType.FLOAT)) {
+        if (!isOverflow) {
+          ((NumericLiteral)children_.get(0)).explicitlyCastToFloat(type_);
+        }
+      } else {
+        Preconditions.checkState(type_.isScalarType(PrimitiveType.DOUBLE));
+        Preconditions.checkState(!isOverflow);
+        ((NumericLiteral)children_.get(0)).explicitlyCastToFloat(type_);
+      }
     }
 
     if (children_.get(0).getType().isNull()) {
@@ -350,6 +396,7 @@ public class CastExpr extends Expr {
 
     Type childType = children_.get(0).type_;
     Preconditions.checkState(!childType.isNull());
+
     // IMPALA-4550: We always need to set noOp_ to the correct value, since we could
     // be performing a subsequent analysis run and its correct value might have changed.
     // This can happen if the child node gets substituted and its type changes.
@@ -386,7 +433,7 @@ public class CastExpr extends Expr {
    */
   @Override
   public Expr ignoreImplicitCast() {
-    if (isImplicit_) {
+    if (isImplicit()) {
       // we don't expect to see to consecutive implicit casts
       Preconditions.checkState(
           !(getChild(0) instanceof CastExpr) || !((CastExpr) getChild(0)).isImplicit());
@@ -402,7 +449,7 @@ public class CastExpr extends Expr {
   }
 
   @Override
-  public boolean localEquals(Expr that) {
+  protected boolean localEquals(Expr that) {
     if (!super.localEquals(that)) return false;
     CastExpr other = (CastExpr) that;
     return isImplicit_ == other.isImplicit_
@@ -410,5 +457,24 @@ public class CastExpr extends Expr {
   }
 
   @Override
+  public int hashCode() {
+    if (isImplicit()) {
+      return children_.get(0).hashCode();
+    }
+    return Objects.hash(super.localHash(), type_, children_);
+  }
+
+  // Pass through since cast's are cheap.
+  @Override
+  public boolean shouldConvertToCNF() {
+    return getChild(0).shouldConvertToCNF();
+  }
+
+  @Override
   public Expr clone() { return new CastExpr(this); }
+
+  @Override
+  public boolean recordChildrenInWorkloadManagement() {
+    return true;
+  }
 }

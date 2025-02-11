@@ -16,13 +16,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import json
 import subprocess
 import os
 import shutil
 from tempfile import mkdtemp
 
-ALL_BUILD_OPTIONS_JOB = "all-build-options-ub1604"
+ALL_BUILD_OPTIONS_JOB = "all-build-options-ub2004"
 JENKINS_IMPALA_IO = "jenkins.impala.io"
 M2_ARCHIVE_NAME = "m2_archive.tar.gz"
 

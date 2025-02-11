@@ -19,5 +19,9 @@
 # under the License.
 ##############################################################################
 
-source $(dirname "$0")/impala-python-common.sh
+if [[ "${IMPALA_USE_PYTHON3_TESTS}" == "true" ]]; then
+    source $(dirname "$0")/impala-python3-common.sh
+else
+    source $(dirname "$0")/impala-python-common.sh
+fi
 exec "$PY_ENV_DIR/bin/py.test" "$@"

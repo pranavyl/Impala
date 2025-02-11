@@ -156,6 +156,8 @@ public class FrontendTestBase extends AbstractFrontendTest {
       "d2 decimal(10, 0), d3 decimal(20, 10), d4 decimal(38, 38), d5 decimal(10, 5), " +
       "timestamp_col timestamp, string_col string, varchar_col varchar(50), " +
       "char_col char (30), date_col date)");
+    // TODO: no BINARY column added at the moment, as this table is used to test all
+    //       columns with sampled_ndv, which is currently not enabled for BINARY
   }
 
   /**
@@ -194,9 +196,17 @@ public class FrontendTestBase extends AbstractFrontendTest {
   /**
    * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error.
    * If 'expectedWarning' is not null, asserts that a warning is produced.
+   * Otherwise, asserts no warnings.
    */
   public ParseNode AnalyzesOk(String stmt, String expectedWarning) {
-    return AnalyzesOk(stmt, createAnalysisCtx(), expectedWarning);
+    return AnalyzesOk(stmt, createAnalysisCtx(), expectedWarning, true);
+  }
+
+  /**
+   * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error or warnings.
+   */
+  public ParseNode AnalyzesOkWithoutWarnings(String stmt) {
+    return AnalyzesOk(stmt, createAnalysisCtx(), null, true);
   }
 
   protected AnalysisContext createAnalysisCtx() {
@@ -241,11 +251,21 @@ public class FrontendTestBase extends AbstractFrontendTest {
   /**
    * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error.
    * If 'expectedWarning' is not null, asserts that a warning is produced.
+   * Otherwise, asserts no warnings if 'assertNoWarnings' is true.
    */
-  public ParseNode AnalyzesOk(String stmt, AnalysisContext ctx, String expectedWarning) {
+  public ParseNode AnalyzesOk(String stmt, AnalysisContext ctx, String expectedWarning,
+      boolean assertNoWarnings) {
     try (FrontendProfile.Scope scope = FrontendProfile.createNewWithScope()) {
-      return feFixture_.analyzeStmt(stmt, ctx, expectedWarning);
+      return feFixture_.analyzeStmt(stmt, ctx, expectedWarning, assertNoWarnings);
     }
+  }
+
+  public ParseNode AnalyzesOk(String stmt, AnalysisContext ctx, String expectedWarning) {
+    return AnalyzesOk(stmt, ctx, expectedWarning, false);
+  }
+
+  public ParseNode AnalyzesOkWithoutWarnings(String stmt, AnalysisContext ctx) {
+    return AnalyzesOk(stmt, ctx, null, true);
   }
 
   /**
@@ -300,6 +320,13 @@ public class FrontendTestBase extends AbstractFrontendTest {
         errorString = errorString.replace("No FileSystem for scheme ",
             "No FileSystem for scheme: ");
       }
+      // Different versions of Avro use different versions of Jackson. That can result
+      // in a different package name for JsonParseException. Tolerate either version
+      // by replacing the old package (org.codehaus.jackson.JsonParseException) for
+      // the new package (com.fasterxml.jackson.core.JsonParseException).
+      errorString = errorString.replace("org.codehaus.jackson.JsonParseException",
+          "com.fasterxml.jackson.core.JsonParseException");
+
       Assert.assertTrue(msg, errorString.startsWith(expectedErrorString));
       return;
     }
@@ -317,8 +344,8 @@ public class FrontendTestBase extends AbstractFrontendTest {
       ctx.getQueryCtx().getClient_request().setStmt(stmt);
       StatementBase parsedStmt = Parser.parse(stmt, ctx.getQueryOptions());
       User user = new User(TSessionStateUtil.getEffectiveUser(ctx.getQueryCtx().session));
-      StmtMetadataLoader mdLoader =
-          new StmtMetadataLoader(fe, ctx.getQueryCtx().session.database, null, user);
+      StmtMetadataLoader mdLoader = new StmtMetadataLoader(
+          fe, ctx.getQueryCtx().session.database, null, user, null);
       StmtTableCache stmtTableCache = mdLoader.loadTables(parsedStmt);
       return ctx.analyzeAndAuthorize(parsedStmt, stmtTableCache, fe.getAuthzChecker());
     }
@@ -418,6 +445,11 @@ public class FrontendTestBase extends AbstractFrontendTest {
 
           @Override
           public void postAnalyze(AuthorizationContext authzCtx) {
+          }
+
+          @Override
+          public boolean roleExists(String roleName) {
+            return catalog_.getAuthPolicy().getRole(roleName) != null;
           }
 
           @Override

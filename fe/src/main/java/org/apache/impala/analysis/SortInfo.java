@@ -21,12 +21,21 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
+import org.apache.impala.catalog.ArrayType;
+import org.apache.impala.catalog.MapType;
+import org.apache.impala.catalog.PrimitiveType;
+import org.apache.impala.catalog.StructField;
+import org.apache.impala.catalog.StructType;
+import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.TreeNode;
 import org.apache.impala.planner.PlanNode;
+import org.apache.impala.planner.ProcessingCost;
 import org.apache.impala.thrift.TSortingOrder;
+import org.apache.impala.util.ExprUtil;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
@@ -256,17 +265,18 @@ public class SortInfo {
       }
       dstSlotDesc.setSourceExpr(srcExpr);
       SlotRef dstExpr = new SlotRef(dstSlotDesc);
-      if (dstSlotDesc.getType().isStructType() &&
+      Type dstType = dstSlotDesc.getType();
+      if (dstType.isStructType() &&
           dstSlotDesc.getItemTupleDesc() != null) {
-        dstSlotDesc.clearItemTupleDesc();
-        dstExpr.createStructTuplesAndSlots(analyzer, null);
         try {
-          dstExpr.addStructChildrenAsSlotRefs(analyzer, dstSlotDesc.getItemTupleDesc());
+          dstExpr.reExpandStruct(analyzer);
         } catch (AnalysisException ex) {
           // Adding SlotRefs shouldn't throw here as the source SlotRef had already been
           // analysed.
           Preconditions.checkNotNull(null);
         }
+      } else if (dstType.isCollectionType()) {
+        dstSlotDesc.setShouldMaterializeRecursively(true);
       }
       outputSmap_.put(srcExpr.clone(), dstExpr);
       materializedExprs_.add(srcExpr);
@@ -314,5 +324,50 @@ public class SortInfo {
       }
     }
     return result;
+  }
+
+  public ProcessingCost computeProcessingCost(String label, long inputCardinality) {
+    float weight = ExprUtil.computeExprsTotalCost(getSortExprs());
+
+    return ProcessingCost.basicCost(label, inputCardinality, weight);
+  }
+
+  // Collections within structs (also if they are nested in another struct or collection)
+  // are currently not allowed in the sorting tuple (see IMPALA-12160). This function
+  // returns whether the given type is allowed in the sorting tuple.
+  public static boolean isValidInSortingTuple(Type type) {
+    if (type.isCollectionType()) {
+      if (type instanceof ArrayType) {
+        ArrayType arrayType = (ArrayType) type;
+        return isValidInSortingTuple(arrayType.getItemType());
+      } else {
+        Preconditions.checkState(type instanceof MapType);
+        MapType mapType = (MapType) type;
+
+        if (!isValidInSortingTuple(mapType.getKeyType())) return false;
+
+        return isValidInSortingTuple(mapType.getValueType());
+      }
+    } else if (type.isStructType()) {
+      StructType structType = (StructType) type;
+      return isValidStructInSortingTuple(structType);
+    }
+
+    return true;
+  }
+
+  // Helper for isValidInSortingTuple(), see more there.
+  private static boolean isValidStructInSortingTuple(StructType structType) {
+    for (StructField field : structType.getFields()) {
+      Type fieldType = field.getType();
+      if (fieldType.isStructType()) {
+        if (!isValidStructInSortingTuple((StructType) fieldType)) return false;
+      } else if (fieldType.isCollectionType()) {
+        // TODO IMPALA-12160: Once we allow sorting collections in structs, test that
+        // collections containing var-len types are handled correctly.
+        return false;
+      }
+    }
+    return true;
   }
 }

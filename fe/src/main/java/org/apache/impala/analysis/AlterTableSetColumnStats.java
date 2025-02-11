@@ -54,6 +54,9 @@ public class AlterTableSetColumnStats extends AlterTableStmt {
   }
 
   @Override
+  public String getOperation() { return "SET COLUMN STATS"; }
+
+  @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     super.analyze(analyzer);
 
@@ -122,7 +125,7 @@ public class AlterTableSetColumnStats extends AlterTableStmt {
       if (statsVal == null || statsVal < -1) {
         throw new AnalysisException(String.format(
             "Invalid stats value '%s' for column stats key: %s\n" +
-            "Expected a positive integer or -1 for unknown.",
+            "Expected a non-negative integer or -1 for unknown.",
             statsValue, statsKey));
       }
       stats.update(col.getType(), statsKey, statsVal);
@@ -136,7 +139,7 @@ public class AlterTableSetColumnStats extends AlterTableStmt {
           statsVal.isNaN() || statsVal.isInfinite()) {
         throw new AnalysisException(String.format(
             "Invalid stats value '%s' for column stats key: %s\n" +
-            "Expected a positive floating-point number or -1 for unknown.",
+            "Expected a non-negative floating-point number or -1 for unknown.",
             statsValue, statsKey));
       }
       stats.update(col.getType(), statsKey, statsVal);

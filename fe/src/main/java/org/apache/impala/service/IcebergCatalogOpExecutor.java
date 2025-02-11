@@ -18,72 +18,91 @@
 package org.apache.impala.service;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Collections;
 
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.DeleteFiles;
+import org.apache.iceberg.ExpireSnapshots;
+import org.apache.iceberg.FileMetadata;
+import org.apache.iceberg.ManageSnapshots;
 import org.apache.iceberg.Metrics;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.ReplacePartitions;
+import org.apache.iceberg.RewriteFiles;
+import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.TableMetadata;
-import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.Transaction;
+import org.apache.iceberg.UpdatePartitionSpec;
 import org.apache.iceberg.UpdateProperties;
 import org.apache.iceberg.UpdateSchema;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.expressions.Expressions;
-import org.apache.iceberg.types.Types;
-import org.apache.iceberg.hadoop.HadoopCatalog;
-import org.apache.iceberg.hadoop.HadoopTables;
-import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEventPropertyKey;
+import org.apache.iceberg.expressions.Term;
+import org.apache.iceberg.hive.HiveCatalog;
+import org.apache.impala.analysis.IcebergPartitionSpec;
 import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.IcebergTable;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.catalog.TableNotFoundException;
-import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEventPropertyKey;
+import org.apache.impala.catalog.iceberg.GroupedContentFiles;
 import org.apache.impala.catalog.iceberg.IcebergCatalog;
+import org.apache.impala.catalog.iceberg.IcebergHiveCatalog;
 import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.fb.FbIcebergColumnStats;
 import org.apache.impala.fb.FbIcebergDataFile;
+import org.apache.impala.thrift.TAlterTableDropPartitionParams;
+import org.apache.impala.thrift.TAlterTableExecuteExpireSnapshotsParams;
+import org.apache.impala.thrift.TAlterTableExecuteRollbackParams;
 import org.apache.impala.thrift.TColumn;
-import org.apache.impala.thrift.TCreateTableParams;
 import org.apache.impala.thrift.TIcebergCatalog;
 import org.apache.impala.thrift.TIcebergOperationParam;
 import org.apache.impala.thrift.TIcebergPartitionSpec;
+import org.apache.impala.thrift.TRollbackType;
 import org.apache.impala.util.IcebergSchemaConverter;
 import org.apache.impala.util.IcebergUtil;
-import org.apache.log4j.Logger;
+import org.apache.thrift.TException;
 
 import com.google.common.base.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.apache.impala.common.FileSystemUtil.deleteIfExists;
 
 /**
  * This is a helper for the CatalogOpExecutor to provide Iceberg related DDL functionality
  * such as creating and dropping tables from Iceberg.
  */
 public class IcebergCatalogOpExecutor {
-  public static final Logger LOG = Logger.getLogger(IcebergCatalogOpExecutor.class);
+  public static final Logger LOG =
+      LoggerFactory.getLogger(IcebergCatalogOpExecutor.class);
 
   /**
    * Create Iceberg table by Iceberg api
    * Return value is table location from Iceberg
    */
   public static Table createTable(TIcebergCatalog catalog, TableIdentifier identifier,
-      String location, TCreateTableParams params) throws ImpalaRuntimeException {
+      String location, List<TColumn> columns, TIcebergPartitionSpec partitionSpec,
+      List<String> primaryKeyColumnNames, String owner,
+      Map<String, String> tableProperties) throws ImpalaRuntimeException {
     // Each table id increase from zero
-    Schema schema = createIcebergSchema(params);
-    PartitionSpec spec = IcebergUtil.createIcebergPartition(schema,
-        params.getPartition_spec());
+    Schema schema = createIcebergSchema(columns, primaryKeyColumnNames);
+    PartitionSpec spec = IcebergUtil.createIcebergPartition(schema, partitionSpec);
     IcebergCatalog icebergCatalog = IcebergUtil.getIcebergCatalog(catalog, location);
+    if (icebergCatalog instanceof IcebergHiveCatalog) {
+      // Put table owner to table properties for HiveCatalog.
+      tableProperties.put(HiveCatalog.HMS_TABLE_OWNER, owner);
+    }
     Table iceTable = icebergCatalog.createTable(identifier, schema, spec, location,
-        params.getTable_properties());
+        tableProperties);
     LOG.info("Create iceberg table successful.");
     return iceTable;
   }
@@ -94,9 +113,11 @@ public class IcebergCatalogOpExecutor {
   public static void populateExternalTableCols(
       org.apache.hadoop.hive.metastore.api.Table msTbl, Table iceTbl)
       throws TableLoadingException {
-    TableMetadata metadata = ((BaseTable)iceTbl).operations().current();
-    Schema schema = metadata.schema();
-    msTbl.getSd().setCols(IcebergSchemaConverter.convertToHiveSchema(schema));
+    try {
+      msTbl.getSd().setCols(IcebergSchemaConverter.convertToHiveSchema(iceTbl.schema()));
+    } catch (ImpalaRuntimeException e) {
+      throw new TableLoadingException(e.getMessage());
+    }
   }
 
   /**
@@ -164,29 +185,90 @@ public class IcebergCatalogOpExecutor {
    * Sets new default partition spec for an Iceberg table.
    */
   public static void alterTableSetPartitionSpec(FeIcebergTable feTable,
-      TIcebergPartitionSpec partSpec, String catalogServiceId, long catalogVersion)
-      throws TableLoadingException, ImpalaRuntimeException {
-    BaseTable iceTable = (BaseTable)IcebergUtil.loadTable(feTable);
-    TableOperations tableOp = iceTable.operations();
-    TableMetadata metadata = tableOp.current();
+      TIcebergPartitionSpec partSpec, Transaction transaction)
+      throws ImpalaRuntimeException {
+    try {
+      if (!feTable.getPrimaryKeyColumnNames().isEmpty()) {
+        throw new ImpalaRuntimeException("Not allowed to do partition evolution on " +
+            "Iceberg tables with primary keys.");
+      }
+    } catch (TException tEx) {
+      throw new ImpalaRuntimeException(tEx.getMessage());
+    }
 
-    Schema schema = metadata.schema();
-    PartitionSpec newPartSpec = IcebergUtil.createIcebergPartition(schema, partSpec);
-    TableMetadata newMetadata = metadata.updatePartitionSpec(newPartSpec);
-    Map<String, String> properties = new HashMap<>(newMetadata.properties());
-    properties.put(MetastoreEventPropertyKey.CATALOG_SERVICE_ID.getKey(),
-                   catalogServiceId);
-    properties.put(MetastoreEventPropertyKey.CATALOG_VERSION.getKey(),
-                   String.valueOf(catalogVersion));
-    newMetadata = newMetadata.replaceProperties(properties);
-    tableOp.commit(metadata, newMetadata);
+    BaseTable iceTable = (BaseTable)feTable.getIcebergApiTable();
+    UpdatePartitionSpec updatePartitionSpec = transaction.updateSpec();
+    iceTable.spec().fields().forEach(partitionField -> updatePartitionSpec.removeField(
+        partitionField.name()));
+    List<Term> partitioningTerms = IcebergUtil.getPartitioningTerms(partSpec);
+    partitioningTerms.forEach(updatePartitionSpec::addField);
+    updatePartitionSpec.commit();
   }
 
   /**
-   * Drops a column from a Iceberg table.
+   * Use the ExpireSnapshot API to expire snapshots by calling the
+   * ExpireSnapshot.expireOlderThan(timestampMillis) method.
+   * TableProperties.MIN_SNAPSHOTS_TO_KEEP table property manages how many snapshots
+   * should be retained even when all snapshots are selected by expireOlderThan().
    */
-  public static void dropColumn(Transaction txn, String colName)
-      throws TableLoadingException, ImpalaRuntimeException {
+  public static String alterTableExecuteExpireSnapshots(
+      Transaction txn, TAlterTableExecuteExpireSnapshotsParams params) {
+    ExpireSnapshots expireApi = txn.expireSnapshots();
+    Preconditions.checkState(params.isSetOlder_than_millis());
+    expireApi.expireOlderThan(params.older_than_millis);
+    expireApi.commit();
+    return "Snapshots have been expired.";
+  }
+
+  /**
+   * Executes an ALTER TABLE EXECUTE ROLLBACK.
+   */
+  public static String alterTableExecuteRollback(
+      Transaction iceTxn, FeIcebergTable tbl, TAlterTableExecuteRollbackParams params) {
+    TRollbackType kind = params.getKind();
+    ManageSnapshots manageSnapshots = iceTxn.manageSnapshots();
+    switch (kind) {
+      case TIME_ID:
+        Preconditions.checkState(params.isSetTimestamp_millis());
+        long timestampMillis = params.getTimestamp_millis();
+        LOG.info("Rollback iceberg table to snapshot before timestamp {}",
+            timestampMillis);
+        manageSnapshots.rollbackToTime(timestampMillis);
+        break;
+      case VERSION_ID:
+        Preconditions.checkState(params.isSetSnapshot_id());
+        long snapshotId = params.getSnapshot_id();
+        LOG.info("Rollback iceberg table to snapshot id {}", snapshotId);
+        manageSnapshots.rollbackTo(snapshotId);
+        break;
+      default: throw new IllegalStateException("Bad kind of execute rollback " + kind);
+    }
+    // Commit the update.
+    manageSnapshots.commit();
+    return "Rollback executed.";
+  }
+
+  /**
+   * Deletes files related to specific set of partitions
+   */
+  public static long alterTableDropPartition(
+      Transaction iceTxn, TAlterTableDropPartitionParams params) {
+    DeleteFiles deleteFiles = iceTxn.newDelete();
+    if (params.iceberg_drop_partition_request.is_truncate) {
+      deleteFiles.deleteFromRowFilter(Expressions.alwaysTrue());
+    } else {
+      for (String path : params.iceberg_drop_partition_request.paths) {
+        deleteFiles.deleteFile(path);
+      }
+    }
+    deleteFiles.commit();
+    return params.iceberg_drop_partition_request.num_partitions;
+  }
+
+  /**
+   * Drops a column from an Iceberg table.
+   */
+  public static void dropColumn(Transaction txn, String colName) {
     UpdateSchema schema = txn.updateSchema();
     schema.deleteColumn(colName);
     schema.commit();
@@ -226,9 +308,9 @@ public class IcebergCatalogOpExecutor {
   /**
    * Build iceberg schema by parameters.
    */
-  private static Schema createIcebergSchema(TCreateTableParams params)
-      throws ImpalaRuntimeException {
-    return IcebergSchemaConverter.genIcebergSchema(params.getColumns());
+  private static Schema createIcebergSchema(List<TColumn> columns,
+      List<String> primaryKeyColumnNames) throws ImpalaRuntimeException {
+    return IcebergSchemaConverter.genIcebergSchema(columns, primaryKeyColumnNames);
   }
 
   /**
@@ -258,8 +340,10 @@ public class IcebergCatalogOpExecutor {
 
   private static class DynamicOverwrite implements BatchWrite {
     final private ReplacePartitions replace;
-    public DynamicOverwrite(Transaction txn) {
+    final long initialSnapshotId;
+    public DynamicOverwrite(Transaction txn, long initialSnapshotId) {
       replace = txn.newReplacePartitions();
+      this.initialSnapshotId = initialSnapshotId;
     }
 
     @Override
@@ -269,8 +353,114 @@ public class IcebergCatalogOpExecutor {
 
     @Override
     public void commit() {
+      replace.validateFromSnapshot(initialSnapshotId);
+      replace.validateNoConflictingData();
+      replace.validateNoConflictingDeletes();
       replace.commit();
     }
+  }
+
+  public static void execute(FeIcebergTable feIcebergTable, Transaction txn,
+      TIcebergOperationParam icebergOp) throws ImpalaRuntimeException {
+    switch (icebergOp.operation) {
+      case INSERT: appendFiles(feIcebergTable, txn, icebergOp); break;
+      case DELETE: deleteRows(feIcebergTable, txn, icebergOp); break;
+      case MERGE:
+      case UPDATE: updateRows(feIcebergTable, txn, icebergOp); break;
+      case OPTIMIZE: optimizeTable(feIcebergTable, txn, icebergOp); break;
+      default: throw new ImpalaRuntimeException(
+          "Unknown Iceberg operation: " + icebergOp.operation);
+    }
+  }
+
+  private static void deleteRows(FeIcebergTable feIcebergTable, Transaction txn,
+      TIcebergOperationParam icebergOp) throws ImpalaRuntimeException {
+    List<ByteBuffer> deleteFilesFb = icebergOp.getIceberg_delete_files_fb();
+    RowDelta rowDelta = txn.newRowDelta();
+    for (ByteBuffer buf : deleteFilesFb) {
+      DeleteFile deleteFile = createDeleteFile(feIcebergTable, buf);
+      rowDelta.addDeletes(deleteFile);
+    }
+    // Validate that there are no conflicting data files, because if data files are
+    // added in the meantime, they potentially contain records that should have been
+    // affected by this DELETE operation.
+    rowDelta.validateFromSnapshot(icebergOp.getInitial_snapshot_id());
+    rowDelta.validateNoConflictingDataFiles();
+    rowDelta.validateDataFilesExist(
+        icebergOp.getData_files_referenced_by_position_deletes());
+    rowDelta.validateDeletedFiles();
+    rowDelta.commit();
+  }
+
+  private static void updateRows(FeIcebergTable feIcebergTable, Transaction txn,
+      TIcebergOperationParam icebergOp) throws ImpalaRuntimeException {
+    List<ByteBuffer> deleteFilesFb = icebergOp.getIceberg_delete_files_fb();
+    List<ByteBuffer> dataFilesFb = icebergOp.getIceberg_data_files_fb();
+    RowDelta rowDelta = txn.newRowDelta();
+    for (ByteBuffer buf : deleteFilesFb) {
+      DeleteFile deleteFile = createDeleteFile(feIcebergTable, buf);
+      rowDelta.addDeletes(deleteFile);
+    }
+    for (ByteBuffer buf : dataFilesFb) {
+      DataFile dataFile = createDataFile(feIcebergTable, buf);
+      rowDelta.addRows(dataFile);
+    }
+    // Validate that there are no conflicting data files, because if data files are
+    // added in the meantime, they potentially contain records that should have been
+    // affected by this UPDATE operation. Also validate that there are no conflicting
+    // delete files, because we don't want to revive records that have been deleted
+    // in the meantime.
+    rowDelta.validateFromSnapshot(icebergOp.getInitial_snapshot_id());
+    rowDelta.validateNoConflictingDataFiles();
+    rowDelta.validateNoConflictingDeleteFiles();
+    rowDelta.validateDataFilesExist(
+        icebergOp.getData_files_referenced_by_position_deletes());
+    rowDelta.validateDeletedFiles();
+    rowDelta.commit();
+  }
+
+  private static DataFile createDataFile(FeIcebergTable feIcebergTable, ByteBuffer buf)
+      throws ImpalaRuntimeException {
+    FbIcebergDataFile dataFile = FbIcebergDataFile.getRootAsFbIcebergDataFile(buf);
+
+    PartitionSpec partSpec = feIcebergTable.getIcebergApiTable().specs().get(
+        dataFile.specId());
+    IcebergPartitionSpec impPartSpec =
+        feIcebergTable.getPartitionSpec(dataFile.specId());
+    Metrics metrics = buildDataFileMetrics(dataFile);
+    DataFiles.Builder builder =
+        DataFiles.builder(partSpec)
+        .withMetrics(metrics)
+        .withPath(dataFile.path())
+        .withFormat(IcebergUtil.fbFileFormatToIcebergFileFormat(dataFile.format()))
+        .withRecordCount(dataFile.recordCount())
+        .withFileSizeInBytes(dataFile.fileSizeInBytes());
+    IcebergUtil.PartitionData partitionData = IcebergUtil.partitionDataFromDataFile(
+        partSpec.partitionType(), impPartSpec, dataFile);
+    if (partitionData != null) builder.withPartition(partitionData);
+    return builder.build();
+  }
+
+  private static DeleteFile createDeleteFile(FeIcebergTable feIcebergTable,
+      ByteBuffer buf) throws ImpalaRuntimeException {
+    FbIcebergDataFile deleteFile = FbIcebergDataFile.getRootAsFbIcebergDataFile(buf);
+
+    PartitionSpec partSpec = feIcebergTable.getIcebergApiTable().specs().get(
+        deleteFile.specId());
+    IcebergPartitionSpec impPartSpec = feIcebergTable.getPartitionSpec(
+        deleteFile.specId());
+    Metrics metrics = buildDataFileMetrics(deleteFile);
+    FileMetadata.Builder builder = FileMetadata.deleteFileBuilder(partSpec)
+        .ofPositionDeletes()
+        .withMetrics(metrics)
+        .withPath(deleteFile.path())
+        .withFormat(IcebergUtil.fbFileFormatToIcebergFileFormat(deleteFile.format()))
+        .withRecordCount(deleteFile.recordCount())
+        .withFileSizeInBytes(deleteFile.fileSizeInBytes());
+    IcebergUtil.PartitionData partitionData = IcebergUtil.partitionDataFromDataFile(
+        partSpec.partitionType(), impPartSpec, deleteFile);
+    if (partitionData != null) builder.withPartition(partitionData);
+    return builder.build();
   }
 
   /**
@@ -278,41 +468,24 @@ public class IcebergCatalogOpExecutor {
    * API.
    */
   public static void appendFiles(FeIcebergTable feIcebergTable, Transaction txn,
-      TIcebergOperationParam icebergOp) throws ImpalaRuntimeException,
-      TableLoadingException {
-    org.apache.iceberg.Table nativeIcebergTable =
-        IcebergUtil.loadTable(feIcebergTable);
+      TIcebergOperationParam icebergOp) throws ImpalaRuntimeException {
     List<ByteBuffer> dataFilesFb = icebergOp.getIceberg_data_files_fb();
     BatchWrite batchWrite;
     if (icebergOp.isIs_overwrite()) {
-      batchWrite = new DynamicOverwrite(txn);
+      batchWrite = new DynamicOverwrite(txn, icebergOp.getInitial_snapshot_id());
     } else {
       batchWrite = new Append(txn);
     }
     for (ByteBuffer buf : dataFilesFb) {
-      FbIcebergDataFile dataFile = FbIcebergDataFile.getRootAsFbIcebergDataFile(buf);
-
-      PartitionSpec partSpec = nativeIcebergTable.specs().get(icebergOp.getSpec_id());
-      Metrics metrics = buildDataFileMetrics(feIcebergTable, dataFile);
-      DataFiles.Builder builder =
-          DataFiles.builder(partSpec)
-          .withMetrics(metrics)
-          .withPath(dataFile.path())
-          .withFormat(IcebergUtil.fbFileFormatToIcebergFileFormat(dataFile.format()))
-          .withRecordCount(dataFile.recordCount())
-          .withFileSizeInBytes(dataFile.fileSizeInBytes());
-      IcebergUtil.PartitionData partitionData = IcebergUtil.partitionDataFromPath(
-          partSpec.partitionType(),
-          feIcebergTable.getDefaultPartitionSpec(), dataFile.partitionPath());
-      if (partitionData != null) builder.withPartition(partitionData);
-      batchWrite.addFile(builder.build());
+      DataFile dataFile = createDataFile(feIcebergTable, buf);
+      batchWrite.addFile(dataFile);
     }
     batchWrite.commit();
   }
 
-  private static Metrics buildDataFileMetrics(FeIcebergTable feIcebergTable,
-      FbIcebergDataFile dataFile) {
+  private static Metrics buildDataFileMetrics(FbIcebergDataFile dataFile) {
     Map<Integer, Long> columnSizes = new HashMap<>();
+    Map<Integer, Long> valueCounts = new HashMap<>();
     Map<Integer, Long> nullValueCounts = new HashMap<>();
     Map<Integer, ByteBuffer> lowerBounds = new HashMap<>();
     Map<Integer, ByteBuffer> upperBounds = new HashMap<>();
@@ -322,6 +495,7 @@ public class IcebergCatalogOpExecutor {
         int fieldId = stats.fieldId();
         if (fieldId != -1) {
           columnSizes.put(fieldId, stats.totalCompressedByteSize());
+          valueCounts.put(fieldId, stats.valueCount());
           nullValueCounts.put(fieldId, stats.nullCount());
           if (stats.lowerBoundLength() > 0) {
             lowerBounds.put(fieldId, stats.lowerBoundAsByteBuffer());
@@ -332,15 +506,60 @@ public class IcebergCatalogOpExecutor {
         }
       }
     }
-    return new Metrics(dataFile.recordCount(), columnSizes, null,
+    return new Metrics(dataFile.recordCount(), columnSizes, valueCounts,
         nullValueCounts, null, lowerBounds, upperBounds);
+  }
+
+  private static void optimizeTable(FeIcebergTable feIcebergTable, Transaction txn,
+      TIcebergOperationParam icebergOp) throws ImpalaRuntimeException {
+    GroupedContentFiles contentFiles;
+    try {
+      // Get all files from the initial snapshot.
+      contentFiles = IcebergUtil.getIcebergFilesFromSnapshot(
+          feIcebergTable, /*predicates=*/Collections.emptyList(),
+          icebergOp.getInitial_snapshot_id());
+    } catch (TableLoadingException e) {
+      throw new ImpalaRuntimeException(e.getMessage(), e);
+    }
+    RewriteFiles rewrite = txn.newRewrite();
+    // Delete current data files from table if the operation is a full table rewrite.
+    // If there was file filtering, keep the data files without deletes that were not
+    // selected, and delete only the selected, rewritten files.
+    if (icebergOp.isSetReplaced_data_files_without_deletes()) {
+      for (DataFile dataFile : contentFiles.dataFilesWithoutDeletes) {
+        if (icebergOp.replaced_data_files_without_deletes.contains(dataFile.path())) {
+          rewrite.deleteFile(dataFile);
+        }
+      }
+    } else {
+      for (DataFile dataFile : contentFiles.dataFilesWithoutDeletes) {
+        rewrite.deleteFile(dataFile);
+      }
+    }
+    for (DataFile dataFile : contentFiles.dataFilesWithDeletes) {
+      rewrite.deleteFile(dataFile);
+    }
+    // Delete current delete files from table.
+    for (DeleteFile deleteFile : contentFiles.positionDeleteFiles) {
+      rewrite.deleteFile(deleteFile);
+    }
+    for (DeleteFile deleteFile : contentFiles.equalityDeleteFiles) {
+      rewrite.deleteFile(deleteFile);
+    }
+    // Add newly written files to the table.
+    List<ByteBuffer> dataFilesToAdd = icebergOp.getIceberg_data_files_fb();
+    for (ByteBuffer buf : dataFilesToAdd) {
+      DataFile dataFile = createDataFile(feIcebergTable, buf);
+      rewrite.addFile(dataFile);
+    }
+    rewrite.validateFromSnapshot(icebergOp.getInitial_snapshot_id());
+    rewrite.commit();
   }
 
   /**
    * Creates new snapshot for the iceberg table by deleting all data files.
    */
-  public static void truncateTable(Transaction txn)
-      throws ImpalaRuntimeException {
+  public static void truncateTable(Transaction txn) {
     DeleteFiles delete = txn.newDelete();
     delete.deleteFromRowFilter(Expressions.alwaysTrue());
     delete.commit();
@@ -358,5 +577,30 @@ public class IcebergCatalogOpExecutor {
     updateProps.set(MetastoreEventPropertyKey.CATALOG_VERSION.getKey(),
                     String.valueOf(version));
     updateProps.commit();
+  }
+
+  /**
+   * When a write operation fails the validation check due to conflicts, the data/delete
+   * files created by it cannot be committed to the table: they would become orphan files.
+   * This method deletes these uncommitted data/delete files from the file system.
+   * @param icebergOp the failed DML operation that contains the list of newly written
+   *                  data and delete files which have to be cleaned up.
+   */
+  protected static void cleanupUncommittedFiles(TIcebergOperationParam icebergOp) {
+    if (icebergOp.isSetIceberg_data_files_fb()) {
+      deleteIcebergFiles(icebergOp.getIceberg_data_files_fb());
+    }
+    if (icebergOp.isSetIceberg_delete_files_fb()) {
+      deleteIcebergFiles(icebergOp.getIceberg_delete_files_fb());
+    }
+  }
+
+  private static void deleteIcebergFiles(Iterable<ByteBuffer> icebergFiles) {
+    for (ByteBuffer buf : icebergFiles) {
+      String pathString = FbIcebergDataFile.getRootAsFbIcebergDataFile(buf).path();
+      if (pathString != null) {
+        deleteIfExists(new org.apache.hadoop.fs.Path((pathString)));
+      }
+    }
   }
 }

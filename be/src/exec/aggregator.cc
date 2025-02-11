@@ -98,7 +98,7 @@ Aggregator::Aggregator(ExecNode* exec_node, ObjectPool* pool,
     needs_finalize_(config.needs_finalize_),
     agg_fns_(config.aggregate_functions_),
     conjuncts_(config.conjuncts_),
-    runtime_profile_(RuntimeProfile::Create(pool_, name)) {}
+    runtime_profile_(RuntimeProfile::Create(pool_, name, false)) {}
 
 Aggregator::~Aggregator() {}
 
@@ -122,7 +122,6 @@ Status Aggregator::Prepare(RuntimeState* state) {
 }
 
 Status Aggregator::Open(RuntimeState* state) {
-  runtime_profile_->AppendExecOption(config_.codegen_status_msg_);
   RETURN_IF_ERROR(AggFnEvaluator::Open(agg_fn_evals_, state));
   RETURN_IF_ERROR(ScalarExprEvaluator::Open(conjunct_evals_, state));
   return Status::OK();
@@ -137,6 +136,8 @@ void Aggregator::Close(RuntimeState* state) {
   if (expr_results_pool_.get() != nullptr) expr_results_pool_->FreeAll();
   if (expr_mem_tracker_.get() != nullptr) expr_mem_tracker_->Close();
   if (mem_tracker_.get() != nullptr) mem_tracker_->Close();
+
+  runtime_profile_->AppendExecOption(config_.codegen_status_msg_);
 }
 
 // TODO: codegen this function.
@@ -430,7 +431,7 @@ Status AggregatorConfig::CodegenUpdateSlot(LlvmCodeGen* codegen, int agg_fn_idx,
         dst.SetIsNull(slot_desc->CodegenIsNull(codegen, &builder, agg_tuple_arg));
       }
     }
-    dst.LoadFromNativePtr(dst_slot_ptr);
+    SlotDescriptor::CodegenLoadAnyVal(&dst, dst_slot_ptr);
 
     // Get the FunctionContext object for the AggFnEvaluator.
     llvm::Function* get_agg_fn_ctx_fn =
@@ -447,7 +448,7 @@ Status AggregatorConfig::CodegenUpdateSlot(LlvmCodeGen* codegen, int agg_fn_idx,
     // Copy the value back to the slot. In the FIXED_UDA_INTERMEDIATE case, the
     // UDA function writes directly to the slot so there is nothing to copy.
     if (dst_type.type != TYPE_FIXED_UDA_INTERMEDIATE) {
-      updated_dst_val.StoreToNativePtr(dst_slot_ptr);
+      SlotDescriptor::CodegenStoreNonNullAnyVal(updated_dst_val, dst_slot_ptr);
     }
 
     if (slot_desc->is_nullable() && !special_null_handling) {

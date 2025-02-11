@@ -21,6 +21,7 @@ import org.apache.impala.authorization.NoopAuthorizationFactory;
 import org.apache.impala.authorization.NoopAuthorizationFactory.NoopAuthorizationManager;
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.hive.executor.TestHiveJavaFunctionFactory;
 import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.service.Frontend;
 import org.apache.impala.thrift.TCatalogUpdateResult;
@@ -60,7 +61,8 @@ public class PlannerTestCaseLoader implements AutoCloseable {
     frontend_ = new Frontend(new NoopAuthorizationFactory(), catalog_);
     catalogOpExecutor_ = new CatalogOpExecutor(catalog_.getSrcCatalog(),
         new NoopAuthorizationFactory().getAuthorizationConfig(),
-        new NoopAuthorizationManager());
+        new NoopAuthorizationManager(),
+        new TestHiveJavaFunctionFactory());
   }
 
   public Catalog getSrcCatalog() { return catalog_.getSrcCatalog(); }
@@ -71,7 +73,7 @@ public class PlannerTestCaseLoader implements AutoCloseable {
    */
   public String loadTestCase(String testCasePath) throws Exception {
     String stmt = catalogOpExecutor_.copyTestCaseData(new TCopyTestCaseReq(testCasePath),
-        new TDdlExecResponse(new TCatalogUpdateResult()));
+        new TDdlExecResponse(new TCatalogUpdateResult()), /*wantMinimalResult*/false);
     TQueryCtx queryCtx = TestUtils.createQueryContext(
         new TQueryOptions().setPlanner_testcase_mode(true));
     queryCtx.client_request.setStmt(stmt);

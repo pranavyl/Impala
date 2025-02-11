@@ -20,12 +20,20 @@ add_subdirectory(cache)
 set(SQUEASEL_SRC_DIR "${CMAKE_SOURCE_DIR}/be/src/thirdparty/squeasel")
 set(MUSTACHE_SRC_DIR "${CMAKE_SOURCE_DIR}/be/src/thirdparty/mustache")
 set(MPFIT_SRC_DIR "${CMAKE_SOURCE_DIR}/be/src/thirdparty/mpfit")
+set(ROARING_SRC_DIR "${CMAKE_SOURCE_DIR}/be/src/thirdparty/roaring")
 
 # where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/util")
 
 # where to put generated binaries
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/util")
+
+add_library(UtilIr
+  bloom-filter-ir.cc
+  in-list-filter-ir.cc
+  min-max-filter-ir.cc
+)
+add_dependencies(UtilIr gen-deps)
 
 set(UTIL_SRCS
   auth-util.cc
@@ -36,7 +44,6 @@ set(UTIL_SRCS
   bit-packing.cc
   bit-util.cc
   bloom-filter.cc
-  bloom-filter-ir.cc
   cgroup-util.cc
   coding-util.cc
   codec.cc
@@ -59,8 +66,10 @@ set(UTIL_SRCS
   hdfs-bulk-ops.cc
   hdr-histogram.cc
   histogram-metric.cc
+  iceberg-utility-functions.cc
   impalad-metrics.cc
   impala-bloom-filter-buffer-allocator.cc
+  in-list-filter.cc
   jni-util.cc
   json-util.cc
   jwt-util.cc
@@ -73,7 +82,6 @@ set(UTIL_SRCS
   memusage-path-handlers.cc
   metrics.cc
   min-max-filter.cc
-  min-max-filter-ir.cc
   minidump.cc
   mpfit-util.cc
   network-util.cc
@@ -83,7 +91,7 @@ set(UTIL_SRCS
   parquet-bloom-filter.cc
   parse-util.cc
   path-builder.cc
-  periodic-counter-updater
+  periodic-counter-updater.cc
   pprof-path-handlers.cc
   progress-updater.cc
   process-state-info.cc
@@ -91,6 +99,7 @@ set(UTIL_SRCS
   runtime-profile.cc
   sharded-query-map-util.cc
   simple-logger.cc
+  sql-util.cc
   string-parser.cc
   string-util.cc
   symbols-util.cc
@@ -104,11 +113,13 @@ set(UTIL_SRCS
   tuple-row-compare.cc
   uid-util.cc
   url-parser.cc
+  version-util.cc
   ${SQUEASEL_SRC_DIR}/squeasel.c
   webserver.cc
   zip-util.cc
   ${MUSTACHE_SRC_DIR}/mustache.cc
-  ${MPFIT_SRC_DIR}/mpfit.c)
+  ${MPFIT_SRC_DIR}/mpfit.c
+  ${ROARING_SRC_DIR}/roaring.c)
 
 # Detect AVX2 support
 set(AVX2_CMD "echo | ${CMAKE_CXX_COMPILER} -mavx2 -dM -E - | awk '$2 == \"__AVX2__\" { print $3 }'")
@@ -136,8 +147,40 @@ else()
   message("Compiler does not support AVX2")
 endif()
 
+# roaring.c uses AVX operations
+# disable AVX512 unconditionally
+set_source_files_properties(${ROARING_SRC_DIR}/roaring.c
+    PROPERTIES COMPILE_DEFINITIONS "CROARING_COMPILER_SUPPORTS_AVX512=0")
+if (NOT AVX2_SUPPORT)
+  set_source_files_properties(${ROARING_SRC_DIR}/roaring.c
+      PROPERTIES COMPILE_DEFINITIONS "ROARING_DISABLE_AVX=1")
+endif()
+
 add_library(Util ${UTIL_SRCS})
-add_dependencies(Util gen-deps gen_ir_descriptions)
+add_dependencies(Util gen-deps)
+
+# Squeasel requires C99 compatibility to build.
+SET_SOURCE_FILES_PROPERTIES(${SQUEASEL_SRC_DIR}/squeasel.c
+  PROPERTIES COMPILE_FLAGS -std=c99)
+
+# shared library which provides native logging support to JVMs over JNI.
+add_library(loggingsupport SHARED
+  logging-support.cc
+)
+
+add_executable(parquet-reader parquet-reader.cc)
+add_executable(impala-profile-tool impala-profile-tool.cc)
+
+install(TARGETS impala-profile-tool DESTINATION ${IMPALA_INSTALLDIR}/util)
+
+target_link_libraries(parquet-reader ${IMPALA_LINK_LIBS})
+target_link_libraries(impala-profile-tool ${IMPALA_LINK_LIBS})
+
+target_link_libraries(loggingsupport ${IMPALA_LINK_LIBS_DYNAMIC_TARGETS})
+
+if (BUILD_WITH_NO_TESTS)
+  return()
+endif()
 
 add_library(UtilTests STATIC
   benchmark-test.cc
@@ -156,10 +199,14 @@ add_library(UtilTests STATIC
   fixed-size-hash-table-test.cc
   hdfs-util-test.cc
   hdr-histogram-test.cc
+  iceberg-utility-functions-test.cc
+  in-list-filter-test.cc
   jwt-util-test.cc
   logging-support-test.cc
+  lru-multi-cache-test.cc
   metrics-test.cc
   min-max-filter-test.cc
+  network-util-test.cc
   openssl-util-test.cc
   os-info-test.cc
   os-util-test.cc
@@ -173,38 +220,26 @@ add_library(UtilTests STATIC
   redactor-test-utils.cc
   redactor-unconfigured-test.cc
   rle-test.cc
+  roaring-bitmap-test.cc
   runtime-profile-test.cc
   simple-logger-test.cc
+  sql-util-test.cc
   string-parser-test.cc
   string-util-test.cc
+  summary-util-test.cc
   symbols-util-test.cc
   sys-info-test.cc
   system-state-info-test.cc
   tagged-ptr-test.cc
   thread-pool-test.cc
+  ticker-test.cc
   time-test.cc
   tuple-row-compare-test.cc
   uid-util-test.cc
+  version-util-test.cc
   zip-util-test.cc
 )
-add_dependencies(UtilTests gen-deps gen_ir_descriptions)
-
-# Squeasel requires C99 compatibility to build.
-SET_SOURCE_FILES_PROPERTIES(${SQUEASEL_SRC_DIR}/squeasel.c
-  PROPERTIES COMPILE_FLAGS -std=c99)
-
-# shared library which provides native logging support to JVMs over JNI.
-add_library(loggingsupport SHARED
-  logging-support.cc
-)
-
-add_executable(parquet-reader parquet-reader.cc)
-add_executable(impala-profile-tool impala-profile-tool.cc)
-
-target_link_libraries(parquet-reader ${IMPALA_LINK_LIBS})
-target_link_libraries(impala-profile-tool ${IMPALA_LINK_LIBS})
-
-target_link_libraries(loggingsupport ${IMPALA_LINK_LIBS_DYNAMIC_TARGETS})
+add_dependencies(UtilTests gen-deps)
 
 ADD_UNIFIED_BE_LSAN_TEST(benchmark-test "BenchmarkTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(bitmap-test "Bitmap.*")
@@ -224,13 +259,19 @@ ADD_UNIFIED_BE_LSAN_TEST(filesystem-util-test "FilesystemUtil.*")
 ADD_UNIFIED_BE_LSAN_TEST(fixed-size-hash-table-test "FixedSizeHash.*")
 ADD_UNIFIED_BE_LSAN_TEST(hdfs-util-test HdfsUtilTest.*)
 ADD_UNIFIED_BE_LSAN_TEST(hdr-histogram-test HdrHistogramTest.*)
+ADD_UNIFIED_BE_LSAN_TEST(iceberg-utility-functions-test "IcebergPartitions.*")
 # internal-queue-test has a non-standard main(), so it needs a small amount of thought
 # to use a unified executable
 ADD_BE_LSAN_TEST(internal-queue-test)
+ADD_UNIFIED_BE_LSAN_TEST(in-list-filter-test "InListFilterTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(jwt-util-test "JwtUtilTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(lru-multi-cache-test "LruMultiCache.*")
 ADD_UNIFIED_BE_LSAN_TEST(logging-support-test "LoggingSupport.*")
 ADD_UNIFIED_BE_LSAN_TEST(metrics-test "MetricsTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(min-max-filter-test "MinMaxFilterTest.*")
+# minidump-test is flaky when the jvm pause monitor is running. So it can't be unified.
+ADD_BE_LSAN_TEST(minidump-test)
+ADD_UNIFIED_BE_LSAN_TEST(network-util-test "NetworkUtil.*")
 ADD_UNIFIED_BE_LSAN_TEST(openssl-util-test "OpenSSLUtilTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(os-info-test "OsInfo.*")
 ADD_UNIFIED_BE_LSAN_TEST(os-util-test "OsUtil.*")
@@ -245,17 +286,22 @@ ADD_UNIFIED_BE_LSAN_TEST(redactor-config-parser-test ParserTest.*)
 ADD_UNIFIED_BE_LSAN_TEST(redactor-test "RedactorTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(redactor-unconfigured-test "RedactorUnconfigTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(rle-test "BitArray.*:RleTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(roaring-bitmap-test "RoaringBitmap64Test.*")
 ADD_UNIFIED_BE_LSAN_TEST(runtime-profile-test "CountersTest.*:TimerCounterTest.*:TimeSeriesCounterTest.*:VariousNumbers/TimeSeriesCounterResampleTest.*:ToThrift.*:ToJson.*")
 ADD_UNIFIED_BE_LSAN_TEST(simple-logger-test "SimpleLoggerTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(sql-util-test "SqlUtilTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(string-parser-test "StringToInt.*:StringToIntWithBase.*:StringToFloat.*:StringToBool.*:StringToDate.*")
-ADD_UNIFIED_BE_LSAN_TEST(string-util-test "TruncateDownTest.*:TruncateUpTest.*:CommaSeparatedContainsTest.*:FindUtf8PosForwardTest.*:FindUtf8PosBackwardTest.*:RandomFindUtf8PosTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(string-util-test "TruncateDownTest.*:TruncateUpTest.*:CommaSeparatedContainsTest.*:FindUtf8PosForwardTest.*:FindUtf8PosBackwardTest.*:RandomFindUtf8PosTest.*:StringStreamPopTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(summary-util-test "PrintTableTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(symbols-util-test "SymbolsUtil.*")
 ADD_UNIFIED_BE_LSAN_TEST(system-state-info-test "SystemStateInfoTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(sys-info-test "CpuInfoTest.*:DiskInfoTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(thread-pool-test "ThreadPoolTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(ticker-test "TickerTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(time-test "TimeTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(tuple-row-compare-test "TupleRowCompareTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(uid-util-test "UidUtil.*")
+ADD_UNIFIED_BE_LSAN_TEST(version-util-test "VersionUtilTest.*")
 # Using standalone webserver-test for now, nonstandard main() passes in a port.
 ADD_BE_LSAN_TEST(webserver-test)
 TARGET_LINK_LIBRARIES(webserver-test mini_kdc)

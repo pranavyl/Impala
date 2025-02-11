@@ -17,6 +17,10 @@
 
 package org.apache.impala.analysis;
 
+import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
+
 import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaException;
@@ -33,6 +37,8 @@ import com.google.common.base.Preconditions;
 import static org.apache.impala.analysis.ToSqlOptions.DEFAULT;
 import static org.apache.impala.analysis.ToSqlOptions.REWRITTEN;
 import static org.apache.impala.analysis.ToSqlOptions.SHOW_IMPLICIT_CASTS;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 /**
  * Tests that the ExprRewriter framework covers all clauses as well as nested statements.
@@ -112,6 +118,14 @@ public class ExprRewriterTest extends AnalyzerTest {
     Assert.assertEquals(0, exprToTrue_.getNumChanges());
   }
 
+  private Expr analyze(String query) {
+    AnalysisContext ctx = createAnalysisCtx();
+    ctx.getQueryOptions().setDecimal_v2(true);
+    ctx.getQueryOptions().setEnable_expr_rewrites(false);
+    return ((SelectStmt) AnalyzesOk(query, ctx)).getSelectList()
+        .getItems().get(0).getExpr();
+  }
+
   // Select statement with all clauses that has 11 rewritable Expr trees.
   // We expect a total of 23 exprs to be changed.
   private final String stmt_ =
@@ -135,8 +149,20 @@ public class ExprRewriterTest extends AnalyzerTest {
         stmt_, stmt_), 47, 23);
     // Constant select.
     RewritesOk("select 1, 2, 3, 4", 4, 4);
-    // Values stmt - expression rewrites are disabled.
-    RewritesOk("values(1, '2', 3, 4.1), (1, '2', 3, 4.1)", 0, 0);
+    // Values stmt - expression rewrites are not required in this test cases.
+    RewritesOk("values(1, '2', 3, 4.1), (1, '2', 3, 4.1),"
+            + "(CAST(true OR false AS INT), '2', 3*1+2-4, 1.1%1)",
+        0, 0);
+    RewritesOk("values(CONCAT('a', 'b'), true OR true)", 0, 0);
+    // Values stmt - expression rewrites are required for || and Between predicate.
+    RewritesOk("values(1 <= 2 || 'impala' <> 'IMPALA'), (0.5 BETWEEN 0 AND 1),"
+            + "('a' NOT BETWEEN 'b' AND 'c')",
+        3, 0);
+    // Values stmt - expression rewrites are required for || and Between predicate that
+    // is not at root Expr.
+    RewritesOk("values(1 <= 2 AND ((0.5 BETWEEN 0 AND 1) AND "
+            + "(('a' || 'b') = 'ab' AND (true || false))))",
+        3, 0);
     // Test WHERE-clause subqueries.
     RewritesOk("select id, int_col from functional.alltypes a " +
         "where exists (select 1 from functional.alltypes " +
@@ -479,8 +505,6 @@ public class ExprRewriterTest extends AnalyzerTest {
         + "values(" + data + ")";
     String expectedToSql = "INSERT INTO TABLE "
         + "functional.alltypesnopart(" + columnName + ") "
-        + "SELECT CAST(" + data + " AS " + castColumn + ")"
-        + " UNION "
         + "SELECT CAST(" + data + " AS " + castColumn + ")";
     assertToSqlWithImplicitCasts(ctx, query, expectedToSql);
   }
@@ -585,5 +609,42 @@ public class ExprRewriterTest extends AnalyzerTest {
     assertToSql(createAnalysisCtx(options), sql1, sql1,
             "SELECT ndv(id), ndv(id, 5), count(DISTINCT id) FROM functional.alltypes");
 
+  }
+
+  @Test
+  public void TestShouldConvertToCNF() {
+    TQueryOptions options = new TQueryOptions();
+    options.setEnable_expr_rewrites(false);
+    AnalysisContext ctx = createAnalysisCtx(options);
+
+    // Positive tests
+    List<String> convertablePredicates = Arrays.asList("select (1=cast(1 as int))",
+        "select (cast(d_date_sk as int) = 10) from tpcds_parquet.date_dim",
+        "select (d_date_sk = d_year) from tpcds_parquet.date_dim",
+        "select (d_date_sk between 1 and 10) from tpcds_parquet.date_dim",
+        "select (d_date_sk in (1,2,10)) from tpcds_parquet.date_dim",
+        "select (d_date_sk is null) from tpcds_parquet.date_dim", "select (cos(1) = 1.1)",
+        "select (cast(d_date_sk as int) * 2 = 10) from tpcds_parquet.date_dim",
+        "select ((2 = cast(1 as int)) and (cos(1) = 1))",
+        "select ((2 = cast(1 as int)) or (cast(0 as int) is not null))",
+        "select (sin(cos(2*pi())))");
+
+    for (String query: convertablePredicates) {
+      Expr expr = analyze(query);
+      assertTrue("Should convert to CNF: "+query, expr.shouldConvertToCNF());
+    }
+
+    // Negative tests
+    List<String> inconvertablePredicates = Arrays.asList(
+        "select (upper(d_day_name) = 'A') from tpcds_parquet.date_dim",
+        "select (d_day_name like '%A') from tpcds_parquet.date_dim",
+        "select (coalesce(d_date_sk, -1) = d_year) from tpcds_parquet.date_dim",
+        "select (log10(cast(1 + length(upper(d_day_name)) as double)) > 1.0) from "
+         + "tpcds_parquet.date_dim");
+
+    for (String query: inconvertablePredicates) {
+      Expr expr = analyze(query);
+      assertFalse("Should not convert to CNF: "+query, expr.shouldConvertToCNF());
+    }
   }
 }

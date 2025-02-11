@@ -51,7 +51,7 @@ public enum HdfsFileFormat {
       false, false, true),
   JSON("org.apache.hadoop.mapred.TextInputFormat",
       "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
-      "org.apache.hadoop.hive.serde2.lazy.JsonSerDe", false, false, true),
+      "org.apache.hadoop.hive.serde2.JsonSerDe", false, false, true),
   // LZO_TEXT is never used as an actual HdfsFileFormat. It is used only to store the
   // input format class and match against it (e.g. in HdfsCompression). Outside of this
   // file, tables that use the LZO input format class use HdfsFileFormat.TEXT.
@@ -82,7 +82,11 @@ public enum HdfsFileFormat {
       "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe", true, true, true),
   ICEBERG("org.apache.iceberg.mr.hive.HiveIcebergInputFormat",
       "org.apache.iceberg.mr.hive.HiveIcebergOutputFormat",
-      "org.apache.iceberg.mr.hive.HiveIcebergSerDe", false, false, false);
+      "org.apache.iceberg.mr.hive.HiveIcebergSerDe", false, false, false),
+  JDBC("org.apache.hadoop.hive.jdbc.JdbcInputFormat",
+      "org.apache.hadoop.hive.jdbc.JdbcOutputFormat",
+      "org.apache.hadoop.hive.jdbc.JdbcSerDe", false, false, true);
+
 
   private final String inputFormat_;
   private final String outputFormat_;
@@ -122,7 +126,7 @@ public enum HdfsFileFormat {
       "parquet.hive.MapredParquetInputFormat"
   };
 
-  private static final String JSON_SERDE = "org.apache.hadoop.hive.serde2.lazy.JsonSerDe";
+  private static final String JSON_SERDE = "org.apache.hadoop.hive.serde2.JsonSerDe";
 
   private static Map<String, HdfsFileFormat> VALID_INPUT_FORMATS =
       ImmutableMap.<String, HdfsFileFormat>builder()
@@ -192,6 +196,7 @@ public enum HdfsFileFormat {
       case KUDU: return HdfsFileFormat.KUDU;
       case ICEBERG: return HdfsFileFormat.ICEBERG;
       case JSON: return HdfsFileFormat.JSON;
+      case JDBC: return HdfsFileFormat.JDBC;
       default:
         throw new RuntimeException("Unknown THdfsFileFormat: "
             + thriftFormat + " - should never happen!");
@@ -210,6 +215,7 @@ public enum HdfsFileFormat {
       case KUDU: return THdfsFileFormat.KUDU;
       case ICEBERG: return THdfsFileFormat.ICEBERG;
       case JSON: return THdfsFileFormat.JSON;
+      case JDBC: return THdfsFileFormat.JDBC;
       default:
         throw new RuntimeException("Unknown HdfsFormat: "
             + this + " - should never happen!");
@@ -236,6 +242,7 @@ public enum HdfsFileFormat {
       case HUDI_PARQUET: return "HUDIPARQUET";
       case ICEBERG: return "ICEBERG";
       case JSON: return "JSONFILE";
+      case JDBC: return "JDBC";
       default:
         throw new RuntimeException("Unknown HdfsFormat: "
             + this + " - should never happen!");
@@ -248,8 +255,8 @@ public enum HdfsFileFormat {
   public boolean isSplittable(HdfsCompression compression) {
     switch (this) {
       case TEXT:
-        return compression == HdfsCompression.NONE;
       case JSON:
+        return compression == HdfsCompression.NONE;
       case RC_FILE:
       case SEQUENCE_FILE:
       case AVRO:
@@ -259,6 +266,8 @@ public enum HdfsFileFormat {
       case ICEBERG:
         return true;
       case KUDU:
+        return false;
+      case JDBC:
         return false;
       default:
         throw new RuntimeException("Unknown HdfsFormat: "

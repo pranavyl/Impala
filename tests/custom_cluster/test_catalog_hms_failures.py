@@ -14,6 +14,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 import os
 import time
@@ -24,12 +25,13 @@ from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.custom_cluster_test_suite import (
     CustomClusterTestSuite,
     DEFAULT_CLUSTER_SIZE)
-from tests.util.filesystem_utils import IS_ISILON, IS_LOCAL
-
+from tests.common.skip import SkipIf
+from tests.util.event_processor_utils import EventProcessorUtils
 
 NUM_SUBSCRIBERS = DEFAULT_CLUSTER_SIZE + 1
 
 
+@SkipIf.is_test_jdk
 class TestHiveMetaStoreFailure(CustomClusterTestSuite):
   """Tests to validate the Catalog Service continues to function even if the HMS
   fails."""
@@ -40,23 +42,21 @@ class TestHiveMetaStoreFailure(CustomClusterTestSuite):
 
   @classmethod
   def setup_class(cls):
-    if cls.exploration_strategy() != 'exhaustive':
-      pytest.skip('These tests only run in exhaustive')
     super(TestHiveMetaStoreFailure, cls).setup_class()
 
   @classmethod
-  def run_hive_server(cls):
+  def run_hive_metastore(cls, if_not_running=False):
     script = os.path.join(os.environ['IMPALA_HOME'], 'testdata/bin/run-hive-server.sh')
-    run_cmd = [script]
-    if IS_LOCAL or IS_ISILON:
-      run_cmd.append('-only_metastore')
+    run_cmd = [script, '-only_metastore']
+    if if_not_running:
+      run_cmd.append('-if_not_running')
     check_call(run_cmd, close_fds=True)
 
   @classmethod
   def teardown_class(cls):
     # Make sure the metastore is running even if the test aborts somewhere unexpected
     # before restarting the metastore itself.
-    cls.run_hive_server()
+    cls.run_hive_metastore(if_not_running=True)
     super(TestHiveMetaStoreFailure, cls).teardown_class()
 
   @pytest.mark.execute_serially
@@ -70,23 +70,53 @@ class TestHiveMetaStoreFailure(CustomClusterTestSuite):
     tbl_name = "functional.alltypes"
     self.client.execute("invalidate metadata %s" % tbl_name)
     kill_cmd = os.path.join(os.environ['IMPALA_HOME'], 'testdata/bin/kill-hive-server.sh')
-    check_call([kill_cmd], close_fds=True)
+    check_call([kill_cmd, '-only_metastore'], close_fds=True)
 
     try:
       self.client.execute("describe %s" % tbl_name)
     except ImpalaBeeswaxException as e:
-      print str(e)
+      print(str(e))
       assert "Failed to load metadata for table: %s. Running 'invalidate metadata %s' "\
           "may resolve this problem." % (tbl_name, tbl_name) in str(e)
-    self.run_hive_server()
+    self.run_hive_metastore()
 
     self.client.execute("invalidate metadata %s" % tbl_name)
     self.client.execute("describe %s" % tbl_name)
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-    impalad_args='--use_local_catalog --catalog_topic_mode=minimal',
+    impalad_args='--use_local_catalog',
     catalogd_args='--catalog_topic_mode=minimal')
+  def test_local_catalog_load_with_hms_state_change(self, unique_database):
+    self.run_test_load_with_hms_down_and_up(unique_database,
+                                            "local_catalog_load_with_hms_state_change")
+
+  @pytest.mark.execute_serially
+  def test_load_with_hms_state_change(self, unique_database):
+    self.run_test_load_with_hms_down_and_up(unique_database,
+                                            "load_with_hms_state_change")
+
+  def run_test_load_with_hms_down_and_up(self, unique_database, table_name):
+    table = unique_database + "." + table_name
+    self.client.execute("create table {0} (i int)".format(table))
+    kill_cmd = os.path.join(os.environ['IMPALA_HOME'], 'testdata/bin/kill-hive-server.sh')
+    check_call([kill_cmd, '-only_metastore'], close_fds=True)
+    for _ in range(2):
+      try:
+        self.client.execute("describe {0}".format(table))
+      except ImpalaBeeswaxException as e:
+        assert "Failed to load metadata for table: %s. "\
+               "Running 'invalidate metadata %s' may resolve this problem." \
+               % (table, table) in str(e)
+    self.run_hive_metastore()
+    res = self.client.execute("describe {0}".format(table))
+    assert res.data == ["i\tint\t"]
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+    impalad_args='--use_local_catalog --catalog_topic_mode=minimal',
+    catalogd_args='--catalog_topic_mode=minimal',
+    disable_log_buffering=True)
   def test_hms_client_retries(self):
     """Test that a running query will trigger the retry logic in
     RetryingMetaStoreClient."""
@@ -94,7 +124,7 @@ class TestHiveMetaStoreFailure(CustomClusterTestSuite):
     tbl_name = "functional.alltypes"
     self.client.execute("invalidate metadata %s" % tbl_name)
     kill_cmd = os.path.join(os.environ['IMPALA_HOME'], 'testdata/bin/kill-hive-server.sh')
-    check_call([kill_cmd], close_fds=True)
+    check_call([kill_cmd, '-only_metastore'], close_fds=True)
 
     # Run a query asynchronously.
     query = "select * from {0} limit 1".format(tbl_name)
@@ -104,14 +134,25 @@ class TestHiveMetaStoreFailure(CustomClusterTestSuite):
 
     # Wait 1 second for the catalogd to start contacting HMS, then start HMS.
     time.sleep(1)
-    self.run_hive_server()
+    self.run_hive_metastore()
 
     # Wait for the query to complete, assert that the HMS client retried the connection.
     thread.join()
     self.assert_catalogd_log_contains("INFO",
         "MetaStoreClient lost connection. Attempting to reconnect", expected_count=-1)
 
+  @CustomClusterTestSuite.with_args(
+    impalad_args='--use_local_catalog',
+    catalogd_args='--catalog_topic_mode=minimal')
+  def test_event_processor_tolerate_hms_restart(self):
+    """IMPALA-12561: Test that event-processor won't go into ERROR state when there are
+    connection issues with HMS (mocked by a restart on HMS)"""
+    assert EventProcessorUtils.get_event_processor_status() == "ACTIVE"
+    self.run_hive_metastore()
+    assert EventProcessorUtils.get_event_processor_status() == "ACTIVE"
 
+
+@SkipIf.is_test_jdk
 class TestCatalogHMSFailures(CustomClusterTestSuite):
   """Test Catalog behavior when HMS is not present."""
 
@@ -122,11 +163,11 @@ class TestCatalogHMSFailures(CustomClusterTestSuite):
     super(TestCatalogHMSFailures, cls).setup_class()
 
   @classmethod
-  def run_hive_server(cls):
+  def run_hive_metastore(cls, if_not_running=False):
     script = os.path.join(os.environ['IMPALA_HOME'], 'testdata/bin/run-hive-server.sh')
-    run_cmd = [script]
-    if IS_LOCAL or IS_ISILON:
-      run_cmd.append('-only_metastore')
+    run_cmd = [script, '-only_metastore']
+    if if_not_running:
+      run_cmd.append('-if_not_running')
     check_call(run_cmd, close_fds=True)
 
   @classmethod
@@ -144,7 +185,7 @@ class TestCatalogHMSFailures(CustomClusterTestSuite):
   def teardown_class(cls):
     # Make sure the metastore is running even if the test aborts somewhere unexpected
     # before restarting the metastore itself.
-    cls.run_hive_server()
+    cls.run_hive_metastore(if_not_running=True)
     super(TestCatalogHMSFailures, cls).teardown_class()
 
   @classmethod
@@ -165,9 +206,9 @@ class TestCatalogHMSFailures(CustomClusterTestSuite):
     client = impalad.service.create_beeswax_client()
     self.reload_metadata(client)
 
-    # Kill Hive
+    # Kill HMS
     kill_cmd = os.path.join(os.environ['IMPALA_HOME'], 'testdata/bin/kill-hive-server.sh')
-    check_call([kill_cmd], close_fds=True)
+    check_call([kill_cmd, '-only_metastore'], close_fds=True)
 
     # Metadata load should fail quickly
     start = time.time()
@@ -180,8 +221,8 @@ class TestCatalogHMSFailures(CustomClusterTestSuite):
     end = time.time()
     assert end - start < 30, "Metadata load hasn't failed quickly enough"
 
-    # Start Hive
-    self.run_hive_server()
+    # Start HMS
+    self.run_hive_metastore()
 
     # Metadata load should work now
     self.reload_metadata(client)
@@ -199,9 +240,9 @@ class TestCatalogHMSFailures(CustomClusterTestSuite):
     client = impalad.service.create_beeswax_client()
     self.reload_metadata(client)
 
-    # Kill Hive
+    # Kill HMS
     kill_cmd = os.path.join(os.environ['IMPALA_HOME'], 'testdata/bin/kill-hive-server.sh')
-    check_call([kill_cmd], close_fds=True)
+    check_call([kill_cmd, '-only_metastore'], close_fds=True)
 
     # Kill the catalogd.
     catalogd = self.cluster.catalogd
@@ -218,8 +259,8 @@ class TestCatalogHMSFailures(CustomClusterTestSuite):
       # startup.
       time.sleep(10)
 
-      # Start Hive and wait for catalogd to come up
-      self.run_hive_server()
+      # Start HMS and wait for catalogd to come up
+      self.run_hive_metastore()
       statestored.service.wait_for_live_subscribers(NUM_SUBSCRIBERS, timeout=60)
       impalad.service.wait_for_metric_value('catalog.ready', True, timeout=60)
 
@@ -241,9 +282,9 @@ class TestCatalogHMSFailures(CustomClusterTestSuite):
     client = impalad.service.create_beeswax_client()
     self.reload_metadata(client)
 
-    # Kill Hive
+    # Kill HMS
     kill_cmd = os.path.join(os.environ['IMPALA_HOME'], 'testdata/bin/kill-hive-server.sh')
-    check_call([kill_cmd], close_fds=True)
+    check_call([kill_cmd, '-only_metastore'], close_fds=True)
 
     # Kill the catalogd.
     catalogd = self.cluster.catalogd
@@ -260,8 +301,8 @@ class TestCatalogHMSFailures(CustomClusterTestSuite):
       # than initial_hms_cnxn_timeout_s.
       time.sleep(40)
 
-      # Start Hive
-      self.run_hive_server()
+      # Start HMS
+      self.run_hive_metastore()
 
       # catalogd has terminated by now
       assert not catalogd.get_pid(), "catalogd should have terminated"

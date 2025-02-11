@@ -404,7 +404,7 @@ PLAN-ROOT SINK
    predicates: CAST(a.id AS STRING) > '123'
    kudu predicates: a.id > 10
    runtime filters: RF000 -> a.id, RF001 -> a.id
-   row-size=4B cardinality=730
+   row-size=4B cardinality=10(filtered from 730)
 ====
 # IMPALA-4662: Kudu analysis failure for NULL literal in IN list
 # NULL literal in values list results in applying predicate at scan node
@@ -510,35 +510,6 @@ INSERT INTO KUDU [default.t]
 00:SCAN HDFS [functional.alltypes]
    partitions=24/24 files=24 size=478.45KB
    row-size=89B cardinality=7.30K
-====
-# IMPALA-5602: If a query contains predicates that are all pushed to kudu and there is a
-# limit, then the query should not incorrectly run with 'small query' optimization.
-select * from functional_kudu.alltypesagg where tinyint_col = 9 limit 10;
----- DISTRIBUTEDPLAN
-PLAN-ROOT SINK
-|
-01:EXCHANGE [UNPARTITIONED]
-|  limit: 10
-|
-00:SCAN KUDU [functional_kudu.alltypesagg_idx]
-   kudu predicates: functional_kudu.alltypesagg_idx.tinyint_col = 9
-   limit: 10
-   row-size=103B cardinality=10
-====
-# IMPALA-5602: If a query contains predicates that are all pushed to kudu, there is a
-# limit, and no table stats, then the query should not incorrectly run with 'small query'
-# optimization.
-select * from kudu_planner_test.no_stats where tinyint_col = 9 limit 10;
----- DISTRIBUTEDPLAN
-PLAN-ROOT SINK
-|
-01:EXCHANGE [UNPARTITIONED]
-|  limit: 10
-|
-00:SCAN KUDU [kudu_planner_test.no_stats]
-   kudu predicates: tinyint_col = 9
-   limit: 10
-   row-size=88B cardinality=10
 ====
 # Insert into an unpartitioned table, shouldn't partition/sort
 insert into tpch_kudu.nation
@@ -711,4 +682,101 @@ PLAN-ROOT SINK
 00:SCAN KUDU [tpch_kudu.lineitem]
    kudu predicates: l_orderkey = 1, l_partkey = 1, l_suppkey = 1
    row-size=0B cardinality=1
+====
+# DATE predicate.
+select * from functional_kudu.date_tbl where date_col = DATE "1970-01-01";
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN KUDU [functional_kudu.date_tbl]
+   kudu predicates: date_col = DATE '1970-01-01'
+   row-size=12B cardinality=1
+---- DISTRIBUTEDPLAN
+PLAN-ROOT SINK
+|
+01:EXCHANGE [UNPARTITIONED]
+|
+00:SCAN KUDU [functional_kudu.date_tbl]
+   kudu predicates: date_col = DATE '1970-01-01'
+   row-size=12B cardinality=1
+====
+# BIGINT predicate.
+select * from functional_kudu.alltypes where bigint_col = 1;
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN KUDU [functional_kudu.alltypes]
+   kudu predicates: bigint_col = 1
+   row-size=97B cardinality=730
+---- DISTRIBUTEDPLAN
+PLAN-ROOT SINK
+|
+01:EXCHANGE [UNPARTITIONED]
+|
+00:SCAN KUDU [functional_kudu.alltypes]
+   kudu predicates: bigint_col = 1
+   row-size=97B cardinality=730
+====
+# FLOAT predicate.
+select * from functional_kudu.alltypes where float_col = 1.0;
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN KUDU [functional_kudu.alltypes]
+   kudu predicates: float_col = 1.0
+   row-size=97B cardinality=730
+---- DISTRIBUTEDPLAN
+PLAN-ROOT SINK
+|
+01:EXCHANGE [UNPARTITIONED]
+|
+00:SCAN KUDU [functional_kudu.alltypes]
+   kudu predicates: float_col = 1.0
+   row-size=97B cardinality=730
+====
+# DOUBLE predicate.
+select * from functional_kudu.alltypes where double_col = 1.0;
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN KUDU [functional_kudu.alltypes]
+   kudu predicates: double_col = 1.0
+   row-size=97B cardinality=730
+---- DISTRIBUTEDPLAN
+PLAN-ROOT SINK
+|
+01:EXCHANGE [UNPARTITIONED]
+|
+00:SCAN KUDU [functional_kudu.alltypes]
+   kudu predicates: double_col = 1.0
+   row-size=97B cardinality=730
+====
+# BINARY predicate.
+select * from functional_kudu.binary_tbl where binary_col=cast("a" as binary);
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN KUDU [functional_kudu.binary_tbl]
+   kudu predicates: binary_col = 'a'
+   row-size=36B cardinality=0
+====
+# BINARY predicate.
+# Non-ASCII strings cannot be pushed down to Kudu (IMPALA-10349)
+select * from functional_kudu.binary_tbl where binary_col=cast("á" as binary);
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN KUDU [functional_kudu.binary_tbl]
+   predicates: binary_col = CAST('á' AS BINARY)
+   row-size=36B cardinality=0
+====
+# BINARY predicate.
+# Not valid utf8 strings cannot be pushed down to Kudu (IMPALA-10349)
+select * from functional_kudu.binary_tbl where binary_col=cast(unhex("aa") as binary);
+---- PLAN
+PLAN-ROOT SINK
+|
+00:SCAN KUDU [functional_kudu.binary_tbl]
+   predicates: binary_col = CAST(unhex('aa') AS BINARY)
+   row-size=36B cardinality=0
 ====

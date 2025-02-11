@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import math
 import os
 import pytest
@@ -24,10 +26,12 @@ import subprocess
 from os.path import join
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.test_dimensions import create_single_exec_option_dimension
+from tests.common.test_dimensions import (
+    add_exec_option_dimension,
+    create_single_exec_option_dimension)
 from tests.common.test_result_verifier import verify_query_result_is_equal
 from tests.common.test_vector import ImpalaTestDimension
-from tests.util.filesystem_utils import get_fs_path
+from tests.util.filesystem_utils import get_fs_path, WAREHOUSE
 
 
 # (file extension, table suffix) pairs
@@ -65,14 +69,14 @@ class TestCompressedFormatsBase(ImpalaTestSuite):
     new table. Unless expected_error is set, it expects the query to run successfully.
     """
     # Calculate locations for the source table
-    base_dir = '/test-warehouse'
+    base_dir = WAREHOUSE
     src_table = "functional{0}.{1}".format(db_suffix, table_name)
     src_table_dir = join(base_dir, table_name + db_suffix)
     file_basename = self.filesystem_client.ls(src_table_dir)[0]
     src_file = join(src_table_dir, file_basename)
 
     # Calculate locations for the destination table
-    dest_table_dir = "/test-warehouse/{0}.db/{1}".format(unique_database, table_name)
+    dest_table_dir = "{2}/{0}.db/{1}".format(unique_database, table_name, WAREHOUSE)
     dest_table = "{0}.{1}".format(unique_database, table_name)
     dest_file = join(dest_table_dir, file_basename + dest_extension)
 
@@ -96,7 +100,7 @@ class TestCompressedFormatsBase(ImpalaTestSuite):
       assert result and int(result) > 0
     except Exception as e:
       error_msg = str(e)
-      print error_msg
+      print(error_msg)
       if expected_error is None or expected_error not in error_msg:
         print("Unexpected error:\n{0}".format(error_msg))
         raise
@@ -153,7 +157,7 @@ class TestCompressedText(TestCompressedFormatsBase):
     super(TestCompressedText, cls).add_test_dimensions()
     cls.ImpalaTestMatrix.clear()
     cls.ImpalaTestMatrix.add_dimension(
-        ImpalaTestDimension('file_format', *['text']))
+        ImpalaTestDimension('file_format', *['text', 'json']))
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('compression_format', *compression_formats))
 
@@ -187,8 +191,8 @@ class TestUnsupportedTableWriters(ImpalaTestSuite):
     # This class tests different formats, but doesn't use constraints.
     # The constraint added below is only to make sure that the test file runs once.
     cls.ImpalaTestMatrix.add_constraint(lambda v:
-        (v.get_value('table_format').file_format == 'text' and
-        v.get_value('table_format').compression_codec == 'none'))
+        (v.get_value('table_format').file_format == 'text'
+         and v.get_value('table_format').compression_codec == 'none'))
 
   def test_error_message(self, vector, unique_database):
     # Tests that an appropriate error message is displayed for unsupported writers like
@@ -227,8 +231,8 @@ class TestLargeCompressedFile(ImpalaTestSuite):
     if cls.exploration_strategy() != 'exhaustive':
       pytest.skip("skipping if it's not exhaustive test.")
     cls.ImpalaTestMatrix.add_constraint(lambda v:
-        (v.get_value('table_format').file_format == 'text' and
-        v.get_value('table_format').compression_codec == 'snap'))
+        (v.get_value('table_format').file_format == 'text'
+         and v.get_value('table_format').compression_codec == 'snap'))
 
   def teardown_method(self, method):
     self.__drop_test_table()
@@ -240,7 +244,7 @@ class TestLargeCompressedFile(ImpalaTestSuite):
     # is generated from a string of 50176 bytes.
     payload_size = 50176
     hdfs_cat = subprocess.Popen(["hadoop", "fs", "-cat",
-        "/test-warehouse/compressed_payload.snap"], stdout=subprocess.PIPE)
+        "%s/compressed_payload.snap" % WAREHOUSE], stdout=subprocess.PIPE)
     compressed_payload = hdfs_cat.stdout.read()
     compressed_size = len(compressed_payload)
     hdfs_cat.stdout.close()
@@ -258,7 +262,7 @@ class TestLargeCompressedFile(ImpalaTestSuite):
     # Number of nested structures described above.
     num_chunks = int(math.ceil(file_size / self.CHUNK_SIZE))
     # Number of compressed snappy blocks per chunk.
-    num_blocks_per_chunk = self.CHUNK_SIZE / (compressed_size + 4)
+    num_blocks_per_chunk = self.CHUNK_SIZE // (compressed_size + 4)
     # Total uncompressed size of a nested structure.
     total_chunk_size = num_blocks_per_chunk * payload_size
 
@@ -305,11 +309,11 @@ class TestBzip2Streaming(ImpalaTestSuite):
 
     if cls.exploration_strategy() != 'exhaustive':
       pytest.skip("skipping if it's not exhaustive test.")
-    cls.ImpalaTestMatrix.add_dimension(
-        ImpalaTestDimension('max_scan_range_length', *cls.MAX_SCAN_RANGE_LENGTHS))
+    add_exec_option_dimension(
+      cls, 'max_scan_range_length', cls.MAX_SCAN_RANGE_LENGTHS)
     cls.ImpalaTestMatrix.add_constraint(lambda v:
-        v.get_value('table_format').file_format == 'text' and
-        v.get_value('table_format').compression_codec == 'bzip')
+        v.get_value('table_format').file_format == 'text'
+        and v.get_value('table_format').compression_codec == 'bzip')
 
   def test_bzip2_streaming(self, vector):
     self.run_test_case('QueryTest/text-bzip-scan', vector)
@@ -339,8 +343,8 @@ class TestReadZtsdLibCompressedFile(ImpalaTestSuite):
     if cls.exploration_strategy() != 'exhaustive':
       pytest.skip('runs only in exhaustive')
     cls.ImpalaTestMatrix.add_constraint(lambda v:
-        (v.get_value('table_format').file_format == 'text' and
-        v.get_value('table_format').compression_codec == 'zstd'))
+        (v.get_value('table_format').file_format == 'text'
+         and v.get_value('table_format').compression_codec == 'zstd'))
 
   def __generate_file(self, local_file_location, table_location):
     """

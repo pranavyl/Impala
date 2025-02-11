@@ -17,21 +17,43 @@
 
 # Common test dimensions and associated utility functions.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import copy
 import os
+import pytest
 from itertools import product
 
-from tests.common.test_vector import ImpalaTestDimension, ImpalaTestVector
+from tests.common.test_vector import (
+    ImpalaTestDimension, ImpalaTestVector, assert_exec_option_key)
 from tests.util.filesystem_utils import (
     IS_HDFS)
 
 WORKLOAD_DIR = os.environ['IMPALA_WORKLOAD_DIR']
 
+# Map from the test dimension file_format string to the SQL "STORED AS" or "STORED BY"
+# argument.
+FILE_FORMAT_TO_STORED_AS_MAP = {
+  'text': 'TEXTFILE',
+  'seq': 'SEQUENCEFILE',
+  'rc': 'RCFILE',
+  'orc': 'ORC',
+  'parquet': 'PARQUET',
+  'hudiparquet': 'HUDIPARQUET',
+  'avro': 'AVRO',
+  'hbase': "'org.apache.hadoop.hive.hbase.HBaseStorageHandler'",
+  'kudu': "KUDU",
+  'iceberg': "ICEBERG",
+  'json': "JSONFILE",
+}
+
+
 # Describes the configuration used to execute a single tests. Contains both the details
 # of what specific table format to target along with the exec options (num_nodes, etc)
 # to use when running the query.
 class TableFormatInfo(object):
-  KNOWN_FILE_FORMATS = ['text', 'seq', 'rc', 'parquet', 'orc', 'avro', 'hbase', 'kudu']
+  KNOWN_FILE_FORMATS = ['text', 'seq', 'rc', 'parquet', 'orc', 'avro', 'hbase',
+                        'kudu', 'iceberg', 'json']
   KNOWN_COMPRESSION_CODECS = ['none', 'snap', 'gzip', 'bzip', 'def', 'zstd', 'lz4']
   KNOWN_COMPRESSION_TYPES = ['none', 'block', 'record']
 
@@ -44,14 +66,14 @@ class TableFormatInfo(object):
 
   def __validate(self):
     if self.file_format not in TableFormatInfo.KNOWN_FILE_FORMATS:
-      raise ValueError, 'Unknown file format: %s' % self.file_format
+      raise ValueError('Unknown file format: %s' % self.file_format)
     if self.compression_codec not in TableFormatInfo.KNOWN_COMPRESSION_CODECS:
-      raise ValueError, 'Unknown compression codec: %s' % self.compression_codec
+      raise ValueError('Unknown compression codec: %s' % self.compression_codec)
     if self.compression_type not in TableFormatInfo.KNOWN_COMPRESSION_TYPES:
-      raise ValueError, 'Unknown compression type: %s' % self.compression_type
+      raise ValueError('Unknown compression type: %s' % self.compression_type)
     if (self.compression_codec == 'none' or self.compression_type == 'none') and\
         self.compression_codec != self.compression_type:
-      raise ValueError, 'Invalid combination of compression codec/type: %s' % str(self)
+      raise ValueError('Invalid combination of compression codec/type: %s' % str(self))
 
   @staticmethod
   def create_from_string(dataset, table_format_string):
@@ -63,11 +85,11 @@ class TableFormatInfo(object):
     or 'none' if the table is uncompressed.
     """
     if table_format_string is None:
-      raise ValueError, 'Table format string cannot be None'
+      raise ValueError('Table format string cannot be None')
 
     format_parts = table_format_string.strip().split('/')
-    if len(format_parts) not in range(2, 4):
-      raise ValueError, 'Invalid table format %s' % table_format_string
+    if len(format_parts) not in list(range(2, 4)):
+      raise ValueError('Invalid table format %s' % table_format_string)
 
     file_format, compression_codec = format_parts[:2]
     if len(format_parts) == 3:
@@ -97,33 +119,46 @@ class TableFormatInfo(object):
       return '_%s_%s' % (self.file_format, self.compression_codec)
 
 
-def create_uncompressed_text_dimension(workload):
+def create_table_format_dimension(workload, table_format_string):
   dataset = get_dataset_from_workload(workload)
   return ImpalaTestDimension('table_format',
-      TableFormatInfo.create_from_string(dataset, 'text/none'))
+      TableFormatInfo.create_from_string(dataset, table_format_string))
+
+
+def create_uncompressed_text_dimension(workload):
+  return create_table_format_dimension(workload, 'text/none')
+
+
+def create_uncompressed_json_dimension(workload):
+  return create_table_format_dimension(workload, 'json/none')
 
 
 def create_parquet_dimension(workload):
-  dataset = get_dataset_from_workload(workload)
-  return ImpalaTestDimension('table_format',
-      TableFormatInfo.create_from_string(dataset, 'parquet/none'))
+  return create_table_format_dimension(workload, 'parquet/none')
 
 
 def create_orc_dimension(workload):
-  dataset = get_dataset_from_workload(workload)
-  return ImpalaTestDimension('table_format',
-      TableFormatInfo.create_from_string(dataset, 'orc/def'))
+  return create_table_format_dimension(workload, 'orc/def')
+
 
 def create_avro_snappy_dimension(workload):
-  dataset = get_dataset_from_workload(workload)
-  return ImpalaTestDimension('table_format',
-      TableFormatInfo.create_from_string(dataset, 'avro/snap/block'))
+  return create_table_format_dimension(workload, 'avro/snap/block')
 
 
 def create_kudu_dimension(workload):
-  dataset = get_dataset_from_workload(workload)
-  return ImpalaTestDimension('table_format',
-      TableFormatInfo.create_from_string(dataset, 'kudu/none'))
+  return create_table_format_dimension(workload, 'kudu/none')
+
+
+def default_client_protocol_dimension():
+  return ImpalaTestDimension('protocol', pytest.config.option.default_test_protocol)
+
+
+def beeswax_client_protocol_dimension():
+  return ImpalaTestDimension('protocol', 'beeswax')
+
+
+def hs2_client_protocol_dimension():
+  return ImpalaTestDimension('protocol', 'hs2')
 
 
 def create_client_protocol_dimension():
@@ -134,6 +169,10 @@ def create_client_protocol_dimension():
   if not hasattr(ssl, "create_default_context"):
     return ImpalaTestDimension('protocol', 'beeswax', 'hs2')
   return ImpalaTestDimension('protocol', 'beeswax', 'hs2', 'hs2-http')
+
+
+def create_client_protocol_http_transport():
+  return ImpalaTestDimension('protocol', 'hs2-http')
 
 
 def create_client_protocol_strict_dimension():
@@ -164,16 +203,24 @@ def hs2_text_constraint(v):
           v.get_value('table_format').file_format == 'text' and
           v.get_value('table_format').compression_codec == 'none')
 
+
+def orc_schema_resolution_constraint(v):
+  """ Constraint to use multiple orc_schema_resolution only in case of orc files"""
+  file_format = v.get_value('table_format').file_format
+  orc_schema_resolution = v.get_value('orc_schema_resolution')
+  return file_format == 'orc' or orc_schema_resolution == 0
+
+
 # Common sets of values for the exec option vectors
 ALL_BATCH_SIZES = [0]
 
-# Don't run with NUM_NODES=1 due to IMPALA-561
-# ALL_CLUSTER_SIZES = [0, 1]
-ALL_CLUSTER_SIZES = [0]
+# Test SingleNode and Distributed Planners
+ALL_CLUSTER_SIZES = [0, 1]
 
 SINGLE_NODE_ONLY = [1]
 ALL_NODES_ONLY = [0]
 ALL_DISABLE_CODEGEN_OPTIONS = [True, False]
+
 
 def create_single_exec_option_dimension(num_nodes=0, disable_codegen_rows_threshold=5000):
   """Creates an exec_option dimension that will produce a single test vector"""
@@ -183,7 +230,9 @@ def create_single_exec_option_dimension(num_nodes=0, disable_codegen_rows_thresh
       disable_codegen_rows_threshold_options=[disable_codegen_rows_threshold],
       batch_sizes=[0])
 
-def create_exec_option_dimension(cluster_sizes=ALL_CLUSTER_SIZES,
+
+# TODO IMPALA-12394: switch to ALL_CLUSTER_SIZES
+def create_exec_option_dimension(cluster_sizes=ALL_NODES_ONLY,
                                  disable_codegen_options=ALL_DISABLE_CODEGEN_OPTIONS,
                                  batch_sizes=ALL_BATCH_SIZES,
                                  sync_ddl=None, exec_single_node_option=[0],
@@ -197,13 +246,15 @@ def create_exec_option_dimension(cluster_sizes=ALL_CLUSTER_SIZES,
       'batch_size': batch_sizes,
       'disable_codegen': disable_codegen_options,
       'disable_codegen_rows_threshold': disable_codegen_rows_threshold_options,
-      'num_nodes': cluster_sizes}
+      'num_nodes': cluster_sizes,
+      'test_replan': [1]}
 
   if sync_ddl is not None:
     exec_option_dimensions['sync_ddl'] = sync_ddl
   if debug_action_options is not None:
     exec_option_dimensions['debug_action'] = debug_action_options
   return create_exec_option_dimension_from_dict(exec_option_dimensions)
+
 
 def create_exec_option_dimension_from_dict(exec_option_dimensions):
   """
@@ -220,26 +271,46 @@ def create_exec_option_dimension_from_dict(exec_option_dimensions):
   # Generate the cross product (all combinations) of the exec options specified. Then
   # store them in exec_option dictionary format.
   keys = sorted(exec_option_dimensions)
+  for name in keys:
+    assert_exec_option_key(name)
   combinations = product(*(exec_option_dimensions[name] for name in keys))
   exec_option_dimension_values = [dict(zip(keys, prod)) for prod in combinations]
 
   # Build a test vector out of it
   return ImpalaTestDimension('exec_option', *exec_option_dimension_values)
 
-def add_exec_option_dimension(test_suite, key, value):
+
+def add_exec_option_dimension(test_suite, key, values):
+  """
+  Takes an ImpalaTestSuite object 'test_suite' and register new exec option dimension.
+  'key' must be a query option known to Impala, and 'values' must be a list of more than
+  one element. Exec option 'key' must not be declared before.
+  If writing constraint against 'key', the value should be looked up at:
+    vector.get_value('key')
+  instead of:
+    vector.get_value('exec_option')['key']
+  """
+  test_suite.ImpalaTestMatrix.add_exec_option_dimension(
+    ImpalaTestDimension(key, *values))
+
+
+def add_mandatory_exec_option(test_suite, key, value):
   """
   Takes an ImpalaTestSuite object 'test_suite' and adds 'key=value' to every exec option
-  test dimension, leaving the number of tests that will be run unchanged.
+  test dimension, leaving the number of tests that will be run unchanged. Exec option
+  'key' must not be declared before.
   """
-  for v in test_suite.ImpalaTestMatrix.dimensions["exec_option"]:
-    v.value[key] = value
+  test_suite.ImpalaTestMatrix.add_mandatory_exec_option(key, value)
+
 
 def extend_exec_option_dimension(test_suite, key, value):
   """
   Takes an ImpalaTestSuite object 'test_suite' and extends the exec option test dimension
   by creating a copy of each existing exec option value that has 'key' set to 'value',
-  doubling the number of tests that will be run.
+  doubling the number of tests that will be run. Exec option 'key' must not be declared
+  before.
   """
+  test_suite.ImpalaTestMatrix.assert_unique_exec_option_key(key)
   dim = test_suite.ImpalaTestMatrix.dimensions["exec_option"]
   new_value = []
   for v in dim:
@@ -248,10 +319,12 @@ def extend_exec_option_dimension(test_suite, key, value):
   dim.extend(new_value)
   test_suite.ImpalaTestMatrix.add_dimension(dim)
 
+
 def get_dataset_from_workload(workload):
   # TODO: We need a better way to define the workload -> dataset mapping so we can
   # extract it without reading the actual test vector file
   return load_table_info_dimension(workload, 'exhaustive')[0].value.dataset
+
 
 def load_table_info_dimension(workload_name, exploration_strategy, file_formats=None,
                       compression_codecs=None):
@@ -260,17 +333,17 @@ def load_table_info_dimension(workload_name, exploration_strategy, file_formats=
       WORKLOAD_DIR, workload_name, '%s_%s.csv' % (workload_name, exploration_strategy))
 
   if not os.path.isfile(test_vector_file):
-    raise RuntimeError, 'Vector file not found: ' + test_vector_file
+    raise RuntimeError('Vector file not found: ' + test_vector_file)
 
   vector_values = []
 
-  with open(test_vector_file, 'rb') as vector_file:
+  with open(test_vector_file, 'r') as vector_file:
     for line in vector_file.readlines():
       if line.strip().startswith('#'):
         continue
 
       # Extract each test vector and add them to a dictionary
-      vals = dict((key.strip(), value.strip()) for key, value in\
+      vals = dict((key.strip(), value.strip()) for key, value in
           (item.split(':') for item in line.split(',')))
 
       # If only loading specific file formats skip anything that doesn't match
@@ -282,6 +355,7 @@ def load_table_info_dimension(workload_name, exploration_strategy, file_formats=
       vector_values.append(TableFormatInfo(**vals))
 
   return ImpalaTestDimension('table_format', *vector_values)
+
 
 def is_supported_insert_format(table_format):
   # Returns true if the given table_format is a supported Impala INSERT format

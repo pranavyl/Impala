@@ -29,11 +29,13 @@
 
 set -euo pipefail
 
-echo "Compiling"
 TMP_BUILDALL_LOG=$(mktemp)
+echo "Compiling, for build logs see ${TMP_BUILDALL_LOG}"
 if ! ./buildall.sh -skiptests -tidy -so -noclean &> "${TMP_BUILDALL_LOG}"
 then
-  echo "buildall.sh failed, dumping output" >&2
+  echo "buildall.sh failed!" >&2
+  grep "^make.* Error " ${TMP_BUILDALL_LOG} >&2
+  echo "Dumping output of ./buildall.sh -skiptests -tidy -so -noclean" >&2
   cat "${TMP_BUILDALL_LOG}"
   exit 1
 fi
@@ -59,9 +61,19 @@ export PATH="${IMPALA_TOOLCHAIN_PACKAGES_HOME}/llvm-${IMPALA_LLVM_VERSION}/share
 :${IMPALA_TOOLCHAIN_PACKAGES_HOME}/llvm-${IMPALA_LLVM_VERSION}/bin/\
 :$PATH"
 TMP_STDERR=$(mktemp)
+echo; echo "Running clang tidy, for error logs see ${TMP_STDERR}"
+STRCAT_MESSAGE="Impala-specific note: This can also be fixed using the StrCat() function \
+from be/src/gutil/strings strcat.h)"
+CLANG_STRING_CONCAT="performance-inefficient-string-concatenation"
+FALLTHROUGH_MESSAGE="Impala-specific note: Impala is a C++ 17 codebase, so the preferred \
+way to indicate intended fallthrough is C++ 17's [[fallthrough]]"
+CLANG_FALLTHROUGH="clang-diagnostic-implicit-fallthrough"
 trap "rm $TMP_STDERR" EXIT
 if ! run-clang-tidy.py -quiet -header-filter "${PIPE_DIRS%?}" \
-                       -j"${CORES}" ${DIRS} 2> ${TMP_STDERR};
+                       -j"${CORES}" ${DIRS} 2> ${TMP_STDERR} | \
+   sed "/${CLANG_STRING_CONCAT}/ s#\$# \n${STRCAT_MESSAGE}#" | \
+   sed "/${CLANG_FALLTHROUGH}/ s#\$# \n${FALLTHROUGH_MESSAGE}#" | \
+   sed 's#FALLTHROUGH_INTENDED#[[fallthrough]]#';
 then
   echo "run-clang-tidy.py hit an error, dumping stderr output"
   cat ${TMP_STDERR} >&2

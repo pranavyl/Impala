@@ -17,6 +17,7 @@
 #
 # The base class that should be used for almost all Impala tests
 
+from __future__ import absolute_import, division, print_function
 import logging
 import pytest
 import os
@@ -24,8 +25,8 @@ import time
 from subprocess import check_call
 from tests.util.filesystem_utils import get_fs_path
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import (SkipIf, SkipIfS3, SkipIfABFS, SkipIfADLS,
-                               SkipIfIsilon, SkipIfGCS, SkipIfCOS, SkipIfLocal)
+from tests.common.skip import SkipIf, SkipIfFS
+from tests.common.test_result_verifier import error_msg_expected
 
 LOG = logging.getLogger('test_coordinators')
 LOG.setLevel(level=logging.DEBUG)
@@ -49,7 +50,7 @@ class TestCoordinators(CustomClusterTestSuite):
     beeswax_client = None
     try:
       beeswax_client = worker.service.create_beeswax_client()
-    except Exception, e:
+    except Exception as e:
       LOG.info("Caught exception {0}".format(e))
     finally:
       assert beeswax_client is None
@@ -57,7 +58,7 @@ class TestCoordinators(CustomClusterTestSuite):
     hs2_client = None
     try:
       hs2_client = worker.service.create_hs2_client()
-    except Exception, e:
+    except Exception as e:
       LOG.info("Caught exception {0}".format(e))
     finally:
       assert hs2_client is None
@@ -265,16 +266,14 @@ class TestCoordinators(CustomClusterTestSuite):
     assert len(self.cluster.impalads) == 3
 
     coordinator = self.cluster.impalads[0]
-    worker1 = self.cluster.impalads[1]
-    worker2 = self.cluster.impalads[2]
 
     client = None
     try:
       client = coordinator.service.create_beeswax_client()
       assert client is not None
-      self.client = client
 
       client.execute("SET EXPLAIN_LEVEL=2")
+      client.execute("SET TEST_REPLAN=0")
 
       # Ensure that the plan generated always uses only the executor nodes for scanning
       # Multi-partition table
@@ -282,13 +281,34 @@ class TestCoordinators(CustomClusterTestSuite):
               "where id NOT IN (0,1,2) and string_col IN ('aaaa', 'bbbb', 'cccc', NULL) "
               "and mod(int_col,50) IN (0,1) and id IN (int_col);").data
       assert 'F00:PLAN FRAGMENT [RANDOM] hosts=2 instances=2' in result
-      # Single partition table
-      result = client.execute("explain select * from tpch.lineitem "
-              "union all select * from tpch.lineitem").data
+      # Single partition table with 3 blocks
+      result = client.execute("explain select * from tpch_parquet.lineitem "
+              "union all select * from tpch_parquet.lineitem").data
       assert 'F02:PLAN FRAGMENT [RANDOM] hosts=2 instances=2' in result
     finally:
       assert client is not None
+      client.close()
       self._stop_impala_cluster()
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(cluster_size=3, num_exclusive_coordinators=1)
+  def test_iceberg_metadata_scan_on_coord(self):
+    """ Tests that Iceberg metadata scan fragments are scheduled on the coordinator. If
+    such a fragment is scheduled on an executor, the below queries fail. Regression test
+    for IMPALA-12809"""
+    # A metadata table joined with itself.
+    q1 = """select count(b.parent_id)
+        from functional_parquet.iceberg_query_metadata.history a
+        join functional_parquet.iceberg_query_metadata.history b
+        on a.snapshot_id = b.snapshot_id"""
+    self.execute_query_expect_success(self.client, q1)
+
+    # A metadata table joined with a regular table.
+    q2 = """select count(DISTINCT a.parent_id, a.is_current_ancestor)
+        from functional_parquet.iceberg_query_metadata.history a
+        join functional_parquet.alltypestiny c
+        on a.is_current_ancestor = c.bool_col"""
+    self.execute_query_expect_success(self.client, q2)
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(impalad_args="--queue_wait_timeout_ms=2000",
@@ -299,10 +319,9 @@ class TestCoordinators(CustomClusterTestSuite):
     # Pick a non-trivial query that needs to be scheduled on executors.
     query = "select count(*) from functional.alltypes where month + random() < 3"
     result = self.execute_query_expect_failure(self.client, query)
-    expected_error = "Query aborted:Admission for query exceeded timeout 2000ms in " \
-                     "pool default-pool. Queued reason: Waiting for executors to " \
-                     "start."
-    assert expected_error in str(result)
+    expected_error = "Admission for query exceeded timeout 2000ms in pool " \
+                     "default-pool. Queued reason: Waiting for executors to start."
+    assert error_msg_expected(str(result), expected_error)
     # Now pick a coordinator only query.
     query = "select 1"
     self.execute_query_expect_success(self.client, query)
@@ -319,13 +338,7 @@ class TestCoordinators(CustomClusterTestSuite):
     num_hosts = "hosts=10 instances=10"
     assert num_hosts in str(ret)
 
-  @SkipIfS3.hbase
-  @SkipIfGCS.hbase
-  @SkipIfCOS.hbase
-  @SkipIfABFS.hbase
-  @SkipIfADLS.hbase
-  @SkipIfIsilon.hbase
-  @SkipIfLocal.hbase
+  @SkipIfFS.hbase
   @SkipIf.skip_hbase
   @pytest.mark.execute_serially
   def test_executor_only_hbase(self):

@@ -68,6 +68,7 @@ public class PlannerContext {
   private final EventSequence timeline_;
   private final TQueryCtx queryCtx_;
   private final QueryStmt queryStmt_;
+  private final Analyzer rootAnalyzer_;
 
   public PlannerContext (AnalysisResult analysisResult, TQueryCtx queryCtx,
       EventSequence timeline) {
@@ -80,17 +81,27 @@ public class PlannerContext {
       queryStmt_ = analysisResult.getUpdateStmt().getQueryStmt();
     } else if (analysisResult.isDeleteStmt()) {
       queryStmt_ = analysisResult.getDeleteStmt().getQueryStmt();
+    } else if (analysisResult.isOptimizeStmt()) {
+      queryStmt_ = analysisResult.getOptimizeStmt().getQueryStmt();
+    } else if (analysisResult.isMergeStmt()) {
+      queryStmt_ = analysisResult.getMergeStmt().getQueryStmt();
     } else {
       queryStmt_ = analysisResult.getQueryStmt();
     }
+    rootAnalyzer_ = analysisResult.getAnalyzer();
   }
 
   // Constructor useful for an external planner module
   public PlannerContext(TQueryCtx queryCtx, EventSequence timeline) {
+    this((Analyzer) null, queryCtx, timeline);
+  }
+
+  public PlannerContext(Analyzer analyzer, TQueryCtx queryCtx, EventSequence timeline) {
     queryCtx_ = queryCtx;
     timeline_ = timeline;
     analysisResult_ = null;
     queryStmt_ = null;
+    rootAnalyzer_ = analyzer;
   }
 
   public QueryStmt getQueryStmt() { return queryStmt_; }
@@ -98,7 +109,7 @@ public class PlannerContext {
   public TQueryOptions getQueryOptions() { return getRootAnalyzer().getQueryOptions(); }
   public AnalysisResult getAnalysisResult() { return analysisResult_; }
   public EventSequence getTimeline() { return timeline_; }
-  public Analyzer getRootAnalyzer() { return analysisResult_.getAnalyzer(); }
+  public Analyzer getRootAnalyzer() { return rootAnalyzer_; }
   public boolean isSingleNodeExec() { return getQueryOptions().num_nodes == 1; }
   public PlanNodeId getNextNodeId() { return nodeIdGenerator_.getNextId(); }
   public PlanFragmentId getNextFragmentId() { return fragmentIdGenerator_.getNextId(); }
@@ -106,12 +117,13 @@ public class PlannerContext {
     return analysisResult_.isInsertStmt() || analysisResult_.isCreateTableAsSelectStmt();
   }
   public boolean isInsert() { return analysisResult_.isInsertStmt(); }
-  public boolean isUpdateOrDelete() {
-    return analysisResult_.isUpdateStmt() || analysisResult_.isDeleteStmt(); }
+  public boolean isOptimize() { return analysisResult_.isOptimizeStmt(); }
+  public boolean isCtas() { return analysisResult_.isCreateTableAsSelectStmt(); }
   public boolean isQuery() { return analysisResult_.isQueryStmt(); }
   public boolean hasTableSink() {
     return isInsertOrCtas() || analysisResult_.isUpdateStmt()
-        || analysisResult_.isDeleteStmt();
+        || analysisResult_.isDeleteStmt() || analysisResult_.isOptimizeStmt()
+        || analysisResult_.isMergeStmt();
   }
   public boolean hasSubplan() { return !subplans_.isEmpty(); }
   public SubplanNode getSubplan() { return subplans_.getFirst(); }
@@ -119,4 +131,5 @@ public class PlannerContext {
   public void popSubplan() { subplans_.removeFirst(); }
   public boolean isUpdate() { return analysisResult_.isUpdateStmt(); }
   public boolean isDelete() { return analysisResult_.isDeleteStmt(); }
+  public boolean isMerge() { return analysisResult_.isMergeStmt(); }
 }

@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 from tests.common.impala_test_suite import ImpalaTestSuite
 
 
@@ -35,3 +36,7 @@ class TestParquetLateMaterialization(ImpalaTestSuite):
 
   def test_parquet_late_materialization(self, vector):
     self.run_test_case('QueryTest/parquet-late-materialization', vector)
+
+  def test_parquet_late_materialization_unique_db(self, vector, unique_database):
+    self.run_test_case('QueryTest/parquet-late-materialization-unique-db', vector,
+        unique_database)

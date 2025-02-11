@@ -9,18 +9,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from multiprocessing.pool import ThreadPool
 
 import pytest
 import time
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import SkipIfS3, SkipIfGCS, SkipIfCOS
+from tests.common.skip import SkipIfFS
 
 
-@SkipIfS3.variable_listing_times
-@SkipIfGCS.variable_listing_times
-@SkipIfCOS.variable_listing_times
+@SkipIfFS.variable_listing_times
 class TestTopicUpdateFrequency(CustomClusterTestSuite):
 
   @pytest.mark.execute_serially

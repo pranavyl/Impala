@@ -23,8 +23,13 @@ add_library(Catalog
   catalog-server.cc
   catalog-util.cc
   catalogd-main.cc
+  workload-management-init.cc
 )
 add_dependencies(Catalog gen-deps)
+
+if (BUILD_WITH_NO_TESTS)
+  return()
+endif()
 
 add_library(CatalogTests STATIC
   catalog-util-test.cc

@@ -38,6 +38,7 @@ import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.StringLiteral;
 import org.apache.impala.analysis.TupleDescriptor;
+import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeHBaseTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HBaseColumn;
@@ -58,7 +59,6 @@ import org.apache.impala.thrift.TScanRangeLocation;
 import org.apache.impala.thrift.TScanRangeLocationList;
 import org.apache.impala.thrift.TScanRangeSpec;
 import org.apache.impala.util.BitUtil;
-import org.apache.impala.util.ExecutorMembershipSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -94,7 +94,6 @@ public class HBaseScanNode extends ScanNode {
   private final static int DEFAULT_MIN_ESTIMATE_BYTES = 4 * 1024;
 
   private final static Logger LOG = LoggerFactory.getLogger(HBaseScanNode.class);
-  private final TupleDescriptor desc_;
 
   // One range per clustering column. The range bounds are expected to be constants.
   // A null entry means there's no range restriction for that particular key.
@@ -123,16 +122,17 @@ public class HBaseScanNode extends ScanNode {
 
   public HBaseScanNode(PlanNodeId id, TupleDescriptor desc) {
     super(id, desc, "SCAN HBASE");
-    desc_ = desc;
   }
 
   @Override
   public void init(Analyzer analyzer) throws ImpalaException {
     FeTable table = desc_.getTable();
     // determine scan predicates for clustering cols
-    for (int i = 0; i < table.getNumClusteringCols(); ++i) {
-      SlotDescriptor slotDesc = analyzer.getColumnSlot(
-          desc_, table.getColumns().get(i));
+    List<Column> columns = table.getColumns();
+    for (int i = 0; i < columns.size(); ++i) {
+      HBaseColumn col = (HBaseColumn) columns.get(i);
+      if (!col.isKeyColumn()) continue;
+      SlotDescriptor slotDesc = analyzer.getColumnSlot(desc_, col);
       if (slotDesc == null || !slotDesc.getType().isStringType()) {
         // the hbase row key is mapped to a non-string type
         // (since it's stored in ASCII it will be lexicographically ordered,
@@ -319,11 +319,12 @@ public class HBaseScanNode extends ScanNode {
         // May return -1 for the estimate if insufficient data is available.
         estimate = tbl.getEstimatedRowStats(startKey_, stopKey_);
       }
+      long rowsFromHms = tbl.getTTableStats().getNum_rows();
       if (estimate.first == -1) {
         // No useful estimate. Rely on HMS row count stats.
         // This works only if HBase stats are available in HMS. This is true
         // for the Impala tests, and may be true for some applications.
-        cardinality_ = tbl.getTTableStats().getNum_rows();
+        cardinality_ = rowsFromHms;
         if (LOG.isTraceEnabled()) {
           LOG.trace("Fallback to use table stats in HMS: num_rows=" + cardinality_);
         }
@@ -336,9 +337,10 @@ public class HBaseScanNode extends ScanNode {
         }
       } else {
         // Use the HBase sampling scan to estimate cardinality. Note that,
-        // in tests, this estimate has proven to be very rough: off by
-        // 2x or more.
-        cardinality_ = estimate.first;
+        // in tests, this estimate has proven to be very rough: off by 2x or more.
+        // Cap the cardinality estimation by the row count from HMS when available.
+        cardinality_ = (rowsFromHms >= 0) ? Long.min(estimate.first, rowsFromHms) :
+                                              estimate.first;
         if (estimate.second > 0) {
           suggestedCaching_ = (int)
               Math.max(MAX_HBASE_FETCH_BATCH_SIZE / estimate.second, 1);
@@ -361,7 +363,7 @@ public class HBaseScanNode extends ScanNode {
 
     // Assume that each node/instance in the cluster gets a scan range, unless there are
     // fewer scan ranges than nodes/instances.
-    int numExecutors = ExecutorMembershipSnapshot.getCluster().numExecutors();
+    int numExecutors = analyzer.numExecutorsForPlanning();
     numNodes_ =
         Math.max(1, Math.min(scanRangeSpecs_.getConcrete_rangesSize(), numExecutors));
     int maxInstances = numNodes_ * getMaxInstancesPerNode(analyzer);
@@ -648,6 +650,11 @@ public class HBaseScanNode extends ScanNode {
       default: throw new IllegalArgumentException(
           "HBase: Unsupported Impala compare operator: " + impalaOp);
     }
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    processingCost_ = computeScanProcessingCost(queryOptions);
   }
 
   @Override

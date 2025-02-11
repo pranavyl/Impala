@@ -39,7 +39,7 @@ using namespace apache::thrift::protocol;
 namespace impala {
 
 Status ClientCacheHelper::GetClient(const TNetworkAddress& address,
-    ClientFactory factory_method, ClientKey* client_key) {
+    const ClientFactory& factory_method, ClientKey* client_key) {
   shared_ptr<PerHostCache> host_cache;
   {
     lock_guard<mutex> lock(cache_lock_);
@@ -67,8 +67,8 @@ Status ClientCacheHelper::GetClient(const TNetworkAddress& address,
   return Status::OK();
 }
 
-Status ClientCacheHelper::ReopenClient(ClientFactory factory_method,
-    ClientKey* client_key) {
+Status ClientCacheHelper::ReopenClient(
+    const ClientFactory& factory_method, ClientKey* client_key) {
   // Clients are not ordinarily removed from the cache completely (in the future, they may
   // be); this is the only method where a client may be deleted and replaced with another.
   shared_ptr<ThriftClientImpl> client_impl;
@@ -109,7 +109,7 @@ Status ClientCacheHelper::ReopenClient(ClientFactory factory_method,
 }
 
 Status ClientCacheHelper::CreateClient(const TNetworkAddress& address,
-    ClientFactory factory_method, ClientKey* client_key) {
+    const ClientFactory& factory_method, ClientKey* client_key) {
   shared_ptr<ThriftClientImpl> client_impl(factory_method(address, client_key));
   VLOG(2) << "CreateClient(): creating new client for " <<
       TNetworkAddressToString(client_impl->address());
@@ -119,9 +119,10 @@ Status ClientCacheHelper::CreateClient(const TNetworkAddress& address,
     return client_impl->init_status();
   }
 
-  // Set the TSocket's send and receive timeouts.
+  // Set the TSocket's send, receive and connect timeouts.
   client_impl->setRecvTimeout(recv_timeout_ms_);
   client_impl->setSendTimeout(send_timeout_ms_);
+  client_impl->setConnTimeout(conn_timeout_ms_);
 
   Status status = client_impl->OpenWithRetry(num_tries_, wait_ms_);
   if (!status.ok()) {
@@ -233,17 +234,24 @@ void ClientCacheHelper::TestShutdown() {
   }
 }
 
-void ClientCacheHelper::InitMetrics(MetricGroup* metrics, const string& key_prefix) {
+void ClientCacheHelper::InitMetrics(MetricGroup* metrics, const string& key_prefix,
+    const string& key_appendix) {
   DCHECK(metrics != NULL);
   // Not strictly needed if InitMetrics is called before any cache usage, but ensures that
   // metrics_enabled_ is published.
   lock_guard<mutex> lock(cache_lock_);
   stringstream count_ss;
   count_ss << key_prefix << ".client-cache.clients-in-use";
+  if (!key_appendix.empty()) {
+    count_ss << "-" << key_appendix;
+  }
   clients_in_use_metric_ = metrics->AddGauge(count_ss.str(), 0);
 
   stringstream max_ss;
   max_ss << key_prefix << ".client-cache.total-clients";
+  if (!key_appendix.empty()) {
+    max_ss << "-" << key_appendix;
+  }
   total_clients_metric_ = metrics->AddGauge(max_ss.str(), 0);
   metrics_enabled_ = true;
 }

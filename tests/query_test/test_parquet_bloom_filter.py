@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import math
 import os
 
@@ -95,6 +97,27 @@ class TestParquetBloomFilter(ImpalaTestSuite):
     vector.get_value('exec_option')['parquet_bloom_filtering'] = False
     self.run_test_case('QueryTest/parquet-bloom-filter-disabled', vector, unique_database)
 
+  def test_parquet_bloom_filtering_schema_change(self, vector, unique_database):
+    """ Regression test for IMPALA-11345. Tests that the query does not fail when a new
+    column is added to the table schema but the old Parquet files do not contain it and
+    therefore no column is found for a conjunct while preparing Bloom filtering. """
+    vector.get_value('exec_option')['parquet_bloom_filtering'] = True
+
+    tbl_name = 'changed_schema'
+
+    stmts = [
+      'create table {db}.{tbl} (id INT) stored as parquet',
+      'insert into {db}.{tbl} values (1),(2),(3)',
+      'alter table {db}.{tbl} add columns (name STRING)',
+      'insert into {db}.{tbl} values (4, "James")',
+      'select * from {db}.{tbl} where name in ("Lily")'
+    ]
+
+    for stmt in stmts:
+      self.execute_query_expect_success(self.client,
+          stmt.format(db=str(unique_database), tbl=tbl_name),
+          vector.get_value('exec_option'))
+
   def test_write_parquet_bloom_filter(self, vector, unique_database, tmpdir):
     # Get Bloom filters from the first row group of file PARQUET_TEST_FILE.
     reference_col_to_bloom_filter = self._get_first_row_group_bloom_filters(
@@ -161,9 +184,9 @@ class TestParquetBloomFilter(ImpalaTestSuite):
     # Query an element that is and one that is not present in the table and check whether
     # we correctly do not skip and skip the row group, respectively.
     self._query_element_check_profile(vector, str(unique_database), tbl_name, column_name,
-        0, ['NumBloomFilteredRowGroups: 0 (0)'], ['NumBloomFilteredRowGroups: 1 (1)'])
+        2, ['NumBloomFilteredRowGroups: 0 (0)'], ['NumBloomFilteredRowGroups: 1 (1)'])
     self._query_element_check_profile(vector, str(unique_database), tbl_name, column_name,
-        1, ['NumBloomFilteredRowGroups: 1 (1)'], ['NumBloomFilteredRowGroups: 0 (0)'])
+        3, ['NumBloomFilteredRowGroups: 1 (1)'], ['NumBloomFilteredRowGroups: 0 (0)'])
 
   def test_fallback_from_dict_if_no_bloom_tbl_props(self, vector, unique_database,
       tmpdir):
@@ -196,6 +219,7 @@ class TestParquetBloomFilter(ImpalaTestSuite):
     result_in_table = self.execute_query(query_stmt.format(col_name=col_name,
         db=db_name, tbl=tbl_name, value=element),
         vector.get_value('exec_option'))
+
     for s in strings_in_profile:
       assert s in result_in_table.runtime_profile
     for s in strings_not_in_profile:
@@ -208,24 +232,21 @@ class TestParquetBloomFilter(ImpalaTestSuite):
     fpp = 0.05
     bitset_size = self._optimal_bitset_size(ndv, fpp)
 
-    # We create a table with a single BIGINT column, optionally with table properties for
-    # Bloom filtering.
-    create_stmt = 'create table {db}.{tbl} ({col_name} BIGINT) stored as parquet'
-    if bloom_tbl_prop:
-      create_stmt += ' TBLPROPERTIES("parquet.bloom.filter.columns"="{col_name}:{size}")'
-    create_stmt = create_stmt.format(
-        db=db_name, tbl=tbl_name, col_name=column_name, size=bitset_size)
+    bloom_tbl_props = \
+        'TBLPROPERTIES("parquet.bloom.filter.columns"="{col_name}:{size}")'.format(
+            col_name=column_name, size=bitset_size)
 
-    # We only insert even numbers so an odd number should be filtered out based on the
-    # Bloom filter.
-    values = ['({})'.format(i * 2) for i in range(ndv)]
-    insert_stmt = 'insert into {db}.{tbl} values {values}'.format(
-        db=db_name, tbl=tbl_name, values=','.join(values))
+    # Create a parquet table containing only even numbers so an odd number should be
+    # filtered out based on the Bloom filter (if there is one).
+    create_stmt_template = 'create table {db}.{tbl} stored as parquet {tbl_props} \
+        as (select (row_number() over (order by o_orderkey)) * 2 as {col} \
+        from tpch_parquet.orders limit {ndv})'
+    create_stmt = create_stmt_template.format(db=db_name, tbl=tbl_name,
+        tbl_props=bloom_tbl_props if bloom_tbl_prop else "", col=column_name, ndv=ndv)
 
     vector.get_value('exec_option')['num_nodes'] = 1
     vector.get_value('exec_option')['parquet_bloom_filter_write'] = 'IF_NO_DICT'
     self.execute_query(create_stmt, vector.get_value('exec_option'))
-    self.execute_query(insert_stmt, vector.get_value('exec_option'))
 
   def _optimal_bitset_size(self, ndv, fpp):
     """ Based on ParquetBloomFilter::OptimalByteSize() in
@@ -299,7 +320,7 @@ class TestParquetBloomFilter(ImpalaTestSuite):
     row_group = file_meta_data.row_groups[0]
     assert len(schemas) == len(row_group.columns)
     col_to_bloom_filter = dict()
-    with open(filename) as file_handle:
+    with open(filename, 'rb') as file_handle:
       for i, column in enumerate(row_group.columns):
         column_meta_data = column.meta_data
         if column_meta_data and column_meta_data.bloom_filter_offset:

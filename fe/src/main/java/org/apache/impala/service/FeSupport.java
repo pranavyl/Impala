@@ -28,6 +28,7 @@ import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
+import org.apache.impala.thrift.TAddressesList;
 import org.apache.impala.thrift.TCacheJarParams;
 import org.apache.impala.thrift.TCacheJarResult;
 import org.apache.impala.thrift.TCatalogObject;
@@ -36,6 +37,8 @@ import org.apache.impala.thrift.TCatalogServiceRequestHeader;
 import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TExprBatch;
+import org.apache.impala.thrift.TGetNullPartitionNameRequest;
+import org.apache.impala.thrift.TGetNullPartitionNameResponse;
 import org.apache.impala.thrift.TGetPartitionStatsRequest;
 import org.apache.impala.thrift.TGetPartitionStatsResponse;
 import org.apache.impala.thrift.TParseDateStringResult;
@@ -47,6 +50,7 @@ import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TSymbolLookupParams;
 import org.apache.impala.thrift.TSymbolLookupResult;
 import org.apache.impala.thrift.TTable;
+import org.apache.impala.thrift.TUniqueId;
 import org.apache.impala.util.NativeLibUtil;
 import org.apache.thrift.TDeserializer;
 import org.apache.thrift.TException;
@@ -57,6 +61,8 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+
+import javax.annotation.Nullable;
 
 /**
  * This class provides the Impala executor functionality to the FE.
@@ -129,11 +135,25 @@ public class FeSupport {
       byte[] queryOptions);
 
   public native static int MinLogSpaceForBloomFilter(long ndv, double fpp);
+  public native static double FalsePositiveProbForBloomFilter(
+      long ndv, int logBufferpoolSpace);
 
   // Parses date string, verifies if it is valid and returns the resulting
   // TParseDateStringResult object. Different date string variations are accepted.
   // E.g.: '2011-01-01', '2011-01-1', '2011-1-01', '2011-01-01'.
   public native static byte[] nativeParseDateString(String date);
+
+  // Does an RPC to the Catalog Server to get the null partition name.
+  public native static byte[] NativeGetNullPartitionName(byte[] thriftReq);
+
+  // Does an RPC to the Catalog Server to get the latest compactions.
+  public native static byte[] NativeGetLatestCompactions(byte[] thriftReq);
+
+  // Get a list of addresses for coordinators.
+  public native static byte[] NativeGetCoordinators();
+
+  // Get the number of live queries.
+  public native static long NativeNumLiveQueries();
 
   /**
    * Locally caches the jar at the specified HDFS location.
@@ -145,9 +165,9 @@ public class FeSupport {
   public static TCacheJarResult CacheJar(String hdfsLocation) throws InternalException {
     Preconditions.checkNotNull(hdfsLocation);
     TCacheJarParams params = new TCacheJarParams(hdfsLocation);
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     byte[] result;
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       result = CacheJar(serializer.serialize(params));
       Preconditions.checkNotNull(result);
       TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
@@ -186,9 +206,9 @@ public class FeSupport {
     Preconditions.checkState(!expr.contains(SlotRef.class));
     TExprBatch exprBatch = new TExprBatch();
     exprBatch.addToExprs(expr.treeToThrift());
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     byte[] result;
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       result = EvalExprsWithoutRowBounded(
           serializer.serialize(exprBatch), serializer.serialize(queryCtx), maxResultSize);
       Preconditions.checkNotNull(result);
@@ -217,8 +237,8 @@ public class FeSupport {
 
   public static TSymbolLookupResult LookupSymbol(TSymbolLookupParams params)
       throws InternalException {
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       byte[] resultBytes = LookupSymbol(serializer.serialize(params));
       Preconditions.checkNotNull(resultBytes);
       TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
@@ -276,7 +296,6 @@ public class FeSupport {
    */
   public static TResultRow EvalPredicateBatch(List<Expr> exprs,
       TQueryCtx queryCtx) throws InternalException {
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     TExprBatch exprBatch = new TExprBatch();
     for (Expr expr: exprs) {
       // Make sure we only process boolean exprs.
@@ -286,6 +305,7 @@ public class FeSupport {
     }
     byte[] result;
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       result = EvalExprsWithoutRow(
           serializer.serialize(exprBatch), serializer.serialize(queryCtx));
       Preconditions.checkNotNull(result);
@@ -308,8 +328,8 @@ public class FeSupport {
     return NativePrioritizeLoad(thriftReq);
   }
 
-  public static void PrioritizeLoad(Set<TableName> tableNames)
-      throws InternalException {
+  public static void PrioritizeLoad(Set<TableName> tableNames,
+      @Nullable TUniqueId queryId) throws InternalException {
     Preconditions.checkNotNull(tableNames);
 
     LOG.info(String.format("Requesting prioritized load of table(s): %s",
@@ -323,12 +343,13 @@ public class FeSupport {
       objectDescs.add(catalogObject);
     }
 
-    TPrioritizeLoadRequest request = new TPrioritizeLoadRequest ();
+    TPrioritizeLoadRequest request = new TPrioritizeLoadRequest();
     request.setHeader(new TCatalogServiceRequestHeader());
+    request.header.setQuery_id(queryId);
     request.setObject_descs(objectDescs);
 
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       byte[] result = PrioritizeLoad(serializer.serialize(request));
       Preconditions.checkNotNull(result);
       TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
@@ -362,8 +383,8 @@ public class FeSupport {
     TGetPartitionStatsRequest request = new TGetPartitionStatsRequest();
     request.setTable_name(table.toThrift());
     TGetPartitionStatsResponse response = new TGetPartitionStatsResponse();
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       byte[] result = GetPartitionStats(serializer.serialize(request));
       Preconditions.checkNotNull(result);
       TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
@@ -404,8 +425,8 @@ public class FeSupport {
     Preconditions.checkNotNull(csvQueryOptions);
     Preconditions.checkNotNull(queryOptions);
 
-    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     try {
+      TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
       byte[] result = ParseQueryOptions(csvQueryOptions,
           serializer.serialize(queryOptions));
       Preconditions.checkNotNull(result);
@@ -430,6 +451,19 @@ public class FeSupport {
       loadLibrary();
     }
     return MinLogSpaceForBloomFilter(ndv, fpp);
+  }
+
+  /**
+   * Returns the expected false positive rate for the given ndv and logBufferpoolSpace.
+   */
+  public static double GetFalsePositiveProbForBloomFilter(
+      long ndv, int logBufferpoolSpace) {
+    try {
+      return FalsePositiveProbForBloomFilter(ndv, logBufferpoolSpace);
+    } catch (UnsatisfiedLinkError e) {
+      loadLibrary();
+    }
+    return FalsePositiveProbForBloomFilter(ndv, logBufferpoolSpace);
   }
 
   public static byte[] GetPartialCatalogObject(byte[] thriftReq)
@@ -469,6 +503,57 @@ public class FeSupport {
     } catch (TException e) {
       throw new InternalException("Could not parse date string: " + e.getMessage(), e);
     }
+  }
+
+  private static byte[] GetNullPartitionName(byte[] thriftReq) {
+    try {
+      return NativeGetNullPartitionName(thriftReq);
+    } catch (UnsatisfiedLinkError e) { loadLibrary(); }
+    return NativeGetNullPartitionName(thriftReq);
+  }
+
+  public static String GetNullPartitionName() throws InternalException {
+    TGetNullPartitionNameRequest request = new TGetNullPartitionNameRequest();
+    TGetNullPartitionNameResponse response = new TGetNullPartitionNameResponse();
+    try {
+      byte[] result = GetNullPartitionName(
+          new TSerializer(new TBinaryProtocol.Factory()).serialize(request));
+      Preconditions.checkNotNull(result);
+      new TDeserializer(new TBinaryProtocol.Factory()).deserialize(response, result);
+      if (response.getStatus().getStatus_code() != TErrorCode.OK) {
+        throw new InternalException("Error requesting GetNullPartitionName: "
+            + Joiner.on("\n").join(response.getStatus().getError_msgs()));
+      }
+      Preconditions.checkNotNull(response.partition_value);
+      return response.partition_value;
+    } catch (TException e) {
+      // this should never happen
+      throw new InternalException("Error processing request: " + e.getMessage(), e);
+    }
+  }
+
+  public static byte[] GetLatestCompactions(byte[] thriftReq) {
+    try {
+      return NativeGetLatestCompactions(thriftReq);
+    } catch (UnsatisfiedLinkError e) { loadLibrary(); }
+    return NativeGetLatestCompactions(thriftReq);
+  }
+
+  public static TAddressesList GetCoordinators() throws InternalException {
+    try {
+      byte[] result = NativeGetCoordinators();
+      Preconditions.checkNotNull(result);
+      TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
+      TAddressesList coordinators_list = new TAddressesList();
+      deserializer.deserialize(coordinators_list, result);
+      return coordinators_list;
+    } catch (TException e) {
+      throw new InternalException("Error getting coordinators", e);
+     }
+  }
+
+  public static long NumLiveQueries() {
+    return NativeNumLiveQueries();
   }
 
   /**

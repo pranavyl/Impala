@@ -226,15 +226,14 @@ inline bool ColumnStats<DateValue>::DecodePlainValue(
 template <>
 inline void ColumnStats<StringValue>::EncodePlainValue(
     const StringValue& v, int64_t bytes_needed, std::string* out) {
-  out->assign(v.ptr, v.len);
+  out->assign(v.Ptr(), v.Len());
 }
 
 template <>
 inline bool ColumnStats<StringValue>::DecodePlainValue(
     const std::string& buffer, void* slot, parquet::Type::type parquet_type) {
   StringValue* result = reinterpret_cast<StringValue*>(slot);
-  result->ptr = const_cast<char*>(buffer.data());
-  result->len = buffer.size();
+  result->Assign(const_cast<char*>(buffer.data()), buffer.size());
   return true;
 }
 
@@ -268,13 +267,11 @@ inline void ColumnStats<StringValue>::Merge(const ColumnStatsBase& other) {
     if (has_min_max_values_) {
       // Make sure that we copied the previous page's min/max values
       // to their own buffer.
-      if (prev_page_min_value_.ptr != nullptr) {
-        DCHECK_NE(static_cast<void*>(prev_page_min_value_.ptr),
-                  static_cast<void*>(cs->min_value_.ptr));
+      if (prev_page_min_value_.Ptr() != nullptr) {
+        DCHECK_NE(prev_page_min_value_.Ptr(), cs->min_value_.Ptr());
       }
-      if (prev_page_max_value_.ptr != nullptr) {
-        DCHECK_NE(static_cast<void*>(prev_page_max_value_.ptr),
-                  static_cast<void*>(cs->max_value_.ptr));
+      if (prev_page_max_value_.Ptr() != nullptr) {
+        DCHECK_NE(prev_page_max_value_.Ptr(), cs->max_value_.Ptr());
       }
       if (ascending_boundary_order_) {
         if (prev_page_max_value_ > cs->max_value_ ||
@@ -315,13 +312,14 @@ inline Status ColumnStats<StringValue>::MaterializeStringValuesToInternalBuffers
 
 template <typename T>
 inline void ColumnStats<T>::GetIcebergStats(
-    int64_t column_size, IcebergColumnStats* out) const {
+    int64_t column_size, int64_t value_count, IcebergColumnStats* out) const {
   DCHECK(out != nullptr);
   out->has_min_max_values = has_min_max_values_;
   if (out->has_min_max_values) {
     SerializeIcebergSingleValue(min_value_, &out->min_binary);
     SerializeIcebergSingleValue(max_value_, &out->max_binary);
   }
+  out->value_count = value_count;
   out->null_count = null_count_;
   // Column size is not traced by ColumnStats.
   out->column_size = column_size;
@@ -358,7 +356,7 @@ inline void ColumnStats<StringValue>::SerializeIcebergSingleValue(
     const StringValue& v, std::string* out) {
   // With iceberg 'v' is UTF-8 encoded (HdfsParquetTableWriter::string_utf8_ is always set
   // to true).
-  out->assign(v.ptr, v.len);
+  out->assign(v.Ptr(), v.Len());
 }
 
 // Serialize Decimal4Value / Decimal8Value / Decimal16Value: values as unscaled,

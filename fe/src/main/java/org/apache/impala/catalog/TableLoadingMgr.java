@@ -32,10 +32,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TTableName;
+import org.apache.impala.util.EventSequence;
 import org.apache.impala.util.HdfsCachingUtil;
+import org.apache.impala.util.NoOpEventSequence;
 import org.apache.log4j.Logger;
 
 import com.google.common.base.Preconditions;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 /**
 * Class that manages scheduling the loading of table metadata from the Hive Metastore and
@@ -148,7 +151,8 @@ public class TableLoadingMgr {
   // (no work will be rejected, but memory consumption is unbounded). If this thread
   // dies it will be automatically restarted.
   // The tables to process are read from the resfreshThreadWork_ queue.
-  ExecutorService asyncRefreshThread_ = Executors.newSingleThreadExecutor();
+  ExecutorService asyncRefreshThread_ = Executors.newSingleThreadExecutor(
+      new ThreadFactoryBuilder().setNameFormat("TableAsyncRefreshThread").build());
 
   // Tables for the async refresh thread to process. Synchronization must be handled
   // externally.
@@ -162,7 +166,8 @@ public class TableLoadingMgr {
     catalog_ = catalog;
     tblLoader_ = new TableLoader(catalog_);
     numLoadingThreads_ = numLoadingThreads;
-    tblLoadingPool_ = Executors.newFixedThreadPool(numLoadingThreads_);
+    tblLoadingPool_ = Executors.newFixedThreadPool(numLoadingThreads_,
+        new ThreadFactoryBuilder().setNameFormat("TableLoadingThread-%d").build());
 
     // Start the background table loading submitter threads.
     startTableLoadingSubmitterThreads();
@@ -231,7 +236,7 @@ public class TableLoadingMgr {
    * loads of the same table.
    */
   public LoadRequest loadAsync(final TTableName tblName, final long createdEventId,
-      final String reason)
+      final String reason, final EventSequence catalogTimeline)
       throws DatabaseNotFoundException {
     final Db parentDb = catalog_.getDb(tblName.getDb_name());
     if (parentDb == null) {
@@ -242,7 +247,9 @@ public class TableLoadingMgr {
     FutureTask<Table> tableLoadTask = new FutureTask<Table>(new Callable<Table>() {
         @Override
         public Table call() throws Exception {
-          return tblLoader_.load(parentDb, tblName.table_name, createdEventId, reason);
+          catalogTimeline.markEvent("Start loading table");
+          return tblLoader_.load(parentDb, tblName.table_name, createdEventId, reason,
+              catalogTimeline);
         }});
 
     FutureTask<Table> existingValue = loadingTables_.putIfAbsent(tblName, tableLoadTask);
@@ -265,7 +272,9 @@ public class TableLoadingMgr {
    */
   private void startTableLoadingSubmitterThreads() {
     ExecutorService submitterLoadingPool =
-        Executors.newFixedThreadPool(numLoadingThreads_);
+      Executors.newFixedThreadPool(numLoadingThreads_,
+          new ThreadFactoryBuilder()
+              .setNameFormat("TableLoadingSubmitterThread-%d").build());
     try {
       for (int i = 0; i < numLoadingThreads_; ++i) {
         submitterLoadingPool.execute(new Runnable() {
@@ -326,7 +335,7 @@ public class TableLoadingMgr {
     try {
       Table tbl = catalog_.getTable(tblName.getDb_name(), tblName.getTable_name());
       if (tbl == null || tbl instanceof IncompleteTable || !tbl.isLoaded()) return;
-      catalog_.reloadTable(tbl, reason);
+      catalog_.reloadTable(tbl, reason, NoOpEventSequence.INSTANCE);
     } catch (CatalogException e) {
       LOG.error("Error reloading cached table: ", e);
     }
@@ -359,5 +368,13 @@ public class TableLoadingMgr {
         }
       }
     }
+  }
+
+  public int numRemainingItems() {
+    return tableLoadingDeque_.size();
+  }
+
+  public int numLoadsInProgress() {
+    return loadingTables_.size();
   }
 }

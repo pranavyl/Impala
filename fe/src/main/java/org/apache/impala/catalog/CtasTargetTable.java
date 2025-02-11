@@ -106,12 +106,7 @@ public abstract class CtasTargetTable implements FeTable {
   @Override
   public List<Column> getColumnsInHiveOrder() {
     List<Column> columns = Lists.newArrayList(getNonClusteringColumns());
-    if (getMetaStoreTable() != null &&
-        AcidUtils.isFullAcidTable(getMetaStoreTable().getParameters())) {
-      // Remove synthetic "row__id" column.
-      Preconditions.checkState(columns.get(0).getName().equals("row__id"));
-      columns.remove(0);
-    }
+    columns = filterColumnsNotStoredInHms(columns);
     columns.addAll(getClusteringColumns());
     return Collections.unmodifiableList(columns);
   }
@@ -173,4 +168,10 @@ public abstract class CtasTargetTable implements FeTable {
   public String getOwnerUser() {
     return owner_;
   }
+
+  @Override
+  public long getCatalogVersion() { return 0; }
+
+  @Override
+  public long getLastLoadedTimeMs() { return 0; }
 }

@@ -57,14 +57,15 @@ HdfsFileReader::~HdfsFileReader() {
   DCHECK(cached_buffer_ == nullptr) << "Cached buffer was not released.";
 }
 
-Status HdfsFileReader::Open(bool use_file_handle_cache) {
+Status HdfsFileReader::Open() {
   unique_lock<SpinLock> hdfs_lock(lock_);
   RETURN_IF_ERROR(scan_range_->cancel_status_);
 
   if (exclusive_hdfs_fh_ != nullptr) return Status::OK();
-  // If using file handle caching, the reader does not maintain its own
-  // hdfs file handle, so it can skip opening a file handle.
-  if (use_file_handle_cache) return Status::OK();
+  return DoOpen();
+}
+
+Status HdfsFileReader::DoOpen() {
   auto io_mgr = scan_range_->io_mgr_;
   // Get a new exclusive file handle.
   RETURN_IF_ERROR(io_mgr->GetExclusiveHdfsFileHandle(hdfs_fs_,
@@ -149,23 +150,21 @@ Status HdfsFileReader::ReadFromPos(DiskQueue* queue, int64_t file_offset, uint8_
     // If the reader has an exclusive file handle, use it. Otherwise, borrow
     // a file handle from the cache.
     req_context_read_timer.Stop();
-    CachedHdfsFileHandle* borrowed_hdfs_fh = nullptr;
+
+    // RAII accessor, it will release the file handle at destruction
+    FileHandleCache::Accessor accessor;
+
     hdfsFile hdfs_file;
     if (exclusive_hdfs_fh_ != nullptr) {
       hdfs_file = exclusive_hdfs_fh_->file();
+    } else if (scan_range_->FileHandleCacheEnabled()) {
+      RETURN_IF_ERROR(io_mgr->GetCachedHdfsFileHandle(hdfs_fs_,
+          scan_range_->file_string(), scan_range_->mtime(), request_context, &accessor));
+      hdfs_file = accessor.Get()->file();
     } else {
-      RETURN_IF_ERROR(
-          io_mgr->GetCachedHdfsFileHandle(hdfs_fs_, scan_range_->file_string(),
-              scan_range_->mtime(), request_context, &borrowed_hdfs_fh));
-      hdfs_file = borrowed_hdfs_fh->file();
+      RETURN_IF_ERROR(DoOpen());
+      hdfs_file = exclusive_hdfs_fh_->file();
     }
-    // Make sure to release any borrowed file handle.
-    auto release_borrowed_hdfs_fh = MakeScopeExitTrigger([this, &borrowed_hdfs_fh]() {
-      if (borrowed_hdfs_fh != nullptr) {
-        scan_range_->io_mgr_->ReleaseCachedHdfsFileHandle(
-            scan_range_->file_string(), borrowed_hdfs_fh);
-      }
-    });
     req_context_read_timer.Start();
 
     while (*bytes_read < bytes_to_read) {
@@ -186,14 +185,14 @@ Status HdfsFileReader::ReadFromPos(DiskQueue* queue, int64_t file_offset, uint8_
       // - first read was not successful
       // and
       // - used a borrowed file handle
-      if (!status.ok() && borrowed_hdfs_fh != nullptr) {
+      if (!status.ok() && accessor.Get()) {
         // The error may be due to a bad file handle. Reopen the file handle and retry.
         // Exclude this time from the read timers.
         req_context_read_timer.Stop();
         RETURN_IF_ERROR(
             io_mgr->ReopenCachedHdfsFileHandle(hdfs_fs_, scan_range_->file_string(),
-                scan_range_->mtime(), request_context, &borrowed_hdfs_fh));
-        hdfs_file = borrowed_hdfs_fh->file();
+                scan_range_->mtime(), request_context, &accessor));
+        hdfs_file = accessor.Get()->file();
         VLOG_FILE << "Reopening file " << scan_range_->file_string() << " with mtime "
                   << scan_range_->mtime() << " offset " << file_offset;
         req_context_read_timer.Start();
@@ -239,6 +238,13 @@ Status HdfsFileReader::ReadFromPos(DiskQueue* queue, int64_t file_offset, uint8_
       bool is_first_read = (num_remote_bytes_ == 0);
       // Collect and accumulate statistics
       GetHdfsStatistics(hdfs_file, log_slow_read);
+      if (scan_range_->is_encrypted()) {
+        scan_range_->reader_->bytes_read_encrypted_.Add(current_bytes_read);
+      }
+      if (scan_range_->is_erasure_coded()) {
+        scan_range_->reader_->bytes_read_ec_.Add(current_bytes_read);
+      }
+
       if (FLAGS_fs_trace_remote_reads && expected_local_ &&
           num_remote_bytes_ > 0 && is_first_read) {
         // Only log the first unexpected remote read for scan range

@@ -20,6 +20,9 @@
 # This should be moved into the test/util folder eventually. The problem is this
 # module depends on db_connection which use some query generator classes.
 
+from __future__ import absolute_import, division, print_function
+from builtins import int, range, zip
+from future.utils import with_metaclass
 import hdfs
 import logging
 import os
@@ -32,20 +35,22 @@ from collections import defaultdict
 from collections import OrderedDict
 from contextlib import contextmanager
 from getpass import getuser
-from itertools import izip
+from io import BytesIO
 from multiprocessing.pool import ThreadPool
 from random import choice
-from StringIO import StringIO
-from sys import maxint
+from sys import maxsize
 from tempfile import mkdtemp
 from threading import Lock
 from time import mktime, strptime
-from urlparse import urlparse
 from xml.etree.ElementTree import parse as parse_xml
 from zipfile import ZipFile
 
+try:
+  from urllib.parse import urlparse
+except ImportError:
+  from urlparse import urlparse
 
-from db_connection import HiveConnection, ImpalaConnection
+from tests.comparison.db_connection import HiveConnection, ImpalaConnection
 from tests.common.environ import HIVE_MAJOR_VERSION
 from tests.common.errors import Timeout
 from tests.util.shell_util import shell as local_shell
@@ -64,13 +69,11 @@ CM_CLEAR_PORT = 7180
 CM_TLS_PORT = 7183
 
 
-class Cluster(object):
+class Cluster(with_metaclass(ABCMeta, object)):
   """This is a base class for clusters. Cluster classes provide various methods for
      interacting with a cluster. Ideally the various cluster implementations provide
      the same set of methods so any cluster implementation can be chosen at runtime.
   """
-
-  __metaclass__ = ABCMeta
 
   def __init__(self):
     self._hadoop_configs = None
@@ -198,7 +201,7 @@ class MiniCluster(Cluster):
     return local_shell(cmd, timeout_secs=timeout_secs)
 
   def _init_local_hadoop_conf_dir(self):
-    self._local_hadoop_conf_dir = mkdtemp()
+    self._local_hadoop_conf_dir = mkdtemp(prefix='impala_mini_cluster_')
 
     node_conf_dir = self._get_node_conf_dir()
     for file_name in os.listdir(node_conf_dir):
@@ -226,8 +229,9 @@ class MiniCluster(Cluster):
     hs2_base_port = 21050
     web_ui_base_port = 25000
     impalads = [MiniClusterImpalad(hs2_base_port + p, web_ui_base_port + p)
-                for p in xrange(self.num_impalads)]
+                for p in range(self.num_impalads)]
     self._impala = Impala(self, impalads)
+
 
 class MiniHiveCluster(MiniCluster):
   """
@@ -321,8 +325,8 @@ class CmCluster(Cluster):
           self._ssh_clients_by_host_name[host_name].append(client)
 
   def _init_local_hadoop_conf_dir(self):
-    self._local_hadoop_conf_dir = mkdtemp()
-    data = StringIO(self.cm.get("/clusters/%s/services/%s/clientConfig"
+    self._local_hadoop_conf_dir = mkdtemp(prefix='impala_mini_hive_cluster_')
+    data = BytesIO(self.cm.get("/clusters/%s/services/%s/clientConfig"
       % (self.cm_cluster.name, self._find_service("HIVE").name)))
     zip_file = ZipFile(data)
     for name in zip_file.namelist():
@@ -427,7 +431,7 @@ class HdfsClient(object):
     s.verify = False
     if use_kerberos:
       try:
-        from hdfs.ext.kerberos import KerberosClient
+        self.init_kerberos_client(url, s)
       except ImportError as e:
         if "No module named requests_kerberos" not in str(e):
           raise e
@@ -441,14 +445,17 @@ class HdfsClient(object):
                       stdout=subprocess.PIPE,
                       stderr=subprocess.STDOUT)
           LOG.info("kerberos installation complete.")
+          self.init_kerberos_client(url, s)
         except Exception as e:
           LOG.error("kerberos installation failed. Try installing libkrb5-dev and"
               " then try again.")
           raise e
-      from hdfs.ext.kerberos import KerberosClient
-      self._client = KerberosClient(url, session=s)
     else:
       self._client = hdfs.client.InsecureClient(url, user=user_name, session=s)
+
+  def init_kerberos_client(self, url, session):
+    from hdfs.ext.kerberos import KerberosClient
+    self._client = KerberosClient(url, session=session)
 
   def __getattr__(self, name):
     return getattr(self._client, name)
@@ -484,8 +491,8 @@ class Yarn(Service):
     """
     env = dict(os.environ)
     env['HADOOP_CONF_DIR'] = self.cluster.local_hadoop_conf_dir
-    env['CDH_MR2_HOME'] =  os.environ['HADOOP_HOME']
-    env['HADOOP_USER_NAME'] =  self.cluster.hadoop_user_name
+    env['CDH_MR2_HOME'] = os.environ['HADOOP_HOME']
+    env['HADOOP_USER_NAME'] = self.cluster.hadoop_user_name
     local_shell('hadoop jar %s %s' % (jar_path, job_args), stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, env=env)
 
@@ -614,7 +621,7 @@ class Impala(Service):
       return dict.fromkeys(stopped_impalads)
     messages = OrderedDict()
     impalads_with_message = dict()
-    for i, message in izip(stopped_impalads, self.for_each_impalad(
+    for i, message in zip(stopped_impalads, self.for_each_impalad(
         lambda i: i.find_last_crash_message(start_time), impalads=stopped_impalads)):
       if message:
         impalads_with_message[i] = "%s crashed:\n%s" % (i.host_name, message)
@@ -628,9 +635,9 @@ class Impala(Service):
       impalads = self.impalads
     promise = self._thread_pool.map_async(func, impalads)
     # Python doesn't handle ctrl-c well unless a timeout is provided.
-    results = promise.get(maxint)
+    results = promise.get(maxsize)
     if as_dict:
-      results = dict(izip(impalads, results))
+      results = dict(zip(impalads, results))
     return results
 
   def restart(self):
@@ -654,9 +661,7 @@ class CmImpala(Impala):
       raise Exception("Failed to restart Impala: %s" % command.resultMessage)
 
 
-class Impalad(object):
-
-  __metaclass__ = ABCMeta
+class Impalad(with_metaclass(ABCMeta, object)):
 
   def __init__(self):
     self.impala = None
@@ -794,7 +799,7 @@ class Impalad(object):
     if not pid:
       raise Exception("Impalad at %s is not running" % self.label)
     mem_kb = self.shell("ps --no-header -o rss -p %s" % pid)
-    return int(mem_kb) / 1024
+    return int(mem_kb) // 1024
 
   def _read_web_page(self, relative_url, params={}, timeout_secs=DEFAULT_TIMEOUT):
     if "json" not in params:
@@ -834,7 +839,7 @@ class Impalad(object):
     for metric in self.get_metrics():
       if metric["name"] == name:
         return metric
-    raise Exception("Metric '%s' not found" % name);
+    raise Exception("Metric '%s' not found" % name)
 
   def __repr__(self):
     return "<%s host: %s>" % (type(self).__name__, self.label)
@@ -873,7 +878,7 @@ class MiniClusterImpalad(Impalad):
       return int(pid)
 
   def find_process_mem_mb_limit(self):
-    return long(self.get_metric("mem-tracker.process.limit")["value"]) / 1024 ** 2
+    return int(self.get_metric("mem-tracker.process.limit")["value"]) // 1024 ** 2
 
   def find_core_dump_dir(self):
     raise NotImplementedError()
@@ -915,7 +920,7 @@ class CmImpalad(Impalad):
       return int(pid)
 
   def find_process_mem_mb_limit(self):
-    return self._get_cm_config("impalad_memory_limit", value_type=int) / 1024 ** 2
+    return self._get_cm_config("impalad_memory_limit", value_type=int) // 1024 ** 2
 
   def find_core_dump_dir(self):
     return self._get_cm_config("core_dump_dir")

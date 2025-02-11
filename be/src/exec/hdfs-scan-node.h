@@ -104,9 +104,6 @@ class HdfsScanNode : public HdfsScanNodeBase {
       const std::vector<THdfsCompression::type>& compression_type, bool skipped = false)
       override;
 
-  /// Transfers all memory from 'pool' to 'scan_node_pool_'.
-  virtual void TransferToScanNodePool(MemPool* pool) override;
-
   virtual ExecutionModel getExecutionModel() const override {
     return NON_TASK_BASED_SYNC;
   }
@@ -158,7 +155,7 @@ class HdfsScanNode : public HdfsScanNodeBase {
 
   /// Compute the estimated memory consumption of a scanner thread in bytes for the
   /// purposes of deciding whether to start a new scanner thread.
-  int64_t EstimateScannerThreadMemConsumption() const;
+  int64_t EstimateScannerThreadMemConsumption(RuntimeState* state) const;
 
   /// Tries to spin up as many scanner threads as the quota allows. Called explicitly
   /// (e.g., when adding new ranges) or when threads are available for this scan node.

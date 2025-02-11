@@ -25,6 +25,7 @@
 #include "exec/parquet/parquet-data-converter.h"
 #include "exec/parquet/parquet-level-decoder.h"
 #include "exec/parquet/parquet-metadata-utils.h"
+#include "exec/parquet/parquet-struct-column-reader.h"
 #include "exec/scratch-tuple-batch.h"
 #include "parquet-collection-column-reader.h"
 #include "runtime/runtime-state.h"
@@ -85,10 +86,10 @@ class ScalarColumnReader : public BaseScalarColumnReader {
   virtual bool NeedsConversion() override { return NeedsConversionInline(); }
   virtual bool NeedsValidation() override { return NeedsValidationInline(); }
 
- protected:
   template <bool IN_COLLECTION>
   inline bool ReadValue(Tuple* tuple);
 
+ protected:
   /// Implementation of the ReadValueBatch() functions specialized for this
   /// column reader type. This function drives the reading of data pages and
   /// caching of rep/def levels. Once a data page and cached levels are available,
@@ -148,6 +149,14 @@ class ScalarColumnReader : public BaseScalarColumnReader {
   /// Read 'num_to_read' position values into a batch of tuples starting at 'tuple_mem'.
   void ReadPositions(
       int64_t num_to_read, int tuple_size, uint8_t* RESTRICT tuple_mem) RESTRICT;
+  void ReadItemPositions(
+      int64_t num_to_read, int tuple_size, uint8_t* RESTRICT tuple_mem) RESTRICT;
+  void ReadFilePositions(
+      int64_t num_to_read, int tuple_size, uint8_t* RESTRICT tuple_mem) RESTRICT;
+
+  /// Reads file position into 'file_pos' based on 'rep_level'.
+  /// It updates 'current_row_' when 'rep_level' is 0.
+  inline ALWAYS_INLINE void ReadFilePositionBatched(int16_t rep_level, int64_t* file_pos);
 
   virtual Status CreateDictionaryDecoder(
       uint8_t* values, int size, DictDecoderBase** decoder) override {
@@ -171,7 +180,7 @@ class ScalarColumnReader : public BaseScalarColumnReader {
     dict_decoder_init_ = false;
   }
 
-  virtual Status InitDataPage(uint8_t* data, int size) override;
+  virtual Status InitDataDecoder(uint8_t* data, int size) override;
 
   virtual bool SkipEncodedValuesInPage(int64_t num_values) override;
 
@@ -183,11 +192,6 @@ class ScalarColumnReader : public BaseScalarColumnReader {
   /// Force inlining - GCC does not always inline this into hot loops.
   template <Encoding::type ENCODING, bool NEEDS_CONVERSION>
   inline ALWAYS_INLINE bool ReadSlot(Tuple* tuple);
-
-  /// Reads position into 'pos' and updates 'pos_current_value_' based on 'rep_level'.
-  /// This helper is only used on the batched decoding path where we need to reset
-  /// 'pos_current_value_' to 0 based on 'rep_level'.
-  inline ALWAYS_INLINE void ReadPositionBatched(int16_t rep_level, int64_t* pos);
 
   /// Decode one value from *data into 'val' and advance *data. 'data_end' is one byte
   /// past the end of the buffer. Return false and set 'parse_error_' if there is an
@@ -245,7 +249,7 @@ class ScalarColumnReader : public BaseScalarColumnReader {
 
   void __attribute__((noinline)) SetBoolDecodeError() {
     parent_->parse_status_ = Status(TErrorCode::PARQUET_CORRUPT_BOOL_VALUE, filename(),
-        PrintThriftEnum(page_encoding_), col_chunk_reader_.stream()->file_offset());
+        PrintValue(page_encoding_), col_chunk_reader_.stream()->file_offset());
   }
 
   ParquetTimestampDecoder& GetTimestampDecoder() {
@@ -336,16 +340,21 @@ inline bool ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>
 
 // TODO: consider performing filter selectivity checks in this function.
 template <typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
-Status ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::InitDataPage(
+Status ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::InitDataDecoder(
     uint8_t* data, int size) {
   // Data can be empty if the column contains all NULLs
   DCHECK_GE(size, 0);
   DCHECK(slot_desc_ == nullptr || slot_desc_->type().type != TYPE_BOOLEAN)
       << "Bool has specialized impl";
-  page_encoding_ = col_chunk_reader_.encoding();
   if (!IsDictionaryEncoding(page_encoding_)
       && page_encoding_ != parquet::Encoding::PLAIN) {
     return GetUnsupportedDecodingError();
+  }
+
+  // PLAIN_DICTIONARY is deprecated in Parquet V2. It means the same as RLE_DICTIONARY
+  // so internally PLAIN_DICTIONARY can be used to represent both encodings.
+  if (page_encoding_ == parquet::Encoding::RLE_DICTIONARY) {
+    page_encoding_ = parquet::Encoding::PLAIN_DICTIONARY;
   }
 
   // If slot_desc_ is NULL, we don't need to decode any values so dict_decoder_ does
@@ -371,11 +380,10 @@ Status ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::InitDataPag
 }
 
 template <>
-Status ScalarColumnReader<bool, parquet::Type::BOOLEAN, true>::InitDataPage(
+Status ScalarColumnReader<bool, parquet::Type::BOOLEAN, true>::InitDataDecoder(
     uint8_t* data, int size) {
   // Data can be empty if the column contains all NULLs
   DCHECK_GE(size, 0);
-  page_encoding_ = col_chunk_reader_.encoding();
 
   /// Boolean decoding is delegated to 'bool_decoder_'.
   if (bool_decoder_->SetData(page_encoding_, data, size)) return Status::OK();
@@ -426,7 +434,7 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::ReadValue(
       }
       if (!continue_execution) return false;
     } else {
-      tuple->SetNull(null_indicator_offset_);
+      SetNullSlot(tuple);
     }
   }
   return NextLevels<IN_COLLECTION>();
@@ -459,7 +467,7 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::ReadValueBatc
 
     // Not materializing anything - skip decoding any levels and rely on the value
     // count from page metadata to return the correct number of rows.
-    if (!MATERIALIZED && !IN_COLLECTION) {
+    if (!MATERIALIZED && !IN_COLLECTION && file_pos_slot_desc() == nullptr) {
       // We cannot filter pages in this context.
       DCHECK(!DoesPageFiltering());
       int vals_to_add = min(num_buffered_values_, max_values - val_count);
@@ -472,7 +480,7 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::ReadValueBatc
     // nested collection into the top-level tuple returned by the scan, so we don't
     // care about the nesting structure unless the position slot is being populated,
     // or we filter out rows.
-    if (IN_COLLECTION && (pos_slot_desc_ != nullptr || DoesPageFiltering()) &&
+    if (IN_COLLECTION && (AnyPosSlotToBeFilled() || DoesPageFiltering()) &&
         !rep_levels_.CacheHasNext()) {
       parent_->parse_status_.MergeStatus(
             rep_levels_.CacheNextBatch(num_buffered_values_));
@@ -530,10 +538,10 @@ template <bool IN_COLLECTION, Encoding::type ENCODING, bool NEEDS_CONVERSION>
 bool ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::MaterializeValueBatch(
     int max_values, int tuple_size, uint8_t* RESTRICT tuple_mem,
     int* RESTRICT num_values) RESTRICT {
-  DCHECK(MATERIALIZED || IN_COLLECTION);
+  DCHECK(MATERIALIZED || IN_COLLECTION || file_pos_slot_desc() != nullptr);
   DCHECK_GT(num_buffered_values_, 0);
   DCHECK(def_levels_.CacheHasNext());
-  if (IN_COLLECTION && (pos_slot_desc_ != nullptr || DoesPageFiltering())) {
+  if (IN_COLLECTION && (AnyPosSlotToBeFilled() || DoesPageFiltering())) {
     DCHECK(rep_levels_.CacheHasNext());
   }
   int cache_start_idx = def_levels_.CacheCurrIdx();
@@ -558,10 +566,13 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::MaterializeVa
         // A containing repeated field is empty or NULL, skip the value.
         continue;
       }
-      if (pos_slot_desc_ != nullptr) {
-        ReadPositionBatched(rep_level,
+      if (pos_slot_desc()) {
+        ReadItemPositionBatched(rep_level,
             tuple->GetBigIntSlot(pos_slot_desc_->tuple_offset()));
       }
+    } else if (file_pos_slot_desc()) {
+      ReadFilePositionBatched(rep_level,
+          tuple->GetBigIntSlot(file_pos_slot_desc_->tuple_offset()));
     }
 
     if (MATERIALIZED) {
@@ -569,7 +580,7 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::MaterializeVa
         bool continue_execution = ReadSlot<ENCODING, NEEDS_CONVERSION>(tuple);
         if (UNLIKELY(!continue_execution)) return false;
       } else {
-        tuple->SetNull(null_indicator_offset_);
+        SetNullSlot(tuple);
       }
     }
     curr_tuple += tuple_size;
@@ -589,7 +600,7 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE,
     uint8_t* RESTRICT tuple_mem, int* RESTRICT num_values) RESTRICT {
   DCHECK_GT(num_buffered_values_, 0);
   if (max_rep_level_ > 0 &&
-      (pos_slot_desc_ != nullptr || DoesPageFiltering())) {
+      (AnyPosSlotToBeFilled() || DoesPageFiltering())) {
     DCHECK(rep_levels_.CacheHasNext());
   }
   int32_t def_level_repeats = def_levels_.NextRepeatedRunLength();
@@ -604,7 +615,7 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE,
     DCHECK_GT(max_rep_level_, 0) << "Only possible if in a collection.";
     // A containing repeated field is empty or NULL. We don't need to return any values
     // but need to advance any rep levels.
-    if (pos_slot_desc_ != nullptr) {
+    if (AnyPosSlotToBeFilled()) {
       num_def_levels_to_consume =
           min<uint32_t>(def_level_repeats, rep_levels_.CacheRemaining());
     } else {
@@ -614,7 +625,7 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE,
     // Cannot consume more levels than allowed by buffered input values and output space.
     num_def_levels_to_consume = min(min(
         num_buffered_values_, max_values), def_level_repeats);
-    if (pos_slot_desc_ != nullptr) {
+    if (max_rep_level_ > 0 && AnyPosSlotToBeFilled()) {
       num_def_levels_to_consume =
           min<uint32_t>(num_def_levels_to_consume, rep_levels_.CacheRemaining());
     }
@@ -624,7 +635,11 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE,
     int rows_remaining = RowsRemainingInCandidateRange();
     if (max_rep_level_ == 0) {
       num_def_levels_to_consume = min(num_def_levels_to_consume, rows_remaining);
-      current_row_ += num_def_levels_to_consume;
+      if (file_pos_slot_desc()) {
+        ReadFilePositions(num_def_levels_to_consume, tuple_size, tuple_mem);
+      } else {
+        current_row_ += num_def_levels_to_consume;
+      }
     } else {
       // We need to calculate how many 'primitive' values are there until the end
       // of the current candidate range. In the meantime we also fill the position
@@ -635,12 +650,12 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE,
   }
   // Now we have 'num_def_levels_to_consume' set, let's read the slots.
   if (def_level < def_level_of_immediate_repeated_ancestor()) {
-    if (pos_slot_desc_ != nullptr && !DoesPageFiltering()) {
+    if (AnyPosSlotToBeFilled() && !DoesPageFiltering()) {
       rep_levels_.CacheSkipLevels(num_def_levels_to_consume);
     }
     *num_values = 0;
   } else {
-    if (pos_slot_desc_ != nullptr && !DoesPageFiltering()) {
+    if (AnyPosSlotToBeFilled() && !DoesPageFiltering()) {
       ReadPositions(num_def_levels_to_consume, tuple_size, tuple_mem);
     }
     if (MATERIALIZED) {
@@ -705,7 +720,7 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::ReadSlot(
     if (UNLIKELY(!parent_->parse_status_.ok())) return false;
     // The value is invalid but execution should continue - set the null indicator and
     // skip conversion.
-    tuple->SetNull(null_indicator_offset_);
+    SetNullSlot(tuple);
     return true;
   }
   return true;
@@ -739,7 +754,7 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::ReadAndConver
       if (UNLIKELY(!parent_->parse_status_.ok())) return false;
       // The value or the conversion is invalid but execution should continue - set the
       // null indicator.
-      tuple->SetNull(null_indicator_offset_);
+      SetNullSlot(tuple);
       continue;
     }
   }
@@ -763,7 +778,7 @@ bool ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::ReadSlotsNoCo
         if (UNLIKELY(!parent_->parse_status_.ok())) return false;
         // The value is invalid but execution should continue - set the null indicator and
         // skip conversion.
-        tuple->SetNull(null_indicator_offset_);
+        SetNullSlot(tuple);
       }
     }
   }
@@ -886,21 +901,52 @@ bool ScalarColumnReader<bool, parquet::Type::BOOLEAN, true>::DecodeValues(
 }
 
 template <typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
-void ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::ReadPositionBatched(
-    int16_t rep_level, int64_t* pos) {
-  // Reset position counter if we are at the start of a new parent collection.
-  if (rep_level <= max_rep_level() - 1) pos_current_value_ = 0;
-  *pos = pos_current_value_++;
+void ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::
+    ReadFilePositionBatched(int16_t rep_level, int64_t* file_pos) {
+  *file_pos = FilePositionOfCurrentRow();
 }
 
 template <typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
 void ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::ReadPositions(
     int64_t num_to_read, int tuple_size, uint8_t* RESTRICT tuple_mem) RESTRICT {
-  const int pos_slot_offset = pos_slot_desc()->tuple_offset();
-  void* first_slot = reinterpret_cast<Tuple*>(tuple_mem)->GetSlot(pos_slot_offset);
-  StrideWriter<int64_t> out{reinterpret_cast<int64_t*>(first_slot), tuple_size};
+  DCHECK(file_pos_slot_desc() != nullptr || pos_slot_desc() != nullptr);
+  DCHECK(file_pos_slot_desc() == nullptr || pos_slot_desc() == nullptr);
+  if (file_pos_slot_desc()) {
+    ReadFilePositions(num_to_read, tuple_size, tuple_mem);
+  } else {
+    ReadItemPositions(num_to_read, tuple_size, tuple_mem);
+  }
+}
+
+template <typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
+void ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::ReadFilePositions(
+    int64_t num_to_read, int tuple_size, uint8_t* RESTRICT tuple_mem) RESTRICT {
+  DCHECK(file_pos_slot_desc() != nullptr);
+  DCHECK(pos_slot_desc() == nullptr);
+  int64_t* file_pos_slot = reinterpret_cast<Tuple*>(tuple_mem)->GetBigIntSlot(
+      file_pos_slot_desc()->tuple_offset());
+  StrideWriter<int64_t> file_out{reinterpret_cast<int64_t*>(file_pos_slot), tuple_size};
   for (int64_t i = 0; i < num_to_read; ++i) {
-    ReadPositionBatched(rep_levels_.CacheGetNext(), out.Advance());
+    int64_t* file_pos = file_out.Advance();
+    uint8_t rep_level = max_rep_level() > 0 ? rep_levels_.CacheGetNext() : 0;
+    if (rep_level == 0) ++current_row_;
+    ReadFilePositionBatched(rep_level, file_pos);
+  }
+}
+
+template <typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
+void ScalarColumnReader<InternalType, PARQUET_TYPE, MATERIALIZED>::ReadItemPositions(
+    int64_t num_to_read, int tuple_size, uint8_t* RESTRICT tuple_mem) RESTRICT {
+  DCHECK(file_pos_slot_desc() == nullptr);
+  DCHECK(pos_slot_desc() != nullptr);
+  int64_t* pos_slot = reinterpret_cast<Tuple*>(tuple_mem)->GetBigIntSlot(
+      pos_slot_desc()->tuple_offset());
+  StrideWriter<int64_t> out{reinterpret_cast<int64_t*>(pos_slot), tuple_size};
+  for (int64_t i = 0; i < num_to_read; ++i) {
+    int64_t* pos = out.Advance();
+    uint8_t rep_level = max_rep_level() > 0 ? rep_levels_.CacheGetNext() : 0;
+    if (rep_level == 0) ++current_row_;
+    ReadItemPositionBatched(rep_level, pos);
   }
 }
 
@@ -998,7 +1044,8 @@ void BaseScalarColumnReader::CreateSubRanges(vector<ScanRange::SubRange>* sub_ra
 }
 
 Status BaseScalarColumnReader::Reset(const HdfsFileDesc& file_desc,
-    const parquet::ColumnChunk& col_chunk, int row_group_idx) {
+    const parquet::ColumnChunk& col_chunk, int row_group_idx,
+    int64_t row_group_first_row) {
   // Ensure metadata is valid before using it to initialize the reader.
   RETURN_IF_ERROR(ParquetMetadataUtils::ValidateRowGroupColumn(parent_->file_metadata_,
       parent_->filename(), row_group_idx, col_idx(), schema_element(),
@@ -1013,6 +1060,8 @@ Status BaseScalarColumnReader::Reset(const HdfsFileDesc& file_desc,
   // See ColumnReader constructor.
   rep_level_ = max_rep_level() == 0 ? 0 : ParquetLevel::INVALID_LEVEL;
   pos_current_value_ = ParquetLevel::INVALID_POS;
+  row_group_first_row_ = row_group_first_row;
+  current_row_ = -1;
 
   vector<ScanRange::SubRange> sub_ranges;
   CreateSubRanges(&sub_ranges);
@@ -1099,34 +1148,20 @@ Status BaseScalarColumnReader::ReadDataPage() {
     return Status::OK();
   }
 
-  bool eos;
-  int data_size;
-  RETURN_IF_ERROR(col_chunk_reader_.ReadNextDataPage(&eos, &data_, &data_size));
-  if (eos) return HandleTooEarlyEos();
-  data_end_ = data_ + data_size;
-  const parquet::PageHeader& current_page_header = col_chunk_reader_.CurrentPageHeader();
-  int num_values = current_page_header.data_page_header.num_values;
-  if (num_values < 0) {
-    return Status(Substitute("Error reading data page in Parquet file '$0'. "
-          "Invalid number of values in metadata: $1", filename(), num_values));
-  }
-  num_buffered_values_ = num_values;
+  // Read the next header, return if not found.
+  RETURN_IF_ERROR(col_chunk_reader_.ReadNextDataPageHeader(&num_buffered_values_));
+  if (num_buffered_values_ == 0) return HandleTooEarlyEos();
+  DCHECK_GT(num_buffered_values_, 0);
+
+  // Read the data in the data page.
+  ParquetColumnChunkReader::DataPageInfo page;
+  RETURN_IF_ERROR(col_chunk_reader_.ReadDataPageData(&page));
+  DCHECK(page.is_valid);
+
   num_values_read_ += num_buffered_values_;
 
-  /// TODO: Move the level decoder initialisation to ParquetPageReader to abstract away
-  /// the differences between Parquet header V1 and V2.
-  // Initialize the repetition level data
-  RETURN_IF_ERROR(rep_levels_.Init(filename(),
-        &current_page_header.data_page_header.repetition_level_encoding,
-        parent_->perm_pool_.get(), parent_->state_->batch_size(), max_rep_level(), &data_,
-        &data_size));
-  // Initialize the definition level data
-  RETURN_IF_ERROR(def_levels_.Init(filename(),
-        &current_page_header.data_page_header.definition_level_encoding,
-        parent_->perm_pool_.get(), parent_->state_->batch_size(), max_def_level(), &data_,
-        &data_size));
-  // Data can be empty if the column contains all NULLs
-  RETURN_IF_ERROR(InitDataPage(data_, data_size));
+  RETURN_IF_ERROR(InitDataPageDecoders(page));
+
   // Skip rows if needed.
   RETURN_IF_ERROR(StartPageFiltering());
 
@@ -1151,45 +1186,46 @@ Status BaseScalarColumnReader::ReadNextDataPageHeader() {
     return Status::OK();
   }
 
-  bool eos;
-  int data_size;
-  RETURN_IF_ERROR(col_chunk_reader_.ReadNextDataPage(&eos, &data_, &data_size,
-      false /*Read next data page's header only*/));
-  if (eos) return HandleTooEarlyEos();
-  const parquet::PageHeader& current_page_header = col_chunk_reader_.CurrentPageHeader();
-  int num_values = current_page_header.data_page_header.num_values;
-  if (UNLIKELY(num_values < 0)) {
-    return Status(Substitute("Error reading data page in Parquet file '$0'. "
-                             "Invalid number of values in metadata: $1",
-        filename(), num_values));
-  }
-  num_buffered_values_ = num_values;
+  RETURN_IF_ERROR(col_chunk_reader_.ReadNextDataPageHeader(&num_buffered_values_));
+  if (num_buffered_values_ == 0) return HandleTooEarlyEos();
+  DCHECK_GT(num_buffered_values_, 0);
+
   num_values_read_ += num_buffered_values_;
   if (parent_->candidate_ranges_.empty()) COUNTER_ADD(parent_->num_pages_counter_, 1);
   return Status::OK();
 }
 
 Status BaseScalarColumnReader::ReadCurrentDataPage() {
-  int data_size;
-  RETURN_IF_ERROR(col_chunk_reader_.ReadDataPageData(&data_, &data_size));
-  data_end_ = data_ + data_size;
-  const parquet::PageHeader& current_page_header = col_chunk_reader_.CurrentPageHeader();
-  /// TODO: Move the level decoder initialisation to ParquetPageReader to abstract away
-  /// the differences between Parquet header V1 and V2.
-  // Initialize the repetition level data
-  RETURN_IF_ERROR(rep_levels_.Init(filename(),
-      &current_page_header.data_page_header.repetition_level_encoding,
-      parent_->perm_pool_.get(), parent_->state_->batch_size(), max_rep_level(), &data_,
-      &data_size));
-  // Initialize the definition level data
-  RETURN_IF_ERROR(def_levels_.Init(filename(),
-      &current_page_header.data_page_header.definition_level_encoding,
-      parent_->perm_pool_.get(), parent_->state_->batch_size(), max_def_level(), &data_,
-      &data_size));
-  // Data can be empty if the column contains all NULLs
-  RETURN_IF_ERROR(InitDataPage(data_, data_size));
+  ParquetColumnChunkReader::DataPageInfo page;
+  RETURN_IF_ERROR(col_chunk_reader_.ReadDataPageData(&page));
+  DCHECK(page.is_valid);
+
+  RETURN_IF_ERROR(InitDataPageDecoders(page));
+
   // Skip rows if needed.
   RETURN_IF_ERROR(StartPageFiltering());
+  return Status::OK();
+}
+
+Status BaseScalarColumnReader::InitDataPageDecoders(
+    const ParquetColumnChunkReader::DataPageInfo& page) {
+  // Initialize the repetition level data
+  DCHECK(page.rep_level_encoding == Encoding::RLE || page.rep_level_size == 0 );
+  RETURN_IF_ERROR(rep_levels_.Init(filename(),
+      parent_->perm_pool_.get(), parent_->state_->batch_size(), max_rep_level(),
+      page.rep_level_ptr, page.rep_level_size));
+
+  // Initialize the definition level data
+  DCHECK(page.def_level_encoding == Encoding::RLE || page.def_level_size == 0 );
+  RETURN_IF_ERROR(def_levels_.Init(filename(),
+      parent_->perm_pool_.get(), parent_->state_->batch_size(), max_def_level(),
+      page.def_level_ptr, page.def_level_size));
+
+  page_encoding_ = page.data_encoding;
+  data_ = page.data_ptr;
+  data_end_ = data_ + page.data_size;
+  // Data can be empty if the column contains all NULLs
+  RETURN_IF_ERROR(InitDataDecoder(page.data_ptr, page.data_size));
   return Status::OK();
 }
 
@@ -1270,7 +1306,8 @@ Status BaseScalarColumnReader::StartPageFiltering() {
     int64_t skip_rows = range_start - current_row_ - 1;
     int64_t remaining = 0;
     if (!SkipTopLevelRows(skip_rows, &remaining)) {
-      return Status(Substitute("Couldn't skip rows in file $0.", filename()));
+      return Status(ErrorMsg(TErrorCode::PARQUET_ROWS_SKIPPING,
+          schema_element().name, filename()));
     }
     DCHECK_EQ(remaining, 0);
     DCHECK_EQ(current_row_, range_start - 1);
@@ -1308,12 +1345,18 @@ bool BaseScalarColumnReader::SkipTopLevelRows(int64_t num_rows, int64_t* remaini
       int repeated_run_length = def_levels_.NextRepeatedRunLength();
       if (repeated_run_length > 0) {
         int read_count = min<int64_t>(num_rows - i, repeated_run_length);
+        // IMPALA-11134: there can be a mismatch between page_header.num_values and
+        // encoded def levels in old Parquet files.
+        read_count = min(num_buffered_values_, read_count);
         int16_t def_level = def_levels_.GetRepeatedValue(read_count);
         if (def_level >= max_def_level_) num_values_to_skip += read_count;
         i += read_count;
         num_buffered_values_ -= read_count;
       } else if (def_levels_.CacheHasNext()) {
         int read_count = min<int64_t>(num_rows - i, def_levels_.CacheRemaining());
+        // IMPALA-11134: there can be a mismatch between page_header.num_values and
+        // encoded def levels in old Parquet files.
+        read_count = min(num_buffered_values_, read_count);
         for (int j = 0; j < read_count; ++j) {
           if (def_levels_.CacheGetNext() >= max_def_level_) ++num_values_to_skip;
         }
@@ -1385,18 +1428,30 @@ int BaseScalarColumnReader::FillPositionsInCandidateRange(int rows_remaining,
     pos_slot = reinterpret_cast<Tuple*>(tuple_mem)->GetBigIntSlot(pos_slot_offset);
   }
   StrideWriter<int64_t> pos_writer{pos_slot, tuple_size};
+
+  int64_t *file_pos_slot = nullptr;
+  if (file_pos_slot_desc_ != nullptr) {
+    const int file_pos_slot_offset = file_pos_slot_desc()->tuple_offset();
+    file_pos_slot = reinterpret_cast<Tuple*>(tuple_mem)->GetBigIntSlot(
+        file_pos_slot_offset);
+  }
+  StrideWriter<int64_t> file_pos_writer{file_pos_slot, tuple_size};
   while (rep_levels_.CacheRemaining() && row_count <= rows_remaining &&
          val_count < max_values) {
     if (row_count == rows_remaining && rep_levels_.CachePeekNext() == 0) break;
     int rep_level = rep_levels_.CacheGetNext();
-    if (rep_level == 0) ++row_count;
+    if (rep_level == 0) {
+      ++row_count;
+      ++current_row_;
+    }
     ++val_count;
-    if (pos_writer.IsValid()) {
+    if (file_pos_writer.IsValid()) {
+      *file_pos_writer.Advance() = FilePositionOfCurrentRow();
+    } else if (pos_writer.IsValid()) {
       if (rep_level <= max_rep_level() - 1) pos_current_value_ = 0;
       *pos_writer.Advance() = pos_current_value_++;
     }
   }
-  current_row_ += row_count;
   return val_count;
 }
 
@@ -1447,7 +1502,7 @@ bool BaseScalarColumnReader::JumpToNextPage() {
 Status BaseScalarColumnReader::GetUnsupportedDecodingError() {
   return Status(Substitute(
       "File '$0' is corrupt: unexpected encoding: $1 for data page of column '$2'.",
-      filename(), PrintThriftEnum(page_encoding_), schema_element().name));
+      filename(), PrintValue(page_encoding_), schema_element().name));
 }
 
 Status BaseScalarColumnReader::LogCorruptNumValuesInMetadataError() {
@@ -1516,6 +1571,8 @@ void BaseScalarColumnReader::SetLevelDecodeError(
 /// For page filtering, we keep track of first and last page indexes and keep
 /// traversing to next page until we find a page that contains 'skip_row_id'.
 /// At that point, we can just skip to the required row id.
+/// If the page of 'skip_row_id' is not a candidate page, we will stop at the
+/// next candidate page and 'skip_row_id' is skipped by the way.
 /// Difference between scenario 2 and 3 is that in scenario 2, we end up
 /// decompressing all the pages being skipped, whereas in scenario 3 we only
 /// decompress pages required and avoid decompression needed. This is possible
@@ -1531,22 +1588,23 @@ bool BaseScalarColumnReader::SkipRowsInternal(int64_t num_rows, int64_t skip_row
         return false;
       }
     }
-    int last_row_idx = LastRowIdxInCurrentPage();
-    // Keep advancing until we hit reach required page containing 'skip_row_id'
-    while (skip_row_id > last_row_idx) {
+    // Keep advancing until we hit reach required page containing 'skip_row_id' or
+    // jump over it if that page is not a candidate page.
+    while (skip_row_id > LastRowIdxInCurrentPage()) {
       COUNTER_ADD(parent_->num_pages_skipped_by_late_materialization_counter_, 1);
       if (UNLIKELY(!JumpToNextPage())) {
         return false;
       }
-      last_row_idx = LastRowIdxInCurrentPage();
     }
-    DCHECK_GE(skip_row_id, FirstRowIdxInCurrentPage());
     int64_t last_row = LastProcessedRow();
     int64_t remaining = 0;
-    // Skip to the required row id within the page.
-    if (last_row < skip_row_id) {
-      if (UNLIKELY(!SkipTopLevelRows(skip_row_id - last_row, &remaining))) {
-        return false;
+    if (skip_row_id >= FirstRowIdxInCurrentPage()) {
+      // Skip to the required row id within the page. Only needs this when row id locates
+      // in current page.
+      if (last_row < skip_row_id) {
+        if (UNLIKELY(!SkipTopLevelRows(skip_row_id - last_row, &remaining))) {
+          return false;
+        }
       }
     }
     // also need to adjust 'candidate_row_ranges' as we skipped to new row id.
@@ -1582,23 +1640,18 @@ bool BaseScalarColumnReader::SkipRowsInternal(int64_t num_rows, int64_t skip_row
       if (!AdvanceNextPageHeader()) {
         return false;
       }
-      const parquet::PageHeader& current_page_header =
-          col_chunk_reader_.CurrentPageHeader();
-      int32_t current_page_values = current_page_header.data_page_header.num_values;
-      if (UNLIKELY(current_page_values <= 0)) {
-        return false;
-      }
+      DCHECK_GT(num_buffered_values_, 0);
       // Keep advancing to next page header if rows to be skipped are more than number
       // of values in the page. Note we will just be reading headers and skipping
       // pages without decompressing them as we advance.
-      while (num_rows > current_page_values) {
+      while (num_rows > num_buffered_values_) {
         COUNTER_ADD(parent_->num_pages_skipped_by_late_materialization_counter_, 1);
-        num_rows -= current_page_values;
+        num_rows -= num_buffered_values_;
+        current_row_ += num_buffered_values_;
         if (!col_chunk_reader_.SkipPageData().ok() || !AdvanceNextPageHeader()) {
           return false;
         }
-        current_page_values =
-            col_chunk_reader_.CurrentPageHeader().data_page_header.num_values;
+        DCHECK_GT(num_buffered_values_, 0);
       }
       // Read the data page (includes decompressing them if required).
       Status page_read = ReadCurrentDataPage();
@@ -1720,6 +1773,8 @@ ParquetColumnReader* ParquetColumnReader::Create(const SchemaNode& node,
             parent, node, slot_desc);
       case TYPE_DECIMAL:
         return CreateDecimalColumnReader(node, slot_desc, parent);
+      case TYPE_STRUCT:
+        return new StructColumnReader(parent, node, slot_desc);
       default:
         DCHECK(false) << slot_desc->type().DebugString();
         return nullptr;

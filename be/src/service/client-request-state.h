@@ -21,11 +21,14 @@
 #include "common/object-pool.h"
 #include "common/status.h"
 #include "exec/catalog-op-executor.h"
+#include "rpc/rpc-trace.h"
 #include "service/child-query.h"
 #include "service/impala-server.h"
 #include "service/query-result-set.h"
+#include "runtime/hdfs-fs-cache.h"
 #include "util/condition-variable.h"
 #include "util/runtime-profile.h"
+#include "util/runtime-profile-counters.h"
 #include "gen-cpp/Frontend_types.h"
 #include "gen-cpp/ImpalaHiveServer2Service.h"
 
@@ -76,8 +79,7 @@ class QuerySchedulePB;
 class ClientRequestState {
  public:
   ClientRequestState(const TQueryCtx& query_ctx, Frontend* frontend, ImpalaServer* server,
-      std::shared_ptr<ImpalaServer::SessionState> session, TExecRequest* exec_request,
-      QueryDriver* query_driver);
+      std::shared_ptr<ImpalaServer::SessionState> session, QueryDriver* query_driver);
 
   ~ClientRequestState();
 
@@ -85,13 +87,21 @@ class ClientRequestState {
 
   enum class RetryState { RETRYING, RETRIED, NOT_RETRIED };
 
+  /// Initialize TExecRequest. Prior to this, exec_request() returns a place-holder.
+  void SetExecRequest(const TExecRequest* exec_request) {
+    DCHECK(exec_request_.Load()->stmt_type == TStmtType::UNKNOWN);
+    exec_request_.Store(exec_request);
+  }
+
   /// Sets the profile that is produced by the frontend. The frontend creates the
   /// profile during planning and returns it to the backend via TExecRequest,
   /// which then sets the frontend profile.
-  void SetFrontendProfile(TRuntimeProfileNode profile);
+  void SetFrontendProfile(const TExecRequest& exec_request);
 
   /// Sets the coordinator time that the plan request was submitted at so that
-  /// the backend timeline starts where the frontend timeline ends
+  /// the backend timeline starts where the frontend timeline ends.
+  /// remote_submit_time will be ignored and replaced with internal
+  /// MonotonicStopWatch::Now() if the later is greater than the former.
   void SetRemoteSubmitTime(int64_t remote_submit_time);
 
   /// Based on query type, this either initiates execution of this ClientRequestState's
@@ -165,11 +175,18 @@ class ClientRequestState {
   /// If current status is already != ok, no update is made (we preserve the first error)
   /// If called with a non-ok argument, the expectation is that the query will be aborted
   /// quickly.
+  /// If 'log_error' is true, log the error when query status become non-ok. This is used
+  /// when running DDLs in async threads. The async thread should take care of the logging
+  /// since the main thread only checks whether the thread creation succeeds.
+  /// E.g. ExecDdlRequest() returns the query status in sync mode, but returns the thread
+  /// creation status in async mode. So LOG_AND_RETURN_IF_ERROR(ExecDdlRequest()) doesn't
+  /// log the query failure in async mode.
   /// Returns the status argument (so we can write
   /// RETURN_IF_ERROR(UpdateQueryStatus(SomeOperation())).
   /// Does not take lock_, but requires it: caller must ensure lock_
   /// is taken before calling UpdateQueryStatus
-  Status UpdateQueryStatus(const Status& status) WARN_UNUSED_RESULT;
+  Status UpdateQueryStatus(const Status& status, bool log_error=false)
+      WARN_UNUSED_RESULT;
 
   /// Cancels the child queries and the coordinator with the given cause.
   /// If cause is NULL, it assumes this was deliberately cancelled by the user while in
@@ -179,19 +196,13 @@ class ClientRequestState {
   /// until cancellaton of 'coord_' finishes and it is finalized.
   /// 'wait_until_finalized' should only used by the single thread finalizing the query,
   /// to avoid many threads piling up waiting for query cancellation.
-  ///
-  /// Only returns an error if 'check_inflight' is true and the query is not yet
-  /// in-flight. Otherwise, proceed and return Status::OK() even if the query isn't
-  /// in-flight (for cleaning up after an error on the query issuing path).
-  Status Cancel(bool check_inflight, const Status* cause, bool wait_until_finalized=false);
+  void Cancel(const Status* cause, bool wait_until_finalized=false);
 
   /// This is called when the query is done (finished, cancelled, or failed). This runs
   /// synchronously within the last client RPC and does any work that is required before
   /// the query is finished from the client's point of view, including cancelling the
-  /// query with 'cause'. Returns an error if 'check_inflight' is true and the query is
-  /// not yet in-flight, or if another thread has already started finalizing the query.
-  /// Takes lock_: callers must not hold lock() before calling.
-  Status Finalize(bool check_inflight, const Status* cause);
+  /// query with 'cause'. Takes lock_: callers must not hold lock() before calling.
+  void Finalize(const Status* cause);
 
   /// Sets the API-specific (Beeswax, HS2) result cache and its size bound.
   /// The given cache is owned by this client request state, even if an error is returned.
@@ -231,11 +242,16 @@ class ClientRequestState {
   /// Queries are run and authorized on behalf of the effective_user.
   const std::string& effective_user() const;
   const std::string& connected_user() const { return query_ctx_.session.connected_user; }
-  bool user_has_profile_access() const { return user_has_profile_access_; }
+  bool user_has_profile_access() const { return user_has_profile_access_.Load(); }
   const std::string& do_as_user() const { return query_ctx_.session.delegated_user; }
   TSessionType::type session_type() const { return query_ctx_.session.session_type; }
   const TUniqueId& session_id() const { return query_ctx_.session.session_id; }
   const std::string& default_db() const { return query_ctx_.session.database; }
+  const std::string& redacted_sql() const {
+    return
+      query_ctx_.client_request.__isset.redacted_stmt ?
+      query_ctx_.client_request.redacted_stmt : query_ctx_.client_request.stmt;
+  }
   bool eos() const { return eos_.Load(); }
   const QuerySchedulePB* schedule() const { return schedule_.get(); }
 
@@ -250,6 +266,14 @@ class ClientRequestState {
   /// control.
   /// Admission control resource pool associated with this query.
   std::string request_pool() const {
+    if (is_planning_done_.load()) {
+      const TExecRequest& exec_req = exec_request();
+      if (exec_req.query_exec_request.query_ctx.__isset.request_pool) {
+        // If the request pool has been set by Planner, return the request pool selected
+        // by Planner.
+        return exec_req.query_exec_request.query_ctx.request_pool;
+      }
+    }
     return query_ctx_.__isset.request_pool ? query_ctx_.request_pool : "";
   }
 
@@ -259,25 +283,38 @@ class ClientRequestState {
   bool returns_result_set() { return !result_metadata_.columns.empty(); }
   const TResultSetMetadata* result_metadata() const { return &result_metadata_; }
   const TUniqueId& query_id() const { return query_ctx_.query_id; }
+
+  /// Return values from counters. See explanation on declaration of
+  /// num_rows_fetched_counter_, row_materialization_rate_, and row_materialization_timer_
+  /// for details.
+  int64_t num_rows_fetched_counter() const;
+  int64_t row_materialization_rate() const;
+  int64_t row_materialization_timer() const;
+
   /// Returns the TExecRequest for the query associated with this ClientRequestState.
-  /// Contents are only valid after InitExecRequest(TQueryCtx) initializes the
+  /// Contents are a place-holder until GetExecRequest(TQueryCtx) initializes the
   /// TExecRequest.
   const TExecRequest& exec_request() const {
-    DCHECK(exec_request_ != nullptr);
-    return *exec_request_;
+    DCHECK(exec_request_.Load() != nullptr);
+    return *exec_request_.Load();
   }
-  TStmtType::type stmt_type() const { return exec_request_->stmt_type; }
+  TStmtType::type stmt_type() const { return exec_request().stmt_type; }
   TCatalogOpType::type catalog_op_type() const {
-    return exec_request_->catalog_op_request.op_type;
+    return exec_request().catalog_op_request.op_type;
   }
   TDdlType::type ddl_type() const {
-    return exec_request_->catalog_op_request.ddl_params.ddl_type;
+    return exec_request().catalog_op_request.ddl_params.ddl_type;
   }
   std::mutex* lock() { return &lock_; }
   std::mutex* fetch_rows_lock() { return &fetch_rows_lock_; }
 
   /// ExecState is stored using an AtomicEnum, so reads do not require holding lock_.
   ExecState exec_state() const { return exec_state_.Load(); }
+
+  /// WaitForCompletionExecState waits until the state reaches FINISHED or ERROR
+  /// or it reaches the timeout. The timeout is specified using the long_polling_time_ms
+  /// query option.
+  void WaitForCompletionExecState();
 
   /// RetryState is stored using an AtomicEnum, so reads do not require holding lock_.
   RetryState retry_state() const { return retry_state_.Load(); }
@@ -292,21 +329,44 @@ class ClientRequestState {
   const Status& query_status() const { return query_status_; }
   void set_result_metadata(const TResultSetMetadata& md) { result_metadata_ = md; }
   void set_user_profile_access(bool user_has_profile_access) {
-    user_has_profile_access_ = user_has_profile_access;
+    user_has_profile_access_.Store(user_has_profile_access);
   }
   const RuntimeProfile* profile() const { return profile_; }
   const RuntimeProfile* summary_profile() const { return summary_profile_; }
+  const RuntimeProfile* frontend_profile() const { return frontend_profile_; }
   int64_t start_time_us() const { return start_time_us_; }
   int64_t end_time_us() const { return end_time_us_.Load(); }
   const std::string& sql_stmt() const { return query_ctx_.client_request.stmt; }
   const TQueryOptions& query_options() const {
     return query_ctx_.client_request.query_options;
   }
+  bool hs2_metadata_op() const { return query_ctx_.client_request.hs2_metadata_op; }
   /// Returns 0:0 if this is a root query
   TUniqueId parent_query_id() const { return query_ctx_.parent_query_id; }
+  const vector<TTableName>& tables() const { return exec_request().tables; }
+
+  const vector<std::string>& select_columns() const {
+    return exec_request().select_columns;
+  }
+
+  const vector<std::string>& where_columns() const {
+    return exec_request().where_columns;
+  }
+
+  const vector<std::string>& join_columns() const {
+    return exec_request().join_columns;
+  }
+
+  const vector<std::string>& aggregate_columns() const {
+    return exec_request().aggregate_columns;
+  }
+
+  const vector<std::string>& orderby_columns() const {
+    return exec_request().orderby_columns;
+  }
 
   const std::vector<std::string>& GetAnalysisWarnings() const {
-    return exec_request_->analysis_warnings;
+    return exec_request().analysis_warnings;
   }
 
   inline int64_t last_active_ms() const {
@@ -318,6 +378,15 @@ class ClientRequestState {
   inline bool is_active() const {
     std::lock_guard<std::mutex> l(expiration_data_lock_);
     return ref_count_ > 0;
+  }
+
+  inline bool is_inflight() const {
+    // If the query is in 'inflight_queries' it means that the query has actually started
+    // executing. It is ok if the query is removed from 'inflight_queries' later, so we
+    // can release the session lock before returning.
+    std::lock_guard<std::mutex> session_lock(session_->lock);
+    return session_->inflight_queries.find(query_id())
+        != session_->inflight_queries.end();
   }
 
   bool is_expired() const {
@@ -343,6 +412,23 @@ class ClientRequestState {
 
   /// Returns the max size of the result_cache_ in number of rows.
   int64_t result_cache_max_size() const { return result_cache_max_size_; }
+
+  /// Returns duration of the query is waiting in the queue.
+  int64_t wait_time_ms() const {
+    // wait_start_time_ms_ is zero iff the query is not require queuing.
+    if (wait_start_time_ms_ == 0) return 0;
+    // wait_end_time_ms_ might still be zero if the query is not yet dequeue.
+    // Use the current Unix time in that case. Note that the duration can be
+    // negative if a system clock reset happened after the query was initiated.
+    int64_t wait_end_time_ms = wait_end_time_ms_ > 0LL ?
+        wait_end_time_ms_ : MonotonicMillis();
+    return wait_end_time_ms - wait_start_time_ms_;
+  }
+
+  /// Returns the time taken for the client to fetch all rows.
+  int64_t client_fetch_wait_time_ns() const {
+    return client_wait_timer_->value();
+  }
 
   /// Sets the RetryState to RETRYING. Updates the runtime profile with the retry status
   /// and cause. Must be called while 'lock_' is held. Sets the query_status_. Future
@@ -425,6 +511,33 @@ class ClientRequestState {
   void SetBlacklistedExecutorAddresses(
       std::unordered_set<NetworkAddressPB>& executor_addresses);
 
+  /// Mark planning as done for this request.
+  /// This function should be called after QueryDriver::RunFrontendPlanner() is
+  /// returned without error.
+  void SetPlanningDone() { is_planning_done_.store(true); }
+
+  // Register an RPC context with the query so that RPC metrics can be
+  // accumulated at the query level and shown in the query profile
+  void RegisterRPC();
+  // Unregister any RPCs that have been released by their RPC thread and
+  // accumulate their metrics into the profile timers
+  void UnRegisterCompletedRPCs();
+  // Unregister any remaining RPCs without recording timing in this query.
+  // RPC threads will usually have completed by this point.
+  void UnRegisterRemainingRPCs();
+  // Copy pending RPCs for a retried query
+  void CopyRPCs(ClientRequestState& from_request);
+
+  // Update the profile counter 'GetInFlightProfileTimeStats' which is the summary stats
+  // of time spent in dumping the profile before the query is archived.
+  void UpdateGetInFlightProfileTime(int64_t elapsed_time_ns) {
+    get_inflight_profile_time_stats_->UpdateCounter(elapsed_time_ns);
+  }
+  // Update the profile counter 'ClientFetchLockWaitTimer' which is the cumulative time
+  // that client fetch requests waiting for locks.
+  void AddClientFetchLockWaitTime(int64_t lock_wait_time_ns) {
+    client_fetch_lock_wait_timer_->Add(lock_wait_time_ns);
+  }
  protected:
   /// Updates the end_time_us_ of this query if it isn't set. The end time is determined
   /// when this function is called for the first time, calling it multiple times does not
@@ -463,6 +576,9 @@ class ClientRequestState {
   /// True if there was a transaction and it got committed or aborted.
   bool transaction_closed_ = false;
 
+  /// Indicates whether the planning is done for the request.
+  std::atomic_bool is_planning_done_{false};
+
   /// Executor for any child queries (e.g. compute stats subqueries). Always non-NULL.
   const boost::scoped_ptr<ChildQueryExecutor> child_query_executor_;
 
@@ -480,6 +596,13 @@ class ClientRequestState {
   /// Condition variable used to signal the threads that are blocked on Wait() to finish.
   /// Callers are expected to use BlockOnWait() for Wait() to finish.
   ConditionVariable block_on_wait_cv_;
+
+  /// Lock used to synchronize access for exec_state_cv_. Some callers hold lock_ while
+  /// acquiring this lock, so if lock_ is needed it must be acquired before this lock.
+  std::mutex exec_state_lock_;
+
+  /// Condition variable used to signal threads that are watching the exec_state_.
+  ConditionVariable exec_state_cv_;
 
   /// Wait condition used in conjunction with block_on_wait_cv_.
   bool is_wait_done_ = false;
@@ -573,9 +696,30 @@ class ClientRequestState {
   RuntimeProfile::Counter* row_materialization_rate_;
 
   /// Tracks how long we are idle waiting for a client to fetch rows.
+  /// Keep summary statistics to get a sense for the number of fetch calls and
+  /// the typical round-trip time.
   RuntimeProfile::Counter* client_wait_timer_;
+  RuntimeProfile::SummaryStatsCounter* client_wait_time_stats_;
   /// Timer to track idle time for the above counter.
   MonotonicStopWatch client_wait_sw_;
+  int64_t last_client_wait_time_ = 0;
+
+  // Tracks time spent in dumping the profile before the query is archived.
+  RuntimeProfile::SummaryStatsCounter* get_inflight_profile_time_stats_;
+  // Tracks time client fetch requests waiting for locks.
+  RuntimeProfile::Counter* client_fetch_lock_wait_timer_;
+
+  // Tracks time spent by client calls reading RPC arguments
+  RuntimeProfile::Counter* rpc_read_timer_;
+  // Tracks time spent by client calls writing RPC results
+  RuntimeProfile::Counter* rpc_write_timer_;
+  // Tracks number of client RPCs
+  RuntimeProfile::Counter* rpc_count_;
+  // Contexts for RPC calls that have not completed and had their stats collected
+  std::set<RpcEventHandler::InvocationContext*> pending_rpcs_;
+  // Enables tracking of RPCs in pending_rpcs_. Also used to turn off tracking once
+  // Finalize() has been called.
+  bool track_rpcs_ = true;
 
   RuntimeProfile::EventSequence* query_events_;
 
@@ -594,14 +738,16 @@ class ClientRequestState {
   /// UpdateQueryStatus(Status) or MarkAsRetrying(Status).
   Status query_status_;
 
+  /// Default TExecRequest to return until SetExecRequest is called.
+  static const TExecRequest unknown_exec_request_;
+
   /// The TExecRequest for the query tracked by this ClientRequestState. The TExecRequest
-  /// is initialized in QueryDriver::RunFrontendPlanner(TQueryCtx).The TExecRequest is
-  /// owned by the parent QueryDriver.
-  TExecRequest* exec_request_;
+  /// is initialized once it's finalized. It's owned by the parent QueryDriver.
+  AtomicPtr<const TExecRequest> exec_request_{&unknown_exec_request_};
 
   /// If true, effective_user() has access to the runtime profile and execution
   /// summary.
-  bool user_has_profile_access_ = true;
+  AtomicBool user_has_profile_access_{true};
 
   TResultSetMetadata result_metadata_; // metadata for select query
   int num_rows_fetched_ = 0; // number of rows fetched by client for the entire query
@@ -639,6 +785,11 @@ class ClientRequestState {
   /// Timeout, in microseconds, when waiting for rows to become available. Derived from
   /// the query option FETCH_ROWS_TIMEOUT_MS.
   const int64_t fetch_rows_timeout_us_;
+
+  /// Start/end time of the query queuing, in Unix milliseconds.
+  /// Initialized to 0, indicating that queries do not need to be queued.
+  int64_t wait_start_time_ms_ = 0;
+  int64_t wait_end_time_ms_ = 0;
 
   /// If this ClientRequestState was created as a retry of a previously failed query, the
   /// original_id_ is set to the query id of the original query that failed. The
@@ -716,8 +867,14 @@ class ClientRequestState {
   /// Core logic of executing a load data statement.
   void ExecLoadDataRequestImpl(bool exec_in_worker_thread);
 
+  /// Executes LOAD DATA related sub-queries for Iceberg tables.
+  void ExecLoadIcebergDataRequestImpl(TLoadDataResp response);
+
   /// Executes a shut down request.
   Status ExecShutdownRequest() WARN_UNUSED_RESULT;
+
+  /// Executes a command on EventProcessor.
+  Status ExecEventProcessorCmd() WARN_UNUSED_RESULT;
 
   /// Core logic of Wait(). Does not update operation_state_/query_status_.
   Status WaitInternal() WARN_UNUSED_RESULT;
@@ -735,6 +892,11 @@ class ClientRequestState {
   /// If an error occurs the transaction gets aborted by this function. Either way
   /// the transaction will be closed when this function returns.
   Status UpdateCatalog() WARN_UNUSED_RESULT;
+
+  /// Fills 'cat_ice_op' based on 'finalize_params'. Returns false if there is no
+  /// need to update the Catalog (no records changed), returns true otherwise.
+  bool CreateIcebergCatalogOps(const TFinalizeParams& finalize_params,
+      TIcebergOperationParam* cat_ice_op);
 
   /// Copies results into request_result_set_
   /// TODO: Have the FE return list<Data.TResultRow> so that this isn't necessary
@@ -809,6 +971,34 @@ class ClientRequestState {
   /// Logs audit and column lineage events. Expects that Wait() has already finished.
   /// Grabs lock_ for polling the query_status(). Hence do not call it under lock_.
   void LogQueryEvents();
-};
 
+  /// Helper function to get common header
+  TCatalogServiceRequestHeader GetCatalogServiceRequestHeader();
+
+  /// The logic of executing a MIGRATE TABLE statement.
+  Status ExecMigrateRequest() WARN_UNUSED_RESULT;
+
+  /// Core logic of executing a MIGRATE TABLE statement.
+  void ExecMigrateRequestImpl();
+
+  /// The logic of executing a KILL QUERY statement.
+  Status ExecKillQueryRequest();
+
+  /// Used when running into an error during table migration to extend 'status' with some
+  /// hints about how to reset the original table name. 'params' holds the SQL query
+  /// string the user should run.
+  void AddTableResetHints(const TConvertTableRequest& params, Status* status) const;
+
+  /// Adds the catalog execution timeline returned from catalog RPCs into the profile.
+  void AddCatalogTimeline();
+
+  /// Try killing query with the given query_id locally as the requesting_user.
+  /// 'is_admin' is true if requesting_user is an admin.
+  Status TryKillQueryLocally(
+      const TUniqueId& query_id, const std::string& requesting_user, bool is_admin);
+
+  /// Try to ask other coordinators to kill query by sending the request.
+  Status TryKillQueryRemotely(
+      const TUniqueId& query_id, const KillQueryRequestPB& request);
+};
 }

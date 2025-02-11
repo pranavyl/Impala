@@ -62,7 +62,7 @@ PLAN-ROOT SINK
    HDFS partitions=1/1 files=4 size=289.07MB
    predicates: c_custkey > CAST(10 AS BIGINT), !empty(c.c_orders)
    predicates on o: !empty(o.o_lineitems), o_orderkey = CAST(4 AS BIGINT)
-   predicates on o_lineitems: CAST(20 AS BIGINT) + CAST(l_linenumber AS BIGINT) < CAST(0 AS BIGINT)
+   predicates on o.o_lineitems: CAST(20 AS BIGINT) + CAST(l_linenumber AS BIGINT) < CAST(0 AS BIGINT)
    stored statistics:
      table: rows=150.00K size=289.07MB
      columns missing stats: c_orders
@@ -71,7 +71,7 @@ PLAN-ROOT SINK
    parquet statistics predicates on o: o_orderkey = CAST(4 AS BIGINT)
    parquet dictionary predicates: c_custkey > CAST(10 AS BIGINT)
    parquet dictionary predicates on o: o_orderkey = CAST(4 AS BIGINT)
-   parquet dictionary predicates on o_lineitems: CAST(20 AS BIGINT) + CAST(l_linenumber AS BIGINT) < CAST(0 AS BIGINT)
+   parquet dictionary predicates on o.o_lineitems: CAST(20 AS BIGINT) + CAST(l_linenumber AS BIGINT) < CAST(0 AS BIGINT)
    mem-estimate=264.00MB mem-reservation=16.00MB thread-reservation=1
    tuple-ids=0 row-size=20B cardinality=15.00K
    in pipelines: 00(GETNEXT)
@@ -116,8 +116,8 @@ PLAN-ROOT SINK
 |  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
 |
 00:SCAN DATA SOURCE [functional.alltypes_datasource]
-data source predicates: CAST(tinyint_col AS DOUBLE) < CAST(256 AS DOUBLE), int_col < CAST(2 AS INT)
-predicates: float_col != CAST(0 AS FLOAT)
+   data source predicates: CAST(tinyint_col AS DOUBLE) < CAST(256 AS DOUBLE), int_col < CAST(2 AS INT)
+   predicates: float_col != CAST(0 AS FLOAT)
    mem-estimate=1.00GB mem-reservation=0B thread-reservation=0
    tuple-ids=0 row-size=116B cardinality=500
    in pipelines: 00(GETNEXT)
@@ -317,7 +317,7 @@ F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
 |  Per-Host Resources: mem-estimate=138.00MB mem-reservation=4.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: sum(2 + id)
-|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
 |
 02:AGGREGATE [FINALIZE]
 |  output: sum(2 + id), count:merge(*)
@@ -463,7 +463,7 @@ F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
 |  Per-Host Resources: mem-estimate=128.02MB mem-reservation=4.00MB thread-reservation=2
 PLAN-ROOT SINK
 |  output exprs: sum(id + c3)
-|  mem-estimate=4.00MB mem-reservation=4.00MB spill-buffer=2.00MB thread-reservation=0
+|  mem-estimate=0B mem-reservation=0B thread-reservation=0
 |
 01:AGGREGATE [FINALIZE]
 |  output: sum(CAST(id AS BIGINT) + CAST(CAST(10 AS INT) + CAST(CAST(20 AS SMALLINT) + CAST(30 AS SMALLINT) AS INT) AS BIGINT))

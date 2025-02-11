@@ -17,24 +17,23 @@
 
 #include "scheduling/request-pool-service.h"
 
-#include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/join.hpp>
 #include <list>
 #include <string>
+
+#include <boost/algorithm/string/join.hpp>
 #include <gutil/strings/substitute.h>
 
 #include "common/constant-strings.h"
 #include "common/logging.h"
+#include "common/names.h"
 #include "rpc/jni-thrift-util.h"
-#include "service/query-options.h"
 #include "util/auth-util.h"
+#include "util/backend-gflag-util.h"
 #include "util/collection-metrics.h"
 #include "util/mem-info.h"
 #include "util/parse-util.h"
 #include "util/test-info.h"
 #include "util/time.h"
-
-#include "common/names.h"
 
 using namespace impala;
 
@@ -78,17 +77,14 @@ DEFINE_bool(disable_pool_max_requests, false, "Disables all per-pool limits on t
     "maximum number of running requests.");
 
 
-// Pool name used when the configuration files are not specified.
-static const string DEFAULT_POOL_NAME = "default-pool";
-
 static const string RESOLVE_POOL_METRIC_NAME = "request-pool-service.resolve-pool-duration-ms";
 
-static const string ERROR_USER_TO_POOL_MAPPING_NOT_FOUND =
-    "No mapping found for request from user '$0' with requested pool '$1'";
 static const string ERROR_USER_NOT_ALLOWED_IN_POOL = "Request from user '$0' with "
     "requested pool '$1' denied access to assigned pool '$2'";
 static const string ERROR_USER_NOT_SPECIFIED = "User must be specified because "
     "-require_username=true.";
+
+const string RequestPoolService::DEFAULT_POOL_NAME = "default-pool";
 
 RequestPoolService::RequestPoolService(MetricGroup* metrics) :
     resolve_pool_ms_metric_(NULL) {
@@ -118,10 +114,12 @@ RequestPoolService::RequestPoolService(MetricGroup* metrics) :
 
   jmethodID start_id; // JniRequestPoolService.start(), only called in this method.
   JniMethodDescriptor methods[] = {
-      {"<init>", "(Ljava/lang/String;Ljava/lang/String;Z)V", &ctor_},
+      {"<init>", "([BLjava/lang/String;Ljava/lang/String;Z)V", &ctor_},
       {"start", "()V", &start_id},
       {"resolveRequestPool", "([B)[B", &resolve_request_pool_id_},
-      {"getPoolConfig", "([B)[B", &get_pool_config_id_}};
+      {"getPoolConfig", "([B)[B", &get_pool_config_id_},
+      {"getHadoopGroups", "([B)[B", &get_hadoop_groups_id_}
+  };
 
   JNIEnv* jni_env = JniUtil::GetJNIEnv();
   jni_request_pool_service_class_ =
@@ -133,6 +131,9 @@ RequestPoolService::RequestPoolService(MetricGroup* metrics) :
         JniUtil::LoadJniMethod(jni_env, jni_request_pool_service_class_, &(methods[i])));
   }
 
+  jbyteArray cfg_bytes;
+  ABORT_IF_ERROR(GetThriftBackendGFlagsForJNI(jni_env, &cfg_bytes));
+
   jstring fair_scheduler_config_path =
       jni_env->NewStringUTF(FLAGS_fair_scheduler_allocation_path.c_str());
   ABORT_IF_EXC(jni_env);
@@ -142,7 +143,7 @@ RequestPoolService::RequestPoolService(MetricGroup* metrics) :
 
   jboolean is_be_test = TestInfo::is_be_test();
   jobject jni_request_pool_service = jni_env->NewObject(jni_request_pool_service_class_,
-      ctor_, fair_scheduler_config_path, llama_site_path, is_be_test);
+      ctor_, cfg_bytes, fair_scheduler_config_path, llama_site_path, is_be_test);
   ABORT_IF_EXC(jni_env);
   ABORT_IF_ERROR(JniUtil::LocalToGlobalRef(
       jni_env, jni_request_pool_service, &jni_request_pool_service_));
@@ -177,10 +178,6 @@ Status RequestPoolService::ResolveRequestPool(const TQueryCtx& ctx,
   if (result.status.status_code != TErrorCode::OK) {
     return Status(boost::algorithm::join(result.status.error_msgs, "; "));
   }
-  if (result.resolved_pool.empty()) {
-    return Status(Substitute(ERROR_USER_TO_POOL_MAPPING_NOT_FOUND,
-        user, requested_pool));
-  }
   if (!result.has_access) {
     return Status(Substitute(ERROR_USER_NOT_ALLOWED_IN_POOL, user,
         requested_pool, result.resolved_pool));
@@ -211,4 +208,10 @@ Status RequestPoolService::GetPoolConfig(const string& pool_name,
   if (FLAGS_disable_pool_max_requests) pool_config->__set_max_requests(-1);
   if (FLAGS_disable_pool_mem_limits) pool_config->__set_max_mem_resources(-1);
   return Status::OK();
+}
+
+Status RequestPoolService::GetHadoopGroups(
+    const TGetHadoopGroupsRequest& request, TGetHadoopGroupsResponse* response) {
+  return JniUtil::CallJniMethod(
+      jni_request_pool_service_, get_hadoop_groups_id_, request, response);
 }

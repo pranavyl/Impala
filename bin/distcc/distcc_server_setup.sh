@@ -57,18 +57,19 @@ fi
 set -x
 ALLOWED_NETS=$1
 
-LSB_ID=$(lsb_release -is)
-LSB_VERSION=$(lsb_release -rs)
-if [[ "$LSB_ID" == Ubuntu ]]; then
-  if ! [[ $LSB_VERSION == 14.04 || $LSB_VERSION == 16.04 || $LSB_VERSION == 18.04 ]]; then
-    echo "This script only supports Ubuntu 14.04, 16.04 and 18.04" >&2
+OS_ID=$(source /etc/os-release && echo "$ID")
+OS_VERSION=$(source /etc/os-release && echo "$VERSION_ID")
+if [[ "$OS_ID" == ubuntu ]]; then
+  if ! [[ $OS_VERSION == 14.04 || $OS_VERSION == 16.04 || $OS_VERSION == 18.04 || \
+      $OS_VERSION == 20.04 ]]; then
+    echo "This script only supports Ubuntu 14.04, 16.04, 18.04, and 20.04" >&2
     exit 1
   fi
   LINUX_FLAVOUR=ubuntu
   DISTCCD_USER=distccd
   DISTCCD_SERVICE=distcc
-elif [[ "$LSB_ID" == CentOS ]]; then
-  if ! [[ $LSB_VERSION == 6.* || $LSB_VERSION = 7.* ]]; then
+elif [[ "$OS_ID" == centos ]]; then
+  if ! [[ $OS_VERSION == 6.* || $OS_VERSION = 7.* ]]; then
     echo "This script only supports CentOS 6 and 7" >&2
     exit 1
   fi
@@ -125,3 +126,9 @@ service ${DISTCCD_SERVICE} restart
 
 echo "Symlinking /opt/Impala-Toolchain to default toolchain location"
 ln -f -s -T "${IMPALA_HOME}/toolchain" /opt/Impala-Toolchain
+
+# To resolve CVE-2004-2687, newer distcc versions only allow programs to be executed
+# if they have a symlink under '/usr/lib/distcc'.
+# https://github.com/distcc/distcc/commit/dfb45b528746bf89c030fccac307ebcf7c988512
+echo "Creating symlink for ccache:"
+ln -s $(which ccache) /usr/lib/distcc/ccache

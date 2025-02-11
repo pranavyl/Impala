@@ -58,6 +58,7 @@ table_name:bad_column_metadata, constraint:restrict_to, table_format:parquet/non
 table_name:lineitem_multiblock, constraint:restrict_to, table_format:parquet/none/none
 table_name:lineitem_sixblocks, constraint:restrict_to, table_format:parquet/none/none
 table_name:lineitem_multiblock_one_row_group, constraint:restrict_to, table_format:parquet/none/none
+table_name:lineitem_multiblock_variable_num_rows, constraint:restrict_to, table_format:parquet/none/none
 table_name:customer_multiblock, constraint:restrict_to, table_format:parquet/none/none
 table_name:hudi_partitioned, constraint:restrict_to, table_format:parquet/none/none
 table_name:hudi_non_partitioned, constraint:restrict_to, table_format:parquet/none/none
@@ -73,6 +74,45 @@ table_name:iceberg_partitioned, constraint:restrict_to, table_format:parquet/non
 table_name:iceberg_partitioned_orc_external, constraint:restrict_to, table_format:parquet/none/none
 table_name:iceberg_partition_transforms_zorder, constraint:restrict_to, table_format:parquet/none/none
 table_name:iceberg_resolution_test_external, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_alltypes_part, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_alltypes_part_orc, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_legacy_partition_schema_evolution, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_legacy_partition_schema_evolution_orc, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_partition_evolution, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_timestamp_part, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_timestamptz_part, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_uppercase_col, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_delete_positional, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_delete_equality, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_delete_equality_nulls, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_delete_both_eq_and_pos, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_delete_equality_partitioned, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_delete_equality_partition_evolution, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_delete_equality_multi_eq_ids, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_delete_pos_and_multi_eq_ids, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_no_deletes, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_no_deletes_orc, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_null_delete_record, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_positional_update_all_rows, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_positional_delete_all_rows, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_positional_delete_all_rows_orc, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_positional_not_all_data_files_have_delete_files, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_positional_not_all_data_files_have_delete_files_orc, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_partitioned_position_deletes, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_partitioned_position_deletes_orc, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_multiple_storage_locations, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_avro_format, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_mixed_file_format, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_mixed_file_format_part, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_test_metadata, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_with_key_metadata, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_lineitem_multiblock, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_lineitem_sixblocks, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_spark_compaction_with_dangling_delete, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_v2_equality_delete_schema_evolution, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_query_metadata, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_metadata_alltypes, constraint:restrict_to, table_format:parquet/none/none
+table_name:iceberg_view, constraint:restrict_to, table_format:parquet/none/none
 
 # TODO: Support Avro. Data loading currently fails for Avro because complex types
 # cannot be converted to the corresponding Avro types yet.
@@ -110,7 +150,6 @@ table_name:complextypes_arrays, constraint:restrict_to, table_format:orc/def/blo
 
 table_name:alltypeserror, constraint:exclude, table_format:parquet/none/none
 table_name:alltypeserrornonulls, constraint:exclude, table_format:parquet/none/none
-table_name:unsupported_types, constraint:exclude, table_format:parquet/none/none
 table_name:escapechartesttable, constraint:exclude, table_format:parquet/none/none
 table_name:TblWithRaggedColumns, constraint:exclude, table_format:parquet/none/none
 
@@ -121,7 +160,8 @@ table_name:text_thorn_ecirc_newline, constraint:restrict_to, table_format:text/n
 
 table_name:bad_serde, constraint:restrict_to, table_format:text/none/none
 table_name:rcfile_lazy_binary_serde, constraint:restrict_to, table_format:rc/none/none
-table_name:unsupported_partition_types, constraint:restrict_to, table_format:text/none/none
+table_name:unsupported_timestamp_partition, constraint:restrict_to, table_format:text/none/none
+table_name:unsupported_binary_partition, constraint:restrict_to, table_format:text/none/none
 table_name:nullformat_custom, constraint:exclude, table_format:parquet/none/none
 
 table_name:alltypes_view, constraint:restrict_to, table_format:text/none/none
@@ -162,7 +202,14 @@ table_name:widerow, constraint:exclude, table_format:hbase/none/none
 # which is not supported in hbase. The schema is also specified in HIVE_CREATE
 # with no corresponding LOAD statement.
 table_name:nullformat_custom, constraint:exclude, table_format:hbase/none/none
-table_name:unsupported_types, constraint:exclude, table_format:hbase/none/none
+
+# complex_json has some complex json object, multiline_json has some multiline json object,
+# malformed_json has some malformed json object, overflow_json has some overflowing numerical value,
+# these tables are used in json scan test.
+table_name:complex_json, constraint:restrict_to, table_format:json/none/none
+table_name:multiline_json, constraint:restrict_to, table_format:json/none/none
+table_name:malformed_json, constraint:restrict_to, table_format:json/none/none
+table_name:overflow_json, constraint:restrict_to, table_format:json/none/none
 
 # Decimal can only be tested on formats Impala can write to (text and parquet).
 # TODO: add Avro once Hive or Impala can write Avro decimals
@@ -174,16 +221,20 @@ table_name:decimal_tbl, constraint:restrict_to, table_format:kudu/none/none
 table_name:decimal_tiny, constraint:restrict_to, table_format:kudu/none/none
 table_name:decimal_tbl, constraint:restrict_to, table_format:orc/def/block
 table_name:decimal_tiny, constraint:restrict_to, table_format:orc/def/block
+table_name:decimal_tbl, constraint:restrict_to, table_format:json/none/none
+table_name:decimal_tiny, constraint:restrict_to, table_format:json/none/none
 
 table_name:decimal_rtf_tbl, constraint:restrict_to, table_format:text/none/none
 table_name:decimal_rtf_tbl, constraint:restrict_to, table_format:parquet/none/none
 table_name:decimal_rtf_tbl, constraint:restrict_to, table_format:kudu/none/none
 table_name:decimal_rtf_tbl, constraint:restrict_to, table_format:orc/def/block
+table_name:decimal_rtf_tbl, constraint:restrict_to, table_format:json/none/none
 
 table_name:decimal_rtf_tiny_tbl, constraint:restrict_to, table_format:text/none/none
 table_name:decimal_rtf_tiny_tbl, constraint:restrict_to, table_format:parquet/none/none
 table_name:decimal_rtf_tiny_tbl, constraint:restrict_to, table_format:kudu/none/none
 table_name:decimal_rtf_tiny_tbl, constraint:restrict_to, table_format:orc/def/block
+table_name:decimal_rtf_tiny_tbl, constraint:restrict_to, table_format:json/none/none
 
 table_name:avro_decimal_tbl, constraint:restrict_to, table_format:avro/snap/block
 
@@ -223,7 +274,7 @@ table_name:large_bzip2_tbl, constraint:restrict_to, table_format:text/bzip/block
 table_name:multistream_bzip2_tbl, constraint:restrict_to, table_format:text/bzip/block
 table_name:large_multistream_bzip2_tbl, constraint:restrict_to, table_format:text/bzip/block
 
-# Kudu can't handle certain types such as timestamp so we pick and choose the tables
+# Kudu needs CREATE_KUDU section in the schema sql so we pick and choose the tables
 # we actually use for Kudu related tests.
 table_name:alltypes, constraint:only, table_format:kudu/none/none
 table_name:alltypessmall, constraint:only, table_format:kudu/none/none
@@ -247,6 +298,10 @@ table_name:decimal_tiny, constraint:only, table_format:kudu/none/none
 table_name:strings_with_quotes, constraint:only, table_format:kudu/none/none
 table_name:manynulls, constraint:only, table_format:kudu/none/none
 table_name:date_tbl, constraint:only, table_format:kudu/none/none
+table_name:timestamp_at_dst_changes, constraint:only, table_format:kudu/none/none
+table_name:binary_tbl, constraint:only, table_format:kudu/none/none
+table_name:binary_tbl_big, constraint:only, table_format:kudu/none/none
+table_name:timestamp_primary_key, constraint:only, table_format:kudu/none/none
 
 # Skipping header lines is only effective with text tables
 table_name:table_with_header, constraint:restrict_to, table_format:text/none/none
@@ -263,6 +318,7 @@ table_name:table_with_header_insert, constraint:restrict_to, table_format:parque
 # IMPALA-7368/IMPALA-7370/IMPALA-8198 adds DATE support for text, hbase, parquet and avro.
 # IMPALA-8801 adds DATE support for ORC.
 # IMPALA-8800 adds DATE support for Kudu.
+# IMPALA-10798 adds DATE support for JSON.
 # Other file-formats will be introduced later.
 table_name:date_tbl, constraint:restrict_to, table_format:parquet/none/none
 table_name:date_tbl, constraint:restrict_to, table_format:avro/snap/block
@@ -274,12 +330,16 @@ table_name:date_tbl, constraint:restrict_to, table_format:text/bzip/block
 table_name:date_tbl, constraint:restrict_to, table_format:text/gzip/block
 table_name:date_tbl, constraint:restrict_to, table_format:text/snap/block
 table_name:date_tbl, constraint:restrict_to, table_format:text/def/block
+table_name:date_tbl, constraint:restrict_to, table_format:json/none/none
 table_name:date_tbl_error, constraint:restrict_to, table_format:text/none/none
 table_name:date_tbl_error, constraint:restrict_to, table_format:text/bzip/block
 table_name:date_tbl_error, constraint:restrict_to, table_format:text/gzip/block
 table_name:date_tbl_error, constraint:restrict_to, table_format:text/snap/block
 table_name:date_tbl_error, constraint:restrict_to, table_format:text/def/block
 table_name:insert_date_tbl, constraint:restrict_to, table_format:hbase/none/none
+
+table_name:binary_in_complex_types, constraint:restrict_to, table_format:parquet/none/none
+table_name:binary_in_complex_types, constraint:restrict_to, table_format:orc/def/block
 
 # Full transactional table is only supported for ORC
 table_name:full_transactional_table, constraint:restrict_to, table_format:orc/def/block
@@ -292,11 +352,13 @@ table_name:insertonly_nopart_insert, constraint:restrict_to, table_format:parque
 table_name:insertonly_part_insert, constraint:restrict_to, table_format:text/none/none
 table_name:insertonly_part_insert, constraint:restrict_to, table_format:parquet/none/none
 
-# 'materialized_view' is based on 'insert_only_transactional_table' from the same
-# database, so it needs to be excluded where 'insert_only_transactional_table' is
-# excluded.
+# A materialized view is based on one or more transactional (in this case insert-only)
+# base tables, so the MVs need to be excluded for the table formats where the base
+# tables are excluded
 table_name:materialized_view, constraint:exclude, table_format:hbase/none/none
 table_name:materialized_view, constraint:exclude, table_format:kudu/none/none
+table_name:mv1_alltypes_jointbl, constraint:restrict_to, table_format:orc/def/block
+table_name:mv2_alltypes_jointbl, constraint:restrict_to, table_format:orc/def/block
 
 table_name:insert_only_transactional_bucketed_table, constraint:exclude, table_format:hbase/none/none
 table_name:insert_only_transactional_bucketed_table, constraint:exclude, table_format:kudu/none/none
@@ -316,3 +378,61 @@ table_name:part_strings_with_quotes, constraint:restrict_to, table_format:text/n
 
 # 'alltypessmall_bool_sorted' only used in ORC tests.
 table_name:alltypessmall_bool_sorted, constraint:restrict_to, table_format:orc/def/block
+
+table_name:complextypes_arrays_only_view, constraint:restrict_to, table_format:parquet/none/none
+table_name:complextypes_arrays_only_view, constraint:restrict_to, table_format:orc/def/block
+
+table_name:collection_tbl, constraint:restrict_to, table_format:parquet/none/none
+table_name:collection_tbl, constraint:restrict_to, table_format:orc/def/block
+
+# In parquet we can't have NULL map keys but in ORC we can.
+table_name:map_null_keys, constraint:restrict_to, table_format:orc/def/block
+
+table_name:map_non_varlen, constraint:restrict_to, table_format:parquet/none/none
+table_name:map_non_varlen, constraint:restrict_to, table_format:orc/def/block
+
+table_name:collection_struct_mix, constraint:restrict_to, table_format:parquet/none/none
+table_name:collection_struct_mix, constraint:restrict_to, table_format:orc/def/block
+
+table_name:collection_struct_mix_view, constraint:restrict_to, table_format:parquet/none/none
+table_name:collection_struct_mix_view, constraint:restrict_to, table_format:orc/def/block
+
+table_name:arrays_big, constraint:restrict_to, table_format:parquet/none/none
+table_name:arrays_big, constraint:restrict_to, table_format:orc/def/block
+
+table_name:complextypes_maps_view, constraint:restrict_to, table_format:parquet/none/none
+table_name:complextypes_maps_view, constraint:restrict_to, table_format:orc/def/block
+
+# 'alltypestiny_negative' only used in ORC tests.
+table_name:alltypestiny_negative, constraint:restrict_to, table_format:orc/def/block
+
+table_name:insert_only_minor_compacted, constraint:restrict_to, table_format:parquet/none/none
+table_name:insert_only_major_and_minor_compacted, constraint:restrict_to, table_format:parquet/none/none
+
+# The table is used in large scale metadata test. File format doesn't matter so restrict to text only
+table_name:widetable_2000_cols_partitioned, constraint:restrict_to, table_format:text/none/none
+
+table_name:alltypesagg_parquet_v2_uncompressed, constraint:restrict_to, table_format:parquet/none/none
+table_name:alltypesagg_parquet_v2_snappy, constraint:restrict_to, table_format:parquet/none/none
+table_name:complextypestbl_parquet_v2_uncompressed, constraint:restrict_to, table_format:parquet/none/none
+table_name:complextypestbl_parquet_v2_snappy, constraint:restrict_to, table_format:parquet/none/none
+
+# The table is used to test a specific parquet page layout bug
+table_name:empty_parquet_page_source_impala10186, constraint:restrict_to, table_format:text/none/none
+
+# The table is used as test coverage for ORC-1304
+table_name:empty_stream_tbl, constraint:restrict_to, table_format:orc/def/block
+
+# The table is used to test DST changes in timestamps, the timestamps in the table near
+# DST changes in the 'America/Los_Angeles' time zone. (DST: UTC-7 / outside DST: UTC-8)
+# The table containts timestamps from 2011. In 2011 Los Angeles, DST starts at 2 a.m. on
+# Sunday, March 13 (clocks were turned forward 1 hour) and fall back to standard time
+# again at 2 a.m. on Sunday, November 6 (clocks were turned backward 1 hour).
+table_name:timestamp_at_dst_changes, constraint:restrict_to, table_format:text/none/none
+table_name:timestamp_at_dst_changes, constraint:restrict_to, table_format:kudu/none/none
+
+table_name:timestamp_primary_key, constraint:restrict_to, table_format:kudu/none/none
+
+# Table where all column values are unique but have some NULLs.
+# Depends on functional.alltypessmall.
+table_name:unique_with_nulls, constraint:restrict_to, table_format:parquet/none/none

@@ -68,7 +68,6 @@ Status BufferedPlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
   // after the sink is closed.
   DCHECK(!closed_);
   DCHECK(batch_queue_->IsOpen());
-  PlanRootSink::ValidateCollectionSlots(*row_desc_, batch);
   RETURN_IF_ERROR(PlanRootSink::UpdateAndCheckRowsProducedLimit(state, batch));
 
   {
@@ -234,9 +233,12 @@ Status BufferedPlanRootSink::GetNext(RuntimeState* state, QueryResultSet* result
             num_rows_to_read - num_rows_read);
         DCHECK_GE(num_rows_to_fetch, 0);
 
-        // Read rows from 'current_batch_' and add them to 'results'.
-        RETURN_IF_ERROR(results->AddRows(output_expr_evals_, current_batch_.get(),
-            current_batch_row_, num_rows_to_fetch));
+        {
+          SCOPED_TIMER(create_result_set_timer_);
+          // Read rows from 'current_batch_' and add them to 'results'.
+          RETURN_IF_ERROR(results->AddRows(output_expr_evals_, current_batch_.get(),
+              current_batch_row_, num_rows_to_fetch));
+        }
         num_rows_read += num_rows_to_fetch;
         current_batch_row_ += num_rows_to_fetch;
 

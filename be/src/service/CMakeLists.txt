@@ -40,22 +40,32 @@ add_library(Service
   impala-http-handler.cc
   impalad-main.cc
   impala-server.cc
+  internal-server.cc
   query-options.cc
   query-result-set.cc
+  query-state-record.cc
+  workload-management-worker.cc
 )
 add_dependencies(Service gen-deps)
-
-add_library(ServiceTests STATIC
-  hs2-util-test.cc
-  impala-server-test.cc
-  query-options-test.cc
-)
-add_dependencies(ServiceTests gen-deps)
 
 # this shared library provides Impala executor functionality to FE test.
 add_library(fesupport SHARED
   fe-support.cc
 )
+
+# Hide all symbols from compression libraries so that users of this libfesupport.so
+# don't have conflicts with libhadoop or other libraries.
+# TODO: This should also hide most other symbols as a precaution.
+# Note: Using the full library name with ".a" is needed for lld/mold linkers.
+# It has no impact on gold, which supports with or without the .a.
+set(LINK_FLAGS "-Wl,--exclude-libs=libbz2.a")
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,--exclude-libs=liblz4.a")
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,--exclude-libs=libsnappy.a")
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,--exclude-libs=libz.a")
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,--exclude-libs=libzstd.a")
+set_target_properties(fesupport
+  PROPERTIES
+  LINK_FLAGS "${LINK_FLAGS}")
 add_dependencies(fesupport gen-deps)
 
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN"
@@ -70,10 +80,6 @@ target_link_libraries(fesupport ${IMPALA_LINK_LIBS_DYNAMIC_TARGETS})
 
 add_executable(impalad
   daemon-main.cc
-)
-
-add_executable(unifiedbetests
-  unified-betest-main.cc
 )
 
 # All Impala daemons run from the same binary. The code that is run is determined by the
@@ -110,12 +116,37 @@ target_link_libraries(impalad
   ${IMPALA_LINK_LIBS}
 )
 
+install(FILES ${STATESTORED_SYMLINK} DESTINATION ${IMPALA_INSTALLDIR}/sbin)
+install(FILES ${CATALOGD_SYMLINK} DESTINATION ${IMPALA_INSTALLDIR}/sbin)
+install(FILES ${ADMISSIOND_SYMLINK} DESTINATION ${IMPALA_INSTALLDIR}/sbin)
+install(TARGETS impalad DESTINATION ${IMPALA_INSTALLDIR}/sbin)
+
+if (BUILD_WITH_NO_TESTS)
+  return()
+endif()
+
+add_executable(unifiedbetests
+  unified-betest-main.cc
+)
+
 target_link_libraries(unifiedbetests
   ${JAVA_JSIG_LIBRARY} ${UNIFIED_TEST_LINK_LIBS})
 ADD_DEPENDENCIES(unified-be-test-executable unifiedbetests)
+
+add_library(ServiceTests STATIC
+  hs2-util-test.cc
+  impala-server-test.cc
+  query-options-test.cc
+  query-state-record-test.cc
+  workload-management-worker-test.cc
+)
+add_dependencies(ServiceTests gen-deps)
 
 # Exception to unified be tests: Custom main() due to leak
 ADD_BE_TEST(session-expiry-test session-expiry-test.cc) # TODO: this leaks thrift server
 ADD_UNIFIED_BE_LSAN_TEST(hs2-util-test "StitchNullsTest.*:PrintTColumnValueTest.*")
 ADD_UNIFIED_BE_LSAN_TEST(query-options-test QueryOptions.*)
 ADD_UNIFIED_BE_LSAN_TEST(impala-server-test ImpalaServerTest.*)
+ADD_UNIFIED_BE_LSAN_TEST(query-state-record-test QueryStateRecordTest.*)
+ADD_UNIFIED_BE_LSAN_TEST(workload-management-worker-test WorkloadManagementWorkerTest.*)
+ADD_BE_LSAN_TEST(internal-server-test)

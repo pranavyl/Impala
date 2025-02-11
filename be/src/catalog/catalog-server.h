@@ -23,22 +23,25 @@
 #include <boost/shared_ptr.hpp>
 #include <boost/unordered_set.hpp>
 
+#include "catalog/catalog.h"
+#include "common/atomic.h"
 #include "gen-cpp/CatalogService.h"
 #include "gen-cpp/Frontend_types.h"
 #include "gen-cpp/Types_types.h"
-#include "catalog/catalog.h"
 #include "kudu/util/web_callback_registry.h"
-#include "statestore/statestore-subscriber.h"
+#include "rapidjson/rapidjson.h"
+#include "statestore/statestore-subscriber-catalog.h"
 #include "util/condition-variable.h"
 #include "util/metrics-fwd.h"
-#include "rapidjson/rapidjson.h"
 
 using kudu::HttpStatusCode;
 
 namespace impala {
 
-class StatestoreSubscriber;
+class ActiveCatalogdVersionChecker;
 class Catalog;
+class CatalogServiceThriftIf;
+class StatestoreSubscriber;
 
 /// The Impala CatalogServer manages the caching and persistence of cluster-wide metadata.
 /// The CatalogServer aggregates the metadata from the Hive Metastore, the NameNode,
@@ -54,11 +57,45 @@ class Catalog;
 /// cache over JNI to get the current state of the catalog. Any updates are broadcast to
 /// the rest of the cluster using the Statestore over the IMPALA_CATALOG_TOPIC.
 /// The CatalogServer must be the only writer to the IMPALA_CATALOG_TOPIC, meaning there
-/// cannot be multiple CatalogServers running at the same time, as the correctness of delta
-/// updates relies upon this assumption.
-/// TODO: In the future the CatalogServer could go into a "standby" mode if it detects
-/// updates from another writer on the topic. This is a bit tricky because it requires
-/// some basic form of leader election.
+/// cannot be multiple CatalogServers running at the same time, as the correctness of
+/// delta updates relies upon this assumption.
+///
+/// Catalog HA:
+/// To support catalog HA, we add the preemptive behavior for catalogd. When enabled,
+/// the preemptive behavior allows the catalogd with the higher priority to become active
+/// and the paired catalogd becomes standby. The active catalogd acts as the source of
+/// metadata and provides catalog service for the Impala cluster.
+/// By default, preemption is disabled on the catalogd which is running as single catalog
+/// instance in an Impala cluster. For deployment with catalog HA, the preemption must
+/// be enabled with starting flag "enable_catalogd_ha" on both the catalogd in the HA pair
+/// and statestore.
+/// The catalogd in an Active-Passive HA pair can be assigned an instance priority value
+/// to indicate a preference for which catalogd should assume the active role. The
+/// registration ID which is assigned by statestore can be used as instance priority
+/// value. The lower numerical value in registration ID corresponds to a higher priority.
+/// The catalogd with the higher priority is designated as active, the other catalogd is
+/// designated as standby. Only the active catalogd propagates the IMPALA_CATALOG_TOPIC
+/// to the cluster. This guarantees only one writer for the IMPALA_CATALOG_TOPIC in a
+/// Impala cluster.
+/// Statestore only send the IMPALA_CATALOG_TOPIC messages to active catalogd. Also
+/// catalogds are registered as writer for IMPALA_CATALOG_TOPIC so the standby catalogd
+/// does not receive catalog updates from statestore. When standby catalogd becomes
+/// active, its "last_sent_catalog_version_" member variable is reset. This will lead to
+/// non-delta catalog update for next IMPALA_CATALOG_TOPIC which also instructs the
+/// statestore to clear all entries for the catalog update topic, so that statestore keeps
+/// in-sync with new active catalogd for the catalog update topic.
+/// statestore which is the registration center of an Impala cluster assigns the roles
+/// for the catalogd in the HA pair after both catalogd register to statestore. When
+/// statestore detects the active catalogd is not healthy, it fails over catalog service
+/// to standby catalogd. When failover occurs, statestore sends notifications with the
+/// address of active catalogd to all coordinators and catalogd in the cluster. The event
+/// is logged in the statestore and catalogd logs. When the catalogd with the higher
+/// priority recovers from a failure, statestore does not resume it as active to avoid
+/// flip-flop between the two catalogd.
+/// To make a specific catalogd in the HA pair as active instance, the catalogd must be
+/// started with starting flag "force_catalogd_active" so that the catalogd will be
+/// assigned with active role when it registers to statestore. This allows administrator
+/// to manually perform catalog service failover.
 class CatalogServer {
  public:
   static std::string IMPALA_CATALOG_TOPIC;
@@ -68,7 +105,9 @@ class CatalogServer {
   /// Returns OK unless some error occurred in which case the status is returned.
   Status Start();
 
-  void RegisterWebpages(Webserver* webserver);
+  /// Registers webpages for the input webserver. If metrics_only is set then only
+  /// '/healthz' page is registered.
+  void RegisterWebpages(Webserver* webserver, bool metrics_only);
 
   /// Returns the Thrift API interface that proxies requests onto the local CatalogService.
   const std::shared_ptr<CatalogServiceIf>& thrift_iface() const {
@@ -85,7 +124,40 @@ class CatalogServer {
   /// service has started.
   void MarkServiceAsStarted();
 
+  // Returns the protocol version of catalog service.
+  CatalogServiceVersion::type GetProtocolVersion() const {
+    return protocol_version_;
+  }
+
+  /// Blocks until this catalog is ready to process requests and does not time out.
+  ///
+  /// If catalog HA is not enabled, the catalog being ready is indicated by the variable
+  /// last_sent_catalog_version_ having a value greater than 0.
+  ///
+  /// If catalog HA is enabled, waits until the active and standby catalogd daemons have
+  /// been determined. In the active daemon, this function will not return until the
+  /// last_sent_catalog_version_ variable is greater than 0. In the standby daemon, this
+  /// function returns as soon as the daemon has been determined to be the standby.
+  ///
+  /// Returns `true` or `false` indicating if this catalogd is the active catalogd.
+  /// If catalog HA is not enabled, returns `true`.
+  bool WaitForCatalogReady();
+
+  // Initializes workload management by creating or upgrading the necessary database and
+  // tables. Does not check if the current catalogd is active or if workload management is
+  // enabled.
+  Status InitWorkloadManagement();
+
  private:
+  friend class CatalogServiceThriftIf;
+
+  // Defines the milliseconds to sleep during the loop that waits for the first catalog
+  // update to take place.
+  static const int WM_INIT_CHECK_SLEEP_MS = 5000;
+
+  /// Protocol version of the Catalog Service.
+  CatalogServiceVersion::type protocol_version_;
+
   /// Indicates whether the catalog service is ready.
   std::atomic_bool service_started_{false};
 
@@ -94,7 +166,7 @@ class CatalogServer {
   ThriftSerializer thrift_serializer_;
   MetricGroup* metrics_;
   boost::scoped_ptr<Catalog> catalog_;
-  boost::scoped_ptr<StatestoreSubscriber> statestore_subscriber_;
+  boost::scoped_ptr<StatestoreSubscriberCatalog> statestore_subscriber_;
 
   /// Metric that tracks the amount of time taken preparing a catalog update.
   StatsMetric<double>* topic_processing_time_metric_;
@@ -102,15 +174,62 @@ class CatalogServer {
   /// Tracks the partial fetch RPC call queue length on the Catalog server.
   IntGauge* partial_fetch_rpc_queue_len_metric_;
 
+  /// Metric that tracks if this catalogd is active.
+  BooleanProperty* active_status_metric_;
+
+  /// Metric to count the number of active status changes.
+  IntCounter* num_ha_active_status_change_metric_;
+
+  /// Metric that tracks the total size of all thread pools used in all
+  /// ParallelFileMetadataLoader instances.
+  IntGauge* num_file_metadata_loading_threads_metric_;
+
+  /// Metric that tracks the total number of unfinished FileMetadataLoader tasks that
+  /// are submitted to the pools.
+  IntGauge* num_file_metadata_loading_tasks_metric_;
+
+  /// Metric that tracks the total number of tables that are loading file metadata.
+  IntGauge* num_tables_loading_file_metadata_metric_;
+
+  /// Metric that tracks the total number of tables that are loading metadata.
+  IntGauge* num_tables_loading_metadata_metric_;
+
+  /// Metric that tracks the total number of tables that are loading metadata
+  /// asynchronously, e.g. initial metadata loading triggered by first access of a table.
+  IntGauge* num_tables_async_loading_metadata_metric_;
+
+  /// Metric that tracks the total number of tables that are waiting for async loading.
+  IntGauge* num_tables_waiting_for_async_loading_metric_;
+
+  /// Metrics of the total number of dbs, tables and functions in the catalog cache
+  IntGauge* num_dbs_metric_;
+  IntGauge* num_tables_metric_;
+  IntGauge* num_functions_metric_;
+
+  /// Metrics that track the number of HMS clients
+  IntGauge* num_hms_clients_idle_metric_;
+  IntGauge* num_hms_clients_in_use_metric_;
+
   /// Thread that polls the catalog for any updates.
   std::unique_ptr<Thread> catalog_update_gathering_thread_;
 
   /// Thread that periodically wakes up and refreshes certain Catalog metrics.
   std::unique_ptr<Thread> catalog_metrics_refresh_thread_;
 
-  /// Protects catalog_update_cv_, pending_topic_updates_,
-  /// catalog_objects_to/from_version_, and last_sent_catalog_version.
+  /// Protects is_active_, active_catalogd_version_checker_,
+  /// catalog_update_cv_, pending_topic_updates_, catalog_objects_to/from_version_,
+  /// last_sent_catalog_version, and is_ha_determined_.
   std::mutex catalog_lock_;
+
+  /// Set to true if this catalog instance is active.
+  bool is_active_;
+
+  /// Set to true after active catalog has been determined. Will be true if catalog ha
+  /// is not enabled.
+  bool is_ha_determined_;
+
+  /// Object to track the version of received active catalogd.
+  boost::scoped_ptr<ActiveCatalogdVersionChecker> active_catalogd_version_checker_;
 
   /// Condition variable used to signal when the catalog_update_gathering_thread_ should
   /// fetch its next set of updates from the JniCatalog. At the end of each statestore
@@ -151,6 +270,19 @@ class CatalogServer {
   void UpdateCatalogTopicCallback(
       const StatestoreSubscriber::TopicDeltaMap& incoming_topic_deltas,
       std::vector<TTopicDelta>* subscriber_topic_updates);
+
+  /// Callback function for receiving notification of new active catalogd.
+  /// This function is called when active catalogd is found from registration process,
+  /// or UpdateCatalogd RPC is received. The two kinds of RPCs could be received out of
+  /// sending order.
+  /// Reset 'last_active_catalogd_version_' if 'is_registration_reply' is true and
+  /// 'active_catalogd_version' is negative. In this case, 'catalogd_registration' is
+  /// invalid and should not be used.
+  void UpdateActiveCatalogd(bool is_registration_reply, int64_t active_catalogd_version,
+      const TCatalogRegistration& catalogd_registration);
+
+  /// Returns the active status of the catalogd.
+  bool IsActive();
 
   /// Executed by the catalog_update_gathering_thread_. Calls into JniCatalog
   /// to get the latest set of catalog objects that exist, along with some metadata on
@@ -232,6 +364,10 @@ class CatalogServer {
   /// Retrieves the catalog operation metrics from FE.
   void OperationUsageUrlCallback(
       const Webserver::WebRequest& req, rapidjson::Document* document);
+  void GetCatalogOpSummary(
+      const TGetOperationUsageResponse& response, rapidjson::Document* document);
+  void GetCatalogOpRecords(
+      const TGetOperationUsageResponse& response, rapidjson::Document* document);
 
   /// Debug webpage handler that is used to dump all the registered metrics of a
   /// table. The caller specifies the "name" parameter which is the fully
@@ -250,6 +386,15 @@ class CatalogServer {
   /// Raw callback to indicate whether the service is ready.
   void HealthzHandler(const Webserver::WebRequest& req, std::stringstream* data,
       HttpStatusCode* response);
+
+  /// Json callback for /hadoop-varz. Produces Json with a list, 'configs', of (key,
+  /// value) pairs, one for each Hadoop configuration value.
+  void HadoopVarzHandler(const Webserver::WebRequest& req,
+      rapidjson::Document* document);
+
+  /// Indicates if the catalog has finished initialization. If last_sent_catalog_version_
+  /// is greater than 0, returns `true`, otherwise returns `false`.
+  inline bool IsCatalogInitialized();
 };
 
 }

@@ -58,6 +58,16 @@ public interface FeKuduTable extends FeTable {
   String getKuduTableName();
 
   /**
+   * Return true if the primary key is unique.
+   */
+  boolean isPrimaryKeyUnique();
+
+  /**
+   * Return true if the table has auto-incrementing column.
+   */
+  boolean hasAutoIncrementingColumn();
+
+  /**
    * Return the names of the columns that make up the primary key
    * of this table.
    */
@@ -206,7 +216,7 @@ public interface FeKuduTable extends FeTable {
       return result;
     }
 
-    public static TResultSet getRangePartitions(FeKuduTable table)
+    public static TResultSet getRangePartitions(FeKuduTable table, boolean showHashSchema)
         throws ImpalaRuntimeException {
       TResultSet result = new TResultSet();
       TResultSetMetadata resultSchema = new TResultSetMetadata();
@@ -215,6 +225,9 @@ public interface FeKuduTable extends FeTable {
       // Build column header
       String header = "RANGE (" + Joiner.on(',').join(
           Utils.getRangePartitioningColNames(table)) + ")";
+      if (showHashSchema) {
+        header += " HASH SCHEMA";
+      }
       resultSchema.addToColumns(new TColumn(header, Type.STRING.toThrift()));
       KuduClient client = KuduUtil.getKuduClient(table.getKuduMasterHosts());
       try {
@@ -222,8 +235,10 @@ public interface FeKuduTable extends FeTable {
         org.apache.kudu.client.KuduTable kuduTable =
             client.openTable(table.getKuduTableName());
         // The Kudu table API will return the partitions in sorted order by value.
-        List<String> partitions = kuduTable.getFormattedRangePartitions(
-            BackendConfig.INSTANCE.getKuduClientTimeoutMs());
+        long timeout = BackendConfig.INSTANCE.getKuduClientTimeoutMs();
+        List<String> partitions = showHashSchema ?
+            kuduTable.getFormattedRangePartitionsWithHashSchema(timeout) :
+            kuduTable.getFormattedRangePartitions(timeout);
         if (partitions.isEmpty()) {
           TResultRowBuilder builder = new TResultRowBuilder();
           result.addToRows(builder.add("").get());

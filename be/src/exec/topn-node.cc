@@ -95,8 +95,7 @@ Status TopNPlanNode::Init(const TPlanNode& tnode, FragmentState* state) {
 
     // Construct SlotRefs that simply copy the output tuple to itself.
     for (const SlotDescriptor* slot_desc : output_tuple_desc_->slots()) {
-      SlotRef* slot_ref =
-          state->obj_pool()->Add(new SlotRef(slot_desc, slot_desc->type()));
+      SlotRef* slot_ref = state->obj_pool()->Add(SlotRef::TypeSafeCreate(slot_desc));
       noop_tuple_exprs_.push_back(slot_ref);
       RETURN_IF_ERROR(slot_ref->Init(*row_descriptor_, true, state));
     }
@@ -121,6 +120,33 @@ Status TopNPlanNode::CreateExecNode(RuntimeState* state, ExecNode** node) const 
   return Status::OK();
 }
 
+/// In the TopNNode constructor if 'pnode.partition_comparator_config_' is NULL, we use
+/// this dummy comparator to avoid 'partition_cmp_' becoming a null pointer. This is
+/// needed because 'partition_cmp_' is wrapped in a
+/// 'ComparatorWrapper<TupleRowComparator>' that takes a reference to the underlying
+/// comparator, so we cannot pass in a null pointer or dereference it.
+class DummyTupleRowComparator: public TupleRowComparator {
+ public:
+  DummyTupleRowComparator()
+   : TupleRowComparator(dummy_scalar_exprs_, dummy_codegend_compare_fn_) {
+  }
+ private:
+  static const std::vector<ScalarExpr*> dummy_scalar_exprs_;
+  static const CodegenFnPtr<TupleRowComparatorConfig::CompareFn>
+      dummy_codegend_compare_fn_;
+
+  int CompareInterpreted(const TupleRow* lhs, const TupleRow* rhs) const override {
+    // This function should never be called as this is a dummy comparator.
+    DCHECK(false);
+    return std::less<const TupleRow*>{}(lhs, rhs);
+  }
+};
+
+/// Initialise vector length to 0 so no buffer needs to be allocated.
+const std::vector<ScalarExpr*> DummyTupleRowComparator::dummy_scalar_exprs_{0};
+const CodegenFnPtr<TupleRowComparatorConfig::CompareFn>
+DummyTupleRowComparator::dummy_codegend_compare_fn_{};
+
 TopNNode::TopNNode(
     ObjectPool* pool, const TopNPlanNode& pnode, const DescriptorTbl& descs)
   : ExecNode(pool, pnode, descs),
@@ -129,7 +155,7 @@ TopNNode::TopNNode(
     output_tuple_desc_(pnode.output_tuple_desc_),
     order_cmp_(new TupleRowLexicalComparator(*pnode.ordering_comparator_config_)),
     partition_cmp_(pnode.partition_comparator_config_ == nullptr ?
-            nullptr :
+            static_cast<TupleRowComparator*>(new DummyTupleRowComparator()) :
             new TupleRowLexicalComparator(*pnode.partition_comparator_config_)),
     intra_partition_order_cmp_(pnode.intra_partition_comparator_config_ == nullptr ?
             nullptr :
@@ -191,7 +217,8 @@ void TopNPlanNode::Codegen(FragmentState* state) {
   Status codegen_status = ordering_comparator_config_->Codegen(state, &compare_fn);
   if (codegen_status.ok() && is_partitioned()) {
     codegen_status =
-        Sorter::TupleSorter::Codegen(state, compare_fn, &codegend_sort_helper_fn_);
+        Sorter::TupleSorter::Codegen(state, compare_fn, output_tuple_desc_->byte_size(),
+            &codegend_sort_helper_fn_);
   }
   if (codegen_status.ok() && is_partitioned()) {
     // TODO: IMPALA-10228: replace comparisons in std::map.
@@ -491,7 +518,8 @@ void TopNNode::Close(RuntimeState* state) {
   if (is_closed()) return;
   if (heap_ != nullptr) heap_->Close();
   for (auto& entry : partition_heaps_) {
-    entry.second->Close();
+    DCHECK(entry.second != nullptr);
+    if (entry.second != nullptr) entry.second->Close();
   }
   if (tuple_pool_.get() != nullptr) tuple_pool_->FreeAll();
   if (order_cmp_.get() != nullptr) order_cmp_->Close(state);
@@ -663,6 +691,13 @@ Status TopNNode::ReclaimTuplePool(RuntimeState* state) {
     for (auto& entry : partition_heaps_) {
       RETURN_IF_ERROR(entry.second->RematerializeTuples(this, state, temp_pool.get()));
       DCHECK(entry.second->DCheckConsistency());
+    }
+    // The second loop is needed for IMPALA-11631. We only move heaps from partition_heap_
+    // to rematerialized_heaps once all have been rematerialized. Otherwise, in case of
+    // an error, we may call Close() on a nullptr or leak the memory by not explicitly
+    // calling Close() on the heap pointer. Maybe better to add Close() in the Heap
+    // destructor later.
+    for (auto& entry : partition_heaps_) {
       // The key references memory in 'tuple_pool_'. Replace it with a rematerialized
       // tuple.
       rematerialized_heaps.push_back(move(entry.second));

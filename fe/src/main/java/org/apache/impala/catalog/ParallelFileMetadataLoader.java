@@ -20,21 +20,22 @@ import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.annotation.Nullable;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.common.ValidTxnList;
 import org.apache.hadoop.hive.common.ValidWriteIdList;
-import org.apache.impala.catalog.FeFsTable.Utils;
+import org.apache.impala.catalog.HdfsPartition.Builder;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.catalog.iceberg.GroupedContentFiles;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.Pair;
 import org.apache.impala.service.BackendConfig;
@@ -65,6 +66,9 @@ public class ParallelFileMetadataLoader {
   private static final int MAX_NON_HDFS_PARTITIONS_PARALLEL_LOAD =
       BackendConfig.INSTANCE.maxNonHdfsPartsParallelLoad();
 
+  public static final AtomicInteger TOTAL_THREADS = new AtomicInteger(0);
+  public static final AtomicInteger TOTAL_TABLES = new AtomicInteger(0);
+
   // Maximum number of errors logged when loading partitioned tables.
   private static final int MAX_PATH_METADATA_LOADING_ERRORS_TO_LOG = 100;
 
@@ -74,10 +78,19 @@ public class ParallelFileMetadataLoader {
   private final FileSystem fs_;
 
   public ParallelFileMetadataLoader(FileSystem fs,
-      Collection<HdfsPartition.Builder> partBuilders,
+      Collection<Builder> partBuilders,
       ValidWriteIdList writeIdList, ValidTxnList validTxnList, boolean isRecursive,
-      @Nullable ListMap<TNetworkAddress> hostIndex, String debugAction, String logPrefix)
-      throws CatalogException {
+      @Nullable ListMap<TNetworkAddress> hostIndex, String debugAction,
+      String logPrefix) {
+    this(fs, partBuilders, writeIdList, validTxnList, isRecursive, hostIndex, debugAction,
+        logPrefix, new GroupedContentFiles(), false);
+  }
+
+  public ParallelFileMetadataLoader(FileSystem fs,
+      Collection<Builder> partBuilders,
+      ValidWriteIdList writeIdList, ValidTxnList validTxnList, boolean isRecursive,
+      @Nullable ListMap<TNetworkAddress> hostIndex, String debugAction, String logPrefix,
+      GroupedContentFiles icebergFiles, boolean canDataBeOutsideOfTableLocation) {
     if (writeIdList != null || validTxnList != null) {
       // make sure that both either both writeIdList and validTxnList are set or both
       // of them are not.
@@ -95,9 +108,16 @@ public class ParallelFileMetadataLoader {
     loaders_ = Maps.newHashMap();
     for (Map.Entry<Path, List<HdfsPartition.Builder>> e : partsByPath_.entrySet()) {
       List<FileDescriptor> oldFds = e.getValue().get(0).getFileDescriptors();
-      FileMetadataLoader loader = new FileMetadataLoader(e.getKey(),
-          isRecursive, oldFds, hostIndex, validTxnList, writeIdList,
-          e.getValue().get(0).getFileFormat());
+      FileMetadataLoader loader;
+      HdfsFileFormat format = e.getValue().get(0).getFileFormat();
+      if (format.equals(HdfsFileFormat.ICEBERG)) {
+        loader = new IcebergFileMetadataLoader(e.getKey(), isRecursive, oldFds, hostIndex,
+            validTxnList, writeIdList, Preconditions.checkNotNull(icebergFiles),
+            canDataBeOutsideOfTableLocation);
+      } else {
+        loader = new FileMetadataLoader(e.getKey(), isRecursive, oldFds, hostIndex,
+            validTxnList, writeIdList, format);
+      }
       // If there is a cached partition mapped to this path, we recompute the block
       // locations even if the underlying files have not changed.
       // This is done to keep the cached block metadata up to date.
@@ -140,6 +160,7 @@ public class ParallelFileMetadataLoader {
         } else {
           partBuilder.setFileDescriptors(loader.getLoadedFds());
         }
+        partBuilder.setFileMetadataStats(loader.getFileMetadataStats());
       }
     }
   }
@@ -153,8 +174,11 @@ public class ParallelFileMetadataLoader {
     if (loaders_.isEmpty()) return;
 
     int failedLoadTasks = 0;
-    ExecutorService pool = createPool();
+    int poolSize = getPoolSize(loaders_.size(), fs_);
+    ExecutorService pool = createPool(poolSize, logPrefix_);
+    TOTAL_THREADS.addAndGet(poolSize);
     try (ThreadNameAnnotator tna = new ThreadNameAnnotator(logPrefix_)) {
+      TOTAL_TABLES.incrementAndGet();
       List<Pair<FileMetadataLoader, Future<Void>>> futures =
           new ArrayList<>(loaders_.size());
       for (FileMetadataLoader loader : loaders_.values()) {
@@ -175,6 +199,8 @@ public class ParallelFileMetadataLoader {
       }
     } finally {
       pool.shutdown();
+      TOTAL_THREADS.addAndGet(-poolSize);
+      TOTAL_TABLES.addAndGet(-1);
     }
     if (failedLoadTasks > 0) {
       int errorsNotLogged = failedLoadTasks - MAX_PATH_METADATA_LOADING_ERRORS_TO_LOG;
@@ -188,7 +214,21 @@ public class ParallelFileMetadataLoader {
   }
 
   /**
-   * Returns the thread pool to load the file metadata.
+   * Returns the thread pool to load the file metadata. Callers should use
+   * {@link #getPoolSize(int, FileSystem)} to get a correct pool size.
+   */
+  public static ExecutorService createPool(int poolSize, String logPrefix) {
+    Preconditions.checkState(poolSize > 0, "Illegal poolSize: {}", poolSize);
+    if (poolSize == 1) {
+      return MoreExecutors.newDirectExecutorService();
+    } else {
+      LOG.info("{} using a thread pool of size {}", logPrefix, poolSize);
+      return Executors.newFixedThreadPool(poolSize);
+    }
+  }
+
+  /**
+   * Returns the thread pool size to load the file metadata.
    *
    * We use different thread pool sizes for HDFS and non-HDFS tables since the latter
    * supports much higher throughput of RPC calls for listStatus/listFiles. For
@@ -199,19 +239,12 @@ public class ParallelFileMetadataLoader {
    * clusters. We narrowed it down to scalability bottlenecks in HDFS RPC implementation
    * (HADOOP-14558) on both the server and the client side.
    */
-  private ExecutorService createPool() {
-    int numLoaders = loaders_.size();
-    Preconditions.checkState(numLoaders > 0);
-    int poolSize = FileSystemUtil.supportsStorageIds(fs_) ?
-        MAX_HDFS_PARTITIONS_PARALLEL_LOAD : MAX_NON_HDFS_PARTITIONS_PARALLEL_LOAD;
+  public static int getPoolSize(int numLoaders, FileSystem fs) {
+    int poolSize = FileSystemUtil.supportsStorageIds(fs) ?
+        MAX_HDFS_PARTITIONS_PARALLEL_LOAD :
+        MAX_NON_HDFS_PARTITIONS_PARALLEL_LOAD;
     // Thread pool size need not exceed the number of paths to be loaded.
     poolSize = Math.min(numLoaders, poolSize);
-
-    if (poolSize == 1) {
-      return MoreExecutors.newDirectExecutorService();
-    } else {
-      LOG.info(logPrefix_ + " using a thread pool of size {}", poolSize);
-      return Executors.newFixedThreadPool(poolSize);
-    }
+    return poolSize;
   }
 }

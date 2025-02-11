@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import map, range
 import pytest
 import random
 import time
@@ -25,6 +27,7 @@ from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.parametrize import UniqueDatabase
 from tests.common.skip import SkipIf
 from tests.stress.stress_util import run_tasks, Task
+from tests.util.filesystem_utils import WAREHOUSE
 
 
 # Stress test for concurrent INSERT operations.
@@ -48,16 +51,9 @@ class TestInsertStress(ImpalaTestSuite):
     try:
       insert_cnt = 0
       while insert_cnt < num_inserts:
-        try:
-          impalad_client.execute("insert into table %s values (%i, %i)" % (
-              tbl_name, wid, insert_cnt))
-          insert_cnt += 1
-        except Exception as e:
-          # It's possible that the Iceberg table is concurrently updated in CatalogD
-          # during data load in local catalog.
-          if "InconsistentMetadataFetchException" in str(e):
-            continue
-          raise e
+        impalad_client.execute("insert into table %s values (%i, %i)" % (
+            tbl_name, wid, insert_cnt))
+        insert_cnt += 1
     finally:
       with counter.get_lock():
         counter.value += 1
@@ -69,31 +65,24 @@ class TestInsertStress(ImpalaTestSuite):
     def verify_result_set(result):
       wid_to_run = dict()
       for line in result.data:
-        [wid, i] = map(int, (line.split('\t')))
+        [wid, i] = list(map(int, (line.split('\t'))))
         wid_to_run.setdefault(wid, []).append(i)
       for wid, run in wid_to_run.items():
         sorted_run = sorted(run)
-        assert sorted_run == range(sorted_run[0], sorted_run[-1] + 1), "wid: %d" % wid
+        assert sorted_run == list(range(sorted_run[0], sorted_run[-1] + 1)), \
+          "wid: %d" % wid
 
     target_impalad = cid % ImpalaTestSuite.get_impalad_cluster_size()
     impalad_client = ImpalaTestSuite.create_client_for_nth_impalad(target_impalad)
     try:
       while counter.value != writers:
-        try:
-          result = impalad_client.execute("select * from %s" % tbl_name)
-          verify_result_set(result)
-          time.sleep(random.random())
-        except Exception as e:
-          # It's possible that the Iceberg table is concurrently updated in CatalogD
-          # during data load in local catalog.
-          if "InconsistentMetadataFetchException" in str(e):
-            continue
-          raise e
+        result = impalad_client.execute("select * from %s" % tbl_name)
+        verify_result_set(result)
+        time.sleep(random.random())
     finally:
       impalad_client.close()
 
   @pytest.mark.execute_serially
-  @pytest.mark.stress
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_inserts(self, unique_database):
     """Issues INSERT statements against multiple impalads in a way that some
@@ -109,15 +98,14 @@ class TestInsertStress(ImpalaTestSuite):
     inserts = 50
 
     writers = [Task(self._impala_role_concurrent_writer, tbl_name, i, inserts, counter)
-               for i in xrange(0, num_writers)]
+               for i in range(0, num_writers)]
     checkers = [Task(self._impala_role_concurrent_checker, tbl_name, i, counter,
                      num_writers)
-                for i in xrange(0, num_checkers)]
+                for i in range(0, num_checkers)]
     run_tasks(writers + checkers)
 
   @pytest.mark.execute_serially
-  @pytest.mark.stress
-  @SkipIf.not_hdfs
+  @SkipIf.not_dfs
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_iceberg_inserts(self, unique_database):
     """Issues INSERT statements against multiple impalads in a way that some
@@ -128,7 +116,7 @@ class TestInsertStress(ImpalaTestSuite):
     self.client.execute("""create table {0} (wid int, i int) stored as iceberg
         tblproperties('iceberg.catalog'='hadoop.catalog',
                       'iceberg.catalog_location'='{1}')""".format(
-        tbl_name, '/test-warehouse/' + unique_database))
+        tbl_name, "{0}/{1}".format(WAREHOUSE, unique_database)))
 
     counter = Value('i', 0)
     num_writers = 4
@@ -136,8 +124,8 @@ class TestInsertStress(ImpalaTestSuite):
     inserts = 30
 
     writers = [Task(self._impala_role_concurrent_writer, tbl_name, i, inserts, counter)
-               for i in xrange(0, num_writers)]
+               for i in range(0, num_writers)]
     checkers = [Task(self._impala_role_concurrent_checker, tbl_name, i, counter,
                      num_writers)
-                for i in xrange(0, num_checkers)]
+                for i in range(0, num_checkers)]
     run_tasks(writers + checkers)

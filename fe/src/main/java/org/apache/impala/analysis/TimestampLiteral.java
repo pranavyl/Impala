@@ -21,6 +21,7 @@ import java.util.Arrays;
 
 import com.google.common.base.Preconditions;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.TypeCompatibility;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
@@ -57,7 +58,7 @@ public class TimestampLiteral extends LiteralExpr {
   }
 
   @Override
-  public boolean localEquals(Expr that) {
+  protected boolean localEquals(Expr that) {
     return super.localEquals(that) &&
         Arrays.equals(value_, ((TimestampLiteral) that).value_);
   }
@@ -84,11 +85,12 @@ public class TimestampLiteral extends LiteralExpr {
   }
 
   @Override
-  protected Expr uncheckedCastTo(Type targetType) throws AnalysisException {
+  protected Expr uncheckedCastTo(Type targetType, TypeCompatibility compatibility)
+      throws AnalysisException {
     if (targetType.equals(type_)) {
       return this;
     } else {
-      return new CastExpr(targetType, this);
+      return new CastExpr(targetType, this, compatibility);
     }
   }
 

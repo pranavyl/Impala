@@ -23,15 +23,18 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.DescriptorTable;
@@ -59,6 +62,7 @@ import org.apache.impala.catalog.HdfsPartition.FileBlock;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.ScalarType;
+import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
@@ -68,6 +72,7 @@ import org.apache.impala.common.NotImplementedException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.common.PrintUtils;
 import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.common.ThriftSerializationCtx;
 import org.apache.impala.fb.FbFileBlock;
 import org.apache.impala.planner.RuntimeFilterGenerator.RuntimeFilter;
 import org.apache.impala.service.BackendConfig;
@@ -89,6 +94,7 @@ import org.apache.impala.thrift.TScanRangeLocationList;
 import org.apache.impala.thrift.TScanRangeSpec;
 import org.apache.impala.thrift.TSortingOrder;
 import org.apache.impala.thrift.TTableStats;
+import org.apache.impala.util.AcidUtils;
 import org.apache.impala.util.BitUtil;
 import org.apache.impala.util.ExecutorMembershipSnapshot;
 import org.apache.impala.util.MathUtil;
@@ -155,8 +161,13 @@ public class HdfsScanNode extends ScanNode {
   // TODO: is it worth making this a tunable query option?
   private static final long DEFAULT_COLUMN_SCAN_RANGE_RESERVATION = 4L * 1024L * 1024L;
 
-  // Read size for Parquet and ORC footers. Matches HdfsScanner::FOOTER_SIZE in backend.
-  private static final long FOOTER_SIZE = 100L * 1024L;
+  // Read size for Parquet and ORC footers.
+  // Matches HdfsParquetScanner::PARQUET_FOOTER_SIZE in backend.
+  private static final long PARQUET_FOOTER_SIZE = 100L * 1024L;
+
+  // Read size for ORC footers.
+  // Matches HdfsOrcScanner::ORC_FOOTER_SIZE in backend.
+  private static final long ORC_FOOTER_SIZE = 16L * 1024L;
 
   // When the information of cardinality is not available for the underlying hdfs table,
   // i.e., the field of cardinality_ is equal to -1, we will attempt to compute an
@@ -195,7 +206,16 @@ public class HdfsScanNode extends ScanNode {
           .add(HdfsFileFormat.PARQUET)
           .add(HdfsFileFormat.HUDI_PARQUET)
           .add(HdfsFileFormat.ORC)
+          .add(HdfsFileFormat.ICEBERG)
           .build();
+
+  // Coefficients for estimating scan CPU processing cost. Derived from benchmarking.
+  // Cost per byte materialized for columnar or per byte scanned for non-columnar.
+  private static final double COST_COEFFICIENT_COLUMNAR_BYTES_MATERIALIZED = 0.0144;
+  private static final double COST_COEFFICIENT_NONCOLUMNAR_BYTES_SCANNED = 0.0354;
+  // Cost per predicate per row
+  private static final double COST_COEFFICIENT_COLUMNAR_PREDICATE_EVAL = 0.0281;
+  private static final double COST_COEFFICIENT_NONCOLUMNAR_PREDICATE_EVAL = 0.0549;
 
   //An estimate of the width of a row when the information is not available.
   private double DEFAULT_ROW_WIDTH_ESTIMATE = 1.0;
@@ -203,7 +223,13 @@ public class HdfsScanNode extends ScanNode {
   private final FeFsTable tbl_;
 
   // List of partitions to be scanned. Partitions have been pruned.
-  protected final List<? extends FeFsPartition> partitions_;
+  protected final List<FeFsPartition> partitions_;
+
+  // List of paritions that has been reduced through sampling.
+  // Only initialized at checkSamplingAndCountStar() if sampling is True.
+  // Accessors must fallback to partitions_ if sampledPartitions_ stays null after
+  // checkSamplingAndCountStar().
+  protected List<FeFsPartition> sampledPartitions_ = null;
 
   // Parameters for table sampling. Null if not sampling.
   private final TableSampleClause sampleParams_;
@@ -224,11 +250,16 @@ public class HdfsScanNode extends ScanNode {
   private Map<FileSystemUtil.FsType, Long> totalFilesPerFsEC_ = new TreeMap<>();
   private Map<FileSystemUtil.FsType, Long> totalBytesPerFsEC_ = new TreeMap<>();
 
-  // File formats scanned. Set in computeScanRangeLocations().
-  private Set<HdfsFileFormat> fileFormats_;
+  // File formats scanned. Set in checkSamplingAndCountStar().
+  // HdfsFileFormat.ICEBERG is always excluded from this set.
+  // Populated in checkSamplingAndCountStar().
+  protected Set<HdfsFileFormat> fileFormats_ = new HashSet<>();
 
   // Whether all formats scanned are Parquet. Set in computeScanRangeLocations().
   private boolean allParquet_ = false;
+
+  // Whether all formats scanned are columnar format. Set in computeScanRangeLocations().
+  private boolean allColumnarFormat_ = false;
 
   // Number of bytes in the largest scan range (i.e. hdfs split). Set in
   // computeScanRangeLocations().
@@ -250,6 +281,11 @@ public class HdfsScanNode extends ScanNode {
   // True if this scan node should use the MT implementation in the backend.
   // Set in computeNodeResourceProfile().
   private boolean useMtScanNode_;
+
+  // True if this scan node should do deterministic assignment of scan ranges to
+  // fragment instances when using mt_dop. If false, this uses the shared queue.
+  // This has no impact on mt_dop=0.
+  private boolean deterministicScanRangeAssignment_ = false;
 
   // True if this is a scan that only returns partition keys and is only required to
   // return at least one of each of the distinct values of the partition keys.
@@ -305,10 +341,10 @@ public class HdfsScanNode extends ScanNode {
   private final Map<TupleDescriptor, List<Expr>> statsOriginalConjuncts_ =
       new LinkedHashMap<>();
 
-  // Tuple that is used to materialize statistics when scanning Parquet files. For each
-  // column it can contain 0, 1, or 2 slots, depending on whether the column needs to be
-  // evaluated against the min and/or the max value of the corresponding
-  // parquet::Statistics.
+  // Tuple that is used to materialize statistics when scanning Parquet or ORC files.
+  // For each column it can contain 0, 1, or 2 slots, depending on whether the column
+  // needs to be evaluated against the min and/or the max value of the corresponding
+  // file statistics.
   private TupleDescriptor statsTuple_;
 
   // The list of overlap predicate descs. See TOverlapPredicateDesc in PlanNodes.thrift.
@@ -321,9 +357,15 @@ public class HdfsScanNode extends ScanNode {
   // this scan node has the count(*) optimization enabled.
   protected SlotDescriptor countStarSlot_ = null;
 
+  // Sampled file descriptors if table sampling is used. Grouped by partition id.
+  // Initialized in checkSamplingAndCountStar();
+  Map<Long, List<FileDescriptor>> sampledFiles_ = null;
+
   // Conjuncts used to trim the set of partitions passed to this node.
   // Used only to display EXPLAIN information.
   private final List<Expr> partitionConjuncts_;
+
+  private boolean isFullAcidTable_ = false;
 
   /**
    * Construct a node to scan given data files into tuples described by 'desc',
@@ -337,13 +379,16 @@ public class HdfsScanNode extends ScanNode {
     super(id, desc, createDisplayName(hdfsTblRef.getTable()));
     tbl_ = (FeFsTable)desc.getTable();
     conjuncts_ = conjuncts;
-    partitions_ = partitions;
+    partitions_ = new ArrayList<>(partitions);
     partitionConjuncts_ = partConjuncts;
     sampleParams_ = hdfsTblRef.getSampleParams();
     replicaPreference_ = hdfsTblRef.getReplicaPreference();
     randomReplica_ = hdfsTblRef.getRandomReplica();
+    tableNumRowsHint_ = hdfsTblRef.getTableNumRowsHint();
     FeFsTable hdfsTable = (FeFsTable)hdfsTblRef.getTable();
     Preconditions.checkState(tbl_ == hdfsTable);
+    isFullAcidTable_ =
+        AcidUtils.isFullAcidTable(hdfsTable.getMetaStoreTable().getParameters());
     StringBuilder error = new StringBuilder();
     aggInfo_ = aggInfo;
     skipHeaderLineCount_ = tbl_.parseSkipHeaderLineCount(error);
@@ -380,14 +425,27 @@ public class HdfsScanNode extends ScanNode {
   }
 
   /**
-   * Returns true if the Parquet count(*) optimization can be applied to the query block
+   * Returns true if this scan node contains ORC.
+   */
+  private boolean hasOrc(Set<HdfsFileFormat> fileFormats) {
+    return fileFormats.contains(HdfsFileFormat.ORC);
+  }
+
+  /**
+   * Returns true if the count(*) optimization can be applied to the query block
    * of this scan node.
    */
   protected boolean canApplyCountStarOptimization(Analyzer analyzer,
       Set<HdfsFileFormat> fileFormats) {
     if (fileFormats.size() != 1) return false;
-    if (!hasParquet(fileFormats)) return false;
+    if (isFullAcidTable_) return false;
+    if (!hasParquet(fileFormats) && !hasOrc(fileFormats)) return false;
     return canApplyCountStarOptimization(analyzer);
+  }
+
+  // Return sampledPartitions_ if not null. Otherwise, return partitions_.
+  private List<FeFsPartition> getSampledOrRawPartitions() {
+    return sampledPartitions_ == null ? partitions_ : sampledPartitions_;
   }
 
   /**
@@ -396,6 +454,7 @@ public class HdfsScanNode extends ScanNode {
   @Override
   public void init(Analyzer analyzer) throws ImpalaException {
     conjuncts_ = orderConjunctsByCost(conjuncts_);
+    checkSamplingAndCountStar(analyzer);
     checkForSupportedFileFormats();
 
     assignCollectionConjuncts(analyzer);
@@ -403,31 +462,17 @@ public class HdfsScanNode extends ScanNode {
     // compute scan range locations with optional sampling
     computeScanRangeLocations(analyzer);
 
-    if (hasParquet(fileFormats_)) {
-      // Compute min-max conjuncts only if the PARQUET_READ_STATISTICS query option is
-      // set to true.
-      if (analyzer.getQueryOptions().parquet_read_statistics) {
-        computeStatsTupleAndConjuncts(analyzer);
-      }
+    boolean hasParquetFormat = hasParquet(fileFormats_);
+    if ((hasParquetFormat && analyzer.getQueryOptions().parquet_read_statistics)
+        || (hasOrc(fileFormats_) && analyzer.getQueryOptions().orc_read_statistics)) {
+      // Compute min-max conjuncts only if the PARQUET_READ_STATISTICS
+      // or ORC_READ_STATISTICS query option is set to true.
+      computeStatsTupleAndConjuncts(analyzer);
+    }
+    if (hasParquetFormat && analyzer.getQueryOptions().parquet_dictionary_filtering) {
       // Compute dictionary conjuncts only if the PARQUET_DICTIONARY_FILTERING query
       // option is set to true.
-      if (analyzer.getQueryOptions().parquet_dictionary_filtering) {
-        computeDictionaryFilterConjuncts(analyzer);
-      }
-    }
-
-    if (fileFormats_.contains(HdfsFileFormat.ORC)) {
-      // Compute min-max conjuncts only if the ORC_READ_STATISTICS query option is
-      // set to true.
-      if (analyzer.getQueryOptions().orc_read_statistics) {
-        computeStatsTupleAndConjuncts(analyzer);
-      }
-    }
-
-    if (canApplyCountStarOptimization(analyzer, fileFormats_)) {
-      Preconditions.checkState(desc_.getPath().destTable() != null);
-      Preconditions.checkState(collectionConjuncts_.isEmpty());
-      countStarSlot_ = applyCountStarOptimization(analyzer);
+      computeDictionaryFilterConjuncts(analyzer);
     }
 
     computeMemLayout(analyzer);
@@ -441,25 +486,73 @@ public class HdfsScanNode extends ScanNode {
   }
 
   /**
+   * Initialize sampledFiles_, sampledPartitions_, fileFormats_, and countStarSlot_.
+   * @param analyzer Analyzer object used to init this class.
+   */
+  private void checkSamplingAndCountStar(Analyzer analyzer)
+      throws ImpalaRuntimeException {
+    if (sampleParams_ != null) {
+      long percentBytes = sampleParams_.getPercentBytes();
+      long randomSeed;
+      if (sampleParams_.hasRandomSeed()) {
+        randomSeed = sampleParams_.getRandomSeed();
+      } else {
+        randomSeed = System.currentTimeMillis();
+      }
+      // Pass a minimum sample size of 0 because users cannot set a minimum sample size
+      // for scans directly. For compute stats, a minimum sample size can be set, and
+      // the sampling percent is adjusted to reflect it.
+      sampledFiles_ = getFilesSample(percentBytes, 0, randomSeed);
+    }
+
+    if (sampledFiles_ != null) {
+      // Initialize sampledPartitions_.
+      sampledPartitions_ = new ArrayList<>();
+      for (FeFsPartition partition : partitions_) {
+        Preconditions.checkState(partition.getId() >= 0);
+        if (sampledFiles_.get(partition.getId()) != null) {
+          sampledPartitions_.add(partition);
+        }
+      }
+    }
+
+    populateFileFormats();
+
+    // Initialize countStarSlot_.
+    if (canApplyCountStarOptimization(analyzer, fileFormats_)) {
+      Preconditions.checkState(desc_.getPath().destTable() != null);
+      Preconditions.checkState(collectionConjuncts_.isEmpty());
+      countStarSlot_ = applyCountStarOptimization(analyzer);
+    }
+  }
+
+  protected void populateFileFormats() throws ImpalaRuntimeException {
+    for (FeFsPartition partition : getSampledOrRawPartitions()) {
+      if (partition.getFileFormat() != HdfsFileFormat.ICEBERG) {
+        fileFormats_.add(partition.getFileFormat());
+      }
+    }
+  }
+
+  /**
    * Throws NotImplementedException if we do not support scanning the partition.
    * Specifically:
    * 1) if the table schema contains a complex type and we need to scan
    * a partition that has a format for which we do not support complex types,
    * regardless of whether a complex-typed column is actually referenced
    * in the query.
-   * 2) if we are scanning ORC partitions and the ORC scanner is disabled.
+   * 2) if we are scanning compressed json file or the json scanner is disabled.
    */
   @Override
   protected void checkForSupportedFileFormats() throws NotImplementedException {
     Preconditions.checkNotNull(desc_);
     Preconditions.checkNotNull(desc_.getTable());
 
-    if (!BackendConfig.INSTANCE.isOrcScannerEnabled()) {
-      for (FeFsPartition part: partitions_) {
-        if (part.getFileFormat() == HdfsFileFormat.ORC) {
-          throw new NotImplementedException(
-              "ORC scans are disabled by --enable_orc_scanner flag");
-        }
+    for (FeFsPartition part: partitions_) {
+      if (!part.getFileFormat().equals(HdfsFileFormat.JSON)) continue;
+      if (!BackendConfig.INSTANCE.isJsonScannerEnabled()) {
+        throw new NotImplementedException(
+            "JSON scans are disabled by --enable_json_scanner flag.");
       }
     }
 
@@ -527,7 +620,7 @@ public class HdfsScanNode extends ScanNode {
   private void buildBinaryStatsPredicate(Analyzer analyzer, SlotRef inputSlot,
       BinaryPredicate inputPred, BinaryPredicate.Operator op) {
     // Obtain the rhs expr of the input predicate
-    Expr constExpr = inputPred.getChild(1);
+    Expr constExpr = inputPred.getChild(1).clone();
     Preconditions.checkState(constExpr.isConstant());
 
     // Make a new slot descriptor, which adds it to the tuple descriptor.
@@ -568,10 +661,10 @@ public class HdfsScanNode extends ScanNode {
   private boolean isUnsupportedStatsType(Type type) {
     // TODO(IMPALA-10882): Push down Min-Max predicates of CHAR/VARCHAR to ORC reader
     // TODO(IMPALA-10915): Push down Min-Max predicates of TIMESTAMP to ORC reader
-    return fileFormats_.contains(HdfsFileFormat.ORC)
+    return hasOrc(fileFormats_)
         && (type.getPrimitiveType() == PrimitiveType.CHAR
-            || type.getPrimitiveType() == PrimitiveType.VARCHAR
-            || type.getPrimitiveType() == PrimitiveType.TIMESTAMP);
+               || type.getPrimitiveType() == PrimitiveType.VARCHAR
+               || type.getPrimitiveType() == PrimitiveType.TIMESTAMP);
   }
 
   private void tryComputeBinaryStatsPredicate(Analyzer analyzer,
@@ -593,6 +686,7 @@ public class HdfsScanNode extends ScanNode {
     // LiteralExpr, but can also be an expr like "1 + 2".
     if (!constExpr.isConstant()) return;
     if (Expr.IS_NULL_VALUE.apply(constExpr)) return;
+    if (slotDesc.isVirtualColumn()) return;
     if (isUnsupportedStatsType(slotDesc.getType())) return;
     if (isUnsupportedStatsType(constExpr.getType())) return;
 
@@ -608,7 +702,7 @@ public class HdfsScanNode extends ScanNode {
         buildBinaryStatsPredicate(analyzer, slotRef, binaryPred,
             BinaryPredicate.Operator.GE);
       }
-      if (fileFormats_.contains(HdfsFileFormat.ORC)) {
+      if (hasOrc(fileFormats_)) {
         // We can push down EQ predicates to the ORC reader directly.
         buildBinaryStatsPredicate(analyzer, slotRef, binaryPred, binaryPred.getOp());
       }
@@ -625,10 +719,12 @@ public class HdfsScanNode extends ScanNode {
     // Skip the slot ref if it refers to an array's "pos" field.
     if (slotDesc.isArrayPosRef()) return;
     if (inPred.isNotIn()) return;
-    if (fileFormats_.contains(HdfsFileFormat.ORC)) {
+    boolean inPredRegistered = false;
+    if (hasOrc(fileFormats_)) {
       if (isUnsupportedStatsType(slotDesc.getType())) return;
       addStatsOriginalConjunct(slotDesc.getParent(), inPred);
       buildInListStatsPredicate(analyzer, slotRef, inPred);
+      inPredRegistered = true;
     }
 
     if (!hasParquet(fileFormats_)) return;
@@ -655,7 +751,10 @@ public class HdfsScanNode extends ScanNode {
     BinaryPredicate maxBound = new BinaryPredicate(BinaryPredicate.Operator.LE,
         children.get(0).clone(), max.clone());
 
-    addStatsOriginalConjunct(slotDesc.getParent(), inPred);
+    if (!inPredRegistered) {
+      addStatsOriginalConjunct(slotDesc.getParent(), inPred);
+      inPredRegistered = true;
+    }
     buildBinaryStatsPredicate(analyzer, slotRef, minBound, minBound.getOp());
     buildBinaryStatsPredicate(analyzer, slotRef, maxBound, maxBound.getOp());
   }
@@ -663,7 +762,7 @@ public class HdfsScanNode extends ScanNode {
   private void tryComputeIsNullStatsPredicate(Analyzer analyzer,
       IsNullPredicate isNullPred) {
     // Currently, only ORC table can push down IS-NULL predicates.
-    if (!fileFormats_.contains(HdfsFileFormat.ORC)) return;
+    if (!hasOrc(fileFormats_)) return;
     // Retrieve the left side of the IS-NULL predicate. Skip if it's not a simple slot.
     SlotRef slotRef = isNullPred.getBoundSlot();
     if (slotRef == null) return;
@@ -719,6 +818,7 @@ public class HdfsScanNode extends ScanNode {
    */
   private void computeStatsTupleAndConjuncts(Analyzer analyzer) throws ImpalaException{
     Preconditions.checkNotNull(desc_.getPath());
+    if (statsTuple_ != null) return;
     String tupleName = desc_.getPath().toString() + " statistics";
     DescriptorTable descTbl = analyzer.getDescTbl();
     statsTuple_ = descTbl.createTupleDescriptor(tupleName);
@@ -936,8 +1036,8 @@ public class HdfsScanNode extends ScanNode {
       // FROM clause then avoid pushing down conjunct for this slot to the scanner as it
       // would result incorrect results on that slot after performing the unnest.
       // One exception is when there is only one such table reference in the FROM clause.
-      Set<TupleId> zippingUnnestTupleIds = analyzer.getZippingUnnestTupleIds();
-      if (zippingUnnestTupleIds.size() > 1 && zippingUnnestTupleIds.contains(itemTid)) {
+      if (analyzer.getNumZippingUnnests() > 1 &&
+          analyzer.getZippingUnnestTupleIds().contains(itemTid)) {
         continue;
       }
 
@@ -987,9 +1087,22 @@ public class HdfsScanNode extends ScanNode {
     // at-a-time. Expect a single slot conjunct to be associated with a single tuple-id.
     if (slotIds.size() != 1) return;
 
+    SlotDescriptor firstSlotDesc = analyzer.getSlotDesc(slotIds.get(0));
     // Check to see if this slot is a collection type. Dictionary pruning is applicable
     // to scalar values nested in collection types, not enclosing collection types.
-    if (analyzer.getSlotDesc(slotIds.get(0)).getType().isCollectionType()) return;
+    if (firstSlotDesc.getType().isCollectionType()) return;
+
+    // Dictionary filtering is not applicable on virtual columns.
+    if (firstSlotDesc.isVirtualColumn()) return;
+
+    // If any of the slot descriptors affected by 'conjunct' happens to be a scalar member
+    // of a struct, where the struct is also given in the select list then skip dictionary
+    // filtering as the slot/tuple IDs in the conjunct would mismatch with the ones in the
+    // select list and would result a Precondition check failure later.
+    for (SlotId slotId : slotIds) {
+      SlotDescriptor slotDesc = analyzer.getSlotDesc(slotId);
+      if (IsMemberOfStructInSelectList(slotDesc)) return;
+    }
 
     // Check to see if this conjunct contains any known randomized function
     if (conjunct.contains(Expr.IS_NONDETERMINISTIC_BUILTIN_FN_PREDICATE)) return;
@@ -1021,6 +1134,27 @@ public class HdfsScanNode extends ScanNode {
   }
 
   /**
+   * Checks if 'slotDesc' is a member of a struct slot where the struct slot is given in
+   * the select list.
+   */
+  private boolean IsMemberOfStructInSelectList(SlotDescriptor slotDesc) {
+    SlotDescriptor parentStructSlot = slotDesc.getParent().getParentSlotDesc();
+    // Check if 'slotDesc' is a member of a struct slot descriptor.
+    if (slotDesc.getType().isScalarType() && parentStructSlot == null) return false;
+
+    if (slotDesc.getType().isStructType()) {
+      // Check if the struct is in the select list.
+      for (SlotDescriptor scannedSlots : desc_.getSlots()) {
+        if (scannedSlots.getId() == slotDesc.getId()) return true;
+      }
+    }
+
+    // Recursively check the parent struct if it's given in the select list.
+    if (parentStructSlot != null) return IsMemberOfStructInSelectList(parentStructSlot);
+    return false;
+  }
+
+  /**
    * Walks through conjuncts_ and collectionConjuncts_ and populates
    * dictionaryFilterConjuncts_.
    */
@@ -1039,143 +1173,126 @@ public class HdfsScanNode extends ScanNode {
   }
 
   /**
-   * A collection of metadata associated with a sampled partition. Unlike
-   * {@link FeFsPartition} this class is safe to use in hash-based data structures.
-   */
-  public static final class SampledPartitionMetadata {
-
-    private final long partitionId;
-    private final FileSystemUtil.FsType partitionFsType;
-
-    public SampledPartitionMetadata(
-        long partitionId, FileSystemUtil.FsType partitionFsType) {
-      this.partitionId = partitionId;
-      this.partitionFsType = partitionFsType;
-    }
-
-    @Override
-    public boolean equals(Object o) {
-      if (this == o) return true;
-      if (o == null || getClass() != o.getClass()) return false;
-      SampledPartitionMetadata that = (SampledPartitionMetadata) o;
-      return partitionId == that.partitionId && partitionFsType == that.partitionFsType;
-    }
-
-    @Override
-    public int hashCode() {
-      return java.util.Objects.hash(partitionId, partitionFsType);
-    }
-
-    private FileSystemUtil.FsType getPartitionFsType() { return partitionFsType; }
-  }
-
-  /**
    * Computes scan ranges (i.e. hdfs splits) plus their storage locations, including
    * volume ids, based on the given maximum number of bytes each scan range should scan.
-   * If 'sampleParams_' is not null, generates a sample and computes the scan ranges
-   * based on the sample.
+   * If 'sampledPartitions_' is not null, computes the scan ranges based on the sample
+   * partitions.
    *
    * Initializes members with information about files and scan ranges, e.g.
-   * totalFilesPerFs_, fileFormats_, etc.
+   * scanRangeSpecs_, generatedScanRangeCount_, totalFilesPerFs_, etc.
    */
-  private void computeScanRangeLocations(Analyzer analyzer)
+  protected void computeScanRangeLocations(Analyzer analyzer)
       throws ImpalaRuntimeException {
-    Map<SampledPartitionMetadata, List<FileDescriptor>> sampledFiles = null;
-    if (sampleParams_ != null) {
-      long percentBytes = sampleParams_.getPercentBytes();
-      long randomSeed;
-      if (sampleParams_.hasRandomSeed()) {
-        randomSeed = sampleParams_.getRandomSeed();
-      } else {
-        randomSeed = System.currentTimeMillis();
-      }
-      // Pass a minimum sample size of 0 because users cannot set a minimum sample size
-      // for scans directly. For compute stats, a minimum sample size can be set, and
-      // the sampling percent is adjusted to reflect it.
-      sampledFiles = FeFsTable.Utils.getFilesSample(tbl_, partitions_, percentBytes, 0,
-          randomSeed);
-    }
-
     long scanRangeBytesLimit = analyzer.getQueryCtx().client_request.getQuery_options()
         .getMax_scan_range_length();
-    scanRangeSpecs_ = new TScanRangeSpec();
-
-    if (sampledFiles != null) {
-      numPartitionsPerFs_ = sampledFiles.keySet().stream().collect(Collectors.groupingBy(
-          SampledPartitionMetadata::getPartitionFsType, Collectors.counting()));
-    } else {
-      numPartitionsPerFs_.putAll(partitions_.stream().collect(
-          Collectors.groupingBy(FeFsPartition::getFsType, Collectors.counting())));
+    if (RuntimeEnv.INSTANCE.hasTableScanRangeLimit() && desc_.getTableName() != null) {
+      long testLimit = RuntimeEnv.INSTANCE.getTableScanRangeLimit(
+          desc_.getTableName().getDb(), desc_.getTableName().getTbl());
+      if (testLimit > 0
+          && (scanRangeBytesLimit == 0 || scanRangeBytesLimit > testLimit)) {
+        scanRangeBytesLimit = testLimit;
+      }
     }
 
+    // Initialize class fields that related to scan ranges.
+    scanRangeSpecs_ = new TScanRangeSpec();
+    generatedScanRangeCount_ = 0;
+    largestScanRangeBytes_ = 0;
+    maxScanRangeNumRows_ = -1;
+    numScanRangesNoDiskIds_ = 0;
+    numFilesNoDiskIds_ = 0;
+    numPartitionsNoDiskIds_ = 0;
+    numPartitionsPerFs_ = new TreeMap<>();
     totalFilesPerFs_ = new TreeMap<>();
     totalBytesPerFs_ = new TreeMap<>();
     totalFilesPerFsEC_ = new TreeMap<>();
     totalBytesPerFsEC_ = new TreeMap<>();
-    largestScanRangeBytes_ = 0;
-    maxScanRangeNumRows_ = -1;
-    fileFormats_ = new HashSet<>();
-    boolean allParquet = (partitions_.size() > 0) ? true : false;
+
+    Preconditions.checkState((sampleParams_ == null) == (sampledPartitions_ == null));
+    // Assume all table files are in parquet format and all in columnar format
+    // until proven otherwise.
+    boolean allParquet = true;
+    boolean allColumnarFormat = true;
+
+    if (this instanceof IcebergScanNode && this.fileFormats_.isEmpty()) {
+      // Iceberg tables always have one partition, even if the scan node contains zero
+      // file descriptors. TODO: IMPALA-13267
+      allParquet = false;
+      allColumnarFormat = false;
+    } else {
+      // If table has no partition, then it is not all parquet, nor it is all columnar.
+      int partitionsSize = getSampledOrRawPartitions().size();
+      allParquet = partitionsSize > 0;
+      allColumnarFormat = partitionsSize > 0;
+    }
     long simpleLimitNumRows = 0; // only used for the simple limit case
     boolean isSimpleLimit = sampleParams_ == null &&
         (analyzer.getQueryCtx().client_request.getQuery_options()
             .isOptimize_simple_limit()
         && analyzer.getSimpleLimitStatus() != null
         && analyzer.getSimpleLimitStatus().first);
-    for (FeFsPartition partition: partitions_) {
+
+    // Save the last looked up FileSystem object. It is enough for the scheme and
+    // authority part of the URI to match to ensure that getFileSystem() would return the
+    // same file system. See Hadoop's filesystem caching implementation at
+    // https://github.com/apache/hadoop/blob/1046f9cf9888155c27923f3f56efa107d908ad5b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java#L3867
+    // Note that in the Hadoop code the slow part is UserGroupInformation.getCurrentUser()
+    // which is not important here as the user is always the same in Impala.
+    String lastFsScheme = null;
+    String lastFsAuthority = null;
+    FileSystem lastFileSytem = null;
+    for (FeFsPartition partition : getSampledOrRawPartitions()) {
+      // Save location to local variable because getLocation() can be slow as it needs to
+      // decompress the partition's location.
+      String partitionLocation = partition.getLocation();
+      Path partitionPath = new Path(partitionLocation);
+      String fsScheme = partitionPath.toUri().getScheme();
+      String fsAuthority = partitionPath.toUri().getAuthority();
+      FileSystemUtil.FsType fsType = FileSystemUtil.FsType.getFsType(fsScheme);
+
+      FileSystem partitionFs;
+      if (lastFileSytem != null &&
+         Objects.equals(lastFsScheme, fsScheme) &&
+         Objects.equals(lastFsAuthority, fsAuthority)) {
+        partitionFs = lastFileSytem;
+      } else {
+        try {
+          partitionFs = partitionPath.getFileSystem(CONF);
+        } catch (IOException e) {
+          throw new ImpalaRuntimeException("Error determining partition fs type", e);
+        }
+        lastFsScheme = fsScheme;
+        lastFsAuthority = fsAuthority;
+        lastFileSytem = partitionFs;
+      }
+
       // Missing disk id accounting is only done for file systems that support the notion
       // of disk/storage ids.
-      FileSystem partitionFs;
-      try {
-        partitionFs = partition.getLocationPath().getFileSystem(CONF);
-      } catch (IOException e) {
-        throw new ImpalaRuntimeException("Error determining partition fs type", e);
-      }
       boolean fsHasBlocks = FileSystemUtil.supportsStorageIds(partitionFs);
-      List<FileDescriptor> fileDescs;
-      if (this instanceof IcebergScanNode) {
-        fileDescs = ((IcebergScanNode) this).getFileDescriptorByIcebergPredicates();
-      } else {
-        if (isSimpleLimit) {
-          fileDescs = new ArrayList<>();
-          for (FileDescriptor fd : partition.getFileDescriptors()) {
-            // skip empty files
-            if ((fsHasBlocks && fd.getNumFileBlocks() == 0)
-                || (!fsHasBlocks && fd.getFileLength() <= 0)) {
-              continue;
-            }
-            simpleLimitNumRows++;  // conservatively estimate 1 row per file
-            fileDescs.add(fd);
-            if (simpleLimitNumRows == analyzer.getSimpleLimitStatus().second) {
-              break;
-            }
-          }
-        } else {
-          fileDescs = partition.getFileDescriptors();
-        }
+      List<FileDescriptor> fileDescs = getFileDescriptorsWithLimit(partition, fsHasBlocks,
+          isSimpleLimit ? analyzer.getSimpleLimitStatus().second - simpleLimitNumRows
+                        : -1);
+      // conservatively estimate 1 row per file
+      simpleLimitNumRows += fileDescs.size();
+      if (sampledFiles_ != null) {
+        // If we are sampling, get files in the sample.
+        fileDescs = sampledFiles_.get(partition.getId());
       }
 
-      if (sampledFiles != null) {
-        // If we are sampling, check whether this partition is included in the sample.
-        fileDescs = sampledFiles.get(
-            new SampledPartitionMetadata(partition.getId(), partition.getFsType()));
-        if (fileDescs == null) continue;
-      }
       long partitionNumRows = partition.getNumRows();
-
       analyzer.getDescTbl().addReferencedPartition(tbl_, partition.getId());
-      fileFormats_.add(partition.getFileFormat());
       if (!partition.getFileFormat().isParquetBased()) {
         allParquet = false;
       }
-      Preconditions.checkState(partition.getId() >= 0);
+      allColumnarFormat =
+          allColumnarFormat && VALID_COLUMNAR_FORMATS.contains(partition.getFileFormat());
 
       if (!fsHasBlocks) {
         // Limit the scan range length if generating scan ranges (and we're not
         // short-circuiting the scan for a partition key scan).
         long defaultBlockSize = (partition.getFileFormat().isParquetBased()) ?
             analyzer.getQueryOptions().parquet_object_store_split_size :
-            partitionFs.getDefaultBlockSize(partition.getLocationPath());
+            partitionFs.getDefaultBlockSize(partitionPath);
         long maxBlockSize =
             Math.max(defaultBlockSize, FileDescriptor.MIN_SYNTHETIC_BLOCK_SIZE);
         if (scanRangeBytesLimit > 0) {
@@ -1187,32 +1304,45 @@ public class HdfsScanNode extends ScanNode {
       final long partitionBytes = FileDescriptor.computeTotalFileLength(fileDescs);
       long partitionMaxScanRangeBytes = 0;
       boolean partitionMissingDiskIds = false;
-      totalBytesPerFs_.merge(partition.getFsType(), partitionBytes, Long::sum);
-      totalFilesPerFs_.merge(partition.getFsType(), (long) fileDescs.size(), Long::sum);
+      totalBytesPerFs_.merge(fsType, partitionBytes, Long::sum);
+      totalFilesPerFs_.merge(fsType, (long) fileDescs.size(), Long::sum);
+      numPartitionsPerFs_.merge(fsType, 1L, Long::sum);
 
       for (FileDescriptor fileDesc: fileDescs) {
         if (!analyzer.getQueryOptions().isAllow_erasure_coded_files() &&
             fileDesc.getIsEc()) {
-          throw new ImpalaRuntimeException(String.format(
-              "Scanning of HDFS erasure-coded file (%s/%s) is not supported",
-              partition.getLocation(), fileDesc.getRelativePath()));
+          throw new ImpalaRuntimeException(String
+              .format("Scanning of HDFS erasure-coded file (%s) is not supported",
+                  fileDesc.getAbsolutePath(partitionLocation)));
         }
 
         // Accumulate on the number of EC files and the total size of such files.
         if (fileDesc.getIsEc()) {
-          totalFilesPerFsEC_.merge(partition.getFsType(), 1L, Long::sum);
-          totalBytesPerFsEC_.merge(
-              partition.getFsType(), fileDesc.getFileLength(), Long::sum);
+          totalFilesPerFsEC_.merge(fsType, 1L, Long::sum);
+          totalBytesPerFsEC_.merge(fsType, fileDesc.getFileLength(), Long::sum);
         }
+
+        // If parquet count star optimization is enabled, we only need the
+        // 'RowGroup.num_rows' in file metadata, thus only the scan range that contains
+        // a file footer is required.
+        // IMPALA-8834 introduced the optimization for partition key scan by generating
+        // one scan range for each HDFS file. With Parquet and ORC, we only need to get
+        // the scan range that contains a file footer for short-circuiting.
+        boolean isFooterOnly = countStarSlot_ != null
+            || (isPartitionKeyScan_
+                && (partition.getFileFormat().isParquetBased()
+                    || partition.getFileFormat() == HdfsFileFormat.ORC));
 
         if (!fsHasBlocks) {
           Preconditions.checkState(fileDesc.getNumFileBlocks() == 0);
-          generateScanRangeSpecs(partition, fileDesc, scanRangeBytesLimit);
+          generateScanRangeSpecs(
+              partition, partitionLocation, fileDesc, scanRangeBytesLimit, isFooterOnly);
         } else {
           // Skips files that have no associated blocks.
           if (fileDesc.getNumFileBlocks() == 0) continue;
-          Pair<Boolean, Long> result = transformBlocksToScanRanges(
-              partition, fileDesc, fsHasBlocks, scanRangeBytesLimit, analyzer);
+          Pair<Boolean, Long> result =
+              transformBlocksToScanRanges(partition, partitionLocation, fsType, fileDesc,
+                  fsHasBlocks, scanRangeBytesLimit, analyzer, isFooterOnly);
           partitionMaxScanRangeBytes =
               Math.max(partitionMaxScanRangeBytes, result.second);
           if (result.first) partitionMissingDiskIds = true;
@@ -1231,6 +1361,7 @@ public class HdfsScanNode extends ScanNode {
       }
     }
     allParquet_ = allParquet;
+    allColumnarFormat_ = allColumnarFormat;
     if (totalFilesPerFs_.isEmpty() || sumValues(totalFilesPerFs_) == 0) {
       maxScanRangeNumRows_ = 0;
     } else {
@@ -1242,6 +1373,42 @@ public class HdfsScanNode extends ScanNode {
             tableNumRows, sumValues(totalBytesPerFs_), largestScanRangeBytes_);
       }
     }
+  }
+
+  protected List<FileDescriptor> getFileDescriptorsWithLimit(
+      FeFsPartition partition, boolean fsHasBlocks, long limit) {
+    List<FileDescriptor> fileDescs;
+    if (limit != -1) {
+      int fileCount = 0;
+      fileDescs = new ArrayList<>();
+      for (FileDescriptor fd : partition.getFileDescriptors()) {
+        // skip empty files
+        if ((fsHasBlocks && fd.getNumFileBlocks() == 0)
+            || (!fsHasBlocks && fd.getFileLength() <= 0)) {
+          continue;
+        }
+        fileCount++;
+        fileDescs.add(fd);
+        if (fileCount == limit) {
+          break;
+        }
+      }
+    } else {
+      fileDescs = partition.getFileDescriptors();
+    }
+    return fileDescs;
+  }
+
+  /**
+   * Returns a sample of file descriptors associated to this scan node.
+   * @param percentBytes must be between 0 and 100.
+   * @param minSampleBytes minimum number of bytes to read.
+   * @param randomSeed used for random number generation.
+   */
+  protected Map<Long, List<FileDescriptor>> getFilesSample(
+      long percentBytes, long minSampleBytes, long randomSeed) {
+    return FeFsTable.Utils.getFilesSample(tbl_, partitions_, percentBytes, minSampleBytes,
+        randomSeed);
   }
 
   /**
@@ -1270,17 +1437,21 @@ public class HdfsScanNode extends ScanNode {
    * Used for file systems that do not have any physical attributes associated with
    * blocks (e.g., replica locations, caching, etc.). 'maxBlock' size determines how large
    * the scan ranges can be (may be ignored if the file is not splittable).
+   * Expects partition's location string in partitionLocation as getting it from
+   * FeFsPartition can be expensive.
    */
-  private void generateScanRangeSpecs(
-      FeFsPartition partition, FileDescriptor fileDesc, long maxBlockSize) {
+  private void generateScanRangeSpecs(FeFsPartition partition, String partitionLocation,
+      FileDescriptor fileDesc, long maxBlockSize, boolean isFooterOnly) {
     Preconditions.checkArgument(fileDesc.getNumFileBlocks() == 0);
     Preconditions.checkArgument(maxBlockSize > 0);
     if (fileDesc.getFileLength() <= 0) return;
     boolean splittable = partition.getFileFormat().isSplittable(
-        HdfsCompression.fromFileName(fileDesc.getRelativePath()));
-    TFileSplitGeneratorSpec splitSpec = new TFileSplitGeneratorSpec(
-        fileDesc.toThrift(), maxBlockSize, splittable, partition.getId(),
-        partition.getLocation().hashCode());
+        HdfsCompression.fromFileName(fileDesc.getPath()));
+    isFooterOnly &= splittable;
+    // Hashing must use String.hashCode() for consistency.
+    int partitionHash = partitionLocation.hashCode();
+    TFileSplitGeneratorSpec splitSpec = new TFileSplitGeneratorSpec(fileDesc.toThrift(),
+        maxBlockSize, splittable, partition.getId(), partitionHash, isFooterOnly);
     scanRangeSpecs_.addToSplit_specs(splitSpec);
     long scanRangeBytes = Math.min(maxBlockSize, fileDesc.getFileLength());
     if (splittable && !isPartitionKeyScan_) {
@@ -1299,14 +1470,19 @@ public class HdfsScanNode extends ScanNode {
    * coordinator can assign ranges to workers to avoid remote reads. These
    * TScanRangeLocationLists are added to scanRanges_. A pair is returned that indicates
    * whether the file has a missing disk id and the maximum scan range (in bytes) found.
+   * Expects partition's location string in partitionLocation and filesystem type in
+   * fsType as getting these from FeFsPartition can be expensive.
    */
   private Pair<Boolean, Long> transformBlocksToScanRanges(FeFsPartition partition,
-      FileDescriptor fileDesc, boolean fsHasBlocks,
-      long scanRangeBytesLimit, Analyzer analyzer) {
+      String partitionLocation, FileSystemUtil.FsType fsType, FileDescriptor fileDesc,
+      boolean fsHasBlocks, long scanRangeBytesLimit, Analyzer analyzer,
+      boolean isFooterOnly) {
     Preconditions.checkArgument(fileDesc.getNumFileBlocks() > 0);
     boolean fileDescMissingDiskIds = false;
     long fileMaxScanRangeBytes = 0;
-    for (int i = 0; i < fileDesc.getNumFileBlocks(); ++i) {
+    int i = 0;
+    if (isFooterOnly) { i = fileDesc.getNumFileBlocks() - 1; }
+    for (; i < fileDesc.getNumFileBlocks(); ++i) {
       FbFileBlock block = fileDesc.getFbFileBlock(i);
       int replicaHostCount = FileBlock.getNumReplicaHosts(block);
       if (replicaHostCount == 0) {
@@ -1327,7 +1503,10 @@ public class HdfsScanNode extends ScanNode {
         Integer globalHostIdx = analyzer.getHostIndex().getOrAddIndex(networkAddress);
         location.setHost_idx(globalHostIdx);
         if (fsHasBlocks && !fileDesc.getIsEc() && FileBlock.getDiskId(block, j) == -1) {
-          ++numScanRangesNoDiskIds_;
+          // Skip Ozone; it returns NULL storageIds and users can't do anything about it.
+          if (fsType != FileSystemUtil.FsType.OZONE) {
+            ++numScanRangesNoDiskIds_;
+          }
           fileDescMissingDiskIds = true;
         }
         location.setVolume_id(FileBlock.getDiskId(block, j));
@@ -1341,12 +1520,24 @@ public class HdfsScanNode extends ScanNode {
         long currentLength = remainingLength;
         if (scanRangeBytesLimit > 0 && remainingLength > scanRangeBytesLimit) {
           currentLength = scanRangeBytesLimit;
+          if (isFooterOnly) {
+            // Only generate one scan range for footer only scans.
+            currentOffset += remainingLength - currentLength;
+            remainingLength = currentLength;
+          }
         }
         TScanRange scanRange = new TScanRange();
-        scanRange.setHdfs_file_split(new THdfsFileSplit(fileDesc.getRelativePath(),
+        THdfsFileSplit hdfsFileSplit = new THdfsFileSplit(fileDesc.getRelativePath(),
             currentOffset, currentLength, partition.getId(), fileDesc.getFileLength(),
             fileDesc.getFileCompression().toThrift(), fileDesc.getModificationTime(),
-            partition.getLocation().hashCode()));
+            partitionLocation.hashCode());
+        hdfsFileSplit.setAbsolute_path(fileDesc.getAbsolutePath());
+        hdfsFileSplit.setIs_encrypted(fileDesc.getIsEncrypted());
+        hdfsFileSplit.setIs_erasure_coded(fileDesc.getIsEc());
+        scanRange.setHdfs_file_split(hdfsFileSplit);
+        if (fileDesc.getFbFileMetadata() != null) {
+          scanRange.setFile_metadata(fileDesc.getFbFileMetadata().getByteBuffer());
+        }
         TScanRangeLocationList scanRangeLocations = new TScanRangeLocationList();
         scanRangeLocations.scan_range = scanRange;
         scanRangeLocations.locations = locations;
@@ -1363,7 +1554,7 @@ public class HdfsScanNode extends ScanNode {
       ++numFilesNoDiskIds_;
       if (LOG.isTraceEnabled()) {
         LOG.trace("File blocks mapping to unknown disk ids. Dir: "
-            + partition.getLocation() + " File:" + fileDesc.toString());
+            + partitionLocation + " File:" + fileDesc.toString());
       }
     }
 
@@ -1400,7 +1591,7 @@ public class HdfsScanNode extends ScanNode {
    * Sets these members:
    * extrapolatedNumRows_, inputCardinality_, cardinality_
    */
-  private void computeCardinalities(Analyzer analyzer) {
+  protected void computeCardinalities(Analyzer analyzer) {
     // Choose between the extrapolated row count and the one based on stored stats.
     extrapolatedNumRows_ = FeFsTable.Utils.getExtrapolatedNumRows(tbl_,
             sumValues(totalBytesPerFs_));
@@ -1467,6 +1658,13 @@ public class HdfsScanNode extends ScanNode {
           numRangesAdjusted :
           Math.min(inputCardinality_, numRangesAdjusted);
     }
+
+    if (countStarSlot_ != null) {
+      // We are doing optimized count star. Override cardinality with total num files.
+      long totalFiles = sumValues(totalFilesPerFs_);
+      inputCardinality_ = totalFiles;
+      cardinality_ = totalFiles;
+    }
     if (LOG.isTraceEnabled()) {
       LOG.trace("HdfsScan: cardinality_=" + Long.toString(cardinality_));
     }
@@ -1483,6 +1681,10 @@ public class HdfsScanNode extends ScanNode {
    *
    * Sets these members:
    * numPartitionsWithNumRows_, partitionNumRows_, hasCorruptTableStats_.
+   *
+   * Currently, we provide a table hint 'TABLE_NUM_ROWS' to set table rows manually if
+   * table has no stats or has corrupt stats. If the table has valid stats, this hint
+   * will be ignored.
    */
   private long getStatsNumRows(TQueryOptions queryOptions) {
     numPartitionsWithNumRows_ = 0;
@@ -1520,7 +1722,7 @@ public class HdfsScanNode extends ScanNode {
     // size of each column of scalar type, and then generate the estimate using
     // sumValues(totalBytesPerFs_), the size of the hdfs table.
     if (!queryOptions.disable_hdfs_num_rows_estimate
-        && (numRows == -1L || hasCorruptTableStats_)) {
+        && (numRows == -1L || hasCorruptTableStats_) && tableNumRowsHint_ == -1L) {
       // Compute the estimated table size from those partitions with missing or corrupt
       // row count, when taking compression into consideration
       long estimatedTableSize =
@@ -1557,7 +1759,9 @@ public class HdfsScanNode extends ScanNode {
       hasCorruptTableStats_ = true;
     }
 
-    return numRows;
+    // Use hint value if table no stats or stats is corrupt and hint is set
+    return (numRows >= 0 && !hasCorruptTableStats_) || tableNumRowsHint_ == -1L ?
+        numRows :tableNumRowsHint_;
   }
 
   /**
@@ -1571,8 +1775,7 @@ public class HdfsScanNode extends ScanNode {
       long estimatedPartitionSize = 0;
       if (format == HdfsFileFormat.TEXT || format == HdfsFileFormat.JSON) {
         for (FileDescriptor desc : p.getFileDescriptors()) {
-          HdfsCompression compression
-            = HdfsCompression.fromFileName(desc.getRelativePath().toString());
+          HdfsCompression compression = HdfsCompression.fromFileName(desc.getPath());
           if (HdfsCompression.SUFFIX_MAP.containsValue(compression)) {
             estimatedPartitionSize += Math.round(desc.getFileLength()
                 * ESTIMATED_COMPRESSION_FACTOR_LEGACY);
@@ -1589,7 +1792,7 @@ public class HdfsScanNode extends ScanNode {
               * ESTIMATED_COMPRESSION_FACTOR_LEGACY);
         } else {
          Preconditions.checkState(VALID_COLUMNAR_FORMATS.contains(format),
-             "Unknown HDFS compressed format: %s", this);
+             "Unknown HDFS compressed format: %s", format, this);
          estimatedPartitionSize += Math.round(p.getSize()
              * ESTIMATED_COMPRESSION_FACTOR_COLUMNAR);
         }
@@ -1614,7 +1817,8 @@ public class HdfsScanNode extends ScanNode {
     Preconditions.checkNotNull(scanRangeSpecs_);
     ExecutorMembershipSnapshot cluster = ExecutorMembershipSnapshot.getCluster();
     final int maxInstancesPerNode = getMaxInstancesPerNode(analyzer);
-    final int maxPossibleInstances = cluster.numExecutors() * maxInstancesPerNode;
+    final int maxPossibleInstances =
+        analyzer.numExecutorsForPlanning() * maxInstancesPerNode;
     int totalNodes = 0;
     int totalInstances = 0;
     int numLocalRanges = 0;
@@ -1637,8 +1841,11 @@ public class HdfsScanNode extends ScanNode {
             ++numLocalRanges;
           }
         }
-        totalNodes =
-            Math.min(scanRangeSpecs_.concrete_ranges.size(), dummyHostIndex.size());
+        totalNodes = Math.min(scanRangeSpecs_.concrete_ranges.size(),
+            analyzer.getQueryOptions().getReplica_preference().equals(
+                TReplicaPreference.REMOTE) ?
+                analyzer.numExecutorsForPlanning() :
+                dummyHostIndex.size());
         totalInstances = Math.min(scanRangeSpecs_.concrete_ranges.size(),
             totalNodes * maxInstancesPerNode);
         LOG.info(String.format("Planner running in DEBUG mode. ScanNode: %s, "
@@ -1678,10 +1885,12 @@ public class HdfsScanNode extends ScanNode {
           // hosts that hold block replica for those ranges.
           int numLocalNodes = Math.min(numLocalRanges, localRangeCounts.size());
           // The remote ranges are round-robined across all the impalads.
-          int numRemoteNodes = Math.min(numRemoteRanges, cluster.numExecutors());
+          int numRemoteNodes =
+              Math.min(numRemoteRanges, analyzer.numExecutorsForPlanning());
           // The local and remote assignments may overlap, but we don't know by how much
           // so conservatively assume no overlap.
-          totalNodes = Math.min(numLocalNodes + numRemoteNodes, cluster.numExecutors());
+          totalNodes = Math.min(
+              numLocalNodes + numRemoteNodes, analyzer.numExecutorsForPlanning());
           totalInstances = computeNumInstances(numLocalRanges, numRemoteRanges,
               totalNodes, maxInstancesPerNode, totalLocalParallelism);
           // Exit early if we have maxed out our estimate of hosts/instances, to avoid
@@ -1698,7 +1907,8 @@ public class HdfsScanNode extends ScanNode {
           generatedScanRangeCount_ >= scanRangeSpecs_.getSplit_specsSize());
       numRemoteRanges += generatedScanRangeCount_;
       int numLocalNodes = Math.min(numLocalRanges, localRangeCounts.size());
-      totalNodes = Math.min(numLocalNodes + numRemoteRanges, cluster.numExecutors());
+      totalNodes =
+          Math.min(numLocalNodes + numRemoteRanges, analyzer.numExecutorsForPlanning());
       totalInstances = computeNumInstances(numLocalRanges, numRemoteRanges,
           totalNodes, maxInstancesPerNode, totalLocalParallelism);
     }
@@ -1707,12 +1917,11 @@ public class HdfsScanNode extends ScanNode {
     numNodes_ = (cardinality == 0 || totalNodes == 0) ? 1 : totalNodes;
     numInstances_ = (cardinality == 0 || totalInstances == 0) ? 1 : totalInstances;
     if (LOG.isTraceEnabled()) {
-      LOG.trace("computeNumNodes totalRanges="
-          + (scanRangeSpecs_.getConcrete_rangesSize() + generatedScanRangeCount_)
+      LOG.trace("computeNumNodes totalRanges=" + getEffectiveNumScanRanges()
           + " localRanges=" + numLocalRanges + " remoteRanges=" + numRemoteRanges
           + " localRangeCounts.size=" + localRangeCounts.size()
           + " totalLocalParallelism=" + totalLocalParallelism
-          + " executorNodes=" + cluster.numExecutors() + " "
+          + " executorNodes=" + analyzer.numExecutorsForPlanning() + " "
           + " numNodes=" + numNodes_ + " numInstances=" + numInstances_);
     }
   }
@@ -1735,7 +1944,15 @@ public class HdfsScanNode extends ScanNode {
 
   @Override
   protected void toThrift(TPlanNode msg) {
-    msg.hdfs_scan_node = new THdfsScanNode(desc_.getId().asInt(), new HashSet<>());
+    Preconditions.checkState(false, "Unexpected use of old toThrift() signature.");
+  }
+
+  @Override
+  protected void toThrift(TPlanNode msg, ThriftSerializationCtx serialCtx) {
+    msg.hdfs_scan_node = new THdfsScanNode(serialCtx.translateTupleId(
+        desc_.getId()).asInt(), new HashSet<>());
+    // Register this scan node as an input for tuple caching.
+    serialCtx.registerInputScanNode(this);
     if (replicaPreference_ != null) {
       msg.hdfs_scan_node.setReplica_preference(replicaPreference_);
     }
@@ -1745,8 +1962,9 @@ public class HdfsScanNode extends ScanNode {
       Map<Integer, List<TExpr>> tcollectionConjuncts = new LinkedHashMap<>();
       for (Map.Entry<TupleDescriptor, List<Expr>> entry:
         collectionConjuncts_.entrySet()) {
-        tcollectionConjuncts.put(entry.getKey().getId().asInt(),
-            Expr.treesToThrift(entry.getValue()));
+        tcollectionConjuncts.put(
+            serialCtx.translateTupleId(entry.getKey().getId()).asInt(),
+            Expr.treesToThrift(entry.getValue(), serialCtx));
       }
       msg.hdfs_scan_node.setCollection_conjuncts(tcollectionConjuncts);
     }
@@ -1754,31 +1972,46 @@ public class HdfsScanNode extends ScanNode {
       msg.hdfs_scan_node.setSkip_header_line_count(skipHeaderLineCount_);
     }
     msg.hdfs_scan_node.setUse_mt_scan_node(useMtScanNode_);
+    // The reason we skip setting the deterministic scan range assignment field for
+    // tuple cache is that has not been set yet at this point. At the point we are
+    // computing the tuple cache key, it is always false and has no information.
+    // Even if it was set, it would not tell us anything about the result set.
+    if (!serialCtx.isTupleCache()) {
+      msg.hdfs_scan_node.setDeterministic_scanrange_assignment(
+          deterministicScanRangeAssignment_);
+    }
     Preconditions.checkState((optimizedAggSmap_ == null) == (countStarSlot_ == null));
     if (countStarSlot_ != null) {
-      msg.hdfs_scan_node.setParquet_count_star_slot_offset(
-          countStarSlot_.getByteOffset());
+      msg.hdfs_scan_node.setCount_star_slot_offset(countStarSlot_.getByteOffset());
     }
-    if (!statsConjuncts_.isEmpty()) {
-      for (Expr e: statsConjuncts_) {
-        msg.hdfs_scan_node.addToStats_conjuncts(e.treeToThrift());
+    // Stats/dictionary filter conjuncts do not change the logical set that would be
+    // returned, so they can be skipped for tuple caching.
+    if (!serialCtx.isTupleCache()) {
+      if (!statsConjuncts_.isEmpty()) {
+        for (Expr e: statsConjuncts_) {
+          msg.hdfs_scan_node.addToStats_conjuncts(e.treeToThrift());
+        }
       }
-    }
 
-    if (statsTuple_ != null) {
-      msg.hdfs_scan_node.setStats_tuple_id(statsTuple_.getId().asInt());
-    }
+      if (statsTuple_ != null) {
+        msg.hdfs_scan_node.setStats_tuple_id(statsTuple_.getId().asInt());
+      }
 
-    Map<Integer, List<Integer>> dictMap = new LinkedHashMap<>();
-    for (Map.Entry<SlotDescriptor, List<Integer>> entry :
-      dictionaryFilterConjuncts_.entrySet()) {
-      dictMap.put(entry.getKey().getId().asInt(), entry.getValue());
+      Map<Integer, List<Integer>> dictMap = new LinkedHashMap<>();
+      for (Map.Entry<SlotDescriptor, List<Integer>> entry :
+        dictionaryFilterConjuncts_.entrySet()) {
+        dictMap.put(entry.getKey().getId().asInt(), entry.getValue());
+      }
+      msg.hdfs_scan_node.setDictionary_filter_conjuncts(dictMap);
     }
-    msg.hdfs_scan_node.setDictionary_filter_conjuncts(dictMap);
     msg.hdfs_scan_node.setIs_partition_key_scan(isPartitionKeyScan_);
 
-    for (HdfsFileFormat format : fileFormats_) {
-      msg.hdfs_scan_node.addToFile_formats(format.toThrift());
+    // Since the tuple cache will hash information about the scan ranges at runtime,
+    // it is not necessary to include the file formats in the hash.
+    if (!serialCtx.isTupleCache()) {
+      for (HdfsFileFormat format : fileFormats_) {
+        msg.hdfs_scan_node.addToFile_formats(format.toThrift());
+      }
     }
 
     if (!overlapPredicateDescs_.isEmpty()) {
@@ -1806,6 +2039,12 @@ public class HdfsScanNode extends ScanNode {
           .append(String.format("partition predicates: %s\n",
               Expr.getExplainString(partitionConjuncts_, detailLevel)));
       }
+      long testTableSize = -1;
+      if (desc_.getTable() instanceof Table
+          && ((Table) desc_.getTable()).getDebugMetadataScale() > -1.0) {
+        // This is in testing mode.
+        testTableSize = desc_.getTable().getTTableStats().total_file_bytes;
+      }
       String partMetaTemplate = "partitions=%d/%d files=%d size=%s\n";
       String erasureCodeTemplate = "erasure coded: files=%d size=%s\n";
       if (!numPartitionsPerFs_.isEmpty()) {
@@ -1816,9 +2055,14 @@ public class HdfsScanNode extends ScanNode {
           FileSystemUtil.FsType fsType = partsPerFs.getKey();
           output.append(detailPrefix);
           output.append(fsType).append(" ");
+          long bytesToDisplay = totalBytesPerFs_.get(fsType);
+          if (testTableSize > -1) {
+            bytesToDisplay = (long) ((double) partsPerFs.getValue()
+                / table.getPartitions().size() * testTableSize);
+          }
           output.append(String.format(partMetaTemplate, partsPerFs.getValue(),
               table.getPartitions().size(), totalFilesPerFs_.get(fsType),
-              PrintUtils.printBytes(totalBytesPerFs_.get(fsType))));
+              PrintUtils.printBytes(bytesToDisplay)));
 
           // Report the total number of erasure coded files and total bytes, if any.
           if (totalFilesPerFsEC_.containsKey(fsType)) {
@@ -1844,6 +2088,15 @@ public class HdfsScanNode extends ScanNode {
             0, PrintUtils.printBytes(0)));
       }
 
+      // Add information about whether this uses deterministic scan range scheduling
+      // To avoid polluting the explain output, only add this if mt_dop>0 and
+      // deterministic scan range scheduling is enabled.
+      if (useMtScanNode_ && deterministicScanRangeAssignment_) {
+        output.append(detailPrefix)
+          .append(String.format("deterministic scan range assignment: %b\n",
+              deterministicScanRangeAssignment_));
+      }
+
       if (!conjuncts_.isEmpty()) {
         output.append(detailPrefix)
           .append(String.format("predicates: %s\n",
@@ -1865,6 +2118,9 @@ public class HdfsScanNode extends ScanNode {
       if (isPartitionKeyScan_) {
         output.append(detailPrefix + "partition key scan\n");
       }
+
+      String derivedExplain = getDerivedExplainString(detailPrefix, detailLevel);
+      if (!derivedExplain.isEmpty()) output.append(derivedExplain);
     }
     if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
       output.append(getStatsExplainString(detailPrefix)).append("\n");
@@ -1875,18 +2131,22 @@ public class HdfsScanNode extends ScanNode {
         extrapRows = "disabled";
       }
       output.append(detailPrefix)
-            .append("extrapolated-rows=")
-            .append(extrapRows)
-            .append(" max-scan-range-rows=")
-            .append(PrintUtils.printEstCardinality(maxScanRangeNumRows_))
-            .append("\n");
+          .append("extrapolated-rows=")
+          .append(extrapRows)
+          .append(" max-scan-range-rows=")
+          .append(PrintUtils.printEstCardinality(maxScanRangeNumRows_));
+      if (filteredCardinality_ > -1 && scanRangeSelectivity_ < 1.0) {
+        output.append(String.format(" est-scan-range=%d(filtered from %d)",
+            estScanRangeAfterRuntimeFilter(), getEffectiveNumScanRanges()));
+      }
+      output.append("\n");
       if (numScanRangesNoDiskIds_ > 0) {
         output.append(detailPrefix)
-          .append(String.format("missing disk ids: "
-                + "partitions=%s/%s files=%s/%s scan ranges %s/%s\n",
-            numPartitionsNoDiskIds_, sumValues(numPartitionsPerFs_),
-            numFilesNoDiskIds_, sumValues(totalFilesPerFs_), numScanRangesNoDiskIds_,
-            scanRangeSpecs_.getConcrete_rangesSize() + generatedScanRangeCount_));
+            .append(String.format("missing disk ids: "
+                    + "partitions=%s/%s files=%s/%s scan ranges %s/%s\n",
+                numPartitionsNoDiskIds_, sumValues(numPartitionsPerFs_),
+                numFilesNoDiskIds_, sumValues(totalFilesPerFs_), numScanRangesNoDiskIds_,
+                getEffectiveNumScanRanges()));
       }
       // Groups the min max original conjuncts by tuple descriptor.
       output.append(getMinMaxOriginalConjunctsExplainString(detailPrefix, detailLevel));
@@ -1908,6 +2168,14 @@ public class HdfsScanNode extends ScanNode {
     return output.toString();
   }
 
+  // Overriding this function can be used to add extra information to the explain string
+  // of the HDFS Scan node from the derived classes (e.g. IcebergScanNode). Each new line
+  // in the output should be appended to 'explainLevel' to have the correct indentation.
+  protected String getDerivedExplainString(
+      String indentPrefix, TExplainLevel detailLevel) {
+    return "";
+  }
+
   // Helper method that prints min max original conjuncts by tuple descriptor.
   private String getMinMaxOriginalConjunctsExplainString(
       String prefix, TExplainLevel detailLevel) {
@@ -1917,7 +2185,7 @@ public class HdfsScanNode extends ScanNode {
       TupleDescriptor tupleDesc = entry.getKey();
       List<Expr> exprs = entry.getValue();
       String fileFormatStr;
-      if (hasParquet(fileFormats_) && fileFormats_.contains(HdfsFileFormat.ORC)) {
+      if (hasParquet(fileFormats_) && hasOrc(fileFormats_)) {
         fileFormatStr = "parquet/orc";
       } else {
         fileFormatStr = hasParquet(fileFormats_) ? "parquet" : "orc";
@@ -1961,6 +2229,7 @@ public class HdfsScanNode extends ScanNode {
       List<Expr> conjuncts;
       TupleDescriptor tupleDescriptor = entry.getKey();
       String tupleName = "";
+
       if (tupleDescriptor == getTupleDesc()) {
         conjuncts = conjuncts_;
       } else {
@@ -1999,21 +2268,68 @@ public class HdfsScanNode extends ScanNode {
   }
 
   @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    Preconditions.checkNotNull(scanRangeSpecs_);
+    processingCost_ = computeScanProcessingCost(queryOptions);
+  }
+
+  /**
+   *  Estimate CPU processing cost for the scan.  Based on benchmarking, the cost can be
+   *  estimated as a function of the number of bytes materialized (for columnar scans) or
+   *  bytes read (for non-columnar) plus an additional per row cost for each predicate
+   * evaluated.
+   */
+  @Override
+  protected ProcessingCost computeScanProcessingCost(TQueryOptions queryOptions) {
+    long inputCardinality = getFilteredInputCardinality();
+    long estBytes = 0L;
+    double bytesCostCoefficient = 0.0;
+    double predicateCostCoefficient = 0.0;
+
+    if (inputCardinality >= 0) {
+      if (allColumnarFormat_) {
+        float avgRowDataSize = getAvgRowSizeWithoutPad();
+        estBytes = (long) Math.ceil(avgRowDataSize * (double) inputCardinality);
+        bytesCostCoefficient = COST_COEFFICIENT_COLUMNAR_BYTES_MATERIALIZED;
+        predicateCostCoefficient = COST_COEFFICIENT_COLUMNAR_PREDICATE_EVAL;
+      } else {
+        estBytes = sumValues(totalBytesPerFs_);
+        bytesCostCoefficient = COST_COEFFICIENT_NONCOLUMNAR_BYTES_SCANNED;
+        predicateCostCoefficient = COST_COEFFICIENT_NONCOLUMNAR_PREDICATE_EVAL;
+      }
+      double totalCost = (estBytes * bytesCostCoefficient)
+          + (inputCardinality * getConjuncts().size() * predicateCostCoefficient);
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("Scan CPU cost estimate: " + totalCost + ", All Columnar: "
+            + allColumnarFormat_ + ", Input Cardinality: " + inputCardinality
+            + ", Bytes: " + estBytes + ", Pred Count: " + getConjuncts().size());
+      }
+      return ProcessingCost.basicCost(getDisplayLabel(), totalCost);
+    } else {
+      // Input cardinality is 0 or unknown. Fallback to superclass.
+      return super.computeScanProcessingCost(queryOptions);
+    }
+  }
+
+  @Override
   public void computeNodeResourceProfile(TQueryOptions queryOptions) {
+    // Update 'useMtScanNode_' before any return cases. It's used in BE.
+    useMtScanNode_ = Planner.useMTFragment(queryOptions);
     Preconditions.checkNotNull(scanRangeSpecs_, "Cost estimation requires scan ranges.");
-    long scanRangeSize =
-        scanRangeSpecs_.getConcrete_rangesSize() + generatedScanRangeCount_;
+    long scanRangeSize = getEffectiveNumScanRanges();
     if (scanRangeSize == 0) {
       nodeResourceProfile_ = ResourceProfile.noReservation(0);
       return;
     }
 
-    Preconditions.checkState(0 < numNodes_ && numNodes_ <= scanRangeSize);
+    Preconditions.checkState(0 < numNodes_);
+    Preconditions.checkState(numNodes_ <= scanRangeSize);
     Preconditions.checkNotNull(desc_);
     Preconditions.checkState(desc_.getTable() instanceof FeFsTable);
     List<Long> columnReservations = null;
-    if (hasParquet(fileFormats_) || fileFormats_.contains(HdfsFileFormat.ORC)) {
-      columnReservations = computeMinColumnMemReservations();
+    if (hasParquet(fileFormats_) || hasOrc(fileFormats_)) {
+      boolean orcAsyncRead = hasOrc(fileFormats_) && queryOptions.orc_async_read;
+      columnReservations = computeMinColumnMemReservations(orcAsyncRead);
     }
 
     int perHostScanRanges = 0;
@@ -2038,7 +2354,6 @@ public class HdfsScanNode extends ScanNode {
     }
 
     // The non-MT scan node requires at least one scanner thread.
-    useMtScanNode_ = queryOptions.mt_dop > 0;
     int requiredThreads = useMtScanNode_ ? 0 : 1;
     int maxScannerThreads = computeMaxNumberOfScannerThreads(queryOptions,
         perHostScanRanges);
@@ -2052,6 +2367,11 @@ public class HdfsScanNode extends ScanNode {
     long perThreadIoBuffers =
         Math.min((long) Math.ceil(avgScanRangeBytes / (double) maxIoBufferSize),
             MAX_IO_BUFFERS_PER_THREAD) + 1;
+    if (queryOptions.compute_processing_cost) {
+      // In scan-node.cc, we fix max_row_batches to a constant of 2.
+      Preconditions.checkState(maxScannerThreads == 1);
+      perThreadIoBuffers = 2;
+    }
     long perInstanceMemEstimate = checkedMultiply(
         checkedMultiply(maxScannerThreads, perThreadIoBuffers), maxIoBufferSize);
 
@@ -2067,7 +2387,8 @@ public class HdfsScanNode extends ScanNode {
 
     nodeResourceProfile_ = new ResourceProfileBuilder()
         .setMemEstimateBytes(perInstanceMemEstimate)
-        .setMinMemReservationBytes(computeMinMemReservation(columnReservations))
+        .setMinMemReservationBytes(computeMinMemReservation(
+            columnReservations, queryOptions))
         .setThreadReservation(requiredThreads).build();
   }
 
@@ -2085,7 +2406,8 @@ public class HdfsScanNode extends ScanNode {
    * - The hdfs split size, to avoid reserving excessive memory for small files or ranges,
    *   e.g. small dimension tables with very few rows.
    */
-  private long computeMinMemReservation(List<Long> columnReservations) {
+  private long computeMinMemReservation(
+      List<Long> columnReservations, TQueryOptions queryOptions) {
     Preconditions.checkState(largestScanRangeBytes_ >= 0);
     long maxIoBufferSize =
         BitUtil.roundUpToPowerOf2(BackendConfig.INSTANCE.getReadSize());
@@ -2095,13 +2417,16 @@ public class HdfsScanNode extends ScanNode {
       // TODO: IMPALA-6875 - ORC should compute total reservation across columns once the
       // ORC scanner supports reservations. For now it is treated the same as a
       // row-oriented format because there is no per-column reservation.
-      if (format.isParquetBased()) {
-        // With Parquet, we first read the footer then all of the materialized columns in
-        // parallel.
+      if (format.isParquetBased()
+          || (format == HdfsFileFormat.ORC && queryOptions.orc_async_read)) {
+        // With Parquet and ORC, we first read the footer then all of the materialized
+        // columns in parallel.
         for (long columnReservation : columnReservations) {
           formatReservationBytes += columnReservation;
         }
-        formatReservationBytes = Math.max(FOOTER_SIZE, formatReservationBytes);
+        long footerSize =
+            format == HdfsFileFormat.ORC ? ORC_FOOTER_SIZE : PARQUET_FOOTER_SIZE;
+        formatReservationBytes = Math.max(footerSize, formatReservationBytes);
       } else {
         // Scanners for row-oriented formats issue only one IoMgr scan range at a time.
         // Minimum reservation is based on using I/O buffer per IoMgr scan range to get
@@ -2129,14 +2454,22 @@ public class HdfsScanNode extends ScanNode {
    * Compute minimum memory reservations in bytes per column per scan range for each of
    * the columns read from disk for a columnar format. Returns the raw estimate for
    * each column, not quantized to a buffer size.
-
+   *
    * If there are nested collections, returns a size for each of the leaf scalar slots
    * per collection. This matches Parquet's "shredded" approach to nested collections,
-   * where each nested field is stored as a separate column. We may need to adjust this
-   * logic for nested types in non-shredded columnar formats (e.g. IMPALA-6503 - ORC)
-   * if/when that is added.
+   * where each nested field is stored as a separate column.
+   *
+   * If table is in ORC format and orcAsyncRead is true, we split per column reservation
+   * evenly for number of stream representing that column. For example, an ORC string
+   * column with dictionary encoding has four streams (PRESENT, DATA, DICTIONARY_DATA, and
+   * LENGTH stream). A computeMinColumnMemReservations over ORC table having one string
+   * column will return list:
+   *   [1048576, 1048576, 1048576, 1048576]
+   * Meanwhile, computeMinColumnMemReservations over Parquet table having one string
+   * column will return list:
+   *   [4194304]
    */
-  private List<Long> computeMinColumnMemReservations() {
+  private List<Long> computeMinColumnMemReservations(boolean orcAsyncRead) {
     List<Long> columnByteSizes = new ArrayList<>();
     FeFsTable table = (FeFsTable) desc_.getTable();
     boolean havePosSlot = false;
@@ -2144,28 +2477,56 @@ public class HdfsScanNode extends ScanNode {
       if (!slot.isMaterialized() || slot == countStarSlot_) continue;
       if (slot.getColumn() == null ||
           slot.getColumn().getPosition() >= table.getNumClusteringCols()) {
+        Type type = slot.getType();
         if (slot.isArrayPosRef()) {
           // Position virtual slots can be materialized by piggybacking on another slot.
           havePosSlot = true;
-        } else if (slot.getType().isScalarType()) {
+        } else if (type.isScalarType()) {
           Column column = slot.getColumn();
+          long estReservation;
           if (column == null) {
             // Not a top-level column, e.g. a value from a nested collection that is
             // being unnested by the scanner. No stats are available for nested
             // collections.
-            columnByteSizes.add(DEFAULT_COLUMN_SCAN_RANGE_RESERVATION);
+            estReservation = DEFAULT_COLUMN_SCAN_RANGE_RESERVATION;
           } else {
-            columnByteSizes.add(computeMinScalarColumnMemReservation(column));
+            estReservation = computeMinScalarColumnMemReservation(column);
+          }
+
+          if (orcAsyncRead) {
+            // estReservation need to be spread for each stream. Estimate how many stream
+            // that will be available for this column based on column type.
+            int estNumStream = 2; // DATA and PRESENT stream.
+            if (type.isTimestamp() || type.isStringType() || type.isDecimal()) {
+              estNumStream++; // SECONDARY/LENGTH stream.
+              if (type.isStringType()) {
+                estNumStream++; // DICTIONARY_DATA stream
+              }
+            }
+            long reservationPerStream = estReservation / estNumStream;
+            for (int i = 0; i < estNumStream; i++) {
+              columnByteSizes.add(reservationPerStream);
+            }
+          } else {
+            columnByteSizes.add(estReservation);
           }
         } else {
-          appendMinColumnMemReservationsForComplexType(slot, columnByteSizes);
+          appendMinColumnMemReservationsForComplexType(
+              slot, columnByteSizes, orcAsyncRead);
         }
       }
     }
-    if (havePosSlot && columnByteSizes.isEmpty()) {
-      // Must scan something to materialize a position slot. We don't know anything about
-      // the column that we're scanning so use the default reservation.
-      columnByteSizes.add(DEFAULT_COLUMN_SCAN_RANGE_RESERVATION);
+
+    if (columnByteSizes.isEmpty()) {
+      if (havePosSlot || (orcAsyncRead && desc_.getSlots().isEmpty())) {
+        // We must scan something to materialize a position slot (hasPosSlot=true).
+        // For the case of orcAsyncRead=true and empty descriptor slot, we probably need
+        // to materialize something too if the query can not be served by file metadata
+        // (ie., select count(*) against subtype of a complex column).
+        // We do not know anything about the column we are scanning in either case, so use
+        // the default reservation.
+        appendDefaultColumnReservation(columnByteSizes, orcAsyncRead);
+      }
     }
     return columnByteSizes;
   }
@@ -2173,10 +2534,11 @@ public class HdfsScanNode extends ScanNode {
   /**
    * Helper for computeMinColumnMemReservations() - compute minimum memory reservations
    * for all of the scalar columns read from disk when materializing complexSlot.
-   * Appends one number per scalar column to columnMemReservations.
+   * Appends one number per scalar column to columnMemReservations for Parquet format.
+   * For Orc, up to 4 number per scalar column can be added to columnMemReservations.
    */
   private void appendMinColumnMemReservationsForComplexType(SlotDescriptor complexSlot,
-      List<Long> columnMemReservations) {
+      List<Long> columnMemReservations, boolean orcAsyncRead) {
     Preconditions.checkState(complexSlot.getType().isComplexType());
     boolean addedColumn = false;
     for (SlotDescriptor nestedSlot: complexSlot.getItemTupleDesc().getSlots()) {
@@ -2185,16 +2547,40 @@ public class HdfsScanNode extends ScanNode {
       if (nestedSlot.getType().isScalarType()) {
         // No column stats are available for nested collections so use the default
         // reservation.
-        columnMemReservations.add(DEFAULT_COLUMN_SCAN_RANGE_RESERVATION);
+        appendDefaultColumnReservation(columnMemReservations, orcAsyncRead);
         addedColumn = true;
       } else if (nestedSlot.getType().isComplexType()) {
-        appendMinColumnMemReservationsForComplexType(nestedSlot, columnMemReservations);
+        appendMinColumnMemReservationsForComplexType(
+            nestedSlot, columnMemReservations, orcAsyncRead);
       }
     }
     // Need to scan at least one column to materialize the pos virtual slot and/or
     // determine the size of the nested array. Assume it is the size of a single I/O
     // buffer.
-    if (!addedColumn) columnMemReservations.add(DEFAULT_COLUMN_SCAN_RANGE_RESERVATION);
+    if (!addedColumn) {
+      appendDefaultColumnReservation(columnMemReservations, orcAsyncRead);
+    }
+  }
+
+  /**
+   * Compute minimum memory reservation for an unknown column.
+   *
+   * If orcAsyncRead is true, we allocate DEFAULT_COLUMN_SCAN_RANGE_RESERVATION and split
+   * it for 4 streams. This is because an ORC column can have 4 streams at most (ie.,
+   * dictionary encoded string/char/varchar column). If orcAsyncRead is false, just append
+   * single default reservation.
+   */
+  private void appendDefaultColumnReservation(
+      List<Long> columnMemReservations, boolean orcAsyncRead) {
+    if (orcAsyncRead) {
+      int estNumStream = 4;
+      Long reservationPerStream = DEFAULT_COLUMN_SCAN_RANGE_RESERVATION / estNumStream;
+      for (int i = 0; i < estNumStream; i++) {
+        columnMemReservations.add(reservationPerStream);
+      }
+    } else {
+      columnMemReservations.add(DEFAULT_COLUMN_SCAN_RANGE_RESERVATION);
+    }
   }
 
   /**
@@ -2303,6 +2689,18 @@ public class HdfsScanNode extends ScanNode {
   }
 
   /**
+   * Return the number of scan ranges when considering MAX_SCAN_RANGE_LENGTH option.
+   * computeScanRangeLocations() must be called before calling this.
+   */
+  @Override
+  public long getEffectiveNumScanRanges() {
+    Preconditions.checkNotNull(scanRangeSpecs_);
+    Preconditions.checkState(
+        generatedScanRangeCount_ >= scanRangeSpecs_.getSplit_specsSize());
+    return scanRangeSpecs_.getConcrete_rangesSize() + generatedScanRangeCount_;
+  }
+
+  /**
    * Sort filters in runtimeFilters_: min/max first followed by bloom.
    */
   public void arrangeRuntimefiltersForParquet() {
@@ -2318,5 +2716,54 @@ public class HdfsScanNode extends ScanNode {
         }
       });
     }
+  }
+
+  protected boolean isAllColumnarScanner() { return allColumnarFormat_; }
+
+  @Override
+  public boolean isTupleCachingImplemented() { return true; }
+
+  public void setDeterministicScanRangeAssignment(boolean enabled) {
+    // Deterministic scan range assignment only applies when using mt_dop,
+    // but we set it unconditionally for simplicity.
+    deterministicScanRangeAssignment_ = enabled;
+  }
+
+  public boolean usesDeterministicScanRangeAssignment() {
+    return deterministicScanRangeAssignment_;
+  }
+
+  // Remove any expression in 'exprs' that has matching equality predicate,
+  // is-null predicate, or simple in-list predicate in statsOriginalConjuncts_.
+  // Return NDV multiple of expression that are filtered out after considering
+  // those predicates, or 1 if nothing is filtered out.
+  public long filterExprWithStatsConjunct(TupleDescriptor tupleDesc, List<Expr> exprs) {
+    long ndvMult = 1;
+    List<Expr> statsConjuncts = statsOriginalConjuncts_.get(tupleDesc);
+    if (statsConjuncts == null || exprs.isEmpty()) return ndvMult;
+
+    int originalSize = exprs.size();
+    for (Expr statsConjunct : statsConjuncts) {
+      for (Iterator<Expr> it = exprs.iterator(); it.hasNext();) {
+        Expr groupingExpr = it.next();
+        if (!groupingExpr.equals(statsConjunct.getChild(0))) continue;
+        if (statsConjunct instanceof BinaryPredicate
+            && BinaryPredicate.IS_EQ_PREDICATE.apply((BinaryPredicate) statsConjunct)) {
+          // This is an equality predicate.
+          it.remove();
+        } else if (statsConjunct instanceof InPredicate) {
+          // This is a simple in-list predicate.
+          Preconditions.checkState(statsConjunct.getChildCount() > 1,
+              "InPredicate must have at least two child expressions");
+          ndvMult = MathUtil.saturatingMultiplyCardinalities(
+              ndvMult, statsConjunct.getChildCount() - 1);
+          it.remove();
+        } else if (statsConjunct instanceof IsNullPredicate) {
+          // This is an is-null predicate.
+          it.remove();
+        }
+      }
+    }
+    return ndvMult;
   }
 }

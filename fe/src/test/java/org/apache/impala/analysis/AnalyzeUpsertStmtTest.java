@@ -120,10 +120,5 @@ public class AnalyzeUpsertStmtTest extends AnalyzerTest {
         "'b.int_array_col' correlated with an outer block as well as an " +
         "uncorrelated one 'functional.alltypestiny':\n" +
         "SELECT item FROM b.int_array_col, functional.alltypestiny");
-    // Illegal complex-typed expr
-    AnalysisError("upsert into functional_kudu.testtbl " +
-        "select int_array_col from functional.allcomplextypes",
-        "Expr 'int_array_col' in select list returns a collection type 'ARRAY<INT>'.\n" +
-        "Collection types are not allowed in the select list.");
   }
 }

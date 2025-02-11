@@ -97,7 +97,8 @@ Status RemoteAdmissionControlClient::TryAdmitQuery(AdmissionControlServiceProxy*
 Status RemoteAdmissionControlClient::SubmitForAdmission(
     const AdmissionController::AdmissionRequest& request,
     RuntimeProfile::EventSequence* query_events,
-    std::unique_ptr<QuerySchedulePB>* schedule_result) {
+    std::unique_ptr<QuerySchedulePB>* schedule_result,
+    int64_t* wait_start_time_ms, int64_t* wait_end_time_ms) {
   ScopedEvent completedEvent(
       query_events, AdmissionControlClient::QUERY_EVENT_COMPLETED_ADMISSION);
 
@@ -144,6 +145,7 @@ Status RemoteAdmissionControlClient::SubmitForAdmission(
   KUDU_RETURN_IF_ERROR(admit_rpc_status, "AdmitQuery rpc failed");
   RETURN_IF_ERROR(admit_status);
 
+  bool is_query_queued = false;
   while (true) {
     RpcController rpc_controller2;
     GetQueryStatusRequestPB get_status_req;
@@ -160,6 +162,13 @@ Status RemoteAdmissionControlClient::SubmitForAdmission(
       request.summary_profile->Update(tree);
     }
 
+    if (wait_start_time_ms != nullptr && get_status_resp.has_wait_start_time_ms()) {
+      *wait_start_time_ms = get_status_resp.wait_start_time_ms();
+    }
+    if (wait_end_time_ms != nullptr && get_status_resp.has_wait_end_time_ms()) {
+      *wait_end_time_ms = get_status_resp.wait_end_time_ms();
+    }
+
     if (get_status_resp.has_query_schedule()) {
       schedule_result->reset(new QuerySchedulePB());
       schedule_result->get()->Swap(get_status_resp.mutable_query_schedule());
@@ -169,7 +178,11 @@ Status RemoteAdmissionControlClient::SubmitForAdmission(
     if (!admit_status.ok()) {
       break;
     }
-    query_events->MarkEvent(QUERY_EVENT_QUEUED);
+
+    if (!is_query_queued) {
+      query_events->MarkEvent(QUERY_EVENT_QUEUED);
+      is_query_queued = true;
+    }
 
     SleepForMs(FLAGS_admission_status_retry_time_ms);
   }

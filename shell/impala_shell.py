@@ -25,6 +25,7 @@ from compatibility import _xrange as xrange
 import cmd
 import errno
 import getpass
+import logging
 import os
 import prettytable
 import random
@@ -40,14 +41,17 @@ import time
 import traceback
 
 from impala_client import ImpalaHS2Client, StrictHS2Client, \
-    ImpalaBeeswaxClient, QueryOptionLevels
+    ImpalaBeeswaxClient, QueryOptionLevels, log_exception_with_timestamp, log_timestamp
 from impala_shell_config_defaults import impala_shell_defaults
 from option_parser import get_option_parser, get_config_from_file
 from shell_output import (DelimitedOutputFormatter, OutputStream, PrettyOutputFormatter,
-                          OverwritingStdErrOutputStream)
+                          OverwritingStdErrOutputStream, VerticalOutputFormatter,
+                          match_string_type)
 from subprocess import call
 from shell_exceptions import (RPCException, DisconnectedException, QueryStateException,
     QueryCancelledByShellException, MissingThriftMethodException)
+
+from value_converter import HS2ValueConverter
 
 
 VERSION_FORMAT = "Impala Shell v%(version)s (%(git_hash)s) built on %(build_date)s"
@@ -69,6 +73,7 @@ DEFAULT_HS2_PORT = 21050
 DEFAULT_HS2_HTTP_PORT = 28000
 DEFAULT_STRICT_HS2_PORT = 11050
 DEFAULT_STRICT_HS2_HTTP_PORT = 10001
+
 
 def strip_comments(sql):
   """sqlparse default implementation of strip comments has a bad performance when parsing
@@ -133,10 +138,23 @@ class ImpalaShell(cmd.Cmd, object):
   Status tells the caller that the command completed successfully.
   """
 
+  # NOTE: These variables are centrally defined for reuse, but they are also
+  # used directly in several tests to verify shell behavior (e.g. to
+  # verify that the shell remained connected or the shell connected
+  # successfully).
+
   # If not connected to an impalad, the server version is unknown.
   UNKNOWN_SERVER_VERSION = "Not Connected"
   PROMPT_FORMAT = "[{host}:{port}] {db}> "
   DISCONNECTED_PROMPT = "[Not connected] > "
+  # Message to display when the connection failed and it is reconnecting.
+  CONNECTION_LOST_MESSAGE = 'Connection lost, reconnecting...'
+  # Message to display when there is an exception when connecting.
+  ERROR_CONNECTING_MESSAGE = "Error connecting"
+  # Message to display when there is a socket error.
+  SOCKET_ERROR_MESSAGE = "Socket error"
+  # Message to display upon successful connection to an Impalad
+  CONNECTED_TO_MESSAGE = "Connected to"
   # Message to display in shell when cancelling a query
   CANCELLATION_MESSAGE = ' Cancelling Query'
   # Number of times to attempt cancellation before giving up.
@@ -149,7 +167,7 @@ class ImpalaShell(cmd.Cmd, object):
   COMMENTS_BEFORE_SET_PATTERN = r'^(\s*/\*(.|\n)*?\*/|\s*--.*\n)*\s*((un)?set)'
   COMMENTS_BEFORE_SET_REPLACEMENT = r'\3'
   # Variable names are prefixed with the following string
-  VAR_PREFIXES = [ 'VAR', 'HIVEVAR' ]
+  VAR_PREFIXES = ['VAR', 'HIVEVAR']
   DEFAULT_DB = 'default'
   # Regex applied to all tokens of a query to detect DML statements.
   DML_REGEX = re.compile("^(insert|upsert|update|delete)$", re.I)
@@ -163,10 +181,11 @@ class ImpalaShell(cmd.Cmd, object):
   VALID_SHELL_OPTIONS = {
     'LIVE_PROGRESS': (lambda x: x in ImpalaShell.TRUE_STRINGS, "live_progress"),
     'LIVE_SUMMARY': (lambda x: x in ImpalaShell.TRUE_STRINGS, "live_summary"),
-    'WRITE_DELIMITED' : (lambda x: x in ImpalaShell.TRUE_STRINGS, "write_delimited"),
-    'VERBOSE' : (lambda x: x in ImpalaShell.TRUE_STRINGS, "verbose"),
-    'DELIMITER' : (lambda x: " " if x == '\\s' else x, "output_delimiter"),
-    'OUTPUT_FILE' : (lambda x: None if x == '' else x, "output_file"),
+    'WRITE_DELIMITED': (lambda x: x in ImpalaShell.TRUE_STRINGS, "write_delimited"),
+    'VERBOSE': (lambda x: x in ImpalaShell.TRUE_STRINGS, "verbose"),
+    'DELIMITER': (lambda x: " " if x == '\\s' else x, "output_delimiter"),
+    'OUTPUT_FILE': (lambda x: None if x == '' else x, "output_file"),
+    'VERTICAL': (lambda x: x in ImpalaShell.TRUE_STRINGS, "vertical"),
   }
 
   # Minimum time in seconds between two calls to get the exec summary.
@@ -186,15 +205,27 @@ class ImpalaShell(cmd.Cmd, object):
     self.ca_cert = options.ca_cert
     self.user = options.user
     self.ldap_password_cmd = options.ldap_password_cmd
+    self.jwt_cmd = options.jwt_cmd
+    self.oauth_cmd = options.oauth_cmd
     self.strict_hs2_protocol = options.strict_hs2_protocol
     self.ldap_password = options.ldap_password
+    self.use_jwt = options.use_jwt
+    self.jwt = options.jwt
+    self.use_oauth = options.use_oauth
+    self.oauth = options.oauth
     # When running tests in strict mode, the server uses the ldap
     # protocol but can allow any password.
     if options.use_ldap_test_password:
       self.ldap_password = 'password'
     self.use_ldap = options.use_ldap or \
-        (self.strict_hs2_protocol and not self.use_kerberos)
+        (self.strict_hs2_protocol and not self.use_kerberos and not self.use_jwt
+         and not self.use_oauth)
     self.client_connect_timeout_ms = options.client_connect_timeout_ms
+    self.http_socket_timeout_s = None
+    if (options.http_socket_timeout_s != 'None'
+        and options.http_socket_timeout_s is not None):
+        self.http_socket_timeout_s = float(options.http_socket_timeout_s)
+    self.connect_max_tries = options.connect_max_tries
     self.verbose = options.verbose
     self.prompt = ImpalaShell.DISCONNECTED_PROMPT
     self.server_version = ImpalaShell.UNKNOWN_SERVER_VERSION
@@ -208,6 +239,8 @@ class ImpalaShell(cmd.Cmd, object):
     self.cached_prompt = str()
 
     self.show_profiles = options.show_profiles
+    self.rpc_stdout = options.rpc_stdout
+    self.rpc_file = options.rpc_file
 
     # Output formatting flags/options
     self.output_file = options.output_file
@@ -215,6 +248,7 @@ class ImpalaShell(cmd.Cmd, object):
         else options.output_delimiter
     self.write_delimited = options.write_delimited
     self.print_header = options.print_header
+    self.vertical = options.vertical
 
     self.progress_stream = OverwritingStdErrOutputStream()
 
@@ -229,16 +263,31 @@ class ImpalaShell(cmd.Cmd, object):
     self.orig_cmd = None
 
     # Tracks query handle of the last query executed. Used by the 'profile' command.
-    self.last_query_handle = None;
+    self.last_query_handle = None
 
-    self.live_summary = options.live_summary
-    self.live_progress = options.live_progress
+    # live_summary and live_progress are turned off in strict_hs2_protocol mode
+    if options.strict_hs2_protocol:
+      if options.live_summary:
+        warning = "WARNING: Unable to track live summary with strict_hs2_protocol"
+        print(warning, file=sys.stderr)
+      if options.live_progress:
+        warning = "WARNING: Unable to track live progress with strict_hs2_protocol"
+        print(warning, file=sys.stderr)
+
+      # do not allow live_progress or live_summary to be changed.
+      self.VALID_SHELL_OPTIONS['LIVE_PROGRESS'] = (lambda x: x in (), "live_progress")
+      self.VALID_SHELL_OPTIONS['LIVE_SUMMARY'] = (lambda x: x in (), "live_summary")
+
+    self.live_summary = options.live_summary and not options.strict_hs2_protocol
+    self.live_progress = options.live_progress and not options.strict_hs2_protocol
 
     self.ignore_query_failure = options.ignore_query_failure
 
     self.http_path = options.http_path
     self.fetch_size = options.fetch_size
     self.http_cookie_names = options.http_cookie_names
+    self.http_tracing = not options.no_http_tracing
+    self.hs2_x_forward = options.hs2_x_forward
 
     # Due to a readline bug in centos/rhel7, importing it causes control characters to be
     # printed. This breaks any scripting against the shell in non-interactive mode. Since
@@ -281,6 +330,13 @@ class ImpalaShell(cmd.Cmd, object):
     # We handle Ctrl-C ourselves, using an Event object to signal cancellation
     # requests between the handler and the main shell thread.
     signal.signal(signal.SIGINT, self._signal_handler)
+
+    # For debugging, it is useful to be able to get stacktraces from a running shell.
+    # When using Python 3, this hooks up Python 3's faulthandler to handle SIGUSR1.
+    # It will print stacktraces for all threads when receiving SIGUSR1.
+    if sys.version_info.major > 2:
+      import faulthandler
+      faulthandler.register(signal.SIGUSR1)
 
   def __enter__(self):
     return self
@@ -364,8 +420,8 @@ class ImpalaShell(cmd.Cmd, object):
     default values.
     query_options parameter is a subset of the default_query_options map"""
     for option in sorted(query_options):
-      if (option in self.set_query_options and
-          self.set_query_options[option] != query_options[option]):  # noqa
+      if (option in self.set_query_options
+          and self.set_query_options[option] != query_options[option]):  # noqa
         print('\n'.join(["\t%s: %s" % (option, self.set_query_options[option])]))
       else:
         print('\n'.join(["\t%s: [%s]" % (option, query_options[option])]))
@@ -570,6 +626,13 @@ class ImpalaShell(cmd.Cmd, object):
 
   def _new_impala_client(self):
     protocol = options.protocol.lower()
+
+    value_converter = None
+    if protocol == 'hs2' or protocol == 'hs2-http':
+      value_converter = HS2ValueConverter()
+      if options.hs2_fp_format:
+        value_converter.override_floating_point_converter(options.hs2_fp_format)
+
     if options.strict_hs2_protocol:
       assert protocol == 'hs2' or protocol == 'hs2-http'
       if protocol == 'hs2':
@@ -578,28 +641,42 @@ class ImpalaShell(cmd.Cmd, object):
                           self.ca_cert, self.user, self.ldap_password, True,
                           self.client_connect_timeout_ms, self.verbose,
                           use_http_base_transport=False, http_path=self.http_path,
-                          http_cookie_names=None)
+                          http_cookie_names=None, value_converter=value_converter,
+                          rpc_stdout=self.rpc_stdout, rpc_file=self.rpc_file,
+                          http_tracing=self.http_tracing)
       elif protocol == 'hs2-http':
         return StrictHS2Client(self.impalad, self.fetch_size, self.kerberos_host_fqdn,
                           self.use_kerberos, self.kerberos_service_name, self.use_ssl,
                           self.ca_cert, self.user, self.ldap_password, self.use_ldap,
                           self.client_connect_timeout_ms, self.verbose,
                           use_http_base_transport=True, http_path=self.http_path,
-                          http_cookie_names=self.http_cookie_names)
+                          http_cookie_names=self.http_cookie_names,
+                          value_converter=value_converter, rpc_stdout=self.rpc_stdout,
+                          rpc_file=self.rpc_file, http_tracing=self.http_tracing,
+                          jwt=self.jwt, oauth=self.oauth,
+                          hs2_x_forward=self.hs2_x_forward)
     if protocol == 'hs2':
       return ImpalaHS2Client(self.impalad, self.fetch_size, self.kerberos_host_fqdn,
                           self.use_kerberos, self.kerberos_service_name, self.use_ssl,
                           self.ca_cert, self.user, self.ldap_password, self.use_ldap,
                           self.client_connect_timeout_ms, self.verbose,
                           use_http_base_transport=False, http_path=self.http_path,
-                          http_cookie_names=None)
+                          http_cookie_names=None, value_converter=value_converter,
+                          rpc_stdout=self.rpc_stdout, rpc_file=self.rpc_file,
+                          http_tracing=self.http_tracing)
     elif protocol == 'hs2-http':
       return ImpalaHS2Client(self.impalad, self.fetch_size, self.kerberos_host_fqdn,
                           self.use_kerberos, self.kerberos_service_name, self.use_ssl,
                           self.ca_cert, self.user, self.ldap_password, self.use_ldap,
                           self.client_connect_timeout_ms, self.verbose,
                           use_http_base_transport=True, http_path=self.http_path,
-                          http_cookie_names=self.http_cookie_names)
+                          http_cookie_names=self.http_cookie_names,
+                          http_socket_timeout_s=self.http_socket_timeout_s,
+                          value_converter=value_converter,
+                          connect_max_tries=self.connect_max_tries,
+                          rpc_stdout=self.rpc_stdout, rpc_file=self.rpc_file,
+                          http_tracing=self.http_tracing, jwt=self.jwt, oauth=self.oauth,
+                          hs2_x_forward=self.hs2_x_forward)
     elif protocol == 'beeswax':
       return ImpalaBeeswaxClient(self.impalad, self.fetch_size, self.kerberos_host_fqdn,
                           self.use_kerberos, self.kerberos_service_name, self.use_ssl,
@@ -643,7 +720,9 @@ class ImpalaShell(cmd.Cmd, object):
       except Exception as e:
         # Suppress harmless errors.
         err_msg = str(e).strip()
-        if err_msg in ['ERROR: Cancelled', 'ERROR: Invalid or unknown query handle']:
+        # Check twice so that it can work with both the old and the new error formats.
+        if err_msg in ['ERROR: Cancelled', 'ERROR: Invalid or unknown query handle'] or \
+          ('\nCancelled' in err_msg or '\nInvalid or unknown query handle' in err_msg):
           break
         err_details = "Failed to reconnect and close (try %i/%i): %s"
         print(err_details % (cancel_try + 1, ImpalaShell.CANCELLATION_TRIES, err_msg),
@@ -677,7 +756,7 @@ class ImpalaShell(cmd.Cmd, object):
       return str()
     # There is no need to reconnect if we are quitting.
     if not self.imp_client.is_connected() and not self._is_quit_command(args):
-      print("Connection lost, reconnecting...", file=sys.stderr)
+      print(ImpalaShell.CONNECTION_LOST_MESSAGE, file=sys.stderr)
       self._connect()
       self._validate_database(immediately=True)
     return args
@@ -692,7 +771,7 @@ class ImpalaShell(cmd.Cmd, object):
     # Cmd is an old-style class, hence we need to call the method directly
     # instead of using super()
     # TODO: This may have to be changed to a super() call once we move to Python 3
-    if line == None:
+    if line is None:
       return CmdStatus.ERROR
     else:
       # This code is based on the code from the standard Python library package cmd.py:
@@ -744,8 +823,7 @@ class ImpalaShell(cmd.Cmd, object):
     try:
       summary, failed_summary = self.imp_client.get_summary(self.last_query_handle)
     except RPCException as e:
-      import re
-      error_pattern = re.compile("ERROR: Query id \d+:\d+ not found.")
+      error_pattern = re.compile("Query id [a-f0-9]+:[a-f0-9]+ not found.")
       if error_pattern.match(e.value):
         print("Could not retrieve summary for query.", file=sys.stderr)
       else:
@@ -764,7 +842,10 @@ class ImpalaShell(cmd.Cmd, object):
     elif display_mode == QueryAttemptDisplayModes.LATEST:
       self.print_exec_summary(summary)
     elif display_mode == QueryAttemptDisplayModes.ORIGINAL:
-      self.print_exec_summary(failed_summary)
+      if failed_summary:
+        self.print_exec_summary(failed_summary)
+      else:
+        print("No failed summary found")
     else:
       raise FatalShellException("Invalid value for query summary display mode")
 
@@ -773,14 +854,15 @@ class ImpalaShell(cmd.Cmd, object):
     arg_mode = str(arg_mode).lower()
     if arg_mode not in [QueryAttemptDisplayModes.ALL,
         QueryAttemptDisplayModes.LATEST, QueryAttemptDisplayModes.ORIGINAL]:
-      print("Invalid value for query attempt display mode: \'" +
-          arg_mode + "\'. Valid values are [ALL | LATEST | ORIGINAL]")
+      print("Invalid value for query attempt display mode: \'"
+            + arg_mode + "\'. Valid values are [ALL | LATEST | ORIGINAL]")
+      return None
     return arg_mode
 
   def print_exec_summary(self, summary):
     output = []
     table = self._default_summary_table()
-    self.imp_client.build_summary_table(summary, 0, False, 0, False, output)
+    self.imp_client.build_summary_table(summary, output)
     formatter = PrettyOutputFormatter(table)
     self.output_stream = OutputStream(formatter, filename=self.output_file)
     self.output_stream.write(output)
@@ -874,6 +956,10 @@ class ImpalaShell(cmd.Cmd, object):
       del self.set_query_options[option]
     elif self._handle_unset_shell_options(option):
       print('Unsetting shell option %s' % option)
+    elif option == 'ALL':
+      print('Unsetting all option')
+      for key in list(self.set_query_options.keys()):
+        del self.set_query_options[key]
     else:
       print("No option called %s is set" % option)
 
@@ -898,6 +984,12 @@ class ImpalaShell(cmd.Cmd, object):
     # specified. Connecting to a kerberized impalad requires an fqdn as the host name.
     if self.use_ldap and self.ldap_password is None:
       self.ldap_password = getpass.getpass("LDAP password for %s: " % self.user)
+
+    if self.use_jwt and self.jwt is None:
+      self.jwt = getpass.getpass("Enter JWT: ")
+
+    if self.use_oauth and self.oauth is None:
+      self.oauth = getpass.getpass("Enter OAUTH: ")
 
     if not args: args = socket.getfqdn()
     tokens = args.split(" ")
@@ -935,8 +1027,7 @@ class ImpalaShell(cmd.Cmd, object):
     # If the connection fails and the Kerberos has not been enabled,
     # check for a valid kerberos ticket and retry the connection
     # with kerberos enabled.
-    # IMPALA-8932: Kerberos is not yet supported for hs2-http, so don't retry.
-    if not self.imp_client.connected and not self.use_kerberos and protocol != 'hs2-http':
+    if not self.imp_client.connected and not self.use_kerberos:
       try:
         if call(["klist", "-s"]) == 0:
           print("Kerberos ticket found in the credentials cache, retrying "
@@ -944,13 +1035,18 @@ class ImpalaShell(cmd.Cmd, object):
           self.use_kerberos = True
           self.use_ldap = False
           self.ldap_password = None
+          self.use_jwt = False
+          self.jwt = None
+          self.use_oauth = False
+          self.oauth = None
           self.imp_client = self._new_impala_client()
           self._connect()
       except OSError:
         pass
 
     if self.imp_client.connected:
-      self._print_if_verbose('Connected to %s:%s' % self.impalad)
+      self._print_if_verbose('%s %s:%s' %
+          (self.CONNECTED_TO_MESSAGE, self.impalad[0], self.impalad[1]))
       self._print_if_verbose('Server version: %s' % self.server_version)
       self.set_prompt(ImpalaShell.DEFAULT_DB)
       self._validate_database()
@@ -1019,7 +1115,7 @@ class ImpalaShell(cmd.Cmd, object):
       if e.errno == errno.EINTR:
         self._reconnect_cancellation()
       else:
-        print("Socket error %s: %s" % (e.errno, e), file=sys.stderr)
+        print("%s %s: %s" % (self.SOCKET_ERROR_MESSAGE, e.errno, e), file=sys.stderr)
         self.close_connection()
         self.prompt = self.DISCONNECTED_PROMPT
     except Exception as e:
@@ -1028,10 +1124,11 @@ class ImpalaShell(cmd.Cmd, object):
           self.ldap_password.endswith('\n'):
         print("Warning: LDAP password contains a trailing newline. "
               "Did you use 'echo' instead of 'echo -n'?", file=sys.stderr)
-      if self.use_ssl and sys.version_info < (2,7,9) \
+      if self.use_ssl and sys.version_info < (2, 7, 9) \
           and "EOF occurred in violation of protocol" in str(e):
         print("Warning: TLSv1.2 is not supported for Python < 2.7.9", file=sys.stderr)
-      print("Error connecting: %s, %s" % (type(e).__name__, e), file=sys.stderr)
+      log_exception_with_timestamp(e, "Exception",
+          self.ERROR_CONNECTING_MESSAGE + type(e).__name__)
       # A secure connection may still be open. So we explicitly close it.
       self.close_connection()
       # If a connection to another impalad failed while already connected
@@ -1078,11 +1175,13 @@ class ImpalaShell(cmd.Cmd, object):
     """
     if self.show_profiles or status:
       if profile:
-        query_profile_prefix = "Query Runtime Profile:\n"
+        query_profile_prefix = match_string_type("Query Runtime Profile:\n", profile)
         if profile_display_mode == QueryAttemptDisplayModes.ALL:
           print(query_profile_prefix + profile)
           if failed_profile:
-            print("Failed Query Runtime Profile(s):\n" + failed_profile)
+            failed_profile_prefix = \
+                match_string_type("Failed Query Runtime Profile(s):\n", failed_profile)
+            print(failed_profile_prefix + failed_profile)
         elif profile_display_mode == QueryAttemptDisplayModes.LATEST:
           print(query_profile_prefix + profile)
         elif profile_display_mode == QueryAttemptDisplayModes.ORIGINAL:
@@ -1102,7 +1201,7 @@ class ImpalaShell(cmd.Cmd, object):
     arg = arg.replace('\n', '')
     # Get the database and table name, using the current database if the table name
     # wasn't fully qualified.
-    db_name, tbl_name = self.current_db, arg
+    db_name = self.current_db
     if db_name is None:
       db_name = ImpalaShell.DEFAULT_DB
     db_table_name = arg.split('.')
@@ -1183,6 +1282,9 @@ class ImpalaShell(cmd.Cmd, object):
       # print the column names
       if self.print_header:
         self.output_stream.write([column_names])
+    elif self.vertical:
+      formatter = VerticalOutputFormatter(column_names)
+      self.output_stream = OutputStream(formatter, filename=self.output_file)
     else:
       prettytable = self.construct_table_with_header(column_names)
       formatter = PrettyOutputFormatter(prettytable)
@@ -1201,53 +1303,91 @@ class ImpalaShell(cmd.Cmd, object):
       if not summary:
         return
 
-      if summary.is_queued:
-        queued_msg = "Query queued. Latest queuing reason: %s\n" % summary.queued_reason
-        self.progress_stream.write(queued_msg)
-        self.last_summary = time.time()
-        return
-
-      data = ""
-      if summary.error_logs:
-        for error_line in summary.error_logs:
-          data += error_line + "\n"
-          if self.webserver_address:
-            query_id_search = re.search("Retrying query using query id: (.*)",
-                                        error_line)
-            if query_id_search and len(query_id_search.groups()) == 1:
-              retried_query_id = query_id_search.group(1)
-              data += "Retried query link: %s\n"\
-                      % self.imp_client.get_query_link(retried_query_id)
-
-      if summary.progress:
-        progress = summary.progress
-
-        # If the data is not complete return and wait for a good result.
-        if not progress.total_scan_ranges and not progress.num_completed_scan_ranges:
-          self.last_summary = time.time()
-          return
-
-        if self.live_progress and progress.total_scan_ranges > 0:
-          val = ((summary.progress.num_completed_scan_ranges * 100) /
-                 summary.progress.total_scan_ranges)
-          fragment_text = "[%s%s] %s%%\n" % ("#" * val, " " * (100 - val), val)
-          data += fragment_text
-
-        if self.live_summary:
-          table = self._default_summary_table()
-          output = []
-          self.imp_client.build_summary_table(summary, 0, False, 0, False, output)
-          formatter = PrettyOutputFormatter(table)
-          data += formatter.format(output) + "\n"
-
-      self.progress_stream.write(data)
+      summary_str = self._format_periodic_summary(summary)
+      if summary_str:
+        self.progress_stream.write(summary_str)
       self.last_summary = time.time()
+
+  def _format_periodic_summary(self, summary):
+    if summary.is_queued:
+      return "Query queued. Latest queuing reason: %s\n" % summary.queued_reason
+
+    data = ""
+    if summary.error_logs:
+      for error_line in summary.error_logs:
+        data += error_line + "\n"
+        if self.webserver_address:
+          query_id_search = re.search("Retrying query using query id: (.*)",
+                                      error_line)
+          if query_id_search and len(query_id_search.groups()) == 1:
+            retried_query_id = query_id_search.group(1)
+            data += "Retried query link: %s\n"\
+                    % self.imp_client.get_query_link(retried_query_id)
+
+    if summary.progress:
+      progress = summary.progress
+
+      has_scan_progress = progress.num_completed_scan_ranges is not None \
+          and progress.total_scan_ranges is not None \
+          and progress.total_scan_ranges > 0
+
+      if self.live_progress and has_scan_progress:
+        val = ((summary.progress.num_completed_scan_ranges * 100)
+                // summary.progress.total_scan_ranges)
+        scan_progress_text =\
+            " Scan Progress:[%s%s] %s%%\n" % ("#" * val, " " * (100 - val), val)
+        data += scan_progress_text
+
+      has_query_progress = progress.num_completed_fragment_instances is not None \
+          and progress.total_fragment_instances is not None \
+          and progress.total_fragment_instances > 0
+
+      if self.live_progress and has_query_progress:
+        val = ((progress.num_completed_fragment_instances * 100)
+                // progress.total_fragment_instances)
+        query_progress_text =\
+            "Query Progress:[%s%s] %s%%\n" % ("#" * val, " " * (100 - val), val)
+        data += query_progress_text
+
+      if self.live_summary:
+        table = self._default_summary_table()
+        output = []
+        self.imp_client.build_summary_table(summary, output)
+        formatter = PrettyOutputFormatter(table)
+        data += formatter.format(output) + "\n"
+
+    return data
 
   def _default_summary_table(self):
     return self.construct_table_with_header(["Operator", "#Hosts", "#Inst",
                                              "Avg Time", "Max Time", "#Rows",
                                              "Est. #Rows", "Peak Mem",
                                              "Est. Peak Mem", "Detail"])
+
+  def _format_num_rows_report(self, time_elapsed, num_fetched_rows=None, dml_result=None):
+    num_rows = None
+    verb = None
+    error_report = ""
+    if dml_result is not None:
+      (num_modified_rows, num_deleted_rows, num_row_errors) = dml_result
+      if num_modified_rows == 0 and num_deleted_rows is not None and num_deleted_rows > 0:
+        verb = "Deleted"
+        num_rows = num_deleted_rows
+      elif num_modified_rows is not None:
+        verb = "Modified"
+        num_rows = num_modified_rows
+      # Add the number of row errors if this DML and the operation supports it.
+      # num_row_errors is None if the DML operation doesn't return it.
+      if num_row_errors is not None:
+        error_report = ", %d row error(s)" % (num_row_errors)
+    elif num_fetched_rows is not None:
+      verb = "Fetched"
+      num_rows = num_fetched_rows
+
+    if verb is not None:
+      return "%s %d row(s)%s in %2.2fs" % (verb, num_rows, error_report, time_elapsed)
+    else:
+      return "Time elapsed: %2.2fs" % time_elapsed
 
   def _execute_stmt(self, query_str, is_dml=False, print_web_link=False):
     """Executes 'query_str' with options self.set_query_options on the Impala server.
@@ -1276,18 +1416,18 @@ class ImpalaShell(cmd.Cmd, object):
       self.last_summary = time.time()
       if print_web_link:
         self._print_if_verbose(
-            "Query progress can be monitored at: %s" % self.imp_client.get_query_link(
+            "Query state can be monitored at: %s" % self.imp_client.get_query_link(
              self.imp_client.get_query_id_str(self.last_query_handle)))
 
-      wait_to_finish = self.imp_client.wait_to_finish(self.last_query_handle,
-          self._periodic_wait_callback)
+      self.imp_client.wait_to_finish(
+        self.last_query_handle, self._periodic_wait_callback)
       # Reset the progress stream.
       self.progress_stream.clear()
 
       if is_dml:
         # retrieve the error log
         warning_log = self.imp_client.get_warning_log(self.last_query_handle)
-        (num_rows, num_row_errors) = self.imp_client.close_dml(self.last_query_handle)
+        dml_result = self.imp_client.close_dml(self.last_query_handle)
       else:
         # impalad does not support the fetching of metadata for certain types of queries.
         if not self.imp_client.expect_result_metadata(query_str, self.last_query_handle):
@@ -1301,7 +1441,8 @@ class ImpalaShell(cmd.Cmd, object):
         num_rows = 0
 
         for rows in rows_fetched:
-          # IMPALA-4418: Break out of the loop to prevent printing an unnecessary empty line.
+          # IMPALA-4418: Break out of the loop to prevent printing an unnecessary
+          # empty line.
           if len(rows) == 0:
             continue
           self.output_stream.write(rows)
@@ -1310,38 +1451,36 @@ class ImpalaShell(cmd.Cmd, object):
         # retrieve the error log
         warning_log = self.imp_client.get_warning_log(self.last_query_handle)
 
+        # Flush the row output. This is important so that the row output will not
+        # come after the "Fetch X row(s)" message.
+        self.output_stream.flush()
+
       end_time = time.time()
 
       if warning_log:
         self._print_if_verbose(warning_log)
-      # print 'Modified' when is_dml is true (i.e. 1), or 'Fetched' otherwise.
-      verb = ["Fetched", "Modified"][is_dml]
+
       time_elapsed = end_time - start_time
-
-      # Add the number of row errors if this DML and the operation supports it.
-      # num_row_errors is None if the DML operation doesn't return it.
-      if is_dml and num_row_errors is not None:
-        error_report = ", %d row error(s)" % (num_row_errors)
+      row_report = ""
+      if is_dml:
+        row_report = self._format_num_rows_report(time_elapsed, dml_result=dml_result)
       else:
-        error_report = ""
-
-      self._print_if_verbose("%s %d row(s)%s in %2.2fs" %\
-          (verb, num_rows, error_report, time_elapsed))
+        row_report = self._format_num_rows_report(time_elapsed, num_fetched_rows=num_rows)
+      self._print_if_verbose(row_report)
 
       if not is_dml:
         self.imp_client.close_query(self.last_query_handle)
-      try:
+      if self.show_profiles:
         profile, retried_profile = self.imp_client.get_runtime_profile(
             self.last_query_handle)
         self.print_runtime_profile(profile, retried_profile)
-      except RPCException as e:
-        if self.show_profiles: raise e
       return CmdStatus.SUCCESS
     except QueryCancelledByShellException as e:
+      log_exception_with_timestamp(e, "Warning", "Query Interrupted")
       return CmdStatus.SUCCESS
     except RPCException as e:
       # could not complete the rpc successfully
-      print(e, file=sys.stderr)
+      log_exception_with_timestamp(e)
     except UnicodeDecodeError as e:
       # An error occoured possibly during the fetching.
       # Depending of which protocol is at use it can come from different places.
@@ -1349,8 +1488,8 @@ class ImpalaShell(cmd.Cmd, object):
       # undecodable elements.
       if self.last_query_handle is not None:
         self.imp_client.close_query(self.last_query_handle)
-      print('UnicodeDecodeError : %s \nPlease check for columns containing binary data '
-          'to find the possible source of the error.' % (e,), file=sys.stderr)
+      log_exception_with_timestamp(e, "UnicodeDecodeError", "Please check for"
+         "columns containing binary data to find the possible source of the error")
     except QueryStateException as e:
       # an exception occurred while executing the query
       if self.last_query_handle is not None:
@@ -1361,31 +1500,31 @@ class ImpalaShell(cmd.Cmd, object):
       # Here we use 'utf-8' to explicitly convert 'msg' to str if it's in unicode type.
       if sys.version_info.major == 2 and isinstance(msg, unicode):
         msg = msg.encode('utf-8')
-      print(msg, file=sys.stderr)
+      log_exception_with_timestamp(msg)
     except DisconnectedException as e:
       # the client has lost the connection
-      print(e, file=sys.stderr)
+      log_exception_with_timestamp(e)
       self.imp_client.connected = False
       self.prompt = ImpalaShell.DISCONNECTED_PROMPT
     except socket.error as e:
       # if the socket was interrupted, reconnect the connection with the client
       if e.errno == errno.EINTR:
-        print(ImpalaShell.CANCELLATION_MESSAGE)
+        log_timestamp("Warning", ImpalaShell.CANCELLATION_MESSAGE)
         self._reconnect_cancellation()
       else:
-        print("Socket error %s: %s" % (e.errno, e), file=sys.stderr)
+        log_exception_with_timestamp(e, "Exception", self.SOCKET_ERROR_MESSAGE
+          + str(e.errno))
         self.prompt = self.DISCONNECTED_PROMPT
         self.imp_client.connected = False
     except Exception as e:
       # if the exception is unknown, there was possibly an issue with the connection
       # set the shell as disconnected
-      print('Unknown Exception : %s' % (e,), file=sys.stderr)
+      log_exception_with_timestamp(e, "Exception", "Unknown Exception")
       # Print the stack trace for the exception.
       traceback.print_exc()
       self.close_connection()
       self.prompt = ImpalaShell.DISCONNECTED_PROMPT
     return CmdStatus.ERROR
-
 
   def construct_table_with_header(self, column_names):
     """ Constructs the table header for a given query handle.
@@ -1470,6 +1609,9 @@ class ImpalaShell(cmd.Cmd, object):
   def do_insert(self, args):
     return self.__do_dml(self.orig_cmd, args)
 
+  def do_merge(self, args):
+    return self.__do_dml(self.orig_cmd, args)
+
   def do_explain(self, args):
     """Explain the query execution plan"""
     return self._execute_stmt(
@@ -1482,7 +1624,10 @@ class ImpalaShell(cmd.Cmd, object):
     if self.readline and self.readline.get_current_history_length() > 0:
       for index in xrange(1, self.readline.get_current_history_length() + 1):
         cmd = self.readline.get_history_item(index)
-        print('[%d]: %s' % (index, cmd.decode('utf-8', 'replace')), file=sys.stderr)
+        if sys.version_info.major == 2:
+          print('[%d]: %s' % (index, cmd.decode('utf-8', 'replace')), file=sys.stderr)
+        else:
+          print('[%d]: %s' % (index, cmd), file=sys.stderr)
     else:
       print(READLINE_UNAVAILABLE_ERROR, file=sys.stderr)
 
@@ -1685,7 +1830,7 @@ class ImpalaShell(cmd.Cmd, object):
     """
     cmd_names = [cmd for cmd in self.commands if cmd.startswith(text.lower())]
     # If the user input is upper case, return commands in upper case.
-    if text.isupper(): return [cmd_names.upper() for cmd_names in cmd_names]
+    if text.isupper(): return [cmd_name.upper() for cmd_name in cmd_names]
     # If the user input is lower case or mixed case, return lower case commands.
     return cmd_names
 
@@ -1722,7 +1867,7 @@ warned, it can be very long!",
   "Want to know what version of Impala you're connected to? Run the VERSION command to \
 find out!",
   "You can change the Impala daemon that you're connected to by using the CONNECT \
-command."
+command.",
   "To see how Impala will plan to run your query without actually executing it, use the \
 EXPLAIN command. You can change the level of detail in the EXPLAIN output by setting the \
 EXPLAIN_LEVEL query option.",
@@ -1736,7 +1881,7 @@ HEADER_DIVIDER =\
 def _format_tip(tip):
   """Takes a tip string and splits it on word boundaries so that it fits neatly inside the
   shell header."""
-  return '\n'.join([l for l in textwrap.wrap(tip, len(HEADER_DIVIDER))])
+  return '\n'.join([line for line in textwrap.wrap(tip, len(HEADER_DIVIDER))])
 
 
 WELCOME_STRING = """\
@@ -1779,8 +1924,8 @@ def parse_variables(keyvals):
     for keyval in keyvals:
       match = re.match(kv_pattern, keyval)
       if not match:
-        print('Error: Could not parse key-value "%s". ' % (keyval,) +
-              'It must follow the pattern "KEY=VALUE".', file=sys.stderr)
+        print('Error: Could not parse key-value "%s". ' % (keyval,)
+              + 'It must follow the pattern "KEY=VALUE".', file=sys.stderr)
         parser.print_help()
         raise FatalShellException()
       else:
@@ -1806,8 +1951,8 @@ def replace_variables(set_variables, input_string):
     # Check if syntax is correct
     var_name = get_var_name(name)
     if var_name is None:
-      print('Error: Unknown substitution syntax (%s). ' % (name,) +
-            'Use ${VAR:var_name}.', file=sys.stderr)
+      print('Error: Unknown substitution syntax (%s). ' % (name,)
+            + 'Use ${VAR:var_name}.', file=sys.stderr)
       errors = True
     else:
       # Replaces variable value
@@ -1861,8 +2006,8 @@ def execute_queries_non_interactive_mode(options, query_options):
 
   queries = parse_query_text(query_text)
   with ImpalaShell(options, query_options) as shell:
-    return (shell.execute_query_list(shell.cmdqueue) and
-            shell.execute_query_list(queries))
+    return (shell.execute_query_list(shell.cmdqueue)
+            and shell.execute_query_list(queries))
 
 
 def get_intro(options):
@@ -1876,11 +2021,57 @@ def get_intro(options):
     intro += ("\n\nLDAP authentication is enabled, but the connection to Impala is "
               "not secured by TLS.\nALL PASSWORDS WILL BE SENT IN THE CLEAR TO IMPALA.")
 
+  if not options.ssl and options.creds_ok_in_clear and options.use_jwt:
+    intro += ("\n\nJWT authentication is enabled, but the connection to Impala is "
+              "not secured by TLS.\nALL JWTs WILL BE SENT IN THE CLEAR TO IMPALA.")
+
+  if not options.ssl and options.creds_ok_in_clear and options.use_oauth:
+    intro += ("\n\nOAUTH authentication is enabled, but the connection to Impala is "
+              "not secured by TLS.\nALL OAUTHs WILL BE SENT IN THE CLEAR TO IMPALA.")
+
   if options.protocol == 'beeswax':
     intro += ("\n\nWARNING: The beeswax protocol is deprecated and will be removed in a "
               "future version of Impala.")
+    if options.hs2_fp_format:
+      intro += ("\n\nWARNING: Formatting floating-point values is "
+                "not supported with Beeswax protocol")
 
   return intro
+
+
+def _validate_hs2_fp_format_specification(format_specification):
+  try:
+    format_str = "{:%s}" % format_specification
+    format_str.format(float())
+  except UnicodeDecodeError as e:
+    raise e
+  except (ValueError, TypeError) as e:
+    raise FatalShellException(e)
+
+
+def read_password_cmd(password_cmd, auth_method_desc, strip_newline=False):
+  try:
+    p = subprocess.Popen(shlex.split(password_cmd), stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+    password, stderr = p.communicate()
+
+    if p.returncode != 0:
+      print("Error retrieving %s (command was '%s', error was: "
+            "'%s')" % (auth_method_desc, password_cmd, stderr.strip()), file=sys.stderr)
+      raise FatalShellException()
+
+    if sys.version_info.major > 2:
+      # Ensure we can manipulate the password as a string later.
+      password = password.decode('utf-8')
+
+    if strip_newline:
+      password = password.rstrip('\r\n')
+
+    return password
+  except Exception as e:
+    print("Error retrieving %s (command was: '%s', exception "
+          "was: '%s')" % (auth_method_desc, password_cmd, e), file=sys.stderr)
+    raise FatalShellException()
 
 
 def impala_shell_main():
@@ -1969,21 +2160,84 @@ def impala_shell_main():
             "must be a 1-character string." % delim, file=sys.stderr)
       raise FatalShellException()
 
-  if options.use_kerberos and options.use_ldap:
-    print("Please specify at most one authentication mechanism (-k or -l)",
+  auth_method_count = 0
+  if options.use_kerberos:
+    auth_method_count += 1
+
+  if options.use_ldap:
+    auth_method_count += 1
+
+  if options.use_jwt:
+    auth_method_count += 1
+
+  if options.use_oauth:
+    auth_method_count += 1
+
+  if auth_method_count > 1:
+    print("Please specify at most one authentication mechanism (-k, -l, or -j)",
           file=sys.stderr)
     raise FatalShellException()
 
   if not options.ssl and not options.creds_ok_in_clear and options.use_ldap:
-    print("LDAP credentials may not be sent over insecure " +
-          "connections. Enable SSL or set --auth_creds_ok_in_clear",
+    print(("LDAP credentials may not be sent over insecure "
+           "connections. Enable SSL or set --auth_creds_ok_in_clear"),
           file=sys.stderr)
     raise FatalShellException()
 
   if not options.use_ldap and options.ldap_password_cmd:
-    print("Option --ldap_password_cmd requires using LDAP authentication " +
-          "mechanism (-l)", file=sys.stderr)
+    print(("Option --ldap_password_cmd requires using LDAP authentication "
+           "mechanism (-l)"), file=sys.stderr)
     raise FatalShellException()
+
+  if options.use_jwt and options.protocol.lower() != 'hs2-http':
+    print("Invalid protocol '{0}'. JWT authentication requires using the 'hs2-http' "
+          "protocol".format(options.protocol), file=sys.stderr)
+    raise FatalShellException()
+
+  if options.use_jwt and options.strict_hs2_protocol:
+    print("JWT authentication is not supported when using strict hs2.", file=sys.stderr)
+    raise FatalShellException()
+
+  if options.use_jwt and not options.ssl and not options.creds_ok_in_clear:
+    print("JWTs may not be sent over insecure connections. Enable SSL or "
+          "set --auth_creds_ok_in_clear", file=sys.stderr)
+    raise FatalShellException()
+
+  if not options.use_jwt and options.jwt_cmd:
+    print("Option --jwt_cmd requires using JWT authentication mechanism (-j)",
+          file=sys.stderr)
+    raise FatalShellException()
+
+  if options.use_oauth and options.protocol.lower() != 'hs2-http':
+    print("Invalid protocol '{0}'. OAUTH authentication requires using the 'hs2-http' "
+          "protocol".format(options.protocol), file=sys.stderr)
+    raise FatalShellException()
+
+  if options.use_oauth and options.strict_hs2_protocol:
+    print("OAUTH authentication is not supported when using strict hs2.", file=sys.stderr)
+    raise FatalShellException()
+
+  if options.use_oauth and not options.ssl and not options.creds_ok_in_clear:
+    print("OAUTHs may not be sent over insecure connections. Enable SSL or "
+          "set --auth_creds_ok_in_clear", file=sys.stderr)
+    raise FatalShellException()
+
+  if not options.use_oauth and options.oauth_cmd:
+    print("Option --oauth_cmd requires using OAUTH authentication mechanism (-a)",
+          file=sys.stderr)
+    raise FatalShellException()
+
+  if options.hs2_fp_format:
+    try:
+      _validate_hs2_fp_format_specification(options.hs2_fp_format)
+    except FatalShellException as e:
+      print("Invalid floating point format specification: %s" %
+            options.hs2_fp_format, file=sys.stderr)
+      raise e
+    except UnicodeDecodeError as e:
+      print("Unicode character in format specification is not supported",
+            file=sys.stderr)
+      raise FatalShellException(e)
 
   start_msg = "Starting Impala Shell"
 
@@ -2008,6 +2262,14 @@ def impala_shell_main():
     if options.verbose:
       ldap_msg = "with LDAP-based authentication"
       print("{0} {1} {2}".format(start_msg, ldap_msg, py_version_msg), file=sys.stderr)
+  elif options.use_jwt:
+    if options.verbose:
+      ldap_msg = "with JWT-based authentication"
+      print("{0} {1} {2}".format(start_msg, ldap_msg, py_version_msg), file=sys.stderr)
+  elif options.use_oauth:
+    if options.verbose:
+      ldap_msg = "with OAUTH-based authentication"
+      print("{0} {1} {2}".format(start_msg, ldap_msg, py_version_msg), file=sys.stderr)
   else:
     if options.verbose:
       no_auth_msg = "with no authentication"
@@ -2015,18 +2277,15 @@ def impala_shell_main():
 
   options.ldap_password = None
   if options.use_ldap and options.ldap_password_cmd:
-    try:
-      p = subprocess.Popen(shlex.split(options.ldap_password_cmd), stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE)
-      options.ldap_password, stderr = p.communicate()
-      if p.returncode != 0:
-        print("Error retrieving LDAP password (command was '%s', error was: "
-              "'%s')" % (options.ldap_password_cmd, stderr.strip()), file=sys.stderr)
-        raise FatalShellException()
-    except Exception as e:
-      print("Error retrieving LDAP password (command was: '%s', exception "
-            "was: '%s')" % (options.ldap_password_cmd, e), file=sys.stderr)
-      raise FatalShellException()
+    options.ldap_password = read_password_cmd(options.ldap_password_cmd, "LDAP password")
+
+  options.jwt = None
+  if options.use_jwt and options.jwt_cmd:
+    options.jwt = read_password_cmd(options.jwt_cmd, "JWT", True)
+
+  options.oauth = None
+  if options.use_oauth and options.oauth_cmd:
+    options.oauth = read_password_cmd(options.oauth_cmd, "OAUTH", True)
 
   if options.ssl:
     if options.ca_cert is None:
@@ -2037,6 +2296,14 @@ def impala_shell_main():
       if options.verbose:
         print("SSL is enabled", file=sys.stderr)
 
+  if options.verbose:
+    try:
+      import thrift.protocol.fastbinary
+    except Exception as e:
+      print("WARNING: Failed to load Thrift's fastbinary module. Thrift's "
+            "BinaryProtocol will not be accelerated, which can reduce performance. "
+            "Error was '{0}'".format(e), file=sys.stderr)
+
   if options.output_file:
     try:
       # Make sure the given file can be opened for writing. This will also clear the file
@@ -2045,6 +2312,17 @@ def impala_shell_main():
     except IOError as e:
       print('Error opening output file for writing: %s' % e, file=sys.stderr)
       raise FatalShellException()
+
+  if options.http_socket_timeout_s is not None:
+    if (options.http_socket_timeout_s != 'None'
+        and float(options.http_socket_timeout_s) < 0):
+        print("http_socket_timeout_s must be a nonnegative floating point number"
+              " expressing seconds, or None", file=sys.stderr)
+        raise FatalShellException()
+
+  if options.connect_max_tries < 1:
+    print("connect_max_tries must be greater than or equal to 1", file=sys.stderr)
+    raise FatalShellException()
 
   options.variables = parse_variables(options.keyval)
 
@@ -2087,7 +2365,8 @@ def impala_shell_main():
             print(shell.CANCELLATION_MESSAGE)
             shell._reconnect_cancellation()
           else:
-            print("Socket error %s: %s" % (e.errno, e), file=sys.stderr)
+            print("%s %s: %s" %
+                (shell.SOCKET_ERROR_MESSAGE, e.errno, e), file=sys.stderr)
             shell.imp_client.connected = False
             shell.prompt = shell.DISCONNECTED_PROMPT
         except DisconnectedException as e:
@@ -2110,6 +2389,8 @@ def impala_shell_main():
 
 
 if __name__ == "__main__":
+  # Suppressing unwanted notifications from Thrift
+  logging.getLogger('thrift').addHandler(logging.NullHandler())
   try:
     impala_shell_main()
   except FatalShellException:

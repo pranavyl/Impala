@@ -53,6 +53,17 @@ enum TTableType {
   DATA_SOURCE_TABLE = 3
   KUDU_TABLE = 4
   ICEBERG_TABLE = 5
+  // Type for tables that we haven't loaded its full metadata so we don't know whether
+  // it's a HDFS or Kudu table, etc. We just know it's not a view.
+  UNLOADED_TABLE = 6
+  // We added MATERIALIZED_VIEW as a table type to TImpalaTableType in IMPALA-3268.
+  // To properly set the table type of a materialized view when calling
+  // JniFrontend#updateCatalogCache(), we need to also introduce this table type here
+  // so that a materialized view will not be classified as a table. Refer to
+  // IncompleteTable#toThrift() for further details.
+  MATERIALIZED_VIEW = 7
+  // Represents a system table reflecting backend internal state.
+  SYSTEM_TABLE = 8
 }
 
 // TODO: Separate the storage engines (e.g. Kudu) from the file formats.
@@ -69,6 +80,16 @@ enum THdfsFileFormat {
   HUDI_PARQUET = 7
   ICEBERG = 8
   JSON = 9
+  JDBC = 10
+}
+
+enum TVirtualColumnType {
+  NONE,
+  INPUT_FILE_NAME,
+  FILE_POSITION,
+  PARTITION_SPEC_ID,
+  ICEBERG_PARTITION_SERIALIZED,
+  ICEBERG_DATA_SEQUENCE_NUMBER
 }
 
 // TODO: Since compression is also enabled for Kudu columns, we should
@@ -89,10 +110,11 @@ enum THdfsCompression {
   LZ4_BLOCKED = 12
 }
 
-// Iceberg table file format identitied by table property 'write.format.default'
+// Iceberg table file format identified by table property 'write.format.default'
 enum TIcebergFileFormat {
   PARQUET = 0
   ORC = 1
+  AVRO = 2
 }
 
 // Iceberg table catalog type identified by table property 'iceberg.catalog'
@@ -124,6 +146,9 @@ enum TTablePropertyType {
   SERDE_PROPERTY = 1
 }
 
+// Table properties used by Impala
+const string TBL_PROP_SYSTEM_TABLE = "__IMPALA_SYSTEM_TABLE"
+
 // The access level that is available to Impala on the Catalog object.
 enum TAccessLevel {
   NONE = 0
@@ -143,21 +168,20 @@ enum TIcebergPartitionTransformType {
   VOID = 7
 }
 
+// Data distribution method of bucketed table.
+// (Easy to add more types later.)
+enum TBucketType {
+  // Non-Bucketed
+  NONE = 0
+  // For hive compatibility, the hash function used in Hive's bucketed tables
+  HASH = 1
+}
+
 struct TCompressionCodec {
   // Compression codec
   1: required THdfsCompression codec
   // Compression level
   2: optional i32 compression_level
-}
-
-// Mapping from names defined by Avro to values in the THdfsCompression enum.
-const map<string, THdfsCompression> COMPRESSION_MAP = {
-  "": THdfsCompression.NONE,
-  "none": THdfsCompression.NONE,
-  "deflate": THdfsCompression.DEFAULT,
-  "gzip": THdfsCompression.GZIP,
-  "bzip2": THdfsCompression.BZIP2,
-  "snappy": THdfsCompression.SNAPPY
 }
 
 // Represents a single item in a partition spec (column name + value)
@@ -186,6 +210,13 @@ struct TTableStats {
   2: optional i64 total_file_bytes
 }
 
+// Represents the bucket spec of a table.
+struct TBucketInfo {
+  1: required TBucketType bucket_type
+  2: optional list<string> bucket_columns
+  3: required i32 num_bucket
+}
+
 // Column stats data that Impala uses.
 struct TColumnStats {
   // Average size and max size, in bytes. Excludes serialization overhead.
@@ -211,6 +242,8 @@ struct TColumnStats {
 
 // Intermediate state for the computation of per-column stats. Impala can aggregate these
 // structures together to produce final stats for a column.
+// Fields should be optional for backward compatibility since this is stored in HMS
+// partition properties.
 struct TIntermediateColumnStats {
   // One byte for each bucket of the NDV HLL computation
   1: optional binary intermediate_ndv
@@ -231,8 +264,8 @@ struct TIntermediateColumnStats {
   6: optional i64 num_rows
 
   // The number of true and false value, of the column
-  7: required i64 num_trues
-  8: required i64 num_falses
+  7: optional i64 num_trues
+  8: optional i64 num_falses
 
   // The low and the high value
   9: optional Data.TColumnValue low_value
@@ -259,31 +292,36 @@ struct TColumn {
   4: optional TColumnStats col_stats
   // Ordinal position in the source table
   5: optional i32 position
+  6: optional TVirtualColumnType virtual_column_type = TVirtualColumnType.NONE
+  // True for hidden columns
+  7: optional bool is_hidden
 
   // Indicates whether this is an HBase column. If true, implies
   // all following HBase-specific fields are set.
-  6: optional bool is_hbase_column
-  7: optional string column_family
-  8: optional string column_qualifier
-  9: optional bool is_binary
+  8: optional bool is_hbase_column
+  9: optional string column_family
+  10: optional string column_qualifier
+  11: optional bool is_binary
 
   // The followings are Kudu-specific column properties
-  10: optional bool is_kudu_column
-  11: optional bool is_key
-  12: optional bool is_nullable
-  13: optional TColumnEncoding encoding
-  14: optional THdfsCompression compression
-  15: optional Exprs.TExpr default_value
-  16: optional i32 block_size
+  12: optional bool is_kudu_column
+  13: optional bool is_key
+  14: optional bool is_nullable
+  15: optional TColumnEncoding encoding
+  16: optional THdfsCompression compression
+  17: optional Exprs.TExpr default_value
+  18: optional i32 block_size
   // The column name, in the case that it appears in Kudu.
-  17: optional string kudu_column_name
+  19: optional string kudu_column_name
+  24: optional bool is_primary_key_unique
+  25: optional bool is_auto_incrementing
 
   // Here come the Iceberg-specific fields.
-  18: optional bool is_iceberg_column
-  19: optional i32 iceberg_field_id
+  20: optional bool is_iceberg_column
+  21: optional i32 iceberg_field_id
   // Key and value field id for Iceberg column with Map type.
-  20: optional i32 iceberg_field_map_key_id
-  21: optional i32 iceberg_field_map_value_id
+  22: optional i32 iceberg_field_map_key_id
+  23: optional i32 iceberg_field_map_value_id
 }
 
 // Represents an HDFS file in a partition.
@@ -292,6 +330,10 @@ struct THdfsFileDesc {
   // (defined in common/fbs/CatalogObjects.fbs).
   // TODO: Put this in a KRPC sidecar to avoid serialization cost.
   1: required binary file_desc_data
+
+  // Additional file metadata serialized into a FlatBuffer
+  // TODO: Put this in a KRPC sidecar to avoid serialization cost.
+  2: optional binary file_metadata
 }
 
 // Represents an HDFS partition's location in a compressed format. 'prefix_index'
@@ -473,6 +515,13 @@ struct THdfsTable {
 
   // Set iff this is an acid table. The valid write ids list.
   13: optional TValidWriteIdList valid_write_ids
+
+  // Bucket information for HDFS tables
+  16: optional TBucketInfo bucket_info
+
+  // Recently dropped partitions that are not yet synced to the catalog topic.
+  // Only used in catalogd.
+  17: optional list<THdfsPartition> dropped_partitions
 }
 
 struct THBaseTable {
@@ -520,6 +569,7 @@ struct TRangePartition {
   2: optional bool is_lower_bound_inclusive
   3: optional list<Exprs.TExpr> upper_bound_values
   4: optional bool is_upper_bound_inclusive
+  5: optional list<TKuduPartitionParam> hash_specs
 }
 
 // A range partitioning is identified by a list of columns and a list of range partitions.
@@ -546,6 +596,14 @@ struct TKuduTable {
 
   // Partitioning
   4: required list<TKuduPartitionParam> partition_by
+
+  // Set to true if primary key of the Kudu table is unique.
+  // Kudu engine automatically adds an auto-incrementing column in the table if
+  // primary key is not unique, in this case, this field is set to false.
+  5: optional bool is_primary_key_unique
+
+  // Set to true if the table has auto-incrementing column
+  6: optional bool has_auto_incrementing
 }
 
 struct TIcebergPartitionTransform {
@@ -561,11 +619,40 @@ struct TIcebergPartitionField {
   3: required string orig_field_name
   4: required string field_name
   5: required TIcebergPartitionTransform transform
+  6: required Types.TScalarType type
 }
 
 struct TIcebergPartitionSpec {
-  1: required i32 partition_id
+  1: required i32 spec_id
   2: optional list<TIcebergPartitionField> partition_fields
+}
+
+struct TIcebergPartitionStats {
+  1: required i64 num_files;
+  2: required i64 num_rows;
+  3: required i64 file_size_in_bytes;
+}
+
+// Contains maps from 128-bit Murmur3 hash of file path to its file descriptor
+struct TIcebergContentFileStore {
+  1: optional map<string, THdfsFileDesc> path_hash_to_data_file_without_deletes
+  2: optional map<string, THdfsFileDesc> path_hash_to_data_file_with_deletes
+  3: optional map<string, THdfsFileDesc> path_hash_to_position_delete_file
+  4: optional map<string, THdfsFileDesc> path_hash_to_equality_delete_file
+  5: optional bool has_avro
+  6: optional bool has_orc
+  7: optional bool has_parquet
+}
+
+// Represents a drop partition request for Iceberg tables
+struct TIcebergDropPartitionRequest {
+  // List of affected file paths (could be empty if the drop partition
+  // request can be exchanged with a truncate command)
+  1: required list<string> paths
+  // Indicates whether the request could be exchanged with a truncate command
+  2: required bool is_truncate
+  // Number of affected partitions that will be dropped
+  3: required i64 num_partitions
 }
 
 struct TIcebergTable {
@@ -573,10 +660,10 @@ struct TIcebergTable {
   1: required string table_location
   2: required list<TIcebergPartitionSpec> partition_spec
   3: required i32 default_partition_spec_id
-  // Map from 128-bit Murmur3 hash of data file path to its file descriptor
-  4: optional map<string,THdfsFileDesc> path_hash_to_file_descriptor
-  // Iceberg snapshot id of the table
-  5: optional i64 snapshot_id
+  // Iceberg data and delete files
+  4: optional TIcebergContentFileStore content_files
+  // Snapshot id of the org.apache.iceberg.Table object cached in the CatalogD
+  5: optional i64 catalog_snapshot_id;
   // Iceberg 'write.parquet.compression-codec' and 'write.parquet.compression-level' table
   // properties
   6: optional TCompressionCodec parquet_compression_codec
@@ -586,6 +673,18 @@ struct TIcebergTable {
   // properties
   8: optional i64 parquet_plain_page_size;
   9: optional i64 parquet_dict_page_size;
+  10: optional map<string, TIcebergPartitionStats> partition_stats;
+}
+
+// System Table identifiers.
+// These are used as the table name, so should not be changed.
+enum TSystemTableName {
+  IMPALA_QUERY_LIVE = 0
+}
+
+// Represents a System Table
+struct TSystemTable {
+  1: required TSystemTableName table_name
 }
 
 // Represents a table or view.
@@ -611,34 +710,44 @@ struct TTable {
   // List of clustering columns (empty list if table has no clustering columns)
   6: optional list<TColumn> clustering_columns
 
+  // List of virtual columns (empty list if table has no virtual columns)
+  7: optional list<TColumn> virtual_columns
+
   // Table stats data for the table.
-  7: optional TTableStats table_stats
+  8: optional TTableStats table_stats
 
   // Determines the table type - either HDFS, HBASE, or VIEW.
-  8: optional TTableType table_type
+  9: optional TTableType table_type
 
   // Set iff this is an HDFS table
-  9: optional THdfsTable hdfs_table
+  10: optional THdfsTable hdfs_table
 
   // Set iff this is an Hbase table
-  10: optional THBaseTable hbase_table
+  11: optional THBaseTable hbase_table
 
   // The Hive Metastore representation of this table. May not be set if there were
   // errors loading the table metadata
-  11: optional hive_metastore.Table metastore_table
+  12: optional hive_metastore.Table metastore_table
 
   // Set iff this is a table from an external data source
-  12: optional TDataSourceTable data_source_table
+  13: optional TDataSourceTable data_source_table
 
   // Set iff this a kudu table
-  13: optional TKuduTable kudu_table
+  14: optional TKuduTable kudu_table
 
   // Set if this table needs storage access during metadata load.
   // Time used for storage loading in nanoseconds.
-  15: optional i64 storage_metadata_load_time_ns
+  16: optional i64 storage_metadata_load_time_ns
 
   // Set if this a iceberg table
-  16: optional TIcebergTable iceberg_table
+  17: optional TIcebergTable iceberg_table
+
+  // Comment of the table/view. Set only for FeIncompleteTable where msTable doesn't
+  // exists.
+  18: optional string tbl_comment
+
+  // Set if this is a system table
+  19: optional TSystemTable system_table
 }
 
 // Represents a database.
@@ -682,6 +791,9 @@ enum TPrivilegeScope {
   DATABASE = 2
   TABLE = 3
   COLUMN = 4
+  STORAGE_TYPE = 5
+  STORAGEHANDLER_URI = 6
+  USER_DEFINED_FN = 7
 }
 
 // The privilege level allowed.
@@ -694,6 +806,7 @@ enum TPrivilegeLevel {
   ALTER = 5
   DROP = 6
   OWNER = 7
+  RWSTORAGE = 8
 }
 
 // Represents a privilege in an authorization policy. Privileges contain the level
@@ -730,7 +843,7 @@ struct TPrivilege {
   // Set if scope is SERVER, URI, DATABASE, or TABLE
   7: optional string server_name
 
-  // Set if scope is DATABASE or TABLE
+  // Set if scope is DATABASE or TABLE or USER_DEFINED_FN
   8: optional string db_name
 
   // Unqualified table name. Set if scope is TABLE.
@@ -744,6 +857,13 @@ struct TPrivilege {
 
   // Set if scope is COLUMN
   12: optional string column_name
+
+  13: optional string storage_type
+
+  14: optional string storage_url
+
+  // Set if scope is USER_DEFINED_FN
+  15: optional string fn_name
 }
 
 // Thrift representation of an HdfsCachePool.
@@ -809,4 +929,7 @@ struct TCatalogObject {
 
   // Set iff object type is HDFS_PARTITION
   12: optional THdfsPartition hdfs_partition
+
+  // Timestamp when the catalog version changes in catalogd
+  13: optional i64 last_modified_time_ms
 }

@@ -19,11 +19,60 @@
 # and other functions used for checking for strings in files and
 # directories.
 
+from __future__ import absolute_import, division, print_function
 import os
 import re
+import shutil
+import tempfile
 from subprocess import check_call
 
-from tests.util.filesystem_utils import get_fs_path
+from tests.util.filesystem_utils import get_fs_path, WAREHOUSE_PREFIX
+from tests.util.iceberg_metadata_util import rewrite_metadata
+
+
+def create_iceberg_table_from_directory(impala_client, unique_database, table_name,
+                                        file_format):
+  """Utility function to create an iceberg table from a directory. The directory must
+  exist in $IMPALA_HOME/testdata/data/iceberg_test with the name 'table_name'"""
+
+  # Only orc and parquet tested/supported
+  assert file_format == "orc" or file_format == "parquet"
+
+  local_dir = os.path.join(
+    os.environ['IMPALA_HOME'], 'testdata', 'data', 'iceberg_test', table_name)
+  assert os.path.isdir(local_dir)
+
+  # Rewrite iceberg metadata to use the warehouse prefix and use unique_database
+  tmp_dir = tempfile.mktemp(table_name)
+  # Need to create the temp dir so 'cp -r' will copy local dir with its original name
+  # under the temp dir. rewrite_metadata() has the assumption that the parent directory
+  # of the 'metadata' directory bears the name of the table.
+  check_call(['mkdir', '-p', tmp_dir])
+  check_call(['cp', '-r', local_dir, tmp_dir])
+  local_dir = os.path.join(tmp_dir, table_name)
+  rewrite_metadata(WAREHOUSE_PREFIX, unique_database, os.path.join(local_dir, 'metadata'))
+
+  # Put the directory in the database's directory (not the table directory)
+  hdfs_parent_dir = os.path.join(get_fs_path("/test-warehouse"), unique_database)
+  hdfs_dir = os.path.join(hdfs_parent_dir, table_name)
+
+  # Purge existing files if any
+  check_call(['hdfs', 'dfs', '-rm', '-f', '-r', hdfs_dir])
+
+  # Note: -d skips a staging copy
+  check_call(['hdfs', 'dfs', '-mkdir', '-p', hdfs_parent_dir])
+  check_call(['hdfs', 'dfs', '-put', '-d', local_dir, hdfs_parent_dir])
+
+  # Create external table
+  qualified_table_name = '{0}.{1}'.format(unique_database, table_name)
+  impala_client.execute("""create external table {0} stored as iceberg location '{1}'
+                        tblproperties('write.format.default'='{2}', 'iceberg.catalog'=
+                        'hadoop.tables')""".format(qualified_table_name, hdfs_dir,
+                                                   file_format))
+
+  # Automatic clean up after drop table
+  impala_client.execute("""alter table {0} set tblproperties ('external.table.purge'=
+                        'True');""".format(qualified_table_name))
 
 
 def create_table_from_parquet(impala_client, unique_database, table_name):
@@ -131,3 +180,19 @@ def assert_no_files_in_dir_contain(dir, search):
   assert not results, \
       "%s should not have any file containing '%s' but a file was found" \
       % (dir, search)
+
+
+def make_tmp_test_dir(name):
+  """Create temporary directory with prefix 'impala_test_<name>_'.
+  Return the path of temporary directory as string. Caller is responsible to
+  clean them. If LOG_DIR env var exist, the temporary dir will be placed inside
+  LOG_DIR."""
+  # TODO: Consider using tempfile.TemporaryDirectory from python3 in the future.
+  parent_dir = os.getenv("LOG_DIR", None)
+  return tempfile.mkdtemp(prefix='impala_test_{}_'.format(name), dir=parent_dir)
+
+
+def cleanup_tmp_test_dir(dir_path):
+  """Remove temporary 'dir_path' and its content.
+  Ignore errors upon deletion."""
+  shutil.rmtree(dir_path, ignore_errors=True)

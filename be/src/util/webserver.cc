@@ -33,6 +33,7 @@
 #include <rapidjson/stringbuffer.h>
 
 #include "common/logging.h"
+#include "common/global-flags.h"
 #include "gutil/endian.h"
 #include "gutil/strings/escaping.h"
 #include "gutil/strings/strip.h"
@@ -55,6 +56,7 @@
 #include "util/jwt-util.h"
 #include "util/mem-info.h"
 #include "util/metrics.h"
+#include "util/openssl-util.h"
 #include "util/os-info.h"
 #include "util/os-util.h"
 #include "util/pretty-printer.h"
@@ -143,18 +145,32 @@ DEFINE_bool(webserver_ldap_passwords_in_clear_ok, false,
     "(Advanced) If true, allows the webserver to start with LDAP authentication even if "
     "SSL is not enabled, a potentially insecure configuration.");
 
+DEFINE_bool(disable_content_security_policy_header, false,
+    "If true then the webserver will not add the Content-Security-Policy "
+    "HTTP header to HTTP responses");
+
+DEFINE_int64(slow_http_response_warning_threshold_ms, 500,
+    "(Advanced) Threshold for considering a HTTP response to be unusually slow.");
+
 DECLARE_bool(enable_ldap_auth);
 DECLARE_string(hostname);
 DECLARE_bool(is_coordinator);
 DECLARE_int64(max_cookie_lifetime_s);
 DECLARE_string(ssl_minimum_version);
 DECLARE_string(ssl_cipher_list);
+DECLARE_string(tls_ciphersuites);
 DECLARE_string(trusted_domain);
 DECLARE_bool(trusted_domain_use_xff_header);
+DECLARE_bool(trusted_domain_empty_xff_header_use_origin);
+DECLARE_bool(trusted_domain_strict_localhost);
 DECLARE_bool(jwt_token_auth);
 DECLARE_bool(jwt_validate_signature);
 DECLARE_string(jwt_custom_claim_username);
 DECLARE_string(trusted_auth_header);
+DECLARE_string(spnego_keytab_file);
+DECLARE_bool(oauth_token_auth);
+DECLARE_bool(oauth_jwt_validate_signature);
+DECLARE_string(oauth_jwt_custom_claim_username);
 
 static const char* DOC_FOLDER = "/www/";
 static const int DOC_FOLDER_LEN = strlen(DOC_FOLDER);
@@ -168,6 +184,11 @@ static const char* COMMON_JSON_KEY = "__common__";
 static const char* ERROR_KEY = "__error_msg__";
 
 static const char* CRLF = "\r\n";
+
+// The value to be returned in the Content-Security-Policy header.
+static const char* CSP_HEADER = "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                                "script-src 'self' 'unsafe-inline'; "
+                                "img-src 'self' data:;";
 
 // Returns $IMPALA_HOME if set, otherwise /tmp/impala_www
 const char* GetDefaultDocumentRoot() {
@@ -196,6 +217,8 @@ string HttpStatusCodeToString(HttpStatusCode code) {
   switch (code) {
     case HttpStatusCode::Ok:
       return "200 OK";
+    case HttpStatusCode::TemporaryRedirect:
+      return "307 Temporary Redirect";
     case HttpStatusCode::BadRequest:
       return "400 Bad Request";
     case HttpStatusCode::AuthenticationRequired:
@@ -226,6 +249,16 @@ void SendResponse(struct sq_connection* connection, const string& response_code_
     oss << h << CRLF;
   }
   oss << "X-Frame-Options: " << FLAGS_webserver_x_frame_options << CRLF;
+  oss << "X-Content-Type-Options: nosniff" << CRLF;
+  oss << "Cache-Control: no-store" << CRLF;
+  if (!FLAGS_disable_content_security_policy_header) {
+    oss << "Content-Security-Policy: " << CSP_HEADER << CRLF;
+  }
+
+  struct sq_request_info* request_info = sq_get_request_info(connection);
+  if (request_info->is_ssl) {
+    oss << "Strict-Transport-Security: max-age=31536000; includeSubDomains" << CRLF;
+  }
   oss << "Content-Type: " << content_type << CRLF;
   oss << "Content-Length: " << content.size() << CRLF;
   oss << CRLF;
@@ -239,6 +272,7 @@ void SendResponse(struct sq_connection* connection, const string& response_code_
 // Return the address of the remote user from the squeasel request info.
 kudu::Sockaddr GetRemoteAddress(const struct sq_request_info* req) {
   struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = NetworkByteOrder::FromHost16(req->remote_port);
   addr.sin_addr.s_addr = NetworkByteOrder::FromHost32(req->remote_ip);
@@ -289,7 +323,8 @@ Webserver::Webserver(const string& interface, const int port, MetricGroup* metri
     use_cookies_(FLAGS_max_cookie_lifetime_s > 0),
     check_trusted_domain_(!FLAGS_trusted_domain.empty()),
     check_trusted_auth_header_(!FLAGS_trusted_auth_header.empty()),
-    use_jwt_(FLAGS_jwt_token_auth) {
+    use_jwt_(FLAGS_jwt_token_auth),
+    use_oauth_(FLAGS_oauth_token_auth) {
   http_address_ = MakeNetworkAddress(interface.empty() ? "0.0.0.0" : interface, port);
   Init();
 
@@ -305,7 +340,7 @@ Webserver::Webserver(const string& interface, const int port, MetricGroup* metri
     total_basic_auth_failure_ =
         metrics->AddCounter("impala.webserver.total-basic-auth-failure", 0);
   }
-  if (use_cookies_ && (auth_mode_ == AuthMode::SPNEGO || auth_mode_ == AuthMode::LDAP)) {
+  if (use_cookies_ && auth_mode_ != AuthMode::NONE) {
     total_cookie_auth_success_ =
         metrics->AddCounter("impala.webserver.total-cookie-auth-success", 0);
     total_cookie_auth_failure_ =
@@ -326,6 +361,12 @@ Webserver::Webserver(const string& interface, const int port, MetricGroup* metri
         metrics->AddCounter("impala.webserver.total-jwt-token-auth-success", 0);
     total_jwt_token_auth_failure_ =
         metrics->AddCounter("impala.webserver.total-jwt-token-auth-failure", 0);
+  }
+  if (use_oauth_) {
+    total_oauth_token_auth_success_ =
+        metrics->AddCounter("impala.webserver.total-oauth-token-auth-success", 0);
+    total_oauth_token_auth_failure_ =
+        metrics->AddCounter("impala.webserver.total-oauth-token-auth-failure", 0);
   }
 }
 
@@ -402,9 +443,8 @@ Status Webserver::Start() {
 
       const string& password_cmd = FLAGS_webserver_private_key_password_cmd;
       if (!password_cmd.empty()) {
-        if (!RunShellProcess(password_cmd, &key_password, true)) {
-          return Status(TErrorCode::SSL_PASSWORD_CMD_FAILED, password_cmd, key_password,
-              {"JAVA_TOOL_OPTIONS"});
+        if (!RunShellProcess(password_cmd, &key_password, true, {"JAVA_TOOL_OPTIONS"})) {
+          return Status(TErrorCode::SSL_PASSWORD_CMD_FAILED, password_cmd, key_password);
         }
         options.push_back("ssl_private_key_password");
         options.push_back(key_password.c_str());
@@ -417,6 +457,8 @@ Status Webserver::Start() {
       options.push_back("ssl_ciphers");
       options.push_back(FLAGS_ssl_cipher_list.c_str());
     }
+    options.push_back("tls_ciphersuites");
+    options.push_back(FLAGS_tls_ciphersuites.c_str());
   }
 
   if (!FLAGS_webserver_authentication_domain.empty()) {
@@ -425,7 +467,7 @@ Status Webserver::Start() {
   }
 
   if (!FLAGS_webserver_password_file.empty()) {
-    if (FIPS_mode()) {
+    if (IsFIPSMode()) {
       return Status("HTTP digest authorization is not supported in FIPS approved mode.");
     } else {
       // Squeasel doesn't log anything if it can't stat the password file (but will if it
@@ -448,7 +490,13 @@ Status Webserver::Start() {
     // propagated into this environment variable where the GSSAPI calls will
     // pick it up. In other words, we aren't expecting users to pass in this
     // environment variable specifically.
-    const char* kt_file = getenv("KRB5_KTNAME");
+
+    // If --spnego_keytab_file flag is not empty, web server uses keytab file location
+    // specified in --spnego_keytab_file instead of --keytab_file. This is for seperation
+    // of impala service keytab and spnego keytab for web console authentication.
+    const char* kt_file = FLAGS_spnego_keytab_file.empty() ?
+      getenv("KRB5_KTNAME") :
+      FLAGS_spnego_keytab_file.c_str();
     if (!kt_file || !kudu::Env::Default()->FileExists(kt_file)) {
       return Status("Unable to configure web server for SPNEGO authentication: "
                     "must configure a keytab file for the server");
@@ -534,13 +582,18 @@ void Webserver::Init() {
       "$0://$1:$2", IsSecure() ? "https" : "http", hostname_, http_address_.port);
 }
 
-void Webserver::GetCommonJson(
-    Document* document, const struct sq_connection* connection, const WebRequest& req) {
+void Webserver::GetCommonJson(Document* document, const struct sq_connection* connection,
+    const WebRequest& req, const std::string& csrf_token) {
   DCHECK(document != nullptr);
   Value obj(kObjectType);
   obj.AddMember("process-name",
       rapidjson::StringRef(google::ProgramInvocationShortName()),
       document->GetAllocator());
+  if (!csrf_token.empty()) {
+    obj.AddMember("csrf_token",
+        Value(csrf_token.c_str(), document->GetAllocator()),
+        document->GetAllocator());
+  }
 
   // If Apacke Knox is being used to proxy connections to the webserver, the
   // 'x-forwarded-context' header will be present.
@@ -619,8 +672,18 @@ sq_callback_result_t Webserver::BeginRequestCallback(struct sq_connection* conne
 
   vector<string> response_headers;
   bool authenticated = false;
+  // Random value from cookie that we'll also use as a csrf_token to implement the
+  // "Double Submit Cookie" and custom header (X-Requested-By) patterns for preventing
+  // cross-site request forgery (CSRF).
+  std::string cookie_rand_value;
+  // With JWTs we can skip CSRF protection because browsers won't send "Authorization:
+  // Bearer" headers automatically.
+  bool check_csrf_protection = true;
+  // Flags if we have a valid cookie to test for CSRF.
+  bool cookie_authenticated = false;
+
   // Try authenticating with JWT token first, if enabled.
-  if (use_jwt_) {
+  if (use_jwt_ || use_oauth_) {
     const char* auth_value = nullptr;
     const char* value = sq_get_header(connection, "Authorization");
     if (value != nullptr) auth_value = StripLeadingWhiteSpace(value);
@@ -630,31 +693,57 @@ sq_callback_result_t Webserver::BeginRequestCallback(struct sq_connection* conne
     // separated by dots (.).
     if (auth_value != nullptr && strncasecmp(auth_value, "Bearer ", 7) == 0
         && strchr(auth_value, '.') != nullptr) {
-      string jwt_token = string(auth_value + 7);
-      StripWhiteSpace(&jwt_token);
-      if (!jwt_token.empty()) {
-        if (JWTTokenAuth(jwt_token, connection, request_info)) {
-          total_jwt_token_auth_success_->Increment(1);
-          authenticated = true;
-          // TODO: cookies are not added, but are not needed right now
-        } else {
-          LOG(INFO) << "Invalid JWT token provided: " << jwt_token;
-          total_jwt_token_auth_failure_->Increment(1);
+      string bearer_token= string(auth_value + 7);
+      StripWhiteSpace(&bearer_token);
+      if (!bearer_token.empty()) {
+        if (use_jwt_) {
+          if (JWTTokenAuth(bearer_token, connection, request_info)) {
+            total_jwt_token_auth_success_->Increment(1);
+            authenticated = true;
+            check_csrf_protection = false;
+            // TODO: cookies are not added, but are not needed right now
+          }
+        }
+        if (!authenticated && use_oauth_) {
+          if (OAuthTokenAuth(bearer_token, connection, request_info)) {
+            total_oauth_token_auth_success_->Increment(1);
+            authenticated = true;
+            check_csrf_protection = false;
+            // TODO: cookies are not added, but are not needed right now
+          }
+        }
+        if (!authenticated) {
+          if (use_jwt_) {
+            LOG(INFO) << "Invalid JWT token provided: " << bearer_token;
+            total_jwt_token_auth_failure_->Increment(1);
+          }
+          if (use_oauth_) {
+            LOG(INFO) << "Invalid OAuth token provided: " << bearer_token;
+            total_oauth_token_auth_failure_->Increment(1);
+          }
         }
       }
     }
   }
-  if (!authenticated) {
-    authenticated = auth_mode_ != AuthMode::SPNEGO && auth_mode_ != AuthMode::LDAP;
+
+  if (!authenticated && auth_mode_ == AuthMode::NONE) {
+    // With AuthMode::NONE, any protection can be bypassed. We sometimes initialize a 2nd
+    // Metrics webserver using AuthMode::NONE, and metrics counters are not named
+    // uniquely to work with two webservers using cookies so we skip using cookies.
+    authenticated = true;
+    check_csrf_protection = false;
   }
+
   // Try authenticating with a cookie, if enabled.
   if (!authenticated && use_cookies_) {
     const char* cookie_header = sq_get_header(connection, "Cookie");
     string username;
     if (cookie_header != nullptr) {
-      Status cookie_status = AuthenticateCookie(hash_, cookie_header, &username);
+      Status cookie_status =
+          AuthenticateCookie(hash_, cookie_header, &username, &cookie_rand_value);
       if (cookie_status.ok()) {
         authenticated = true;
+        cookie_authenticated = true;
         request_info->remote_user = strdup(username.c_str());
         total_cookie_auth_success_->Increment(1);
       } else {
@@ -666,22 +755,40 @@ sq_callback_result_t Webserver::BeginRequestCallback(struct sq_connection* conne
     }
   }
 
+  if (!authenticated && auth_mode_ == AuthMode::HTPASSWD) {
+    // Squeasel already handled HTPASSWD authentication. We still enable CSRF protection
+    // as browsers automatically include HTPASSWD credentials in requests, so add and use
+    // cookies to avoid requiring the custom header.
+    authenticated = true;
+    AddCookie(request_info->remote_user, &response_headers, &cookie_rand_value);
+  }
+
   // Connections originating from trusted domains should not require authentication.
   // Returns a cookie on the first successful auth attempt. This check is performed after
   // checking for cookie to avoid subsequent reverse DNS lookups which can be
   // unpredictably costly.
   if (!authenticated && check_trusted_domain_) {
     const char* xff_origin = sq_get_header(connection, "X-Forwarded-For");
-    string xff_origin_string = !xff_origin ? "" : string(xff_origin);
-    string origin = FLAGS_trusted_domain_use_xff_header ?
-        xff_origin_string :
-        GetRemoteAddress(request_info).ToString();
+    std::string_view xff_origin_sv = !xff_origin ? "" : xff_origin;
+    string origin;
+    if (FLAGS_trusted_domain_use_xff_header) {
+      Status status = GetXFFOriginClientAddress(xff_origin_sv, origin);
+      if (!status.ok()) LOG(WARNING) << status.GetDetail();
+    } else {
+      origin = GetRemoteAddress(request_info).ToString();
+    }
+
     StripWhiteSpace(&origin);
+    if (origin.empty() && FLAGS_trusted_domain_use_xff_header &&
+        FLAGS_trusted_domain_empty_xff_header_use_origin) {
+      origin = GetRemoteAddress(request_info).ToString();
+      StripWhiteSpace(&origin);
+    }
     if (!origin.empty()) {
       if (TrustedDomainCheck(origin, connection, request_info)) {
         total_trusted_domain_check_success_->Increment(1);
         authenticated = true;
-        AddCookie(request_info, &response_headers);
+        AddCookie(request_info->remote_user, &response_headers, &cookie_rand_value);
       }
     }
   }
@@ -694,7 +801,7 @@ sq_callback_result_t Webserver::BeginRequestCallback(struct sq_connection* conne
       if (GetUsernameFromAuthHeader(connection, request_info, err_msg)) {
         total_trusted_auth_header_check_success_->Increment(1);
         authenticated = true;
-        AddCookie(request_info, &response_headers);
+        AddCookie(request_info->remote_user, &response_headers, &cookie_rand_value);
       } else {
         LOG(ERROR) << "Found trusted auth header but " << err_msg;
       }
@@ -707,7 +814,7 @@ sq_callback_result_t Webserver::BeginRequestCallback(struct sq_connection* conne
           HandleSpnego(connection, request_info, &response_headers);
       if (spnego_result == SQ_CONTINUE_HANDLING) {
         // Spnego negotiation was successful.
-        AddCookie(request_info, &response_headers);
+        AddCookie(request_info->remote_user, &response_headers, &cookie_rand_value);
       } else {
         // Spnego negotiation is incomplete or failed, stop processing the request.
         return spnego_result;
@@ -718,7 +825,7 @@ sq_callback_result_t Webserver::BeginRequestCallback(struct sq_connection* conne
       if (basic_status.ok()) {
         // Basic auth was successful.
         total_basic_auth_success_->Increment(1);
-        AddCookie(request_info, &response_headers);
+        AddCookie(request_info->remote_user, &response_headers, &cookie_rand_value);
       } else {
         total_basic_auth_failure_->Increment(1);
         if (!sq_get_header(connection, "Authorization")) {
@@ -813,6 +920,44 @@ sq_callback_result_t Webserver::BeginRequestCallback(struct sq_connection* conne
       req.post_data.append(buf, n);
       rem -= n;
     }
+
+    if (check_csrf_protection) {
+      // Always require 1) a csrf_token and cookie or 2) X-Requested-By header.
+      if (cookie_authenticated) {
+        std::vector<char> csrf_token(RAND_MAX_LENGTH+1, '\0');
+        int csrf_len = sq_get_var(req.post_data.c_str(), req.post_data.size(),
+            "csrf_token", csrf_token.data(), csrf_token.size());
+        if (csrf_len == -1) {
+          LOG(WARNING) << "CSRF protection: rejected POST without CSRF token";
+          sq_printf(connection, "HTTP/1.1 403 Forbidden\r\n");
+          return SQ_HANDLED_CLOSE_CONNECTION;
+        } else if (csrf_len == -2) {
+          LOG(WARNING) << "CSRF protection: CSRF token is too long";
+          sq_printf(connection, "HTTP/1.1 403 Forbidden\r\n");
+          return SQ_HANDLED_CLOSE_CONNECTION;
+        }
+        DCHECK(csrf_len >= 0 && csrf_len < csrf_token.size());
+
+        // Prevent CSRF for POSTs using the Double Submit Cookie pattern only if cookie
+        // authentication succeeded.
+        if (cookie_rand_value != csrf_token.data()) {
+          LOG(WARNING) << "CSRF protection: rejected POST with token mismatch: "
+                      << cookie_rand_value << " != " << csrf_token.data();
+          const char* msg = "please refresh the page and try again";
+          SendResponse(connection, "403 Forbidden", "text/plain", msg, response_headers);
+          return SQ_HANDLED_CLOSE_CONNECTION;
+        }
+      } else {
+        // Require a custom header matching csrf_token in the POST body.
+        const char* csrf_header = sq_get_header(connection, "X-Requested-By");
+        if (csrf_header == nullptr) {
+          const char* msg = "rejected POST missing X-Requested-By header";
+          LOG(WARNING) << "CSRF protection: " << msg;
+          SendResponse(connection, "403 Forbidden", "text/plain", msg, response_headers);
+          return SQ_HANDLED_CLOSE_CONNECTION;
+        }
+      }
+    }
   }
 
   // The output of this page is accumulated into this stringstream.
@@ -824,12 +969,20 @@ sq_callback_result_t Webserver::BeginRequestCallback(struct sq_connection* conne
     content_type = PLAIN;
     url_handler->raw_callback()(req, &output, &response);
   } else {
-    RenderUrlWithTemplate(connection, req, *url_handler, &output, &content_type);
+    RenderUrlWithTemplate(
+        connection, req, *url_handler, &output, &content_type, cookie_rand_value);
   }
 
-  VLOG(3) << "Rendering page " << request_info->uri << " took "
-          << PrettyPrinter::Print(sw.ElapsedTime(), TUnit::TIME_NS);
-
+  uint64_t elapsed_time_ns = sw.ElapsedTime();
+  if (elapsed_time_ns > FLAGS_slow_http_response_warning_threshold_ms * 1000 * 1000) {
+    LOG(WARNING) << "Rendering page " << request_info->uri << " took "
+        << PrettyPrinter::Print(sw.ElapsedTime(), TUnit::TIME_NS)
+        << ". User: " << req.source_user << ". Address: " << req.source_socket
+        << ". Args: " << req.query_string;
+  } else {
+    VLOG(3) << "Rendering page " << request_info->uri << " took "
+            << PrettyPrinter::Print(sw.ElapsedTime(), TUnit::TIME_NS);
+  }
   SendResponse(connection, HttpStatusCodeToString(response),
       Webserver::GetMimeType(content_type), output.str(), response_headers);
 
@@ -900,7 +1053,10 @@ bool Webserver::GetUsernameFromAuthHeader(struct sq_connection* connection,
 
 bool Webserver::TrustedDomainCheck(const string& origin, struct sq_connection* connection,
     struct sq_request_info* request_info) {
-  if (!IsTrustedDomain(origin, FLAGS_trusted_domain)) return false;
+  if (!IsTrustedDomain(origin, FLAGS_trusted_domain,
+          FLAGS_trusted_domain_strict_localhost)) {
+    return false;
+  }
 
   string err_msg;
   if (!GetUsernameFromAuthHeader(connection, request_info, err_msg)) {
@@ -920,7 +1076,7 @@ bool Webserver::JWTTokenAuth(const std::string& jwt_token,
     return false;
   }
   if (FLAGS_jwt_validate_signature) {
-    status = JWTHelper::GetInstance()->Verify(decoded_token.get());
+    status = ExecEnv::GetInstance()->GetJWTHelperInstance()->Verify(decoded_token.get());
     if (!status.ok()) {
       LOG(ERROR) << "Error verifying JWT token in Authorization header, "
                  << "Error: " << status;
@@ -938,6 +1094,39 @@ bool Webserver::JWTTokenAuth(const std::string& jwt_token,
     return false;
   }
   request_info->remote_user = strdup(username.c_str());
+  return true;
+}
+
+bool Webserver::OAuthTokenAuth(const std::string& oauth_token,
+    struct sq_connection* connection, struct sq_request_info* request_info) {
+  JWTHelper::UniqueJWTDecodedToken decoded_token;
+  Status status = JWTHelper::Decode(oauth_token, decoded_token);
+  if (!status.ok()) {
+    LOG(ERROR) << "Error decoding OAuth token in Authorization header, "
+               << "Error: " << status;
+    return false;
+  }
+  if (FLAGS_oauth_jwt_validate_signature) {
+    status = ExecEnv::GetInstance()->GetOAuthHelperInstance()->Verify(
+        decoded_token.get());
+    if (!status.ok()) {
+      LOG(ERROR) << "Error verifying OAuth token in Authorization header, "
+                 << "Error: " << status;
+      return false;
+    }
+  }
+
+  DCHECK(!FLAGS_oauth_jwt_custom_claim_username.empty());
+  string username;
+  status = JWTHelper::GetCustomClaimUsername(
+      decoded_token.get(), FLAGS_oauth_jwt_custom_claim_username, username);
+  if (!status.ok()) {
+    LOG(ERROR) << "Cannot retrieve username from OAUTh token in Authorization header, "
+               << "Error: " << status;
+    return false;
+  }
+  request_info->remote_user = strdup(username.c_str());
+
   return true;
 }
 
@@ -968,8 +1157,8 @@ Status Webserver::HandleBasic(struct sq_connection* connection,
   return Status::Expected("Failed to authenticate to LDAP.");
 }
 
-void Webserver::AddCookie(
-    struct sq_request_info* request_info, vector<string>* response_headers) {
+void Webserver::AddCookie(const char* user, vector<string>* response_headers,
+    string* cookie_rand_value) {
   if (use_cookies_) {
     // If cookie auth failed and we generated a 'delete cookie' header, remove it.
     auto eq = [](const string& header) { return header.rfind("Set-Cookie", 0) == 0; };
@@ -978,17 +1167,17 @@ void Webserver::AddCookie(
       response_headers->erase(it);
     }
     // Generate a cookie to return.
-    response_headers->push_back(
-        Substitute("Set-Cookie: $0", GenerateCookie(request_info->remote_user, hash_)));
+    response_headers->push_back(Substitute("Set-Cookie: $0",
+        GenerateCookie(user, hash_, cookie_rand_value)));
   }
 }
 
 void Webserver::RenderUrlWithTemplate(const struct sq_connection* connection,
     const WebRequest& req, const UrlHandler& url_handler, stringstream* output,
-    ContentType* content_type) {
+    ContentType* content_type, const std::string& csrf_token) {
   Document document;
   document.SetObject();
-  GetCommonJson(&document, connection, req);
+  GetCommonJson(&document, connection, req, csrf_token);
 
   const auto& arguments = req.parsed_args;
   url_handler.callback()(req, &document);
@@ -1073,5 +1262,11 @@ Webserver::AuthMode Webserver::GetConfiguredAuthMode() {
     return AuthMode::LDAP;
   }
   return AuthMode::NONE;
+}
+
+Webserver::ArgumentMap Webserver::GetVars(const std::string& data) {
+  ArgumentMap vars;
+  BuildArgumentMap(data, &vars);
+  return vars;
 }
 }

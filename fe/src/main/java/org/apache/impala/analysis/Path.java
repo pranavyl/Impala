@@ -28,6 +28,9 @@ import org.apache.impala.catalog.MapType;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.catalog.VirtualColumn;
+import org.apache.impala.catalog.iceberg.IcebergMetadataTable;
+import org.apache.impala.thrift.TVirtualColumnType;
 import org.apache.impala.util.AcidUtils;
 
 import com.google.common.base.Joiner;
@@ -131,6 +134,7 @@ public class Path {
 
   // Registered table alias that this path is rooted at, if any.
   // Null if the path is rooted at a catalog table/view.
+  // Note that this is also set for STAR path of "v.*" when "v" is a catalog table/view.
   private final TupleDescriptor rootDesc_;
 
   // Catalog table that this resolved path is rooted at, if any.
@@ -142,7 +146,9 @@ public class Path {
   private final Path rootPath_;
 
   // List of matched types and field positions set during resolution. The matched
-  // types/positions describe the physical path through the schema tree.
+  // types/positions describe the physical path through the schema tree of a catalog
+  // table/view. Empty if the path corresponds to a catalog table/view, e.g. when it's a
+  // TABLE_REF or when it's a STAR on a table/view.
   private final List<Type> matchedTypes_ = new ArrayList<>();
   private final List<Integer> matchedPositions_ = new ArrayList<>();
 
@@ -156,6 +162,8 @@ public class Path {
 
   // Caches the result of getAbsolutePath() to avoid re-computing it.
   private List<Integer> absolutePath_ = null;
+
+  private TVirtualColumnType virtualColType_ = TVirtualColumnType.NONE;
 
   // Resolved path before we resolved it again inside the table masking view.
   private Path pathBeforeMasking_ = null;
@@ -206,11 +214,20 @@ public class Path {
 
   /**
    * Resolves this path in the context of the root tuple descriptor / root table
-   * or continues resolving this relative path from an existing root path.
+   * or continues resolving this relative path from an existing root path. If normal
+   * path resolution fails it tries to resolve the path as a virtual column.
    * Returns true if the path could be fully resolved, false otherwise.
    * A failed resolution leaves this Path in a partially resolved state.
    */
   public boolean resolve() {
+    if (!resolveNonVirtualPath()) {
+      return resolveVirtualColumn();
+    } else {
+      return true;
+    }
+  }
+
+  private boolean resolveNonVirtualPath() {
     if (isResolved_) return true;
     Preconditions.checkState(rootDesc_ != null || rootTable_ != null);
     Type currentType = null;
@@ -269,6 +286,32 @@ public class Path {
     return true;
   }
 
+  private boolean resolveVirtualColumn() {
+    if (isResolved_) return true;
+    if (rootTable_ == null) return false;
+    if (rootDesc_ != null) {
+      if (rootDesc_.getType() != rootTable_.getType().getItemType()) {
+        // 'rootDesc_' describes a collection tuple. Currently we only allow virtual
+        // columns at the table-level.
+        return false;
+      }
+    }
+    if (rawPath_.size() != 1) return false;
+
+    String colName = rawPath_.get(0);
+    List<VirtualColumn> virtualColumns = rootTable_.getVirtualColumns();
+    for (VirtualColumn vCol : virtualColumns) {
+      if (vCol.getName().equalsIgnoreCase(colName)) {
+        virtualColType_ = vCol.getVirtualColumnType();
+        matchedTypes_.add(vCol.getType());
+        matchedPositions_.add(vCol.getPosition());
+        isResolved_ = true;
+        return true;
+      }
+    }
+    return false;
+  }
+
   /**
    * If the given type is a collection, returns a collection struct type representing
    * named fields of its explicit path. Returns the given type itself if it is already
@@ -294,6 +337,9 @@ public class Path {
    * a.b -> [<sessionDb>.a, a.b]
    * a.b.c -> [<sessionDb>.a, a.b]
    * a.b.c... -> [<sessionDb>.a, a.b]
+   *
+   * Notes on Iceberg tables:
+   * a.b.c -> translates to metadata table querying
    */
   public static List<TableName> getCandidateTables(List<String> path, String sessionDb) {
     Preconditions.checkArgument(path != null && !path.isEmpty());
@@ -302,7 +348,11 @@ public class Path {
     for (int tblNameIdx = 0; tblNameIdx < end; ++tblNameIdx) {
       String dbName = (tblNameIdx == 0) ? sessionDb : path.get(0);
       String tblName = path.get(tblNameIdx);
-      result.add(new TableName(dbName, tblName));
+      String vTblName = null;
+      if (IcebergMetadataTable.canBeIcebergMetadataTable(path)) {
+        vTblName = path.get(2);
+      }
+      result.add(new TableName(dbName, tblName, vTblName));
     }
     return result;
   }
@@ -313,6 +363,10 @@ public class Path {
   public boolean isRootedAtTuple() { return rootDesc_ != null; }
   public List<String> getRawPath() { return rawPath_; }
   public boolean isResolved() { return isResolved_; }
+  public TVirtualColumnType getVirtualColumnType() { return virtualColType_; }
+  public boolean isVirtualColumn() {
+    return virtualColType_ != TVirtualColumnType.NONE;
+  }
   public boolean isMaskedPath() { return pathBeforeMasking_ != null; }
   public Path getPathBeforeMasking() { return pathBeforeMasking_; }
   public void setPathBeforeMasking(Path p) {
@@ -385,17 +439,49 @@ public class Path {
     return null;
   }
 
-  public List<String> getFullyQualifiedRawPath() {
+  /**
+   * Builds a {@link List} containing the individual parts of this path.
+   *
+   * @param preferAlias {@code boolean} specifying if a path that represents an alias
+   *                    should use that alias in the return or if the alias should be
+   *                    resolved to its actual db, table, and column.
+   *
+   * @return {@link List} of {@link String}s with each element of the list containing an
+   *         individual piece of the path. Element {@code 0} contains the database,
+   *         element {@code 1} contains the table, and all elements after contain the
+   *         remaining pieces of the path.
+   */
+  public List<String> getFullyQualifiedRawPath(boolean preferAlias) {
     Preconditions.checkState(rootTable_ != null || rootDesc_ != null);
     List<String> result = Lists.newArrayListWithCapacity(rawPath_.size() + 2);
-    if (rootDesc_ != null) {
+    if (rootDesc_ != null && (preferAlias || rootTable_ == null)) {
       result.addAll(Lists.newArrayList(rootDesc_.getAlias().split("\\.")));
     } else {
       result.add(rootTable_.getDb().getName());
       result.add(rootTable_.getName());
+      if (rootTable_ instanceof IcebergMetadataTable) {
+        result.add(((IcebergMetadataTable)rootTable_).getMetadataTableName());
+      }
     }
     result.addAll(rawPath_);
     return result;
+  }
+
+  public List<String> getFullyQualifiedRawPath() {
+    return getFullyQualifiedRawPath(true);
+  }
+
+  /**
+   * Returns whether the given path belongs to a (possibly nested) field from an Iceberg
+   * metadata table.
+   */
+  public boolean comesFromIcebergMetadataTable() {
+    Preconditions.checkState(rootTable_ != null || rootDesc_ != null);
+    if (rootDesc_ != null) {
+      return rootDesc_.getTable() instanceof IcebergMetadataTable;
+    } else {
+      return rootTable_ instanceof IcebergMetadataTable;
+    }
   }
 
   /**
@@ -423,7 +509,15 @@ public class Path {
   private void getCanonicalPath(List<String> result) {
     Type currentType = null;
     if (isRootedAtTuple()) {
-      rootDesc_.getPath().getCanonicalPath(result);
+      if (rootDesc_.getPath() == null) {
+        // Unnest expressions of columns from views have a root description with a
+        // source view instead of a table but are still rooted at a tuple.
+        Preconditions.checkState(rootDesc_.getSourceView() != null);
+        result.add(rootDesc_.getSourceView().getView().getDb().getName());
+        result.add(rootDesc_.getSourceView().getView().getName());
+      } else {
+        rootDesc_.getPath().getCanonicalPath(result);
+      }
       currentType = rootDesc_.getType();
     } else {
       Preconditions.checkState(isRootedAtTable());
@@ -472,6 +566,7 @@ public class Path {
   private void convertToFullAcidFilePath() {
     // For Full ACID tables we need to create a schema path that corresponds to the
     // ACID file schema.
+    if (virtualColType_ != TVirtualColumnType.NONE) return;
     int numPartitions = rootTable_.getNumClusteringCols();
     if (absolutePath_.get(0) == numPartitions) {
       // The path refers to the synthetic "row__id" column.

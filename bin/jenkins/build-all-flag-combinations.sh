@@ -30,7 +30,7 @@ setup_report_build_error
 
 export IMPALA_MAVEN_OPTIONS="-U"
 
-. bin/impala-config.sh
+. bin/impala-config.sh > /dev/null 2>&1
 
 : ${GENERATE_M2_ARCHIVE:=false}
 
@@ -39,11 +39,15 @@ CONFIGS=(
   # Test gcc builds with and without -so:
   "-skiptests -noclean"
   "-skiptests -noclean -release"
+  "-notests -noclean -release -package"
   "-skiptests -noclean -release -so -ninja"
   # clang sanitizer builds:
   "-skiptests -noclean -asan"
   "-skiptests -noclean -tsan"
   "-skiptests -noclean -ubsan -so -ninja"
+  # USE_APACHE_HIVE=true build:
+  "-skiptests -noclean -use_apache_components"
+  "-notests -noclean -use_apache_components -package"
 )
 
 FAILED=""
@@ -63,7 +67,14 @@ function onexit {
 trap onexit EXIT
 
 for CONFIG in "${CONFIGS[@]}"; do
-  DESCRIPTION="Options $CONFIG"
+  CONFIG2=${CONFIG/-use_apache_components/}
+  if [[ "$CONFIG" != "$CONFIG2" ]]; then
+    CONFIG=$CONFIG2
+    export USE_APACHE_COMPONENTS=true
+  else
+    export USE_APACHE_COMPONENTS=false
+  fi
+  DESCRIPTION="Options $CONFIG USE_APACHE_COMPONENTS=$USE_APACHE_COMPONENTS"
 
   if [[ $# == 1 && $1 == "--dryrun" ]]; then
     echo $DESCRIPTION
@@ -81,6 +92,10 @@ for CONFIG in "${CONFIGS[@]}"; do
   fi
   ccache -s
   bin/jenkins/get_maven_statistics.sh logs/mvn/mvn.log
+  # Dump the current disk usage and check the usage for
+  # several heavy users of disk space.
+  df
+  du -s ~/.m2 ./be ./toolchain
 
   # Keep each maven log from each round of the build
   cp logs/mvn/mvn.log "${TMP_DIR}/mvn.$(date +%s.%N).log"
@@ -98,8 +113,12 @@ if [[ $# == 1 && $1 == "--dryrun" ]]; then
   echo $DESCRIPTION
 else
   # Note: this command modifies files in the git checkout
+  pushd bin
+  sed "s#export IMPALA_VERSION=.*#export IMPALA_VERSION=${NEW_MAVEN_VERSION}#g"\
+      -i impala-config.sh
+  popd
   pushd java
-  mvn versions:set -DnewVersion=${NEW_MAVEN_VERSION}
+  mvn org.codehaus.mojo:versions-maven-plugin:2.13.0:set -DnewVersion=${NEW_MAVEN_VERSION}
   popd
 
   if ! ./bin/clean.sh; then
@@ -108,22 +127,35 @@ else
   fi
 
   echo "Building with OPTIONS: $DESCRIPTION"
-  if ! time -p ./buildall.sh -skiptests -noclean ; then
+  # Since this is only testing the version replacements for Java, this uses -notests to
+  # skip building the backend tests. Because everything is already in ccache, building
+  # backend tests does many link invocations simultaneously and the system can run out of
+  # memory.
+  if ! time -p ./buildall.sh -notests -noclean ; then
     echo "Build failed: $DESCRIPTION"
     FAILED="${FAILED}:${DESCRIPTION}"
   fi
 
-  # Reset the files changed by mvn versions:set
-  git reset --hard HEAD
+  if ! git reset --hard HEAD ; then
+    echo "Failed to reset the files changed by mvn versions:set"
+  fi
 
   ccache -s
   bin/jenkins/get_maven_statistics.sh logs/mvn/mvn.log
+  # Dump the current disk usage and check the usage for
+  # several heavy users of disk space.
+  df
+  du -s ~/.m2 ./be ./toolchain
 
   # Keep each maven log from each round of the build
   cp logs/mvn/mvn.log "${TMP_DIR}/mvn.$(date +%s.%N).log"
   # Append the maven log to the accumulated maven log
   cat logs/mvn/mvn.log >> "${TMP_DIR}/mvn_accumulated.log"
 fi
+
+# To avoid diskspace issues, clean up the Impala build directory
+# before creating the archive.
+rm -rf be/build
 
 # Restore the maven logs (these don't interfere with existing mvn.log)
 # These files may not exist if this is doing a dryrun.
@@ -139,6 +171,11 @@ then
 fi
 
 if [[ "$GENERATE_M2_ARCHIVE" == true ]]; then
+  echo "Generating m2 archive."
+
+  # Print current diskspace
+  df
+
   # Make a tarball of the .m2 directory
   bin/jenkins/archive_m2_directory.sh logs/mvn/mvn_accumulated.log logs/m2_archive.tar.gz
 fi

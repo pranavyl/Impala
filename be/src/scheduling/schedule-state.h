@@ -104,7 +104,8 @@ struct FragmentScheduleState {
   /// For scheduling, refer to FInstanceExecParamsPB.per_node_scan_ranges
   FragmentScanRangeAssignment scan_range_assignment;
 
-  bool is_coord_fragment;
+  /// The root fragment of the plan runs on the coordinator.
+  bool is_root_coord_fragment;
   const TPlanFragment& fragment;
 
   /// Fragments that are inputs to an ExchangeNode of this fragment.
@@ -176,6 +177,9 @@ class ScheduleState {
   /// planner. This estimate is only meaningful if this schedule was generated on a
   /// dedicated coordinator.
   int64_t GetDedicatedCoordMemoryEstimate() const;
+
+  /// Return whether the request is a trivial query.
+  bool GetIsTrivialQuery() const;
 
   /// Helper methods used by scheduler to populate this ScheduleState.
   void IncNumScanRanges(int64_t delta);
@@ -250,6 +254,12 @@ class ScheduleState {
   }
 
   /// Must call UpdateMemoryRequirements() at least once before calling this.
+  MemLimitSourcePB per_backend_mem_to_admit_source() const {
+    DCHECK(query_schedule_pb_->has_per_backend_mem_to_admit_source());
+    return query_schedule_pb_->per_backend_mem_to_admit_source();
+  }
+
+  /// Must call UpdateMemoryRequirements() at least once before calling this.
   int64_t coord_backend_mem_limit() const {
     return query_schedule_pb_->coord_backend_mem_limit();
   }
@@ -258,6 +268,12 @@ class ScheduleState {
   int64_t coord_backend_mem_to_admit() const {
     DCHECK_GT(query_schedule_pb_->coord_backend_mem_to_admit(), 0);
     return query_schedule_pb_->coord_backend_mem_to_admit();
+  }
+
+  /// Must call UpdateMemoryRequirements() at least once before calling this.
+  MemLimitSourcePB coord_backend_mem_to_admit_source() const {
+    DCHECK(query_schedule_pb_->has_coord_backend_mem_to_admit_source());
+    return query_schedule_pb_->coord_backend_mem_to_admit_source();
   }
 
   void set_largest_min_reservation(const int64_t largest_min_reservation) {
@@ -284,8 +300,11 @@ class ScheduleState {
   /// Populates or updates the per host query memory limit and the amount of memory to be
   /// admitted based on the pool configuration passed to it. Must be called at least once
   /// before making any calls to per_backend_mem_to_admit(), per_backend_mem_limit() and
-  /// GetClusterMemoryToAdmit().
-  void UpdateMemoryRequirements(const TPoolConfig& pool_cfg);
+  /// GetClusterMemoryToAdmit(). If 'clamp_query_mem_limit_backend_mem_limit' is set, the
+  /// input 'coord_mem_limit_admission' and 'executor_mem_limit_admission' are used for
+  /// capping query memory limit on coordinator and executor backends, respectively.
+  void UpdateMemoryRequirements(const TPoolConfig& pool_cfg,
+      int64_t coord_mem_limit_admission, int64_t executor_mem_limit_admission);
 
   const std::string& executor_group() const { return executor_group_; }
 
@@ -344,7 +363,7 @@ class ScheduleState {
   std::unordered_map<int32_t, const TPlanFragment&> fragments_;
 
   /// Populate fragments_ and fragment_schedule_states_ from request_.plan_exec_info.
-  /// Sets is_coord_fragment and exchange_input_fragments.
+  /// Sets is_root_coord_fragment and exchange_input_fragments.
   /// Also populates plan_node_to_fragment_idx_ and plan_node_to_plan_node_idx_.
   void Init();
 
@@ -352,6 +371,19 @@ class ScheduleState {
   bool RequiresCoordinatorFragment() const {
     return request_.stmt_type == TStmtType::QUERY;
   }
+
+  /// Helper functions to update either
+  /// 'query_schedule_pb_->per_backend_mem_to_admit' or
+  /// 'query_schedule_pb_->coord_backend_mem_to_admit' along with the limiting reason
+  /// 'source' if the 'new_limit' is less or more than the current value.
+  void CompareMaxBackendMemToAdmit(
+      const int64_t new_limit, const MemLimitSourcePB source);
+  void CompareMinBackendMemToAdmit(
+      const int64_t new_limit, const MemLimitSourcePB source);
+  void CompareMaxCoordinatorMemToAdmit(
+      const int64_t new_limit, const MemLimitSourcePB source);
+  void CompareMinCoordinatorMemToAdmit(
+      const int64_t new_limit, const MemLimitSourcePB source);
 };
 
 } // namespace impala

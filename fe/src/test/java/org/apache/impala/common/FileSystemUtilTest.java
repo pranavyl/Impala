@@ -17,7 +17,9 @@
 
 package org.apache.impala.common;
 
+import org.apache.impala.common.Pair;
 import static org.apache.impala.common.FileSystemUtil.HIVE_TEMP_FILE_PREFIX;
+import static org.apache.impala.common.FileSystemUtil.SPARK_TEMP_FILE_PREFIX;
 import static org.apache.impala.common.FileSystemUtil.isIgnoredDir;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -38,7 +40,6 @@ import java.util.List;
  * Tests for the various util methods in FileSystemUtil class
  */
 public class FileSystemUtilTest {
-
   private static final Path TEST_TABLE_PATH = new Path("/test-warehouse/foo"
       + ".db/filesystem-util-test");
 
@@ -59,6 +60,10 @@ public class FileSystemUtilTest {
     assertTrue("Files in hive temporary directories should be ignored",
         testIsInIgnoredDirectory(new Path(TEST_TABLE_PATH,
             HIVE_TEMP_FILE_PREFIX + "delta_000000_2/test.manifest")));
+
+    assertTrue("Files in spark temporary directories should be ignored",
+        testIsInIgnoredDirectory(new Path(TEST_TABLE_PATH,
+            SPARK_TEMP_FILE_PREFIX + "/0")));
 
     //multiple nested levels
     assertTrue(testIsInIgnoredDirectory(new Path(TEST_TABLE_PATH,
@@ -205,6 +210,24 @@ public class FileSystemUtilTest {
                       FileSystemUtil.isPathOnFileSystem(mockFile, fs));
         }
       }
+    }
+  }
+
+  @Test
+  public void testVolumeBucketPair() throws IOException {
+    List<Pair<String, Pair<String, String>>> cases = Arrays.asList(
+      Pair.create(mockLocation(FileSystemUtil.SCHEME_OFS),
+          Pair.create("volume1", "bucket2")),
+      Pair.create("ofs://svc1:9876/volume/bucket/file", Pair.create("volume", "bucket")),
+      Pair.create("ofs://svc1:9876/volume/bucket/", Pair.create("volume", "bucket")),
+      Pair.create("ofs://svc1:9876/volume/bucket", Pair.create("volume", "bucket")),
+      Pair.create("ofs://svc1:9876/volume/", Pair.create("volume", "")),
+      Pair.create("ofs://svc1:9876/volume", Pair.create("volume", "")),
+      Pair.create("ofs://svc1:9876/", Pair.create("", ""))
+    );
+    for (Pair<String, Pair<String, String>> c : cases) {
+      Path p = new Path(c.first);
+      assertEquals(c.second, FileSystemUtil.volumeBucketPair(p));
     }
   }
 

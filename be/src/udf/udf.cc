@@ -109,14 +109,33 @@ class RuntimeState {
     return false;
   }
 
-  const std::string connected_user() const { return ""; }
-  const std::string GetEffectiveUser() const { return ""; }
+  const std::string connected_user() const { return user_string_; }
+  const std::string GetEffectiveUser() const { return user_string_; }
+
+ private:
+  const std::string user_string_ = "";
 };
 
+// Dummy AiFunctions class for UDF SDK
+static const std::string AI_FUNCTIONS_DUMMY_RESPONSE = "dummy response";
+using impala_udf::StringVal;
+using impala_udf::FunctionContext;
+class AiFunctions {
+ public:
+  static StringVal AiGenerateText(FunctionContext* ctx, const StringVal& endpoint,
+      const StringVal& prompt, const StringVal& model, const StringVal& auth_credential,
+      const StringVal& params, const StringVal& impala_options) {
+    return StringVal(AI_FUNCTIONS_DUMMY_RESPONSE.c_str());
+  }
+  static StringVal AiGenerateTextDefault(FunctionContext* ctx, const StringVal& prompt) {
+    return StringVal(AI_FUNCTIONS_DUMMY_RESPONSE.c_str());
+  }
+};
 }
 
 #else
 #include "common/atomic.h"
+#include "exprs/ai-functions.h"
 #include "exprs/anyval-util.h"
 #include "runtime/free-pool.h"
 #include "runtime/mem-pool.h"
@@ -187,6 +206,9 @@ FunctionContext* FunctionContextImpl::CreateContext(RuntimeState* state,
       aligned_malloc(varargs_buffer_size, VARARGS_BUFFER_ALIGNMENT));
   ctx->impl_->varargs_buffer_size_ = varargs_buffer_size;
   ctx->impl_->debug_ = debug;
+  ctx->impl_->functions_.ai_generate_text = impala::AiFunctions::AiGenerateText;
+  ctx->impl_->functions_.ai_generate_text_default =
+      impala::AiFunctions::AiGenerateTextDefault;
   VLOG_ROW << "Created FunctionContext: " << ctx;
   return ctx;
 }
@@ -201,8 +223,7 @@ FunctionContext* FunctionContextImpl::Clone(
   return new_context;
 }
 
-FunctionContext::FunctionContext() : impl_(new FunctionContextImpl(this)) {
-}
+FunctionContext::FunctionContext() : impl_(new FunctionContextImpl(this)) {}
 
 FunctionContext::~FunctionContext() {
   assert(impl_->closed_ && "FunctionContext wasn't closed!");
@@ -472,6 +493,10 @@ void FunctionContext::SetFunctionState(FunctionStateScope scope, void* ptr) {
   }
 }
 
+const BuiltInFunctions* FunctionContext::Functions() const {
+  return &impl_->functions_;
+}
+
 uint8_t* FunctionContextImpl::AllocateForResults(int64_t byte_size) noexcept {
   assert(!closed_);
 #if !defined(NDEBUG) && !defined(IMPALA_UDF_SDK_BUILD)
@@ -500,26 +525,13 @@ void FunctionContextImpl::SetNonConstantArgs(NonConstantArgsVector&& non_constan
 // Note: this function crashes LLVM's JIT in expr-test if it's xcompiled. Do not move to
 // expr-ir.cc. This could probably use further investigation.
 StringVal::StringVal(FunctionContext* context, int str_len) noexcept : len(str_len),
-                                                                       ptr(NULL) {
-  if (UNLIKELY(str_len > StringVal::MAX_LENGTH)) {
-    context->SetError("String length larger than allowed limit of "
-                      "1 GB character data.");
-    len = 0;
-    is_null = true;
-  } else {
-    ptr = context->impl()->AllocateForResults(str_len);
-    if (UNLIKELY(ptr == NULL && str_len > 0)) {
-#ifndef IMPALA_UDF_SDK_BUILD
-      assert(!context->impl()->state()->GetQueryStatus().ok());
-#endif
-      len = 0;
-      is_null = true;
-    }
-  }
+                                                                       ptr(nullptr) {
+  AllocateStringValWithLenCheck(context, str_len, this);
 }
 
 StringVal StringVal::CopyFrom(FunctionContext* ctx, const uint8_t* buf, size_t len) noexcept {
-  StringVal result(ctx, len);
+  StringVal result;
+  AllocateStringValWithLenCheck(ctx, len, &result);
   if (LIKELY(!result.is_null)) {
     std::copy(buf, buf + len, result.ptr);
   }
@@ -546,6 +558,26 @@ bool StringVal::Resize(FunctionContext* ctx, int new_len) noexcept {
     return true;
   }
   return false;
+}
+
+void StringVal::AllocateStringValWithLenCheck(FunctionContext* ctx, uint64_t str_len,
+    StringVal* res) {
+  if (UNLIKELY(str_len > StringVal::MAX_LENGTH)) {
+    ctx->SetError("String length larger than allowed limit of 1 GB character data.");
+    res->len = 0;
+    res->is_null = true;
+  } else {
+    res->ptr = ctx->impl()->AllocateForResults(str_len);
+    if (UNLIKELY(res->ptr == nullptr && str_len > 0)) {
+#ifndef IMPALA_UDF_SDK_BUILD
+      assert(!ctx->impl()->state()->GetQueryStatus().ok());
+#endif
+      res->len = 0;
+      res->is_null = true;
+    } else {
+      res->len = str_len;
+    }
+  }
 }
 
 void StructVal::ReserveMemory(FunctionContext* ctx) {

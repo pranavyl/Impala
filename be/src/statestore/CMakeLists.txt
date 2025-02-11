@@ -29,9 +29,15 @@ add_library(Statestore
   failure-detector.cc
   ${STATESTORE_SERVICE_PROTO_SRCS}
   statestore.cc
+  statestore-catalogd-mgr.cc
+  statestore-subscriber-catalog.cc
   statestore-subscriber.cc
   statestored-main.cc
 )
 add_dependencies(Statestore gen-deps)
+
+if (BUILD_WITH_NO_TESTS)
+  return()
+endif()
 
 ADD_BE_LSAN_TEST(statestore-test)

@@ -17,6 +17,8 @@
 
 # Functional tests for LOAD DATA statements.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import time
 from beeswaxd.BeeswaxService import QueryState
 from copy import deepcopy
@@ -28,15 +30,18 @@ from tests.common.test_dimensions import (
     create_uncompressed_text_dimension)
 from tests.common.skip import SkipIfLocal
 from tests.common.test_vector import ImpalaTestDimension
-from tests.util.filesystem_utils import (WAREHOUSE)
+from tests.util.filesystem_utils import get_fs_path, WAREHOUSE, IS_HDFS
 
 TEST_TBL_PART = "test_load"
 TEST_TBL_NOPART = "test_load_nopart"
-STAGING_PATH = 'test-warehouse/test_load_staging'
-ALLTYPES_PATH = "test-warehouse/alltypes/year=2010/month=1/100101.txt"
-MULTIAGG_PATH = 'test-warehouse/alltypesaggmultifiles/year=2010/month=1/day=1'
+TEST_TBL_NOPART_EXT = "test_load_nopart_ext"
+STAGING_PATH = '%s/test_load_staging' % WAREHOUSE
+ALLTYPES_PATH = "%s/alltypes/year=2010/month=1/100101.txt" % WAREHOUSE
+MULTIAGG_PATH = '%s/alltypesaggmultifiles/year=2010/month=1/day=1' % WAREHOUSE
 HIDDEN_FILES = ["{0}/3/.100101.txt".format(STAGING_PATH),
                 "{0}/3/_100101.txt".format(STAGING_PATH)]
+# A path outside WAREHOUSE, which will be a different bucket for Ozone/ofs.
+TMP_STAGING_PATH = get_fs_path('/tmp/test_load_staging')
 
 @SkipIfLocal.hdfs_client
 class TestLoadData(ImpalaTestSuite):
@@ -73,18 +78,18 @@ class TestLoadData(ImpalaTestSuite):
     #   - Sub Directories 5-6 have multiple files (4) copied from alltypesaggmultifiles
     #   - Sub Directory 3 also has hidden files, in both supported formats.
     #   - All sub-dirs contain a hidden directory
-    for i in xrange(1, 6):
+    for i in range(1, 6):
       stagingDir = '{0}/{1}'.format(STAGING_PATH, i)
       self.filesystem_client.make_dir(stagingDir, permission=777)
       self.filesystem_client.make_dir('{0}/_hidden_dir'.format(stagingDir),
                                       permission=777)
     # Copy single file partitions from alltypes.
-    for i in xrange(1, 4):
+    for i in range(1, 4):
       self.filesystem_client.copy(ALLTYPES_PATH,
                                "{0}/{1}/100101.txt".format(STAGING_PATH, i))
     # Copy multi file partitions from alltypesaggmultifiles.
     file_names = self.filesystem_client.ls(MULTIAGG_PATH)
-    for i in xrange(4, 6):
+    for i in range(4, 6):
       for file_ in file_names:
         self.filesystem_client.copy(
             "{0}/{1}".format(MULTIAGG_PATH, file_),
@@ -108,6 +113,45 @@ class TestLoadData(ImpalaTestSuite):
 
 
 @SkipIfLocal.hdfs_client
+class TestLoadDataExternal(ImpalaTestSuite):
+
+  @classmethod
+  def get_workload(self):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestLoadDataExternal, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
+    cls.ImpalaTestMatrix.add_dimension(
+        create_uncompressed_text_dimension(cls.get_workload()))
+
+  def _clean_test_tables(self):
+    self.client.execute("drop table if exists functional.{0}".format(TEST_TBL_NOPART_EXT))
+    self.filesystem_client.delete_file_dir(TMP_STAGING_PATH, recursive=True)
+
+  def teardown_method(self, method):
+    self._clean_test_tables()
+
+  def setup_method(self, method):
+    # Defensively clean the data dirs if they exist.
+    self._clean_test_tables()
+
+    self.filesystem_client.make_dir(TMP_STAGING_PATH)
+    self.filesystem_client.copy(ALLTYPES_PATH, "{0}/100101.txt".format(TMP_STAGING_PATH))
+
+    self.client.execute("create table functional.{0} like functional.alltypesnopart"
+        " location '{1}/{0}'".format(TEST_TBL_NOPART_EXT, WAREHOUSE))
+
+  def test_load(self, vector):
+    self.execute_query_expect_success(self.client, "load data inpath '{0}/100101.txt'"
+        " into table functional.{1}".format(TMP_STAGING_PATH, TEST_TBL_NOPART_EXT))
+    result = self.execute_scalar(
+        "select count(*) from functional.{0}".format(TEST_TBL_NOPART_EXT))
+    assert(result == '310')
+
+
+@SkipIfLocal.hdfs_client
 class TestAsyncLoadData(ImpalaTestSuite):
 
   @classmethod
@@ -128,6 +172,9 @@ class TestAsyncLoadData(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(create_exec_option_dimension(
         disable_codegen_options=[False]))
 
+  # This test subjects the load into either sync or async compilation of the load
+  # query at the backend through beewax or hs2 clients. The objective is to assure
+  # the load query completes successfully.
   def test_async_load(self, vector, unique_database):
     enable_async_load_data = vector.get_value('enable_async_load_data_execution')
     protocol = vector.get_value('protocol')
@@ -152,7 +199,7 @@ class TestAsyncLoadData(ImpalaTestSuite):
 
     # Create a table with the staging path
     self.client.execute("create table {0} like functional.alltypesnopart \
-        location \'/{1}\'".format(qualified_table_name, staging_path))
+        location \'{1}\'".format(qualified_table_name, staging_path))
 
     try:
 
@@ -168,7 +215,7 @@ class TestAsyncLoadData(ImpalaTestSuite):
            enable_async_load_data
       delay = "CRS_DELAY_BEFORE_LOAD_DATA:SLEEP@3000"
       new_vector.get_value('exec_option')['debug_action'] = "{0}".format(delay)
-      load_stmt = "load data inpath \'/{1}\' \
+      load_stmt = "load data inpath \'{1}\' \
           into table {0}".format(qualified_table_name, staging_path)
       exec_start = time.time()
       handle = self.execute_query_async_using_client(client, load_stmt, new_vector)
@@ -176,25 +223,29 @@ class TestAsyncLoadData(ImpalaTestSuite):
       exec_time = exec_end - exec_start
       exec_end_state = client.get_state(handle)
 
-      # Wait for the statement to finish with a timeout of 10 seconds
+      # Wait for the statement to finish with a timeout of 20 seconds
+      # (30 seconds without shortcircuit reads)
+      wait_time = 20 if IS_HDFS else 30
       wait_start = time.time()
-      self.wait_for_state(handle, finished_state, 10, client=client)
+      self.wait_for_state(handle, finished_state, wait_time, client=client)
       wait_end = time.time()
       wait_time = wait_end - wait_start
       self.close_query_using_client(client, handle)
-      # In sync mode:
-      #  The entire LOAD is processed in the exec step with delay. exec_time should be
-      #  more than 3 seconds.
-      #
-      # In async mode:
-      #  The compilation of LOAD is processed in the exec step without delay. And the
-      #  processing of the LOAD plan is in wait step with delay. The wait time should
-      #  definitely take more time than 3 seconds.
       if enable_async_load_data:
+        # In async mode:
+        #  The compilation of LOAD is processed in the exec step without delay. And the
+        #  processing of the LOAD plan is in wait step with delay. The wait time should
+        #  definitely take more time than 3 seconds.
         assert(exec_end_state == running_state)
         assert(wait_time >= 3)
       else:
-        assert(exec_end_state == finished_state)
+        # In sync mode:
+        #  The entire LOAD is processed in the exec step with delay. exec_time should be
+        #  more than 3 seconds. Since the load query is submitted async, it is possible
+        #  that the exec state returned is still in RUNNING state due to the the wait-for
+        #  thread executing ClientRequestState::Wait() does not have time to set the
+        #  exec state from RUNNING to FINISH.
+        assert(exec_end_state == running_state or exec_end_state == finished_state)
         assert(exec_time >= 3)
     finally:
       client.close()

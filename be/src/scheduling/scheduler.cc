@@ -31,6 +31,7 @@
 #include "gen-cpp/DataSinks_types.h"
 #include "gen-cpp/ErrorCodes_types.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
+#include "gen-cpp/Query_constants.h"
 #include "gen-cpp/Types_types.h"
 #include "gen-cpp/common.pb.h"
 #include "gen-cpp/statestore_service.pb.h"
@@ -55,15 +56,21 @@ using namespace apache::thrift;
 using namespace org::apache::impala::fb;
 using namespace strings;
 
+DEFINE_bool_hidden(sort_runtime_filter_aggregator_candidates, false,
+    "Control whether to sort intermediate runtime filter aggregator candidates based on "
+    "their KRPC address. Only used for testing.");
+
 namespace impala {
 
 static const string LOCAL_ASSIGNMENTS_KEY("simple-scheduler.local-assignments.total");
 static const string ASSIGNMENTS_KEY("simple-scheduler.assignments.total");
 static const string SCHEDULER_INIT_KEY("simple-scheduler.initialized");
+static const string SCHEDULER_WARNING_KEY("Scheduler Warning");
 
 static const vector<TPlanNodeType::type> SCAN_NODE_TYPES{TPlanNodeType::HDFS_SCAN_NODE,
     TPlanNodeType::HBASE_SCAN_NODE, TPlanNodeType::DATA_SOURCE_NODE,
-    TPlanNodeType::KUDU_SCAN_NODE};
+    TPlanNodeType::KUDU_SCAN_NODE, TPlanNodeType::ICEBERG_METADATA_SCAN_NODE,
+    TPlanNodeType::SYSTEM_TABLE_SCAN_NODE};
 
 // Consistent scheduling requires picking up to k distinct candidates out of n nodes.
 // Since each iteration can pick a node that it already picked (i.e. it is sampling with
@@ -74,6 +81,9 @@ static const vector<TPlanNodeType::type> SCAN_NODE_TYPES{TPlanNodeType::HDFS_SCA
 // per distinct candidate provides a very high probability of actually getting k distinct
 // candidates. See GetRemoteExecutorCandidates() for a deeper description.
 static const int MAX_ITERATIONS_PER_EXECUTOR_CANDIDATE = 8;
+
+const string Scheduler::PROFILE_INFO_KEY_PER_HOST_MIN_MEMORY_RESERVATION =
+    "Per Host Min Memory Reservation";
 
 Scheduler::Scheduler(MetricGroup* metrics, RequestPoolService* request_pool_service)
   : metrics_(metrics->GetOrCreateChildGroup("scheduler")),
@@ -90,11 +100,18 @@ const BackendDescriptorPB& Scheduler::LookUpBackendDesc(
     const ExecutorConfig& executor_config, const NetworkAddressPB& host) {
   const BackendDescriptorPB* desc = executor_config.group.LookUpBackendDesc(host);
   if (desc == nullptr) {
-    // Coordinator host may not be in executor_config's executor group if it's a dedicated
-    // coordinator, or if it is configured to be in a different executor group.
-    const BackendDescriptorPB& coord_desc = executor_config.coord_desc;
-    DCHECK(host == coord_desc.address());
-    desc = &coord_desc;
+    if (executor_config.all_coords.NumExecutors() > 0) {
+      // Group containing all coordinators was provided, so use that for lookup.
+      desc = executor_config.all_coords.LookUpBackendDesc(host);
+      DCHECK_NE(nullptr, desc);
+    } else {
+      // Coordinator host may not be in executor_config's executor group if it's a
+      // dedicated coordinator, or if it is configured to be in a different executor
+      // group.
+      const BackendDescriptorPB& coord_desc = executor_config.coord_desc;
+      DCHECK(host == coord_desc.address());
+      desc = &coord_desc;
+    }
   }
   return *desc;
 }
@@ -119,8 +136,17 @@ Status Scheduler::GenerateScanRanges(const vector<TFileSplitGeneratorSpec>& spec
 
     long scan_range_offset = 0;
     long remaining = fb_desc->length();
-    long scan_range_length = std::min(spec.max_block_size, fb_desc->length());
-    if (!spec.is_splittable) scan_range_length = fb_desc->length();
+    long scan_range_length = fb_desc->length();
+
+    if (spec.is_splittable) {
+      scan_range_length = std::min(spec.max_block_size, fb_desc->length());
+      if (spec.is_footer_only) {
+        scan_range_offset = fb_desc->length() - scan_range_length;
+        remaining = scan_range_length;
+      }
+    } else {
+      DCHECK(!spec.is_footer_only);
+    }
 
     while (remaining > 0) {
       THdfsFileSplit hdfs_scan_range;
@@ -134,8 +160,16 @@ Status Scheduler::GenerateScanRanges(const vector<TFileSplitGeneratorSpec>& spec
       hdfs_scan_range.__set_offset(scan_range_offset);
       hdfs_scan_range.__set_partition_id(spec.partition_id);
       hdfs_scan_range.__set_partition_path_hash(spec.partition_path_hash);
+      hdfs_scan_range.__set_is_encrypted(fb_desc->is_encrypted());
+      hdfs_scan_range.__set_is_erasure_coded(fb_desc->is_ec());
+      if (fb_desc->absolute_path() != nullptr) {
+        hdfs_scan_range.__set_absolute_path(fb_desc->absolute_path()->str());
+      }
       TScanRange scan_range;
       scan_range.__set_hdfs_file_split(hdfs_scan_range);
+      if (spec.file_desc.__isset.file_metadata) {
+        scan_range.__set_file_metadata(spec.file_desc.file_metadata);
+      }
       TScanRangeLocationList scan_range_list;
       scan_range_list.__set_scan_range(scan_range);
 
@@ -193,14 +227,15 @@ Status Scheduler::ComputeScanRangeAssignment(
       RETURN_IF_ERROR(
           ComputeScanRangeAssignment(executor_config, node_id, node_replica_preference,
               node_random_replica, *locations, exec_request.host_list, exec_at_coord,
-              state->query_options(), total_assignment_timer, state->rng(), assignment));
+              state->query_options(), total_assignment_timer, state->rng(),
+              state->summary_profile(), assignment));
       state->IncNumScanRanges(locations->size());
     }
   }
   return Status::OK();
 }
 
-void Scheduler::ComputeFragmentExecParams(
+Status Scheduler::ComputeFragmentExecParams(
     const ExecutorConfig& executor_config, ScheduleState* state) {
   const TQueryExecRequest& exec_request = state->request();
 
@@ -210,18 +245,29 @@ void Scheduler::ComputeFragmentExecParams(
   // be easily co-located with the plans consuming their output.
   for (const TPlanExecInfo& plan_exec_info : exec_request.plan_exec_info) {
     // set instance_id, host, per_node_scan_ranges
-    ComputeFragmentExecParams(executor_config, plan_exec_info,
-        state->GetFragmentScheduleState(plan_exec_info.fragments[0].idx), state);
+    RETURN_IF_ERROR(ComputeFragmentExecParams(executor_config, plan_exec_info,
+        state->GetFragmentScheduleState(plan_exec_info.fragments[0].idx), state));
 
     // Set destinations, per_exch_num_senders, sender_id.
     for (const TPlanFragment& src_fragment : plan_exec_info.fragments) {
       VLOG(3) << "Computing exec params for fragment " << src_fragment.display_name;
+      if (!src_fragment.output_sink.__isset.stream_sink
+          && !src_fragment.output_sink.__isset.join_build_sink) {
+        continue;
+      }
+
+      FragmentScheduleState* src_state =
+          state->GetFragmentScheduleState(src_fragment.idx);
+      if (state->query_options().runtime_filter_mode == TRuntimeFilterMode::GLOBAL
+          && src_fragment.produced_runtime_filters_reservation_bytes > 0) {
+        ComputeRandomKrpcForAggregation(executor_config, state, src_state,
+            state->query_options().max_num_filters_aggregated_per_host);
+      }
+
       if (!src_fragment.output_sink.__isset.stream_sink) continue;
       FragmentIdx dest_idx =
           state->GetFragmentIdx(src_fragment.output_sink.stream_sink.dest_node_id);
       FragmentScheduleState* dest_state = state->GetFragmentScheduleState(dest_idx);
-      FragmentScheduleState* src_state =
-          state->GetFragmentScheduleState(src_fragment.idx);
 
       // populate src_state->destinations
       for (int i = 0; i < dest_state->instance_states.size(); ++i) {
@@ -242,7 +288,8 @@ void Scheduler::ComputeFragmentExecParams(
       DCHECK(sink.output_partition.type == TPartitionType::UNPARTITIONED
           || sink.output_partition.type == TPartitionType::HASH_PARTITIONED
           || sink.output_partition.type == TPartitionType::RANDOM
-          || sink.output_partition.type == TPartitionType::KUDU);
+          || sink.output_partition.type == TPartitionType::KUDU
+          || sink.output_partition.type == TPartitionType::DIRECTED);
       PlanNodeId exch_id = sink.dest_node_id;
       google::protobuf::Map<int32_t, int32_t>* per_exch_num_senders =
           dest_state->exec_params->mutable_per_exch_num_senders();
@@ -254,16 +301,189 @@ void Scheduler::ComputeFragmentExecParams(
       }
     }
   }
+  return Status::OK();
 }
 
-void Scheduler::ComputeFragmentExecParams(const ExecutorConfig& executor_config,
+// Helper type to map instance indexes to aggregator indexes.
+typedef vector<pair<int, int>> InstanceToAggPairs;
+
+void Scheduler::ComputeRandomKrpcForAggregation(const ExecutorConfig& executor_config,
+    ScheduleState* state, FragmentScheduleState* src_state, int num_filters_per_host) {
+  if (num_filters_per_host <= 1) return;
+  // src_state->instance_states organize fragment instances as one dimension vector
+  // where instances scheduled in same host is placed in adjacent indices.
+  // Group instance indices from common host to 'instance_groups' by comparing
+  // krpc address between adjacent element of instance_states.
+  const NetworkAddressPB& coord_address = executor_config.coord_desc.krpc_address();
+  vector<InstanceToAggPairs> instance_groups;
+  InstanceToAggPairs coordinator_instances;
+  for (int i = 0; i < src_state->instance_states.size(); ++i) {
+    const NetworkAddressPB& krpc_address = src_state->instance_states[i].krpc_host;
+    if (KrpcAddressEqual(krpc_address, coord_address)) {
+      coordinator_instances.emplace_back(i, 0);
+    } else {
+      if (i == 0
+          || !KrpcAddressEqual(
+              krpc_address, src_state->instance_states[i - 1].krpc_host)) {
+        // This is the first fragment instance scheduled in a host.
+        // Append empty InstanceToAggPairs to 'instance_groups'.
+        instance_groups.emplace_back();
+      }
+      instance_groups.back().emplace_back(i, 0);
+    }
+  }
+
+  int num_non_coordinator_host = instance_groups.size();
+  if (num_non_coordinator_host == 0) return;
+
+  // Select number of intermediate aggregator so that each aggregator will receive
+  // runtime filter update from at most 'num_filters_per_host' executors.
+  int num_agg = (int)ceil((double)num_non_coordinator_host / num_filters_per_host);
+  DCHECK_GT(num_agg, 0);
+
+  if (UNLIKELY(FLAGS_sort_runtime_filter_aggregator_candidates)) {
+    sort(instance_groups.begin(), instance_groups.end(),
+        [src_state](InstanceToAggPairs a, InstanceToAggPairs b) {
+          int idx_a = a[0].first;
+          int idx_b = b[0].first;
+          return CompareNetworkAddressPB(src_state->instance_states[idx_a].krpc_host,
+                     src_state->instance_states[idx_b].krpc_host)
+              < 0;
+        });
+  } else {
+    std::shuffle(instance_groups.begin(), instance_groups.end(), *state->rng());
+  }
+  if (coordinator_instances.size() > 0) {
+    // Put coordinator group behind so that coordinator won't be selected as intermediate
+    // aggregator.
+    instance_groups.push_back(coordinator_instances);
+  }
+
+  RuntimeFilterAggregatorInfoPB* agg_info =
+      src_state->exec_params->mutable_filter_agg_info();
+  agg_info->set_num_aggregators(num_agg);
+
+  int group_idx = 0;
+  int agg_idx = -1;
+  InstanceToAggPairs instance_to_agg;
+  vector<int> num_reporting_hosts(num_agg, 0);
+  for (auto group : instance_groups) {
+    const NetworkAddressPB& host = src_state->instance_states[group[0].first].host;
+    if (group_idx < num_agg) {
+      // First 'num_agg' of 'instance_groups' host selected as intermediate aggregator.
+      const BackendDescriptorPB& desc = LookUpBackendDesc(executor_config, host);
+      NetworkAddressPB* address = agg_info->add_aggregator_krpc_addresses();
+      *address = desc.address();
+      DCHECK(desc.has_krpc_address());
+      DCHECK(IsResolvedAddress(desc.krpc_address()));
+      NetworkAddressPB* krpc_address = agg_info->add_aggregator_krpc_backends();
+      *krpc_address = desc.krpc_address();
+    }
+    agg_idx = (agg_idx + 1) % num_agg;
+    num_reporting_hosts[agg_idx] += 1;
+    for (auto entry : group) {
+      entry.second = agg_idx;
+      instance_to_agg.push_back(entry);
+    }
+    ++group_idx;
+  }
+
+  // Sort 'instance_to_agg' based on the original instance order to populate
+  // 'aggregator_idx_to_report'.
+  sort(instance_to_agg.begin(), instance_to_agg.end());
+  DCHECK_EQ(src_state->instance_states.size(), instance_to_agg.size());
+  for (auto entry : instance_to_agg) {
+    agg_info->add_aggregator_idx_to_report(entry.second);
+  }
+
+  // Write how many host is expected to report to each intermediate aggregator,
+  // including the aggregator host itself.
+  for (auto num_reporters : num_reporting_hosts) {
+    agg_info->add_num_reporter_per_aggregator(num_reporters);
+  }
+}
+
+static inline void initializeSchedulerWarning(RuntimeProfile* summary_profile) {
+  if (summary_profile->GetInfoString(SCHEDULER_WARNING_KEY) == nullptr) {
+    summary_profile->AddInfoString(SCHEDULER_WARNING_KEY,
+        "Cluster membership might changed between planning and scheduling");
+  }
+}
+
+Status Scheduler::CheckEffectiveInstanceCount(
+    const FragmentScheduleState* fragment_state, ScheduleState* state) {
+  // These checks are only intended if COMPUTE_PROCESSING_COST=true.
+  if (!state->query_options().compute_processing_cost) return Status::OK();
+
+  int effective_instance_count = fragment_state->fragment.effective_instance_count;
+  DCHECK_GT(effective_instance_count, 0);
+  if (effective_instance_count < fragment_state->instance_states.size()) {
+    initializeSchedulerWarning(state->summary_profile());
+    string warn_message = Substitute(
+        "$0 scheduled instance count ($1) is higher than its effective count ($2)",
+        fragment_state->fragment.display_name, fragment_state->instance_states.size(),
+        effective_instance_count);
+    state->summary_profile()->AppendInfoString(SCHEDULER_WARNING_KEY, warn_message);
+    LOG(WARNING) << warn_message;
+  }
+
+  DCHECK(!fragment_state->instance_states.empty());
+  // Find host with the largest instance assignment.
+  // Initialize to the first fragment instance.
+  int largest_inst_idx = 0;
+  int largest_inst_per_host = 1;
+  int this_inst_count = 1;
+  int num_host = 1;
+  for (int i = 1; i < fragment_state->instance_states.size(); i++) {
+    if (fragment_state->instance_states[i].host
+        == fragment_state->instance_states[i - 1].host) {
+      this_inst_count++;
+    } else {
+      if (largest_inst_per_host < this_inst_count) {
+        largest_inst_per_host = this_inst_count;
+        largest_inst_idx = i - 1;
+      }
+      this_inst_count = 1;
+      num_host++;
+    }
+  }
+  if (largest_inst_per_host < this_inst_count) {
+    largest_inst_per_host = this_inst_count;
+    largest_inst_idx = fragment_state->instance_states.size() - 1;
+  }
+
+  QueryConstants qc;
+  if (largest_inst_per_host > qc.MAX_FRAGMENT_INSTANCES_PER_NODE) {
+    return Status(Substitute(
+        "$0 scheduled instance count ($1) is higher than maximum instances per node"
+        " ($2), indicating a planner bug. Consider running the query with"
+        " COMPUTE_PROCESSING_COST=false.",
+        fragment_state->fragment.display_name, largest_inst_per_host,
+        qc.MAX_FRAGMENT_INSTANCES_PER_NODE));
+  }
+
+  int planned_inst_per_host = ceil((float)effective_instance_count / num_host);
+  if (largest_inst_per_host > planned_inst_per_host) {
+    LOG(WARNING) << fragment_state->fragment.display_name
+                 << " has imbalance number of instance to host assignment."
+                 << " Consider running the query with COMPUTE_PROCESSING_COST=false."
+                 << " Host " << fragment_state->instance_states[largest_inst_idx].host
+                 << " has " << largest_inst_per_host << " instances assigned."
+                 << " effective_instance_count=" << effective_instance_count
+                 << " planned_inst_per_host=" << planned_inst_per_host
+                 << " num_host=" << num_host;
+  }
+  return Status::OK();
+}
+
+Status Scheduler::ComputeFragmentExecParams(const ExecutorConfig& executor_config,
     const TPlanExecInfo& plan_exec_info, FragmentScheduleState* fragment_state,
     ScheduleState* state) {
   // Create exec params for child fragments connected by an exchange. Instance creation
   // for this fragment depends on where the input fragment instances are scheduled.
   for (FragmentIdx input_fragment_idx : fragment_state->exchange_input_fragments) {
-    ComputeFragmentExecParams(executor_config, plan_exec_info,
-        state->GetFragmentScheduleState(input_fragment_idx), state);
+    RETURN_IF_ERROR(ComputeFragmentExecParams(executor_config, plan_exec_info,
+        state->GetFragmentScheduleState(input_fragment_idx), state));
   }
 
   const TPlanFragment& fragment = fragment_state->fragment;
@@ -278,13 +498,19 @@ void Scheduler::ComputeFragmentExecParams(const ExecutorConfig& executor_config,
     // the plan that must be executed at the coordinator or an unpartitioned fragment
     // that can be executed anywhere.
     VLOG(3) << "Computing exec params for "
-            << (fragment_state->is_coord_fragment ? "coordinator" : "unpartitioned")
+            << (fragment_state->is_root_coord_fragment
+                ? "root coordinator" : "unpartitioned")
             << " fragment " << fragment_state->fragment.display_name;
     NetworkAddressPB host;
     NetworkAddressPB krpc_host;
-    if (fragment_state->is_coord_fragment || executor_config.group.NumExecutors() == 0) {
-      // The coordinator fragment must be scheduled on the coordinator. Otherwise if
-      // no executors are available, we need to schedule on the coordinator.
+    if (fragment_state->is_root_coord_fragment || fragment.is_coordinator_only ||
+        executor_config.group.NumExecutors() == 0) {
+      // 1. The root coordinator fragment ('fragment_state->is_root_coord_fragment') must
+      // be scheduled on the coordinator.
+      // 2. Some other fragments ('fragment.is_coordinator_only'), such as
+      // Iceberg metadata scanner fragments, must also run on the coordinator.
+      // 3. Otherwise if no executors are available, we need to schedule on the
+      // coordinator.
       const BackendDescriptorPB& coord_desc = executor_config.coord_desc;
       host = coord_desc.address();
       DCHECK(coord_desc.has_krpc_address());
@@ -313,8 +539,8 @@ void Scheduler::ComputeFragmentExecParams(const ExecutorConfig& executor_config,
     }
     VLOG(3) << "Scheduled unpartitioned fragment on " << krpc_host;
     DCHECK(IsResolvedAddress(krpc_host));
-    // make sure that the coordinator instance ends up with instance idx 0
-    UniqueIdPB instance_id = fragment_state->is_coord_fragment ?
+    // make sure that the root coordinator instance ends up with instance idx 0
+    UniqueIdPB instance_id = fragment_state->is_root_coord_fragment ?
         state->query_id() :
         state->GetNextInstanceId();
     fragment_state->instance_states.emplace_back(
@@ -330,8 +556,7 @@ void Scheduler::ComputeFragmentExecParams(const ExecutorConfig& executor_config,
         instance_state.AddScanRanges(entry.first, entry.second);
       }
     }
-  } else if (ContainsNode(fragment.plan, TPlanNodeType::UNION_NODE)
-      || ContainsScanNode(fragment.plan)) {
+  } else if (ContainsUnionNode(fragment.plan) || ContainsScanNode(fragment.plan)) {
     VLOG(3) << "Computing exec params for scan and/or union fragment.";
     // case 2: leaf fragment (i.e. no input fragments) with a single scan node.
     // case 3: union fragment, which may have scan nodes and may have input fragments.
@@ -340,10 +565,109 @@ void Scheduler::ComputeFragmentExecParams(const ExecutorConfig& executor_config,
     VLOG(3) << "Computing exec params for interior fragment.";
     // case 4: interior (non-leaf) fragment without a scan or union.
     // We assign the same hosts as those of our leftmost input fragment (so that a
-    // merge aggregation fragment runs on the hosts that provide the input data).
+    // merge aggregation fragment runs on the hosts that provide the input data) OR
+    // follow the effective_instance_count specified by planner.
     CreateInputCollocatedInstances(fragment_state, state);
   }
+  return CheckEffectiveInstanceCount(fragment_state, state);
 }
+
+/// Returns a numeric weight that is proportional to the estimated processing time for
+/// the scan range represented by 'params'. Weights from different scan node
+/// implementations, e.g. FS vs Kudu, are not comparable.
+static int64_t ScanRangeWeight(const ScanRangeParamsPB& params) {
+  if (params.scan_range().has_hdfs_file_split()) {
+    return params.scan_range().hdfs_file_split().length();
+  } else {
+    // Give equal weight to each Kudu and Hbase split.
+    // TODO: implement more accurate logic for Kudu and Hbase
+    return 1;
+  }
+}
+
+bool Scheduler::ScanRangeComparator(const ScanRangeParamsPB& a,
+    const ScanRangeParamsPB& b) {
+  // We are ordering by weight largest to smallest. Return quickly if the weights are
+  // different.
+  int64_t a_weight = ScanRangeWeight(a), b_weight = ScanRangeWeight(b);
+  if (a_weight != b_weight) return a_weight > b_weight;
+  // The weights are the same, so we need to break ties to make this deterministic.
+  if (a.scan_range().has_hdfs_file_split()) {
+    // HDFS scan ranges should be compared against other HDFS scan ranges.
+    if (!b.scan_range().has_hdfs_file_split()) {
+      DCHECK(false) << "HDFS scan ranges can only be compared against other HDFS ranges";
+      return false;
+    }
+    // Break ties by comparing various fields of the HDFS split. The ordering here is
+    // arbitrary, so this starts with cheap checks and moves to more expensive checks.
+    const HdfsFileSplitPB& a_hdfs_split = a.scan_range().hdfs_file_split();
+    const HdfsFileSplitPB& b_hdfs_split = b.scan_range().hdfs_file_split();
+    if (a_hdfs_split.mtime() != b_hdfs_split.mtime()) {
+      return a_hdfs_split.mtime() > b_hdfs_split.mtime();
+    }
+    if (a_hdfs_split.offset() != b_hdfs_split.offset()) {
+      return a_hdfs_split.offset() > b_hdfs_split.offset();
+    }
+    if (a_hdfs_split.file_length() != b_hdfs_split.file_length()) {
+      return a_hdfs_split.file_length() > b_hdfs_split.file_length();
+    }
+    if (a_hdfs_split.partition_path_hash() != b_hdfs_split.partition_path_hash()) {
+      return a_hdfs_split.partition_path_hash() > b_hdfs_split.partition_path_hash();
+    }
+    if (a_hdfs_split.relative_path() != b_hdfs_split.relative_path()) {
+      return a_hdfs_split.relative_path() > b_hdfs_split.relative_path();
+    }
+  } else if (a.scan_range().has_kudu_scan_token()) {
+    // Kudu scan ranges should be compared against other Kudu scan ranges
+    if (!b.scan_range().has_kudu_scan_token()) {
+      DCHECK(false) << "Kudu scan ranges can only be compared against other Kudu ranges";
+      return false;
+    }
+    // Break ties by comparing the kudu scan token
+    return a.scan_range().kudu_scan_token() > b.scan_range().kudu_scan_token();
+  } else if (a.scan_range().has_hbase_key_range()) {
+    // HBase scan ranges should be compared against other HBase scan ranges
+    if (!b.scan_range().has_hbase_key_range()) {
+      DCHECK(false)
+          << "HBase scan ranges can only be compared against other HBase ranges";
+      return false;
+    }
+    const HBaseKeyRangePB& a_hbase_range = a.scan_range().hbase_key_range();
+    const HBaseKeyRangePB& b_hbase_range = b.scan_range().hbase_key_range();
+    if (a_hbase_range.startkey() != b_hbase_range.startkey()) {
+      return a_hbase_range.startkey() > b_hbase_range.startkey();
+    }
+    if (a_hbase_range.stopkey() != b_hbase_range.stopkey()) {
+      return a_hbase_range.stopkey() > b_hbase_range.stopkey();
+    }
+  }
+  return false;
+}
+
+/// Helper class used in CreateScanInstances() to track the amount of work assigned
+/// to each instance so far.
+struct InstanceAssignment {
+  // The weight assigned so far.
+  int64_t weight;
+
+  // The index of the instance in 'per_instance_ranges'
+  int instance_idx;
+
+  // Comparator for use in a heap as part of the longest processing time algo.
+  // Invert the comparison order because the *_heap functions implement a max-heap
+  // and we want to assign to the least-loaded instance first.
+  bool operator<(InstanceAssignment& other) const {
+    if (weight == other.weight) {
+      // To make this deterministic, break ties by comparing the instance idxs
+      // (which are unique). Like the weight, this is also inverted to put the lower
+      // indexes first as this is a max heap. That matches the order that we use when
+      // constructing the initial list, so there is no need to call make_heap().
+      return instance_idx > other.instance_idx;
+    } else {
+      return weight > other.weight;
+    }
+  }
+};
 
 // Maybe the easiest way to understand the objective of this algorithm is as a
 // generalization of two simpler instance creation algorithms that decide how many
@@ -373,7 +697,7 @@ void Scheduler::ComputeFragmentExecParams(const ExecutorConfig& executor_config,
 void Scheduler::CreateCollocatedAndScanInstances(const ExecutorConfig& executor_config,
     FragmentScheduleState* fragment_state, ScheduleState* state) {
   const TPlanFragment& fragment = fragment_state->fragment;
-  bool has_union = ContainsNode(fragment.plan, TPlanNodeType::UNION_NODE);
+  bool has_union = ContainsUnionNode(fragment.plan);
   DCHECK(has_union || ContainsScanNode(fragment.plan));
   // Build a map of hosts to the num instances this fragment should have, before we take
   // into account scan ranges. If this fragment has input fragments, we always run with
@@ -410,8 +734,9 @@ void Scheduler::CreateCollocatedAndScanInstances(const ExecutorConfig& executor_
       << "for plans with no union and multiple scans per fragment";
   vector<NetworkAddressPB> scan_hosts;
   GetScanHosts(scan_node_ids, *fragment_state, &scan_hosts);
-  if (scan_hosts.empty()) {
-    // None of the scan nodes have any scan ranges; run it on a random executor.
+  if (scan_hosts.empty() && instances_per_host.empty()) {
+    // None of the scan nodes have any scan ranges and there is no input fragment feeding
+    // into this fragment; run it on a random executor.
     // TODO TODO: the TODO below seems partially stale
     // TODO: we'll need to revisit this strategy once we can partition joins
     // (in which case this fragment might be executing a right outer join
@@ -430,11 +755,24 @@ void Scheduler::CreateCollocatedAndScanInstances(const ExecutorConfig& executor_
     int& host_num_instances = instances_per_host[host_addr];
     host_num_instances = max(1, host_num_instances);
   }
-  DCHECK(!instances_per_host.empty()) << "no hosts for fragment " << fragment.idx;
+  DCHECK(!instances_per_host.empty())
+      << "no hosts for fragment " << fragment.idx << " (" << fragment.display_name << ")";
 
-  // Number of instances should be bounded by mt_dop.
-  int max_num_instances =
-      max(1, state->request().query_ctx.client_request.query_options.mt_dop);
+  const TQueryOptions& request_query_option =
+      state->request().query_ctx.client_request.query_options;
+  int max_num_instances = 1;
+  if (request_query_option.compute_processing_cost) {
+    // Numbers should follow 'effective_instance_count' from planner.
+    // 'effective_instance_count' is total instances across all executors.
+    DCHECK_GT(fragment.effective_instance_count, 0);
+    int inst_per_host =
+        ceil((float)fragment.effective_instance_count / instances_per_host.size());
+    max_num_instances = max(1, inst_per_host);
+  } else {
+    // Number of instances should be bounded by mt_dop.
+    max_num_instances = max(1, request_query_option.mt_dop);
+  }
+
   // Track the index of the next instance to be created for this fragment.
   int per_fragment_instance_idx = 0;
   for (const auto& entry : instances_per_host) {
@@ -453,8 +791,22 @@ void Scheduler::CreateCollocatedAndScanInstances(const ExecutorConfig& executor_
       if (assignment_it == sra.end()) continue;
       auto scan_ranges_it = assignment_it->second.find(scan_node_id);
       if (scan_ranges_it == assignment_it->second.end()) continue;
+      const TPlanNode& scan_node = state->GetNode(scan_node_id);
+      // For mt_dop, there are two scheduling modes. The first is the normal mode
+      // that uses a shared queue. For that mode, there is no reason to do anything
+      // special about assigning scan ranges to fragment instances, because they will
+      // all be placed in a single queue at runtime. The other is deterministic
+      // scheduling that does not use the shared queue. In this mode, no rebalancing
+      // takes place at runtime, so balancing the scan ranges among the fragment
+      // instances is important. For this mode, use the longest processing time (LPT)
+      // algorithm. The deterministic mode is used for tuple caching.
+      bool use_lpt = scan_node.__isset.hdfs_scan_node
+          && scan_node.hdfs_scan_node.__isset.use_mt_scan_node
+          && scan_node.hdfs_scan_node.use_mt_scan_node
+          && scan_node.hdfs_scan_node.__isset.deterministic_scanrange_assignment
+          && scan_node.hdfs_scan_node.deterministic_scanrange_assignment;
       per_scan_per_instance_ranges.back() =
-          AssignRangesToInstances(max_num_instances, scan_ranges_it->second);
+          AssignRangesToInstances(max_num_instances, &scan_ranges_it->second, use_lpt);
       DCHECK_LE(per_scan_per_instance_ranges.back().size(), max_num_instances);
     }
 
@@ -463,7 +815,12 @@ void Scheduler::CreateCollocatedAndScanInstances(const ExecutorConfig& executor_
     int num_instances = entry.second;
     DCHECK_GE(num_instances, 1);
     DCHECK_LE(num_instances, max_num_instances)
-        << "Input parallelism too high for mt_dop";
+        << "Input parallelism too high. Fragment " << fragment.display_name
+        << " num_host=" << instances_per_host.size()
+        << " scan_host_count=" << scan_hosts.size()
+        << " mt_dop=" << request_query_option.mt_dop
+        << " compute_processing_cost=" << request_query_option.compute_processing_cost
+        << " effective_instance_count=" << fragment.effective_instance_count;
     for (const auto& per_scan_ranges : per_scan_per_instance_ranges) {
       num_instances = max(num_instances, static_cast<int>(per_scan_ranges.size()));
     }
@@ -491,10 +848,7 @@ void Scheduler::CreateCollocatedAndScanInstances(const ExecutorConfig& executor_
       }
     }
   }
-  if (fragment.output_sink.__isset.table_sink
-      && fragment.output_sink.table_sink.__isset.hdfs_table_sink
-      && state->query_options().max_fs_writers > 0
-      && fragment_state->instance_states.size() > state->query_options().max_fs_writers) {
+  if (IsExceedMaxFsWriters(fragment_state, fragment_state, state)) {
     LOG(WARNING) << "Extra table sink instances scheduled, probably due to mismatch of "
                     "cluster state during planning vs scheduling. Expected: "
                  << state->query_options().max_fs_writers
@@ -503,18 +857,48 @@ void Scheduler::CreateCollocatedAndScanInstances(const ExecutorConfig& executor_
 }
 
 vector<vector<ScanRangeParamsPB>> Scheduler::AssignRangesToInstances(
-    int max_num_instances, vector<ScanRangeParamsPB>& ranges) {
+    int max_num_instances, vector<ScanRangeParamsPB>* ranges, bool use_lpt) {
   DCHECK_GT(max_num_instances, 0);
-  int num_instances = min(max_num_instances, static_cast<int>(ranges.size()));
+  int num_instances = min(max_num_instances, static_cast<int>(ranges->size()));
   vector<vector<ScanRangeParamsPB>> per_instance_ranges(num_instances);
   if (num_instances < 2) {
     // Short-circuit the assignment algorithm for the single instance case.
-    per_instance_ranges[0] = ranges;
+    per_instance_ranges[0] = *ranges;
   } else {
-    int idx = 0;
-    for (auto& range : ranges) {
-      per_instance_ranges[idx].push_back(range);
-      idx = (idx + 1 == num_instances) ? 0 : idx + 1;
+    if (use_lpt) {
+      // We need to assign scan ranges to instances. We would like the assignment to be
+      // as even as possible, so that each instance does about the same amount of work.
+      // Use longest-processing time (LPT) algorithm, which is a good approximation of the
+      // optimal solution (there is a theoretic bound of ~4/3 of the optimal solution
+      // in the worst case). It also guarantees that at least one scan range is assigned
+      // to each instance.
+      // The LPT algorithm is straightforward:
+      // 1. sort the scan ranges to be assigned by descending weight.
+      // 2. assign each item to the instance with the least weight assigned so far.
+      vector<InstanceAssignment> instance_heap;
+      instance_heap.reserve(num_instances);
+      for (int i = 0; i < num_instances; ++i) {
+        instance_heap.emplace_back(InstanceAssignment{0, i});
+      }
+      // The instance_heap vector was created in sorted order, so this is already a heap
+      // without needing a make_heap() call.
+      DCHECK(std::is_heap(instance_heap.begin(), instance_heap.end()));
+      std::sort(ranges->begin(), ranges->end(), ScanRangeComparator);
+      for (ScanRangeParamsPB& range : *ranges) {
+        per_instance_ranges[instance_heap[0].instance_idx].push_back(range);
+        instance_heap[0].weight += ScanRangeWeight(range);
+        pop_heap(instance_heap.begin(), instance_heap.end());
+        push_heap(instance_heap.begin(), instance_heap.end());
+      }
+    } else {
+      // When not using LPT, a simple round-robin is sufficient. The use case for non-LPT
+      // is when the ranges will be placed in a shared queue anyway, so the balancing
+      // is not as crucial.
+      int idx = 0;
+      for (auto& range : *ranges) {
+        per_instance_ranges[idx].push_back(range);
+        idx = (idx + 1 == num_instances) ? 0 : idx + 1;
+      }
     }
   }
   return per_instance_ranges;
@@ -528,11 +912,14 @@ void Scheduler::CreateInputCollocatedInstances(
       *state->GetFragmentScheduleState(fragment_state->exchange_input_fragments[0]);
   int per_fragment_instance_idx = 0;
 
-  if (fragment.output_sink.__isset.table_sink
-      && fragment.output_sink.table_sink.__isset.hdfs_table_sink
-      && state->query_options().max_fs_writers > 0
-      && input_fragment_state.instance_states.size()
-          > state->query_options().max_fs_writers) {
+  int max_instances = input_fragment_state.instance_states.size();
+  if (fragment.effective_instance_count > 0) {
+    max_instances = fragment.effective_instance_count;
+  } else if (IsExceedMaxFsWriters(fragment_state, &input_fragment_state, state)) {
+    max_instances = state->query_options().max_fs_writers;
+  }
+
+  if (max_instances != input_fragment_state.instance_states.size()) {
     std::unordered_set<std::pair<NetworkAddressPB, NetworkAddressPB>> all_hosts;
     for (const FInstanceScheduleState& input_instance_state :
         input_fragment_state.instance_states) {
@@ -542,7 +929,6 @@ void Scheduler::CreateInputCollocatedInstances(
     // across hosts and ensuring that instances on the same host get consecutive instance
     // indexes.
     int num_hosts = all_hosts.size();
-    int max_instances = state->query_options().max_fs_writers;
     int instances_per_host = max_instances / num_hosts;
     int remainder = max_instances % num_hosts;
     auto host_itr = all_hosts.begin();
@@ -607,7 +993,7 @@ Status Scheduler::ComputeScanRangeAssignment(const ExecutorConfig& executor_conf
     bool node_random_replica, const vector<TScanRangeLocationList>& locations,
     const vector<TNetworkAddress>& host_list, bool exec_at_coord,
     const TQueryOptions& query_options, RuntimeProfile::Counter* timer, std::mt19937* rng,
-    FragmentScanRangeAssignment* assignment) {
+    RuntimeProfile* summary_profile, FragmentScanRangeAssignment* assignment) {
   const ExecutorGroup& executor_group = executor_config.group;
   if (executor_group.NumExecutors() == 0 && !exec_at_coord) {
     return Status(TErrorCode::NO_REGISTERED_BACKENDS);
@@ -656,6 +1042,28 @@ Status Scheduler::ComputeScanRangeAssignment(const ExecutorConfig& executor_conf
           coord_desc.address().hostname(), nullptr));
       assignment_ctx.RecordScanRangeAssignment(
           coord_desc, node_id, host_list, scan_range_locations, assignment);
+    } else if (scan_range_locations.scan_range.__isset.is_system_scan &&
+               scan_range_locations.scan_range.is_system_scan) {
+      // Must run on a coordinator, lookup in executor_config.all_coords
+      DCHECK_EQ(1, scan_range_locations.locations.size());
+      const TNetworkAddress& coordinator =
+          host_list[scan_range_locations.locations[0].host_idx];
+      const BackendDescriptorPB* coordinatorPB =
+          executor_config.all_coords.LookUpBackendDesc(FromTNetworkAddress(coordinator));
+      if (coordinatorPB == nullptr) {
+        // Coordinator is no longer available, skip this range.
+        string warn_message = Substitute(
+            "Coordinator $0 is no longer available for system table scan assignment",
+            TNetworkAddressToString(coordinator));
+        if (LIKELY(summary_profile != nullptr)) {
+          initializeSchedulerWarning(summary_profile);
+          summary_profile->AppendInfoString(SCHEDULER_WARNING_KEY, warn_message);
+        }
+        LOG(WARNING) << warn_message;
+        continue;
+      }
+      assignment_ctx.RecordScanRangeAssignment(
+        *coordinatorPB, node_id, host_list, scan_range_locations, assignment);
     } else {
       // Collect executor candidates with smallest memory distance.
       vector<IpAddr> executor_candidates;
@@ -779,6 +1187,10 @@ bool Scheduler::ContainsScanNode(const TPlan& plan) {
   return ContainsNode(plan, SCAN_NODE_TYPES);
 }
 
+bool Scheduler::ContainsUnionNode(const TPlan& plan) {
+  return ContainsNode(plan, TPlanNodeType::UNION_NODE);
+}
+
 std::vector<TPlanNodeId> Scheduler::FindNodes(
     const TPlan& plan, const vector<TPlanNodeType::type>& types) {
   vector<TPlanNodeId> results;
@@ -814,7 +1226,7 @@ void Scheduler::GetScanHosts(const vector<TPlanNodeId>& scan_ids,
 Status Scheduler::Schedule(const ExecutorConfig& executor_config, ScheduleState* state) {
   RETURN_IF_ERROR(DebugAction(state->query_options(), "SCHEDULER_SCHEDULE"));
   RETURN_IF_ERROR(ComputeScanRangeAssignment(executor_config, state));
-  ComputeFragmentExecParams(executor_config, state);
+  RETURN_IF_ERROR(ComputeFragmentExecParams(executor_config, state));
   ComputeBackendExecParams(executor_config, state);
 #ifndef NDEBUG
   state->Validate();
@@ -834,12 +1246,52 @@ bool Scheduler::IsCoordinatorOnlyQuery(const TQueryExecRequest& exec_request) {
       && type == TPartitionType::UNPARTITIONED;
 }
 
+void Scheduler::PopulateFilepathToHostsMapping(const FInstanceScheduleState& finst,
+    ScheduleState* state, ByNodeFilepathToHosts* duplicate_check) {
+  for (const auto& per_node_ranges : finst.exec_params.per_node_scan_ranges()) {
+    const TPlanNode& node = state->GetNode(per_node_ranges.first);
+    if (node.node_type != TPlanNodeType::HDFS_SCAN_NODE) continue;
+    if (!node.hdfs_scan_node.__isset.deleteFileScanNodeId) continue;
+    const TPlanNodeId delete_file_node_id = node.hdfs_scan_node.deleteFileScanNodeId;
+
+    for (const auto& scan_ranges : per_node_ranges.second.scan_ranges()) {
+      string file_path;
+      bool is_relative = false;
+      const HdfsFileSplitPB& hdfs_file_split = scan_ranges.scan_range().hdfs_file_split();
+      if (hdfs_file_split.has_relative_path() &&
+          !hdfs_file_split.relative_path().empty()) {
+        file_path = hdfs_file_split.relative_path();
+        is_relative = true;
+      } else {
+        file_path = hdfs_file_split.absolute_path();
+      }
+      DCHECK(!file_path.empty());
+
+      std::unordered_set<NetworkAddressPB>& current_hosts =
+          (*duplicate_check)[delete_file_node_id][file_path];
+      if (current_hosts.find(finst.host) != current_hosts.end()) continue;
+      current_hosts.insert(finst.host);
+
+      auto* by_node_filepath_to_hosts =
+          state->query_schedule_pb()->mutable_by_node_filepath_to_hosts();
+      auto* filepath_to_hosts =
+          (*by_node_filepath_to_hosts)[delete_file_node_id].mutable_filepath_to_hosts();
+      (*filepath_to_hosts)[file_path].set_is_relative(is_relative);
+      auto* hosts = (*filepath_to_hosts)[file_path].add_hosts();
+      *hosts = finst.host;
+    }
+  }
+}
+
 void Scheduler::ComputeBackendExecParams(
     const ExecutorConfig& executor_config, ScheduleState* state) {
+  ByNodeFilepathToHosts duplicate_check;
   for (FragmentScheduleState& f : state->fragment_schedule_states()) {
     const NetworkAddressPB* prev_host = nullptr;
     int num_hosts = 0;
     for (FInstanceScheduleState& i : f.instance_states) {
+      PopulateFilepathToHostsMapping(i, state, &duplicate_check);
+
       BackendScheduleState& be_state = state->GetOrCreateBackendScheduleState(i.host);
       be_state.exec_params->add_instance_params()->Swap(&i.exec_params);
       // Different fragments do not synchronize their Open() and Close(), so the backend
@@ -873,23 +1325,64 @@ void Scheduler::ComputeBackendExecParams(
   }
 
   // Compute 'slots_to_use' for each backend based on the max # of instances of
-  // any fragment on that backend.
+  // any fragment on that backend. If 'compute_processing_cost' is on, and Planner
+  // set 'max_slot_per_executor', pick the min between 'dominant_instance_count' and
+  // 'max_slot_per_executor'.
+  bool cap_slots = state->query_options().compute_processing_cost
+      && state->query_options().slot_count_strategy == TSlotCountStrategy::PLANNER_CPU_ASK
+      && state->request().__isset.max_slot_per_executor
+      && state->request().max_slot_per_executor > 0;
   for (auto& backend : state->per_backend_schedule_states()) {
-    int be_max_instances = 0;
+    int be_max_instances = 0; // max # of instances of any fragment.
+    int dominant_instance_count = 0; // sum of all dominant fragment instances.
+
     // Instances for a fragment are clustered together because of how the vector is
-    // constructed above. So we can compute the max # of instances of any fragment
-    // with a single pass over the vector.
+    // constructed above. For example, 3 fragments with 2 instances each will be in this
+    // order inside exec_params->instance_params() vector.
+    //   [F00_a, F00_b, F01_c, F01_d, F02_e, F02_f]
+    // So we can compute the max # of instances of any fragment with a single pass over
+    // the vector.
     int curr_fragment_idx = -1;
     int curr_instance_count = 0; // Number of instances of the current fragment seen.
+    bool is_dominant = false;
     for (auto& finstance : backend.second.exec_params->instance_params()) {
       if (curr_fragment_idx == -1 || curr_fragment_idx != finstance.fragment_idx()) {
+        // We arrived at new fragment group. Update 'be_max_instances'.
+        be_max_instances = max(be_max_instances, curr_instance_count);
+        // Reset 'curr_fragment_idx' and other counting related variables.
         curr_fragment_idx = finstance.fragment_idx();
         curr_instance_count = 0;
+        is_dominant =
+            state->GetFragmentScheduleState(curr_fragment_idx)->fragment.is_dominant;
       }
       ++curr_instance_count;
-      be_max_instances = max(be_max_instances, curr_instance_count);
+      if (is_dominant) ++dominant_instance_count;
     }
-    backend.second.exec_params->set_slots_to_use(be_max_instances);
+    // Update 'be_max_instances' one last time.
+    be_max_instances = max(be_max_instances, curr_instance_count);
+
+    // Default slots to use number from IMPALA-8998.
+    // For fragment with largest num of instances running in this backend, it
+    // ensures allocation of 1 slot for each instance of that fragment.
+    int slots_to_use = be_max_instances;
+
+    // Done looping exec_params->instance_params(). Derived 'slots_to_use' based on
+    // finalized 'be_max_instances' and 'dominant_instance_count'.
+    if (cap_slots) {
+      if (dominant_instance_count >= be_max_instances) {
+        // One case where it is possible to have 'dominant_instance_count' <
+        // 'be_max_instances' is with dedicated coordinator setup. The schedule would
+        // only assign one coordinator fragment instance to the coordinator node,
+        // but 'dominant_instance_count' can be 0 if fragment.is_dominant == false.
+        // In that case, ignore 'dominant_instance_count' and continue with
+        // 'be_max_instances'.
+        // However, if 'dominant_instance_count' >= 'be_max_instances',
+        // continue with 'dominant_instance_count'.
+        slots_to_use = dominant_instance_count;
+      }
+      slots_to_use = min(slots_to_use, state->request().max_slot_per_executor);
+    }
+    backend.second.exec_params->set_slots_to_use(slots_to_use);
   }
 
   // This also ensures an entry always exists for the coordinator backend.
@@ -931,7 +1424,7 @@ void Scheduler::ComputeBackendExecParams(
                               << ") ";
   }
   state->summary_profile()->AddInfoString(
-      "Per Host Min Memory Reservation", min_mem_reservation_ss.str());
+      PROFILE_INFO_KEY_PER_HOST_MIN_MEMORY_RESERVATION, min_mem_reservation_ss.str());
   state->summary_profile()->AddInfoString(
       "Per Host Number of Fragment Instances", num_fragment_instances_ss.str());
 }
@@ -1117,6 +1610,12 @@ void TScanRangeToScanRangePB(const TScanRange& tscan_range, ScanRangePB* scan_ra
     hdfs_file_split->set_mtime(tscan_range.hdfs_file_split.mtime);
     hdfs_file_split->set_partition_path_hash(
         tscan_range.hdfs_file_split.partition_path_hash);
+    hdfs_file_split->set_is_encrypted(tscan_range.hdfs_file_split.is_encrypted);
+    hdfs_file_split->set_is_erasure_coded(tscan_range.hdfs_file_split.is_erasure_coded);
+    if (tscan_range.hdfs_file_split.__isset.absolute_path) {
+      hdfs_file_split->set_absolute_path(
+          tscan_range.hdfs_file_split.absolute_path);
+    }
   }
   if (tscan_range.__isset.hbase_key_range) {
     HBaseKeyRangePB* hbase_key_range = scan_range_pb->mutable_hbase_key_range();
@@ -1126,6 +1625,12 @@ void TScanRangeToScanRangePB(const TScanRange& tscan_range, ScanRangePB* scan_ra
   if (tscan_range.__isset.kudu_scan_token) {
     scan_range_pb->set_kudu_scan_token(tscan_range.kudu_scan_token);
   }
+  if (tscan_range.__isset.file_metadata) {
+    scan_range_pb->set_file_metadata(tscan_range.file_metadata);
+  }
+  if (tscan_range.__isset.is_system_scan) {
+    scan_range_pb->set_is_system_scan(tscan_range.is_system_scan);
+  }
 }
 
 void Scheduler::AssignmentCtx::RecordScanRangeAssignment(
@@ -1133,6 +1638,23 @@ void Scheduler::AssignmentCtx::RecordScanRangeAssignment(
     const vector<TNetworkAddress>& host_list,
     const TScanRangeLocationList& scan_range_locations,
     FragmentScanRangeAssignment* assignment) {
+  if (scan_range_locations.scan_range.__isset.is_system_scan &&
+      scan_range_locations.scan_range.is_system_scan) {
+    // Assigned to a coordinator.
+    PerNodeScanRanges* scan_ranges =
+        FindOrInsert(assignment, executor.address(), PerNodeScanRanges());
+    vector<ScanRangeParamsPB>* scan_range_params_list =
+        FindOrInsert(scan_ranges, node_id, vector<ScanRangeParamsPB>());
+    ScanRangeParamsPB scan_range_params;
+    TScanRangeToScanRangePB(
+        scan_range_locations.scan_range, scan_range_params.mutable_scan_range());
+    scan_range_params_list->push_back(scan_range_params);
+
+    VLOG_FILE << "Scheduler assignment of system table scan to coordinator: "
+              << executor.address();
+    return;
+  }
+
   int64_t scan_range_length = 0;
   if (scan_range_locations.scan_range.__isset.hdfs_file_split) {
     scan_range_length = scan_range_locations.scan_range.hdfs_file_split.length;

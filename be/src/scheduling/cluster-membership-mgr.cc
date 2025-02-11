@@ -31,6 +31,7 @@
 
 DECLARE_int32(num_expected_executors);
 DECLARE_string(expected_executor_group_sets);
+DECLARE_string(cluster_membership_topic_id);
 
 namespace {
 using namespace impala;
@@ -50,11 +51,24 @@ ExecutorGroup* FindOrInsertExecutorGroup(const ExecutorGroupDescPB& group,
   DCHECK(inserted);
   return &it->second;
 }
+
+/// Removes the executor 'be_desc' from the group 'group' if it exists and removes
+/// the group from the cluster if the group become empty after the executor removed.
+void RemoveExecutorAndGroup(const BackendDescriptorPB& be_desc,
+    const ExecutorGroupDescPB& group,
+    ClusterMembershipMgr::ExecutorGroups* executor_groups) {
+  auto it = executor_groups->find(group.name());
+  DCHECK(it != executor_groups->end());
+  DCHECK_EQ(group.name(), it->second.name());
+  it->second.RemoveExecutor(be_desc);
+  if (it->second.NumExecutors() == 0) {
+    VLOG(1) << "Removing empty group " << group.DebugString();
+    executor_groups->erase(it);
+  }
+}
 }
 
 namespace impala {
-
-static const string EMPTY_GROUP_NAME("empty group (using coordinator only)");
 
 static const string LIVE_EXEC_GROUP_KEY("cluster-membership.executor-groups.total");
 static const string HEALTHY_EXEC_GROUP_KEY(
@@ -68,20 +82,30 @@ static const string HEALTHY_EXEC_GROUP_KEY_FORMAT(
 static const string TOTAL_BACKENDS_KEY_FORMAT(
     "cluster-membership.group-set.backends.total.$0");
 
+const string ClusterMembershipMgr::EMPTY_GROUP_NAME(
+    "empty group (using coordinator only)");
+
 ClusterMembershipMgr::ClusterMembershipMgr(
     string local_backend_id, StatestoreSubscriber* subscriber, MetricGroup* metrics)
   : empty_exec_group_(EMPTY_GROUP_NAME),
     current_membership_(std::make_shared<const Snapshot>()),
     statestore_subscriber_(subscriber),
     local_backend_id_(move(local_backend_id)) {
+  if (FLAGS_cluster_membership_topic_id.empty()) {
+    membership_topic_name_ = Statestore::IMPALA_MEMBERSHIP_TOPIC;
+  } else {
+    membership_topic_name_ =
+        FLAGS_cluster_membership_topic_id + '-' + Statestore::IMPALA_MEMBERSHIP_TOPIC;
+  }
   Status status = PopulateExpectedExecGroupSets(expected_exec_group_sets_);
   if(!status.ok()) {
     LOG(FATAL) << "Error populating expected executor group sets: " << status;
   }
   InitMetrics(metrics);
   // Register the metric update function as a callback.
-  RegisterUpdateCallbackFn([this](
-      ClusterMembershipMgr::SnapshotPtr snapshot) { this->UpdateMetrics(snapshot); });
+  RegisterUpdateCallbackFn([this](const ClusterMembershipMgr::SnapshotPtr& snapshot) {
+    this->UpdateMetrics(snapshot);
+  });
 }
 
 void ClusterMembershipMgr::InitMetrics(MetricGroup* metrics) {
@@ -116,7 +140,7 @@ Status ClusterMembershipMgr::Init() {
   StatestoreSubscriber::UpdateCallback cb =
       bind<void>(mem_fn(&ClusterMembershipMgr::UpdateMembership), this, _1, _2);
   Status status = statestore_subscriber_->AddTopic(
-      Statestore::IMPALA_MEMBERSHIP_TOPIC, /* is_transient=*/ true,
+      membership_topic_name_, /* is_transient=*/ true,
       /* populate_min_subscriber_topic_version=*/ false,
       /* filter_prefix= */"", cb);
   if (!status.ok()) {
@@ -146,6 +170,33 @@ ClusterMembershipMgr::SnapshotPtr ClusterMembershipMgr::GetSnapshot() const {
   return state;
 }
 
+static bool is_active_coordinator(const BackendDescriptorPB& be) {
+  return be.has_is_coordinator() && be.is_coordinator() &&
+      !(be.has_is_quiescing() && be.is_quiescing());
+}
+
+ExecutorGroup ClusterMembershipMgr::Snapshot::GetCoordinators() const {
+  ExecutorGroup coordinators("all-coordinators");
+  for (const auto& it : current_backends) {
+    if (is_active_coordinator(it.second)) {
+      coordinators.AddExecutor(it.second);
+    }
+  }
+  return coordinators;
+}
+
+vector<TNetworkAddress> ClusterMembershipMgr::Snapshot::GetCoordinatorAddresses() const {
+  vector<TNetworkAddress> coordinators;
+  for (const auto& it : current_backends) {
+    if (is_active_coordinator(it.second)) {
+      VLOG_QUERY << "Found coordinator "
+                 << it.second.address().hostname() << ":" << it.second.address().port();
+      coordinators.emplace_back(FromNetworkAddressPB(it.second.address()));
+    }
+  }
+  return coordinators;
+}
+
 void ClusterMembershipMgr::UpdateMembership(
     const StatestoreSubscriber::TopicDeltaMap& incoming_topic_deltas,
     vector<TTopicDelta>* subscriber_topic_updates) {
@@ -153,7 +204,7 @@ void ClusterMembershipMgr::UpdateMembership(
 
   // First look to see if the topic we're interested in has an update.
   StatestoreSubscriber::TopicDeltaMap::const_iterator topic =
-      incoming_topic_deltas.find(Statestore::IMPALA_MEMBERSHIP_TOPIC);
+      incoming_topic_deltas.find(membership_topic_name_);
 
   // Ignore spurious messages.
   if (topic == incoming_topic_deltas.end()) return;
@@ -170,8 +221,8 @@ void ClusterMembershipMgr::UpdateMembership(
   BeDescSharedPtr local_be_desc = GetLocalBackendDescriptor();
   bool needs_local_be_update = NeedsLocalBackendUpdate(*base_snapshot, local_be_desc);
 
-  // We consider the statestore to be recovering from a connection failure until its post
-  // recovery grace period has elapsed.
+  // We consider the statestore service to be recovering from a connection failure or
+  // fail-over until its post recovery grace period has elapsed.
   bool ss_is_recovering = statestore_subscriber_ != nullptr
       && statestore_subscriber_->IsInPostRecoveryGracePeriod();
 
@@ -243,8 +294,7 @@ void ClusterMembershipMgr::UpdateMembership(
           for (const auto& group : be_desc.executor_groups()) {
             VLOG(1) << "Removing backend " << item.key << " from group "
                     << group.DebugString() << " (deleted)";
-            FindOrInsertExecutorGroup(
-                group, new_executor_groups)->RemoveExecutor(be_desc);
+            RemoveExecutorAndGroup(be_desc, group, new_executor_groups);
           }
         }
         new_backend_map->erase(item.key);
@@ -310,8 +360,7 @@ void ClusterMembershipMgr::UpdateMembership(
           for (const auto& group : be_desc.executor_groups()) {
             VLOG(1) << "Removing backend " << item.key << " from group "
                     << group.DebugString() << " (quiescing)";
-            FindOrInsertExecutorGroup(group, new_executor_groups)
-                ->RemoveExecutor(be_desc);
+            RemoveExecutorAndGroup(be_desc, group, new_executor_groups);
           }
         }
       }
@@ -352,15 +401,18 @@ void ClusterMembershipMgr::UpdateMembership(
   if (NeedsLocalBackendUpdate(*new_state, local_be_desc)) {
     // We need to update both the new membership state and the statestore
     (*new_backend_map)[local_backend_id_] = *local_be_desc;
-    for (const auto& group : local_be_desc->executor_groups()) {
-      if (local_be_desc->is_quiescing()) {
-        VLOG(1) << "Removing local backend from group " << group.DebugString();
-        FindOrInsertExecutorGroup(
-            group, new_executor_groups)->RemoveExecutor(*local_be_desc);
-      } else if (local_be_desc->is_executor()) {
-        VLOG(1) << "Adding local backend to group " << group.DebugString();
-        FindOrInsertExecutorGroup(
-            group, new_executor_groups)->AddExecutor(*local_be_desc);
+    // Could be a coordinator and/or executor, but only executors add the local backend.
+    DCHECK(local_be_desc->is_coordinator() || local_be_desc->is_executor());
+    if (local_be_desc->is_executor()) {
+      for (const auto& group : local_be_desc->executor_groups()) {
+        if (local_be_desc->is_quiescing()) {
+          VLOG(1) << "Removing local backend from group " << group.DebugString();
+          RemoveExecutorAndGroup(*local_be_desc, group, new_executor_groups);
+        } else {
+          VLOG(1) << "Adding local backend to group " << group.DebugString();
+          FindOrInsertExecutorGroup(
+              group, new_executor_groups)->AddExecutor(*local_be_desc);
+        }
       }
     }
     AddLocalBackendToStatestore(*local_be_desc, subscriber_topic_updates);
@@ -445,7 +497,7 @@ void ClusterMembershipMgr::BlacklistExecutor(
   for (const auto& group : be_desc.executor_groups()) {
     VLOG(1) << "Removing backend " << be_desc.address() << " from group "
             << group.DebugString() << " (blacklisted)";
-    FindOrInsertExecutorGroup(group, new_executor_groups)->RemoveExecutor(be_desc);
+    RemoveExecutorAndGroup(be_desc, group, new_executor_groups);
   }
 
   ExecutorBlacklist* new_blacklist = &(new_state->executor_blacklist);
@@ -482,7 +534,7 @@ void ClusterMembershipMgr::AddLocalBackendToStatestore(
 
   subscriber_topic_updates->emplace_back(TTopicDelta());
   TTopicDelta& update = subscriber_topic_updates->back();
-  update.topic_name = Statestore::IMPALA_MEMBERSHIP_TOPIC;
+  update.topic_name = membership_topic_name_;
   update.topic_entries.emplace_back(TTopicItem());
   // Setting this flag allows us to pass the resulting topic update to other
   // ClusterMembershipMgr instances in tests unmodified.
@@ -503,9 +555,9 @@ ClusterMembershipMgr::BeDescSharedPtr ClusterMembershipMgr::GetLocalBackendDescr
   return local_be_desc_fn_ ? local_be_desc_fn_() : nullptr;
 }
 
-void ClusterMembershipMgr::NotifyListeners(SnapshotPtr snapshot) {
+void ClusterMembershipMgr::NotifyListeners(const SnapshotPtr& snapshot) {
   lock_guard<mutex> l(callback_fn_lock_);
-  for (auto fn : update_callback_fns_) fn(snapshot);
+  for (const auto& fn : update_callback_fns_) fn(snapshot);
 }
 
 void ClusterMembershipMgr::SetState(const SnapshotPtr& new_state) {
@@ -636,7 +688,7 @@ bool ClusterMembershipMgr::IsBackendInExecutorGroups(
 /// executor groups, we assume that we will read data remotely and will only send the
 /// number of executors in the largest healthy group. When expected exec group sets are
 /// specified we apply the aforementioned steps for each group set.
-void PopulateExecutorMembershipRequest(ClusterMembershipMgr::SnapshotPtr& snapshot,
+void PopulateExecutorMembershipRequest(const ClusterMembershipMgr::SnapshotPtr& snapshot,
     const vector<TExecutorGroupSet>& expected_exec_group_sets,
     TUpdateExecutorMembershipRequest& update_req) {
   vector<TExecutorGroupSet> exec_group_sets;
@@ -683,6 +735,7 @@ void PopulateExecutorMembershipRequest(ClusterMembershipMgr::SnapshotPtr& snapsh
     }
     if (matching_exec_groups_found != snapshot->executor_groups.size()) {
       vector<string> group_sets;
+      group_sets.reserve(exec_group_sets.size());
       for (const auto& set : exec_group_sets) {
         group_sets.push_back(set.exec_group_name_prefix);
       }

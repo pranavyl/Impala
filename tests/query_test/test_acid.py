@@ -17,16 +17,15 @@
 
 # Functional tests for ACID integration with Hive.
 
+from __future__ import absolute_import, division, print_function
 import os
 import pytest
 import time
 
-from hive_metastore.ttypes import CommitTxnRequest, OpenTxnRequest
+from hive_metastore.ttypes import CommitTxnRequest, LockType, OpenTxnRequest
 from subprocess import check_call
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import (SkipIf, SkipIfHive2, SkipIfCatalogV2, SkipIfS3, SkipIfABFS,
-                               SkipIfADLS, SkipIfIsilon, SkipIfGCS, SkipIfCOS,
-                               SkipIfLocal)
+from tests.common.skip import SkipIf, SkipIfHive2, SkipIfCatalogV2, SkipIfFS
 from tests.common.test_dimensions import create_single_exec_option_dimension
 from tests.util.acid_txn import AcidTxn
 
@@ -46,13 +45,7 @@ class TestAcid(ImpalaTestSuite):
         v.get_value('table_format').file_format in ['text'])
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_basic(self, vector, unique_database):
     self.run_test_case('QueryTest/acid', vector, use_db=unique_database)
 
@@ -65,59 +58,29 @@ class TestAcid(ImpalaTestSuite):
     self.run_test_case('QueryTest/acid-no-hive', vector, use_db=unique_database)
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_compaction(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-compaction', vector, use_db=unique_database)
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_negative(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-negative', vector, use_db=unique_database)
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_truncate(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-truncate', vector, use_db=unique_database)
     assert "0" == self.run_stmt_in_hive("select count(*) from {0}.{1}".format(
         unique_database, "pt")).split("\n")[1]
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_partitioned(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-partitioned', vector, use_db=unique_database)
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_full_acid_scans(self, vector, unique_database):
     self.run_test_case('QueryTest/full-acid-scans', vector, use_db=unique_database)
 
@@ -132,13 +95,7 @@ class TestAcid(ImpalaTestSuite):
   # it can not be shown in the query profile.  Skip CatalogV2 to avoid flaky tests.
   @SkipIfHive2.acid
   @SkipIfCatalogV2.hms_event_polling_enabled()
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_profile(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-profile', vector, use_db=unique_database)
 
@@ -147,13 +104,7 @@ class TestAcid(ImpalaTestSuite):
     self.run_test_case('QueryTest/full-acid-rowid', vector, use_db=unique_database)
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_full_acid_original_files(self, vector, unique_database):
     table_name = "alltypes_promoted_nopart"
     fq_table_name = "{0}.{1}".format(unique_database, table_name)
@@ -171,13 +122,7 @@ class TestAcid(ImpalaTestSuite):
     self.run_test_case('QueryTest/full-acid-original-file', vector, unique_database)
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_insert_statschg(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-clear-statsaccurate',
         vector, use_db=unique_database)
@@ -189,13 +134,7 @@ class TestAcid(ImpalaTestSuite):
         .format(unique_database, "insertonly_part_colstats"))
     assert "2" in result
 
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_ext_statschg(self, vector, unique_database):
     self.run_test_case('QueryTest/clear-statsaccurate',
         vector, use_db=unique_database)
@@ -209,13 +148,7 @@ class TestAcid(ImpalaTestSuite):
     assert "2" in result
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_compute_stats(self, vector, unique_database):
     self.run_test_case('QueryTest/acid-compute-stats', vector, use_db=unique_database)
 
@@ -225,13 +158,7 @@ class TestAcid(ImpalaTestSuite):
 #  Negative test for LOAD DATA INPATH and all other SQL that we don't support.
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_acid_heartbeats(self, vector, unique_database):
     """Tests heartbeating of transactions. Creates a long-running query via
     some jitting and in the meanwhile it periodically checks whether there is
@@ -304,14 +231,48 @@ class TestAcid(ImpalaTestSuite):
     commit_req.txnid = txn_id
     return self.hive_client.commit_txn(commit_req)
 
+  @SkipIfFS.hive
+  def test_lock_timings(self, vector, unique_database):
+    def elapsed_time_for_query(query):
+      t_start = time.time()
+      self.execute_query_expect_failure(self.client, query)
+      return time.time() - t_start
+
+    tbl_name = "test_lock"
+    tbl = "{0}.{1}".format(unique_database, tbl_name)
+    self.execute_query("create table {} (i int) tblproperties"
+        "('transactional'='true',"
+        "'transactional_properties'='insert_only')".format(tbl))
+    acid_util = AcidTxn(self.hive_client)
+    lock_resp = acid_util.lock(0, unique_database, tbl_name, LockType.EXCLUSIVE)
+    try:
+      if self.exploration_strategy() == 'exhaustive':
+        elapsed = elapsed_time_for_query("insert into {} values (1)".format(tbl))
+        assert elapsed > 300 and elapsed < 310
+      self.execute_query("set lock_max_wait_time_s=20")
+      elapsed = elapsed_time_for_query("insert into {} values (1)".format(tbl))
+      assert elapsed > 20 and elapsed < 28
+
+      self.execute_query("set lock_max_wait_time_s=0")
+      elapsed = elapsed_time_for_query("insert into {} values (1)".format(tbl))
+      assert elapsed < 8
+
+      self.execute_query("set lock_max_wait_time_s=10")
+      elapsed = elapsed_time_for_query("insert into {} values (1)".format(tbl))
+      assert elapsed > 10 and elapsed < 18
+
+      self.execute_query("set lock_max_wait_time_s=2")
+      elapsed = elapsed_time_for_query("truncate table {}".format(tbl))
+      assert elapsed > 2 and elapsed < 10
+
+      self.execute_query("set lock_max_wait_time_s=5")
+      elapsed = elapsed_time_for_query("drop table {}".format(tbl))
+      assert elapsed > 5 and elapsed < 13
+    finally:
+      acid_util.unlock(lock_resp.lockid)
+
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_in_progress_compactions(self, vector, unique_database):
     """Checks that in-progress compactions are not visible. The test mimics
     in-progress compactions by opening a transaction and creating a new base
@@ -344,7 +305,7 @@ class TestAcid(ImpalaTestSuite):
     assert len(self.execute_query("select * from {}".format(tbl_name)).data) == 0
 
   @SkipIfHive2.acid
-  @SkipIf.not_hdfs
+  @SkipIf.not_dfs
   def test_full_acid_schema_without_file_metadata_tag(self, vector, unique_database):
     """IMPALA-10115: Some files have full ACID schema without having
     'hive.acid.version' set. We still need to identify such files as full ACID"""
@@ -355,7 +316,7 @@ class TestAcid(ImpalaTestSuite):
     table_uri = self._get_table_location(fq_table_name, vector)
     acid_file = (os.environ['IMPALA_HOME'] +
         "/testdata/data/full_acid_schema_but_no_acid_version.orc")
-    self.hdfs_client.copy_from_local(acid_file, table_uri + "/bucket_00000")
+    self.filesystem_client.copy_from_local(acid_file, table_uri + "/bucket_00000")
     self.execute_query("refresh {}".format(fq_table_name))
     result = self.execute_query("select count(*) from {0}".format(fq_table_name))
     assert "3" in result.data
@@ -385,3 +346,17 @@ class TestAcid(ImpalaTestSuite):
     valid_write_ids = acid_util.get_valid_write_ids(db_name, tbl_name)
     new_write_id = valid_write_ids.tblValidWriteIds[0].writeIdHighWaterMark
     assert new_write_id > orig_write_id
+
+  @SkipIfHive2.acid
+  def test_alloc_write_id_error_handing(self, unique_database):
+    tbl_name = "insert_only_table"
+    self.client.execute("""CREATE TABLE {0}.{1} (i int)
+        TBLPROPERTIES('transactional'='true', 'transactional_properties'='insert_only')
+        """.format(unique_database, tbl_name))
+    self.execute_query_expect_failure(
+        self.client,
+        "INSERT INTO {0}.{1} VALUES (0), (1), (2)".format(unique_database, tbl_name),
+        {"debug_action": "catalogd_update_catalog_abort_txn"})
+    # Create a new table and load it in catalogd. Catalogd should not hang.
+    self.client.execute("CREATE TABLE {0}.tbl (i int)".format(unique_database))
+    self.client.execute("DESCRIBE {0}.tbl".format(unique_database))

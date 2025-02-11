@@ -106,6 +106,12 @@ message MinMaxFilterPB {
   optional ColumnValuePB max = 4;
 }
 
+message InListFilterPB {
+  optional bool always_true = 1;
+  optional bool contains_null = 2;
+  repeated ColumnValuePB value = 3;
+}
+
 message UpdateFilterParamsPB {
   // Filter ID, unique within a query.
   optional int32 filter_id = 1;
@@ -116,6 +122,11 @@ message UpdateFilterParamsPB {
   optional BloomFilterPB bloom_filter = 3;
 
   optional MinMaxFilterPB min_max_filter = 4;
+
+  optional InListFilterPB in_list_filter = 5;
+
+  // Remaining filter wait time as understood by sender.
+  optional int32 remaining_filter_wait_time_ms = 6;
 }
 
 message UpdateFilterResultPB {
@@ -137,6 +148,9 @@ message PublishFilterParamsPB {
 
   // Actual min_max_filter payload
   optional MinMaxFilterPB min_max_filter = 4;
+
+  // Actual in_list_filter payload
+  optional InListFilterPB in_list_filter = 5;
 }
 
 message PublishFilterResultPB {
@@ -162,6 +176,10 @@ service DataStreamService {
   // Called by fragment instances that produce local runtime filters to deliver them to
   // the coordinator for aggregation and broadcast.
   rpc UpdateFilter(UpdateFilterParamsPB) returns (UpdateFilterResultPB);
+
+  // Called by fragment instances that produce local runtime filters to deliver them to
+  // the aggregator backend for intermediate aggregation.
+  rpc UpdateFilterFromRemote(UpdateFilterParamsPB) returns (UpdateFilterResultPB);
 
   // Called by the coordinator to deliver global runtime filters to fragments for
   // application at plan nodes.

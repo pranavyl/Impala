@@ -20,23 +20,18 @@
 #include "service/impala-server.inline.h"
 
 #include <algorithm>
-#include <type_traits>
 
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/join.hpp>
 #include <boost/bind.hpp>
-#include <boost/date_time/posix_time/posix_time_types.hpp>
 #include <boost/unordered_set.hpp>
-#include <jni.h>
 #include <gperftools/heap-profiler.h>
 #include <gperftools/malloc_extension.h>
 #include <gtest/gtest.h>
 #include <gutil/strings/substitute.h>
-#include <thrift/protocol/TDebugProtocol.h>
 
 #include "common/logging.h"
 #include "common/version.h"
-#include "rpc/thrift-util.h"
 #include "runtime/coordinator.h"
 #include "runtime/exec-env.h"
 #include "runtime/raw-value.h"
@@ -74,12 +69,19 @@ const TProtocolVersion::type MAX_SUPPORTED_HS2_VERSION =
     TProtocolVersion::HIVE_CLI_SERVICE_PROTOCOL_V6;
 
 // HiveServer2 error returning macro
-#define HS2_RETURN_ERROR(return_val, error_msg, error_state) \
-  do { \
-    return_val.status.__set_statusCode(thrift::TStatusCode::ERROR_STATUS); \
-    return_val.status.__set_errorMessage((error_msg)); \
-    return_val.status.__set_sqlState((error_state)); \
-    return; \
+//
+// To include query id in the error message, it is required that the query id of the
+// thread debug info is set in at least the caller's scope.
+#define HS2_RETURN_ERROR(return_val, error_msg, error_state)                \
+  do {                                                                      \
+    return_val.status.__set_statusCode(thrift::TStatusCode::ERROR_STATUS);  \
+    return_val.status.__set_errorMessage(                                   \
+        GetThreadDebugInfo()->GetQueryId() == TUniqueId() ?                 \
+            (error_msg) :                                                   \
+            Substitute(ImpalaServer::QUERY_ERROR_FORMAT,                    \
+                PrintId(GetThreadDebugInfo()->GetQueryId()), (error_msg))); \
+    return_val.status.__set_sqlState((error_state));                        \
+    return;                                                                 \
   } while (false)
 
 #define HS2_RETURN_IF_ERROR(return_val, status, error_state) \
@@ -96,12 +98,17 @@ DECLARE_string(hostname);
 DECLARE_int32(webserver_port);
 DECLARE_int32(idle_session_timeout);
 DECLARE_int32(disconnected_session_timeout);
+DECLARE_int32(max_hs2_sessions_per_user);
 DECLARE_bool(ping_expose_webserver_url);
 DECLARE_string(anonymous_user_name);
 
 namespace impala {
 
 const string IMPALA_RESULT_CACHING_OPT = "impala.resultset.cache.size";
+
+const string SET_HIVECONF_PREFIX = "set:hiveconf:";
+
+const int SET_HIVECONF_PREFIX_LEN = SET_HIVECONF_PREFIX.length();
 
 void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
     TMetadataOpRequest* request, TOperationHandle* handle, thrift::TStatus* status) {
@@ -145,15 +152,20 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
   // from an RPC. As a best effort, we use the type of the operation.
   map<int, const char*>::const_iterator query_text_it =
       _TMetadataOpcode_VALUES_TO_NAMES.find(request->opcode);
-  const string& query_text = query_text_it == _TMetadataOpcode_VALUES_TO_NAMES.end() ?
-      "N/A" : query_text_it->second;
-  query_ctx.client_request.stmt = query_text;
+  if (query_text_it == _TMetadataOpcode_VALUES_TO_NAMES.end()) {
+    query_ctx.client_request.stmt = "N/A";
+  } else {
+    query_ctx.client_request.stmt = query_text_it->second;
+    query_ctx.client_request.__set_hs2_metadata_op(true);
+  }
+
   QueryHandle query_handle;
   QueryDriver::CreateNewDriver(this, &query_handle, query_ctx, session);
   Status register_status = RegisterQuery(query_ctx.query_id, session, &query_handle);
   if (!register_status.ok()) {
     status->__set_statusCode(thrift::TStatusCode::ERROR_STATUS);
-    status->__set_errorMessage(register_status.GetDetail());
+    status->__set_errorMessage(Substitute(
+        QUERY_ERROR_FORMAT, PrintId(query_ctx.query_id), register_status.GetDetail()));
     status->__set_sqlState(SQLSTATE_GENERAL_ERROR);
     return;
   }
@@ -162,7 +174,8 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
   if (!exec_status.ok()) {
     discard_result(UnregisterQuery(query_handle->query_id(), false, &exec_status));
     status->__set_statusCode(thrift::TStatusCode::ERROR_STATUS);
-    status->__set_errorMessage(exec_status.GetDetail());
+    status->__set_errorMessage(Substitute(
+        QUERY_ERROR_FORMAT, PrintId(query_handle->query_id()), exec_status.GetDetail()));
     status->__set_sqlState(SQLSTATE_GENERAL_ERROR);
     return;
   }
@@ -173,7 +186,8 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
   if (!inflight_status.ok()) {
     discard_result(UnregisterQuery(query_handle->query_id(), false, &inflight_status));
     status->__set_statusCode(thrift::TStatusCode::ERROR_STATUS);
-    status->__set_errorMessage(inflight_status.GetDetail());
+    status->__set_errorMessage(Substitute(QUERY_ERROR_FORMAT,
+        PrintId(query_handle->query_id()), inflight_status.GetDetail()));
     status->__set_sqlState(SQLSTATE_GENERAL_ERROR);
     return;
   }
@@ -184,7 +198,7 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
   status->__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
 }
 
-Status ImpalaServer::FetchInternal(TUniqueId query_id, SessionState* session,
+Status ImpalaServer::FetchInternal(const TUniqueId& query_id, SessionState* session,
     int32_t fetch_size, bool fetch_first, TFetchResultsResp* fetch_results,
     int32_t* num_results) {
   bool timed_out = false;
@@ -199,8 +213,11 @@ Status ImpalaServer::FetchInternal(TUniqueId query_id, SessionState* session,
     return Status::OK();
   }
 
+  int64_t start_time_ns = MonotonicNanos();
   lock_guard<mutex> frl(*query_handle->fetch_rows_lock());
   lock_guard<mutex> l(*query_handle->lock());
+  int64_t lock_wait_time_ns = MonotonicNanos() - start_time_ns;
+  query_handle->AddClientFetchLockWaitTime(lock_wait_time_ns);
 
   // Check for cancellation or an error.
   RETURN_IF_ERROR(query_handle->query_status());
@@ -218,8 +235,16 @@ Status ImpalaServer::FetchInternal(TUniqueId query_id, SessionState* session,
   bool is_child_query = query_handle->parent_query_id() != TUniqueId();
   TProtocolVersion::type version = is_child_query ?
       TProtocolVersion::HIVE_CLI_SERVICE_PROTOCOL_V1 : session->hs2_version;
+
+  // In the first fetch, expect 0 results to avoid reserving unnecessarily large result
+  // vectors for small queries. If there are more fetches (so there are more rows than
+  // num_rows_fetched), then expect subsequent fetches to be fully filled.
+  int expected_result_count = query_handle->num_rows_fetched() == 0 ? 0
+      : fetch_size;
+
   scoped_ptr<QueryResultSet> result_set(QueryResultSet::CreateHS2ResultSet(
-      version, *(query_handle->result_metadata()), &(fetch_results->results)));
+      version, *(query_handle->result_metadata()), &(fetch_results->results),
+      query_handle->query_options().stringify_map_keys, expected_result_count));
   RETURN_IF_ERROR(
       query_handle->FetchRows(fetch_size, result_set.get(), block_on_wait_time_us));
   *num_results = result_set->size();
@@ -318,6 +343,7 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
     state->session_type = TSessionType::HIVESERVER2;
   }
   state->network_address = ThriftServer::GetThreadConnectionContext()->network_address;
+  state->http_origin = ThriftServer::GetThreadConnectionContext()->http_origin;
   state->last_accessed_ms = UnixMillis();
   // request.client_protocol is not guaranteed to be a valid TProtocolVersion::type, so
   // loading it can cause undefined behavior. Instead, we copy it to a value of the
@@ -342,6 +368,11 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
   } else {
     state->connected_user = FLAGS_anonymous_user_name;
   }
+  // Set the 'connected_user_short' member in the SessionState. This is only used if
+  // the 'connected_user' is a kerberos principal.
+  if (!connection_context->kerberos_user_short.empty()) {
+    state->connected_user_short = connection_context->kerberos_user_short;
+  }
 
   // Process the supplied configuration map.
   state->database = "default";
@@ -354,17 +385,24 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
         // If the current user is a valid proxy user, he/she can optionally perform
         // authorization requests on behalf of another user. This is done by setting
         // the 'impala.doas.user' Hive Server 2 configuration property.
+        // Note: The 'impala.doas.user' configuration overrides the user specified
+        // in the 'doAs' request parameter, which can be specified for hs2-http transport.
         state->do_as_user = v.second;
         Status status = AuthorizeProxyUser(state->connected_user, state->do_as_user);
         HS2_RETURN_IF_ERROR(return_val, status, SQLSTATE_GENERAL_ERROR);
       } else if (iequals(v.first, "use:database")) {
         state->database = v.second;
       } else {
+        string key = v.first, value = v.second;
+        // Hive JDBC will add a prefix to the configuration, see IMPALA-11992
+        if (key.rfind(SET_HIVECONF_PREFIX, 0) != string::npos) {
+          key = key.substr(SET_HIVECONF_PREFIX_LEN);
+        }
         // Normal configuration key. Use it to set session default query options.
         // Ignore failure (failures will be logged in SetQueryOption()).
-        Status status = SetQueryOption(v.first, v.second, &state->set_query_options,
+        Status status = SetQueryOption(key, value, &state->set_query_options,
             &state->set_query_options_mask);
-        if (status.ok() && iequals(v.first, "idle_session_timeout")) {
+        if (status.ok() && iequals(key, "idle_session_timeout")) {
           state->session_timeout = state->set_query_options.idle_session_timeout;
           VLOG_QUERY << "OpenSession(): session: " << PrintId(session_id)
                      << " idle_session_timeout="
@@ -377,13 +415,36 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
   // If the connected user is an authorized proxy user, we were not able to check the LDAP
   // filters when the connection was created because we didn't know what the effective
   // user would be yet, so check now.
+  // When no 'doAs' user is specified and Kerberos authentication is enabled, then the
+  // connected user is a Kerberos user principal and that will certainly not pass the
+  // LDAP checks, so in this case the LDAP filters will be checked with the short username
+  // derived from the Kerberos user principal.
   if (FLAGS_enable_ldap_auth && IsAuthorizedProxyUser(state->connected_user)) {
+    string username_for_ldap_filters = GetEffectiveUser(*state);
+    if (state->do_as_user.empty() &&
+        !connection_context->kerberos_user_principal.empty()) {
+
+      string short_username = GetShortUsernameFromKerberosPrincipal(
+        connection_context->kerberos_user_principal);
+      VLOG(1) << "No doAs user is specified and Kerberos authentication is enabled, "
+              << "the authenticated user principal is \""
+              << connection_context->kerberos_user_principal << "\". "
+              << "LDAP filters will be checked using the short username \""
+              << short_username << "\", which is extracted from the user principal.";
+      username_for_ldap_filters = short_username;
+    }
+
     bool success =
-        AuthManager::GetInstance()->GetLdap()->LdapCheckFilters(GetEffectiveUser(*state));
+      AuthManager::GetInstance()->GetLdap()->LdapCheckFilters(username_for_ldap_filters);
     if (!success) {
       HS2_RETURN_ERROR(return_val, "User is not authorized.", SQLSTATE_GENERAL_ERROR);
     }
   }
+
+  Status status = IncrementAndCheckSessionCount(state->connected_user);
+  HS2_RETURN_IF_ERROR(return_val, status, SQLSTATE_GENERAL_ERROR);
+
+  // At this point all checks are complete, store session status information.
 
   RegisterSessionTimeout(state->session_timeout);
   TQueryOptionsToMap(state->QueryOptions(), &return_val.configuration);
@@ -412,7 +473,60 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
   return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
   return_val.serverProtocolVersion = state->hs2_version;
   VLOG_QUERY << "Opened session: " << PrintId(session_id)
-             << " effective username: " << GetEffectiveUser(*state);
+             << ", effective username: " << GetEffectiveUser(*state)
+             << ", client address: "
+             << "<" << TNetworkAddressToString(state->network_address) << ">.";
+}
+
+int64_t ImpalaServer::DecrementCount(
+    std::map<std::string, int64_t>& loads, const std::string& key) {
+  // Check if key is present as dereferencing the map will insert it.
+  // FIXME C++20: use contains().
+  if (!loads.count(key)) {
+    string msg = Substitute("Missing key $0 when decrementing count", key);
+    LOG(WARNING) << msg;
+    DCHECK(false) << msg;
+    return 0;
+  }
+  int64_t& current_value = loads[key];
+  if (current_value == 1) {
+    // Remove the entry from the map if the current_value will go to zero.
+    loads.erase(key);
+    return 0;
+  }
+  if (current_value < 1) {
+    // Don't allow decrement below zero.
+    string msg = Substitute("Attempt to decrement below zero with key $0 ", key);
+    LOG(WARNING) << msg;
+    return 0;
+  }
+  return --loads[key];
+}
+
+void ImpalaServer::DecrementSessionCount(const string& user_name) {
+  if (FLAGS_max_hs2_sessions_per_user > 0) {
+    lock_guard<mutex> l(per_user_session_count_lock_);
+    DecrementCount(per_user_session_count_map_, user_name);
+  }
+}
+
+Status ImpalaServer::IncrementAndCheckSessionCount(const string& user_name) {
+  if (FLAGS_max_hs2_sessions_per_user > 0) {
+    lock_guard<mutex> l(per_user_session_count_lock_);
+    // Only check user limit if there is already a session for the user.
+    if (per_user_session_count_map_.count(user_name)) {
+      int64_t load = per_user_session_count_map_[user_name];
+      if (load >= FLAGS_max_hs2_sessions_per_user) {
+        const string& err_msg =
+            Substitute("Number of sessions for user $0 exceeds coordinator limit $1",
+                user_name, FLAGS_max_hs2_sessions_per_user);
+        VLOG(1) << err_msg;
+        return Status::Expected(err_msg);
+      }
+    }
+    per_user_session_count_map_[user_name]++;
+  }
+  return Status::OK();
 }
 
 void ImpalaServer::CloseSession(TCloseSessionResp& return_val,
@@ -454,8 +568,12 @@ void ImpalaServer::GetInfo(TGetInfoResp& return_val,
       return_val.infoValue.__set_stringValue(GetDaemonBuildVersion());
       break;
     default:
-      HS2_RETURN_ERROR(return_val, "Unsupported operation",
-          SQLSTATE_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
+      return_val.status.__set_statusCode(thrift::TStatusCode::ERROR_STATUS);
+      return_val.status.__set_errorMessage(("Unsupported operation"));
+      return_val.status.__set_sqlState((SQLSTATE_OPTIONAL_FEATURE_NOT_IMPLEMENTED));
+      // 'infoValue' is a required field of TGetInfoResp
+      return_val.infoValue.__set_stringValue("");
+      return;
   }
   return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
 }
@@ -504,6 +622,10 @@ void ImpalaServer::ExecuteStatementCommon(TExecuteStatementResp& return_val,
 
   QueryHandle query_handle;
   status = Execute(&query_ctx, session, &query_handle, external_exec_request);
+
+  // Make query id available to the following HS2_RETURN_IF_ERROR().
+  ScopedThreadContext scoped_tdi(GetThreadDebugInfo(), query_handle->query_id());
+
   HS2_RETURN_IF_ERROR(return_val, status, SQLSTATE_GENERAL_ERROR);
 
   // Start thread to wait for results to become available.
@@ -536,12 +658,13 @@ void ImpalaServer::ExecuteStatementCommon(TExecuteStatementResp& return_val,
 }
 
 Status ImpalaServer::SetupResultsCacheing(const QueryHandle& query_handle,
-    shared_ptr<SessionState> session, int64_t cache_num_rows) {
+    const shared_ptr<SessionState>& session, int64_t cache_num_rows) {
   // Optionally enable result caching on the ClientRequestState.
   if (cache_num_rows > 0) {
     const TResultSetMetadata* result_set_md = query_handle->result_metadata();
     QueryResultSet* result_set =
-        QueryResultSet::CreateHS2ResultSet(session->hs2_version, *result_set_md, nullptr);
+        QueryResultSet::CreateHS2ResultSet(session->hs2_version, *result_set_md, nullptr,
+            query_handle->query_options().stringify_map_keys, 0);
     RETURN_IF_ERROR(query_handle->SetResultCache(result_set, cache_num_rows));
   }
   return Status::OK();
@@ -772,6 +895,9 @@ void ImpalaServer::GetOperationStatus(TGetOperationStatusResp& return_val,
       SQLSTATE_GENERAL_ERROR);
   VLOG_ROW << "GetOperationStatus(): query_id=" << PrintId(query_id);
 
+  // Make query id available to the following HS2_RETURN_IF_ERROR().
+  ScopedThreadContext scoped_tdi(GetThreadDebugInfo(), query_id);
+
   QueryHandle query_handle;
   HS2_RETURN_IF_ERROR(
       return_val, GetActiveQueryHandle(query_id, &query_handle), SQLSTATE_GENERAL_ERROR);
@@ -784,13 +910,18 @@ void ImpalaServer::GetOperationStatus(TGetOperationStatusResp& return_val,
           session_id, SecretArg::Operation(op_secret, query_id), &session),
       SQLSTATE_GENERAL_ERROR);
 
+  // When using long polling, this waits up to long_polling_time_ms milliseconds for
+  // query completion.polling
+  query_handle->WaitForCompletionExecState();
+
   {
     lock_guard<mutex> l(*query_handle->lock());
     TOperationState::type operation_state = query_handle->TOperationState();
     return_val.__set_operationState(operation_state);
     if (operation_state == TOperationState::ERROR_STATE) {
       DCHECK(!query_handle->query_status().ok());
-      return_val.__set_errorMessage(query_handle->query_status().GetDetail());
+      return_val.__set_errorMessage(Substitute(QUERY_ERROR_FORMAT,
+          PrintId(query_id), query_handle->query_status().GetDetail()));
       return_val.__set_sqlState(SQLSTATE_GENERAL_ERROR);
     } else {
       ClientRequestState::RetryState retry_state = query_handle->retry_state();
@@ -810,6 +941,9 @@ void ImpalaServer::CancelOperation(TCancelOperationResp& return_val,
       request.operationHandle.operationId, &query_id, &op_secret),
       SQLSTATE_GENERAL_ERROR);
   VLOG_QUERY << "CancelOperation(): query_id=" << PrintId(query_id);
+
+  // Make query id available to the following HS2_RETURN_IF_ERROR().
+  ScopedThreadContext scoped_tdi(GetThreadDebugInfo(), query_id);
 
   QueryHandle query_handle;
   HS2_RETURN_IF_ERROR(
@@ -841,6 +975,9 @@ void ImpalaServer::CloseImpalaOperation(TCloseImpalaOperationResp& return_val,
       request.operationHandle.operationId, &query_id, &op_secret),
       SQLSTATE_GENERAL_ERROR);
   VLOG_QUERY << "CloseOperation(): query_id=" << PrintId(query_id);
+
+  // Make query id available to the following HS2_RETURN_IF_ERROR().
+  ScopedThreadContext scoped_tdi(GetThreadDebugInfo(), query_id);
 
   QueryHandle query_handle;
   HS2_RETURN_IF_ERROR(
@@ -874,6 +1011,9 @@ void ImpalaServer::GetResultSetMetadata(TGetResultSetMetadataResp& return_val,
       SQLSTATE_GENERAL_ERROR);
   VLOG_QUERY << "GetResultSetMetadata(): query_id=" << PrintId(query_id);
 
+  // Make query id available to the following HS2_RETURN_IF_ERROR().
+  ScopedThreadContext scoped_tdi(GetThreadDebugInfo(), query_id);
+
   QueryHandle query_handle;
   HS2_RETURN_IF_ERROR(
       return_val, GetActiveQueryHandle(query_id, &query_handle), SQLSTATE_GENERAL_ERROR);
@@ -897,8 +1037,8 @@ void ImpalaServer::GetResultSetMetadata(TGetResultSetMetadataResp& return_val,
             result_set_md->columns[i].columnName);
         return_val.schema.columns[i].position = i;
         return_val.schema.columns[i].typeDesc.types.resize(1);
-        ColumnType t = ColumnType::FromThrift(result_set_md->columns[i].columnType);
-        return_val.schema.columns[i].typeDesc.types[0] = t.ToHs2Type();
+        return_val.schema.columns[i].typeDesc.types[0] =
+            ColumnToHs2Type(result_set_md->columns[i].columnType);
       }
     }
   }
@@ -925,6 +1065,8 @@ void ImpalaServer::FetchResults(TFetchResultsResp& return_val,
   VLOG_ROW << "FetchResults(): query_id=" << PrintId(query_id)
            << " fetch_size=" << request.maxRows;
 
+  // Make query id available to the following HS2_RETURN_IF_ERROR().
+  ScopedThreadContext scoped_tdi(GetThreadDebugInfo(), query_id);
 
   QueryHandle query_handle;
   HS2_RETURN_IF_ERROR(
@@ -969,6 +1111,8 @@ void ImpalaServer::GetLog(TGetLogResp& return_val, const TGetLogReq& request) {
       request.operationHandle.operationId, &query_id, &op_secret),
       SQLSTATE_GENERAL_ERROR);
 
+  // Make query id available to the following HS2_RETURN_IF_ERROR().
+  ScopedThreadContext scoped_tdi(GetThreadDebugInfo(), query_id);
 
   QueryHandle query_handle;
   HS2_RETURN_IF_ERROR(
@@ -986,13 +1130,17 @@ void ImpalaServer::GetLog(TGetLogResp& return_val, const TGetLogReq& request) {
   Coordinator* coord = query_handle->GetCoordinator();
   if (coord != nullptr) {
     // Report progress
-    ss << coord->progress().ToString() << "\n";
+    ss << coord->scan_progress().ToString() << "\n";
   }
   // Report the query status, if the query failed or has been retried.
   if (query_handle->IsRetriedQuery()) {
     QueryHandle original_query_handle;
-    HS2_RETURN_IF_ERROR(return_val, GetQueryHandle(query_id, &original_query_handle),
-        SQLSTATE_GENERAL_ERROR);
+    Status status = GetQueryHandle(query_id, &original_query_handle);
+    if (UNLIKELY(!status.ok())) {
+      VLOG(1) << "Error in GetLog, could not get query handle: " << status.GetDetail();
+      HS2_RETURN_ERROR(return_val, status.GetDetail(), SQLSTATE_GENERAL_ERROR);
+      return;
+    }
     DCHECK(!original_query_handle->query_status().ok());
     ss << Substitute(GET_LOG_QUERY_RETRY_INFO_FORMAT,
         original_query_handle->query_status().GetDetail(),
@@ -1006,7 +1154,10 @@ void ImpalaServer::GetLog(TGetLogResp& return_val, const TGetLogReq& request) {
     DCHECK_EQ(query_handle->exec_state() == ClientRequestState::ExecState::ERROR,
         !query_status.ok());
     // If the query status is !ok, include the status error message at the top of the log.
-    if (!query_status.ok()) ss << query_status.GetDetail();
+    if (!query_status.ok()) {
+      ss << Substitute(QUERY_ERROR_FORMAT, PrintId(query_handle->query_id()),
+          query_status.GetDetail());
+    }
   }
 
   // Report analysis errors
@@ -1058,6 +1209,11 @@ void ImpalaServer::GetExecSummary(TGetExecSummaryResp& return_val,
       THandleIdentifierToTUniqueId(
           request.operationHandle.operationId, &query_id, &op_secret),
       SQLSTATE_GENERAL_ERROR);
+
+  VLOG_QUERY << "GetExecSummary(): query_id=" << PrintId(query_id);
+
+  // Make query id available to the following HS2_RETURN_IF_ERROR().
+  ScopedThreadContext scoped_tdi(GetThreadDebugInfo(), query_id);
 
   TExecSummary summary;
   TExecSummary original_summary;
@@ -1143,7 +1299,10 @@ void ImpalaServer::GetRuntimeProfile(
       request.operationHandle.operationId, &query_id, &op_secret),
       SQLSTATE_GENERAL_ERROR);
 
-  VLOG_RPC << "GetRuntimeProfile(): query_id=" << PrintId(query_id);
+  VLOG_QUERY << "GetRuntimeProfile(): query_id=" << PrintId(query_id);
+
+  // Make query id available to the following HS2_RETURN_IF_ERROR().
+  ScopedThreadContext scoped_tdi(GetThreadDebugInfo(), query_id);
 
   // Set the RuntimeProfileOutput for the retried query (e.g. the second attempt of a
   // query). If the query has been retried this will be the retried profile. If the

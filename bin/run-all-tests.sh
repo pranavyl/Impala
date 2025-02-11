@@ -28,9 +28,18 @@ setup_report_build_error
 # Allow picking up strategy from environment
 : ${EXPLORATION_STRATEGY:=core}
 : ${NUM_TEST_ITERATIONS:=1}
-: ${MAX_PYTEST_FAILURES:=10}
+: ${MAX_PYTEST_FAILURES:=100}
 : ${TIMEOUT_FOR_RUN_ALL_TESTS_MINS:=1200}
 KERB_ARGS=""
+
+# Use a different JDK for testing. Picked up by impala-config and start-impala-cluster.
+if [ ! -z "${TEST_JAVA_HOME_OVERRIDE:-}" ]; then
+  export MINICLUSTER_JAVA_HOME="${JAVA_HOME}"
+  export IMPALA_JAVA_HOME_OVERRIDE="${TEST_JAVA_HOME_OVERRIDE}"
+elif [ ! -z "${TEST_JDK_VERSION:-}" ]; then
+  export MINICLUSTER_JAVA_HOME="${JAVA_HOME}"
+  export IMPALA_JDK_VERSION="${TEST_JDK_VERSION}"
+fi
 
 . "${IMPALA_HOME}/bin/impala-config.sh" > /dev/null 2>&1
 . "${IMPALA_HOME}/testdata/bin/run-step.sh"
@@ -51,6 +60,13 @@ fi
 : ${JDBC_TEST:=true}
 # Run Cluster Tests
 : ${CLUSTER_TEST:=true}
+: ${CLUSTER_TEST_FILES:=}
+# Run JS tests
+: ${JS_TEST:=false}
+# Verifiers to run after all tests. Skipped if true.
+: ${SKIP_VERIFIERS:=false}
+: ${TEST_SUITE_VERIFIERS:=verifiers/test_banned_log_messages.py}
+: ${TEST_SUITE_VERIFIERS_LOG_DIR:=${IMPALA_LOGS_DIR}/verifiers}
 # Extra arguments passed to start-impala-cluster for tests. These do not apply to custom
 # cluster tests.
 : ${TEST_START_CLUSTER_ARGS:=}
@@ -64,6 +80,14 @@ fi
 : ${DATA_CACHE_SIZE:=}
 # Data cache eviction policy
 : ${DATA_CACHE_EVICTION_POLICY:=}
+# Number of data cache async write threads.
+: ${DATA_CACHE_NUM_ASYNC_WRITE_THREADS:=}
+# Tuple cache root directory location.
+: ${TUPLE_CACHE_DIR:=}
+# Tuple cache capacity.
+: ${TUPLE_CACHE_CAPACITY:=}
+# Tuple cache debug dump directory location.
+: ${TUPLE_CACHE_DEBUG_DUMP_DIR:=}
 if [[ "${TARGET_FILESYSTEM}" == "local" ]]; then
   # TODO: Remove abort_on_config_error flag from here and create-load-data.sh once
   # checkConfiguration() accepts the local filesystem (see IMPALA-1850).
@@ -82,6 +106,10 @@ if [[ -n "${DATA_CACHE_DIR}" && -n "${DATA_CACHE_SIZE}" ]]; then
        TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} "`
            `"--data_cache_eviction_policy=${DATA_CACHE_EVICTION_POLICY}"
    fi
+   if [[ -n "${DATA_CACHE_NUM_ASYNC_WRITE_THREADS}" ]]; then
+       TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} "`
+           `"--data_cache_num_async_write_threads=${DATA_CACHE_NUM_ASYNC_WRITE_THREADS}"
+   fi
    # Force use of data cache for HDFS. Data cache is only enabled for remote reads.
    if [[ "${TARGET_FILESYSTEM}" == "hdfs" ]]; then
       TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} "`
@@ -89,12 +117,31 @@ if [[ -n "${DATA_CACHE_DIR}" && -n "${DATA_CACHE_SIZE}" ]]; then
    fi
 fi
 
+# Enable tuple cache if configured.
+if [[ -n "${TUPLE_CACHE_DIR}" && -n "${TUPLE_CACHE_CAPACITY}" ]]; then
+   TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} "`
+       `"--tuple_cache_dir=${TUPLE_CACHE_DIR} "
+   TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} "`
+       `"--tuple_cache_capacity=${TUPLE_CACHE_CAPACITY} "
+   if [[ -n "${TUPLE_CACHE_DEBUG_DUMP_DIR}" ]]; then
+       TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} "`
+           `"--tuple_cache_debug_dump_dir=${TUPLE_CACHE_DEBUG_DUMP_DIR}"
+   fi
+fi
+
 if [[ "${ERASURE_CODING}" = true ]]; then
   # We do not run FE tests when erasure coding is enabled because planner tests
   # would fail.
   FE_TEST=false
-  TEST_START_CLUSTER_ARGS="${TEST_START_CLUSTER_ARGS} \
-    --impalad_args=--default_query_options=allow_erasure_coded_files=true"
+fi
+
+if test -v CMAKE_BUILD_TYPE && [[ "${CMAKE_BUILD_TYPE}" =~ 'UBSAN' ]] \
+    && [[ "$(uname -p)" = "aarch64" ]]; then
+  # FE tests fail on ARM with
+  #   libfesupport.so: cannot allocate memory in static TLS block
+  # https://bugzilla.redhat.com/show_bug.cgi?id=1722181 mentions this is more likely
+  # on aarch64 due to how it uses thread-local storage (TLS). There's no clear fix.
+  FE_TEST=false
 fi
 
 # Indicates whether code coverage reports should be generated.
@@ -147,11 +194,18 @@ TIMEOUT_PID=$!
 COMMON_PYTEST_ARGS="--maxfail=${MAX_PYTEST_FAILURES} --exploration_strategy=core"`
     `" --workload_exploration_strategy="`
         `"functional-query:${EXPLORATION_STRATEGY},"`
-        `"targeted-stress:${EXPLORATION_STRATEGY}"
+        `"targeted-stress:${EXPLORATION_STRATEGY},"`
+        `"tpcds-insert:${EXPLORATION_STRATEGY}"
 if [[ "${EXPLORATION_STRATEGY}" == "core" ]]; then
   # Skip the stress test in core - all stress tests are in exhaustive and
   # pytest startup takes a significant amount of time.
   RUN_TESTS_ARGS+=" --skip-stress"
+fi
+
+if [[ "$SKIP_VERIFIERS" == true ]]; then
+  # Skip verifiers.
+  TEST_SUITE_VERIFIERS=""
+  RUN_TESTS_ARGS+=" --skip-verifiers"
 fi
 
 if [[ "${TARGET_FILESYSTEM}" == "local" ]]; then
@@ -192,12 +246,23 @@ run_ee_tests() {
 
 for i in $(seq 1 $NUM_TEST_ITERATIONS)
 do
+  echo "Test iteration $i"
   TEST_RET_CODE=0
 
   # Store a list of the files at the beginning of each iteration.
-  hdfs dfs -ls -R /test-warehouse > ${IMPALA_LOGS_DIR}/file-list-begin-${i}.log 2>&1
+  hdfs dfs -ls -R ${FILESYSTEM_PREFIX}/test-warehouse \
+      > ${IMPALA_LOGS_DIR}/file-list-begin-${i}.log 2>&1
 
-  start_impala_cluster
+  # Try not restarting the cluster to save time. BE, FE, JDBC and EE tests require
+  # running on a cluster with default flags. We just need to restart the cluster when
+  # there are custom-cluster tests which will leave the cluster running with specifit
+  # flags.
+  if [[ "$BE_TEST" == true || "$FE_TEST" == true || "$EE_TEST" == true
+      || "$JDBC_TEST" == true || "$CLUSTER_TEST" == true ]]; then
+    if [[ $i == 1 || "$CLUSTER_TEST" == true ]]; then
+      start_impala_cluster
+    fi
+  fi
 
   if [[ "$BE_TEST" == true ]]; then
     if [[ "$TARGET_FILESYSTEM" == "local" ]]; then
@@ -212,18 +277,58 @@ do
     fi
   fi
 
-  # Run some queries using run-workload to verify run-workload has not been broken.
-  if ! run-step "Run test run-workload" test-run-workload.log \
-      "${IMPALA_HOME}/bin/run-workload.py" -w tpch --num_clients=2 --query_names=TPCH-Q1 \
-      --table_format=text/none --exec_options="disable_codegen:False" ${KERB_ARGS}; then
-    TEST_RET_CODE=1
-  fi
-
   if [[ "$FE_TEST" == true ]]; then
     # Run JUnit frontend tests
     # Requires a running impalad cluster because some tests (such as DataErrorTest and
     # JdbcTest) queries against an impala cluster.
     pushd "${IMPALA_FE_DIR}"
+
+    # Add Jamm as javaagent for CatalogdMetaProviderTest.testWeights
+    JAMM_JAR=$(compgen -G ${IMPALA_HOME}/fe/target/dependency/jamm-*.jar)
+    export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS-} -javaagent:${JAMM_JAR}"
+
+    if $JAVA -version 2>&1 | grep -q -E ' version "(9|[1-9][0-9])\.'; then
+      # If running with Java 9+, add-opens to JAVA_TOOL_OPTIONS for
+      # CatalogdMetaProviderTest.testWeights with ehcache.sizeof.
+      JAVA_OPTIONS=" --add-opens=java.base/java.io=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.lang.invoke=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.lang.module=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.lang.ref=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.lang.reflect=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.lang=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.net=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.nio.charset=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.nio.file.attribute=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.nio=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.security=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.util.concurrent.locks=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.util.concurrent=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.util.jar=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.util.regex=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.util.zip=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/java.util=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/jdk.internal.loader=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/jdk.internal.math=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/jdk.internal.module=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/jdk.internal.perf=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/jdk.internal.platform=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/jdk.internal.platform.cgroupv1=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/jdk.internal.reflect=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/jdk.internal.util.jar=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/sun.net.www.protocol.jar=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=java.base/sun.nio.fs=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=jdk.dynalink/jdk.dynalink.beans=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=jdk.dynalink/jdk.dynalink.linker.support=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=jdk.dynalink/jdk.dynalink.linker=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=jdk.dynalink/jdk.dynalink.support=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=jdk.dynalink/jdk.dynalink=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=jdk.management.jfr/jdk.management.jfr=ALL-UNNAMED"
+      JAVA_OPTIONS+=" --add-opens=jdk.management/com.sun.management.internal=ALL-UNNAMED"
+      export JAVA_TOOL_OPTIONS="$JAVA_OPTIONS ${JAVA_TOOL_OPTIONS-}"
+    fi
+
     MVN_ARGS=""
     if [[ "${TARGET_FILESYSTEM}" == "s3" ]]; then
       # When running against S3, only run the S3 frontend tests.
@@ -281,6 +386,12 @@ do
     fi
   fi
 
+  if [[ "$JS_TEST" == true ]]; then
+    if ! "${IMPALA_HOME}/tests/run-js-tests.sh"; then
+      TEST_RET_CODE=1
+    fi
+  fi
+
   if [[ "$JDBC_TEST" == true ]]; then
     # Run the JDBC tests with background loading disabled. This is interesting because
     # it requires loading missing table metadata.
@@ -314,6 +425,17 @@ do
     export IMPALA_MAX_LOG_FILES="${IMPALA_MAX_LOG_FILES_SAVE}"
   fi
 
+  if [ ! -z "${TEST_SUITE_VERIFIERS}" ]; then
+    mkdir -p "${TEST_SUITE_VERIFIERS_LOG_DIR}"
+    pushd "${IMPALA_HOME}/tests"
+    if ! impala-py.test ${TEST_SUITE_VERIFIERS} \
+        --junitxml=${TEST_SUITE_VERIFIERS_LOG_DIR}/TEST-impala-verifiers.xml \
+        --resultlog=${TEST_SUITE_VERIFIERS_LOG_DIR}/TEST-impala-verifiers.log; then
+      TEST_RET_CODE=1
+    fi
+    popd
+  fi
+
   # Run the process failure tests.
   # Disabled temporarily until we figure out the proper timeouts required to make the test
   # succeed.
@@ -323,14 +445,23 @@ do
   # to the file-list-begin*.log from the beginning of the iteration to see if files
   # are not being cleaned up. This is most useful on the first iteration, when
   # the list of files is from dataload.
-  hdfs dfs -ls -R /test-warehouse > ${IMPALA_LOGS_DIR}/file-list-end-${i}.log 2>&1
-
-  # Finally, kill the spawned timeout process and its child sleep process.
-  # There may not be a sleep process, so ignore failure.
-  pkill -P $TIMEOUT_PID || true
-  kill $TIMEOUT_PID
+  if [[ "${TARGET_FILESYSTEM}" = "ozone" ]]; then
+    # Clean up trash to avoid HDDS-4974 causing the next command to fail.
+    ozone fs -rm -r -skipTrash ${FILESYSTEM_PREFIX}/test-warehouse/.Trash
+  fi
+  hdfs dfs -ls -R ${FILESYSTEM_PREFIX}/test-warehouse \
+      > ${IMPALA_LOGS_DIR}/file-list-end-${i}.log 2>&1
 
   if [[ $TEST_RET_CODE == 1 ]]; then
-    exit $TEST_RET_CODE
+    break
   fi
 done
+
+# Finally, kill the spawned timeout process and its child sleep process.
+# There may not be a sleep process, so ignore failure.
+pkill -P $TIMEOUT_PID || true
+kill $TIMEOUT_PID
+
+if [[ $TEST_RET_CODE == 1 ]]; then
+  exit $TEST_RET_CODE
+fi

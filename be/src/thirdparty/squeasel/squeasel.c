@@ -168,8 +168,12 @@ static const char *http_500_error = "Internal Server Error";
 #ifndef SSL_OP_NO_TLSv1_1
 #define SSL_OP_NO_TLSv1_1 0x10000000U
 #endif
+#ifndef SSL_OP_NO_TLSv1_2
+#define SSL_OP_NO_TLSv1_2 0x08000000U
+#endif
 
 #define OPENSSL_MIN_VERSION_WITH_TLS_1_1 0x10001000L
+#define OPENSSL_MIN_VERSION_WITH_TLS_1_3 0x10101000L
 
 static const char *month_names[] = {
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -230,7 +234,7 @@ enum {
   GLOBAL_PASSWORDS_FILE, INDEX_FILES, ENABLE_KEEP_ALIVE, ACCESS_CONTROL_LIST,
   EXTRA_MIME_TYPES, LISTENING_PORTS, DOCUMENT_ROOT, SSL_CERTIFICATE, SSL_PRIVATE_KEY,
   SSL_PRIVATE_KEY_PASSWORD, SSL_GLOBAL_INIT, NUM_THREADS, RUN_AS_USER, REWRITE,
-  HIDE_FILES, REQUEST_TIMEOUT, SSL_VERSION, SSL_CIPHERS, NUM_OPTIONS
+  HIDE_FILES, REQUEST_TIMEOUT, SSL_VERSION, SSL_CIPHERS, TLS_CIPHERSUITES, NUM_OPTIONS
 };
 
 static const char *config_options[] = {
@@ -264,6 +268,7 @@ static const char *config_options[] = {
   "request_timeout_ms", "30000",
   "ssl_min_version", "tlsv1",
   "ssl_ciphers", NULL,
+  "tls_ciphersuites", NULL,
   NULL
 };
 
@@ -3787,6 +3792,19 @@ static int set_uid_option(struct sq_context *ctx) {
 
 static pthread_mutex_t *ssl_mutexes;
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+// IMPALA-11195: disable TLS/SSL renegotiation. In version 1.0.2 and prior it's
+// possible to use the undocumented SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS flag.
+static void ssl_disable_renegotiation_cb(const SSL *ssl, int where, int ret)
+{
+    (void)ret;
+    if ((where & SSL_CB_HANDSHAKE_DONE) != 0) {
+        // disable renegotiation (CVE-2009-3555)
+        ssl->s3->flags |= SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS;
+    }
+}
+#endif
+
 static int sslize(struct sq_connection *conn, SSL_CTX *s, int (*func)(SSL *)) {
   return (conn->ssl = SSL_new(s)) != NULL &&
     SSL_set_fd(conn->ssl, conn->client.sock) == 1 &&
@@ -3877,6 +3895,12 @@ static int set_ssl_option(struct sq_context *ctx) {
       return 0;
     }
     options |= (SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+  } else if (sq_strcasecmp(ssl_version, "tlsv1.3") == 0) {
+    if (SSLeay() < OPENSSL_MIN_VERSION_WITH_TLS_1_3) {
+      cry(fc(ctx), "Unsupported TLS version: %s", ssl_version);
+      return 0;
+    }
+    options |= (SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 | SSL_OP_NO_TLSv1_2);
   } else {
     cry(fc(ctx), "%s: unknown SSL version: %s", __func__, ssl_version);
     return 0;
@@ -3897,6 +3921,28 @@ static int set_ssl_option(struct sq_context *ctx) {
     cry(fc(ctx), "SSL_CTX_new (server) error: %s", ssl_error());
     return 0;
   }
+
+#if OPENSSL_VERSION_NUMBER > 0x1010007fL
+  // IMPALA-11195: disable TLS/SSL renegotiation.
+  // See https://www.openssl.org/docs/man1.1.0/man3/SSL_set_options.html for
+  // details. SSL_OP_NO_RENEGOTIATION option was back-ported from 1.1.1-dev to
+  // 1.1.0h, so this is a best-effort approach if the binary compiled with
+  // newer as per information in the CHANGES file for
+  // 'Changes between 1.1.0g and 1.1.0h [27 Mar 2018]':
+  //     Note that if an application built against 1.1.0h headers (or above) is
+  //     run using an older version of 1.1.0 (prior to 1.1.0h) then the option
+  //     will be accepted but nothing will happen, i.e. renegotiation will
+  //     not be prevented.
+  options |= SSL_OP_NO_RENEGOTIATION;
+#elif OPENSSL_VERSION_NUMBER < 0x10100000L
+  // IMPALA-11195: disable TLS/SSL renegotiation. In version 1.0.2 and prior it's
+  // possible to use the undocumented SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS flag.
+  // We need to set the flag in the callback 'ssl_disable_renegotiation_cb' after
+  // handshake is done, otherwise the flag would get reset in SSL_accept().
+  SSL_CTX_set_info_callback(ctx->ssl_ctx, ssl_disable_renegotiation_cb);
+#else
+  static_error(false, "Found SSL version that is vulnerable to CVE-2009-3555.");
+#endif
 
   if ((SSL_CTX_set_options(ctx->ssl_ctx, options) & options) != options) {
     cry(fc(ctx), "SSL_CTX_set_options (server) error: could not set options (%d)",
@@ -3921,6 +3967,17 @@ static int set_ssl_option(struct sq_context *ctx) {
 
   if (pem != NULL) {
     (void) SSL_CTX_use_certificate_chain_file(ctx->ssl_ctx, pem);
+  }
+
+  if (ctx->config[TLS_CIPHERSUITES] != NULL) {
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+    // Set TLSv1.3 ciphers.
+    if (SSL_CTX_set_ciphersuites(ctx->ssl_ctx, ctx->config[TLS_CIPHERSUITES]) == 0) {
+      cry(fc(ctx), "SSL_CTX_set_ciphersuites: error setting ciphersuites (%s): %s",
+          ctx->config[TLS_CIPHERSUITES], ssl_error());
+      return 0;
+    }
+#endif
   }
 
   if (ctx->config[SSL_CIPHERS] != NULL) {

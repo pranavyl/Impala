@@ -17,15 +17,11 @@
 #
 # Client tests for SQL statement authorization
 
-import os
+from __future__ import absolute_import, division, print_function
 import pytest
-import tempfile
-import grp
-import re
 import random
-import sys
-import subprocess
-import urllib
+import threading
+import time
 
 from getpass import getuser
 from ImpalaService import ImpalaHiveServer2Service
@@ -34,13 +30,12 @@ from thrift.transport.TSocket import TSocket
 from thrift.transport.TTransport import TBufferedTransport
 from thrift.protocol import TBinaryProtocol
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.file_utils import assert_file_in_dir_contains,\
-    assert_no_files_in_dir_contain
-from tests.common.skip import SkipIf
-
+from tests.common.file_utils import assert_file_in_dir_contains
+from tests.common.test_result_verifier import error_msg_equal
 
 PRIVILEGES = ['all', 'alter', 'drop', 'insert', 'refresh', 'select']
 ADMIN = "admin"
+
 
 class TestAuthorization(CustomClusterTestSuite):
   def setup(self):
@@ -92,13 +87,54 @@ class TestAuthorization(CustomClusterTestSuite):
     return resp
 
   @pytest.mark.execute_serially
-  @CustomClusterTestSuite.with_args("--server_name=server1\
-      --authorization_policy_file=ignored_file",
-      impala_log_dir=tempfile.mkdtemp(prefix="test_deprecated_",
-      dir=os.getenv("LOG_DIR")))
+  @CustomClusterTestSuite.with_args(
+      "--server_name=server1 --authorization_policy_file=ignored_file",
+      impala_log_dir="{deprecated_flags}", tmp_dir_placeholders=['deprecated_flags'],
+      disable_log_buffering=True)
   def test_deprecated_flags(self):
     assert_file_in_dir_contains(self.impala_log_dir, "Ignoring removed flag "
                                                      "authorization_policy_file")
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+    impalad_args="--server-name=server1 --ranger_service_type=hive "
+                 "--ranger_app_id=impala --authorization_provider=ranger "
+                 "--min_privilege_set_for_show_stmts=select",
+    catalogd_args="--server-name=server1 --ranger_service_type=hive "
+                  "--ranger_app_id=impala --authorization_provider=ranger")
+  def test_ranger_show_iceberg_metadata_tables(self, unique_name):
+    unique_db = unique_name + "_db"
+    tbl_name = "ice"
+    full_tbl_name = "{}.{}".format(unique_db, tbl_name)
+    non_existent_suffix = "_a"
+    non_existent_tbl_name = full_tbl_name + non_existent_suffix
+    priv = "select"
+    user = getuser()
+    query = "show metadata tables in {}".format(full_tbl_name)
+    query_non_existent = "show metadata tables in {}".format(non_existent_tbl_name)
+    admin_client = self.create_impala_client()
+    try:
+      admin_client.execute("create database {}".format(unique_db), user=ADMIN)
+      admin_client.execute(
+          "create table {} (i int) stored as iceberg".format(full_tbl_name), user=ADMIN)
+
+      # Check that when the user has no privileges on the database, the error is the same
+      # if we try an existing or a non-existing table.
+      exc1_str = str(self.execute_query_expect_failure(self.client, query, user=user))
+      exc2_str = str(self.execute_query_expect_failure(self.client, query_non_existent,
+          user=user))
+      assert error_msg_equal(exc1_str, exc2_str)
+      assert "AuthorizationException" in exc1_str
+      assert "does not have privileges to access"
+
+      # Check that there is no error when the user has access to the table.
+      admin_client.execute("grant {priv} on database {db} to user {user}".format(
+          priv=priv, db=unique_db, user=user))
+      self.execute_query_expect_success(self.client, query, user=user)
+    finally:
+      admin_client.execute("revoke {priv} on database {db} from user {user}".format(
+          priv=priv, db=unique_db, user=user), user=ADMIN)
+      admin_client.execute("drop database if exists {} cascade".format(unique_db))
 
   @staticmethod
   def _verify_show_dbs(result, unique_name, visibility_privileges=PRIVILEGES):
@@ -186,3 +222,39 @@ class TestAuthorization(CustomClusterTestSuite):
                   "--ranger_app_id=impala --authorization_provider=ranger")
   def test_num_check_authorization_threads_with_ranger(self, unique_name):
     self._test_ranger_show_stmts_helper(unique_name, PRIVILEGES)
+
+  @CustomClusterTestSuite.with_args(
+    impalad_args="--server-name=server1 --ranger_service_type=hive "
+                 "--ranger_app_id=impala --authorization_provider=ranger "
+                 "--use_local_catalog=true",
+    catalogd_args="--server-name=server1 --ranger_service_type=hive "
+                  "--ranger_app_id=impala --authorization_provider=ranger "
+                  "--catalog_topic_mode=minimal")
+  def test_local_catalog_show_dbs_with_transient_db(self, unique_name):
+    """Regression test for IMPALA-13170"""
+    # Starts a background thread to create+drop the transient db.
+    # Use admin user to have create+drop privileges.
+    unique_database = unique_name + "_db"
+    admin_client = self.create_impala_client()
+    stop = False
+
+    def create_drop_db():
+      while not stop:
+        admin_client.execute("create database " + unique_database, user=ADMIN)
+        # Sleep some time so coordinator can get the updates of it.
+        time.sleep(0.1)
+        if stop:
+          break
+        admin_client.execute("drop database " + unique_database, user=ADMIN)
+    t = threading.Thread(target=create_drop_db)
+    t.start()
+
+    try:
+      for i in range(100):
+        self.execute_query("show databases")
+        # Sleep some time so the db can be dropped.
+        time.sleep(0.2)
+    finally:
+      stop = True
+      t.join()
+      admin_client.execute("drop database if exists " + unique_database, user=ADMIN)

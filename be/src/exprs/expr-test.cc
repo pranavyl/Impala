@@ -29,12 +29,12 @@
 #include <boost/scoped_ptr.hpp>
 #include <boost/unordered_map.hpp>
 
-#include <openssl/crypto.h>
 #include <openssl/sha.h>
 
 #include "codegen/llvm-codegen.h"
 #include "common/init.h"
 #include "common/object-pool.h"
+#include "exprs/ai-functions.inline.h"
 #include "exprs/anyval-util.h"
 #include "exprs/is-null-predicate.h"
 #include "exprs/like-predicate.h"
@@ -71,16 +71,21 @@
 #include "util/debug-util.h"
 #include "util/decimal-util.h"
 #include "util/metrics.h"
+#include "util/openssl-util.h"
 #include "util/string-parser.h"
 #include "util/string-util.h"
 #include "util/test-info.h"
 #include "utility-functions.h"
+#include "gutil/strings/strcat.h"
 
 #include "common/names.h"
 
 DECLARE_bool(abort_on_config_error);
 DECLARE_bool(disable_optimization_passes);
 DECLARE_string(hdfs_zone_info_zip);
+DECLARE_string(ai_endpoint);
+DECLARE_string(ai_model);
+DECLARE_string(ai_additional_platforms);
 
 namespace posix_time = boost::posix_time;
 using boost::bad_lexical_cast;
@@ -97,7 +102,7 @@ namespace impala {
 // Use this timezone in tests where DST changes may cause problems.
 const char* TEST_TZ_WITHOUT_DST = "America/Anguilla";
 
-ImpaladQueryExecutor* executor_;
+scoped_ptr<ImpaladQueryExecutor> executor_;
 scoped_ptr<MetricGroup> statestore_metrics(new MetricGroup("statestore_metrics"));
 Statestore* statestore;
 
@@ -184,7 +189,7 @@ class ScopedExecOption {
  public:
   ScopedExecOption(ImpaladQueryExecutor* executor, string option_string)
       : executor_(executor) {
-    executor->PushExecOption(option_string);
+    executor->PushExecOption(move(option_string));
   }
 
   ~ScopedExecOption() {
@@ -232,8 +237,15 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
         FLAGS_hostname, statestore->port(), &impala_server));
     IGNORE_LEAKING_OBJECT(impala_server);
 
-    executor_ = new ImpaladQueryExecutor(FLAGS_hostname, impala_server->GetBeeswaxPort());
+    executor_.reset(
+        new ImpaladQueryExecutor(FLAGS_hostname, impala_server->GetBeeswaxPort()));
     ABORT_IF_ERROR(executor_->Setup());
+  }
+
+  static void TearDownTestCase() {
+    // Teardown before global destructors to avoid a race where JvmMetricCache is
+    // destroyed before the last query is closed.
+    executor_.reset();
   }
 
  protected:
@@ -358,7 +370,11 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
       return "";
     }
     EXPECT_TRUE(status.ok()) << "stmt: " << stmt << "\nerror: " << status.GetDetail();
-    EXPECT_EQ(TypeToOdbcString(expr_type.type), result_types[0].type) << expr;
+    string odbcType = TypeToOdbcString(expr_type.ToThrift());
+    // ColumnType cannot be BINARY, so STRING is used instead.
+    string expectedType =
+        result_types[0].type == "binary" ? "string" : result_types[0].type;
+    EXPECT_EQ(odbcType, expectedType) << expr;
     return result_row;
   }
 
@@ -540,8 +556,8 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
   // 'unix_time_at_local_epoch' should be the expected value of the Unix time when it
   // was 1970-01-01 in the current time zone. 'local_time_at_unix_epoch' should be the
   // local time at the Unix epoch (1970-01-01 UTC).
-  void TestTimestampUnixEpochConversions(int64_t unix_time_at_local_epoch,
-      string local_time_at_unix_epoch) {
+  void TestTimestampUnixEpochConversions(
+      int64_t unix_time_at_local_epoch, const string& local_time_at_unix_epoch) {
     TestValue("unix_timestamp(cast('" + local_time_at_unix_epoch + "' as timestamp))",
         TYPE_BIGINT, 0);
     TestValue("unix_timestamp('" + local_time_at_unix_epoch + "')", TYPE_BIGINT, 0);
@@ -687,6 +703,16 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
     EXPECT_TRUE(GetValue(expr, expr_type) == "NULL") << expr;
   }
 
+  template <class T>
+  void TestValueOrError(const string& expr, PrimitiveType expr_type,
+      const T& expected_result, bool expect_error, const std::string& error) {
+    if (expect_error) {
+      TestErrorString(expr, error);
+    } else {
+      TestValue(expr, expr_type, expected_result);
+    }
+  }
+
   void TestIsNotNull(const string& expr, PrimitiveType expr_type) {
     return TestIsNotNull(expr, ColumnType(expr_type));
   }
@@ -714,7 +740,10 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
     Status status = executor_->Exec(stmt, &result_types);
     status = executor_->FetchResult(&result_row);
     ASSERT_FALSE(status.ok());
-    ASSERT_TRUE(EndsWith(status.msg().msg(), error_string)) << "Actual: '"
+    // Ignore the tailing '\n' characters when matching
+    string actual_msg = boost::trim_right_copy(status.msg().msg());
+    string expected_msg = boost::trim_right_copy(error_string);
+    ASSERT_TRUE(EndsWith(actual_msg, expected_msg)) << "Actual: '"
         << status.msg().msg() << "'" << endl << "Expected: '" << error_string << "'";
   }
 
@@ -770,28 +799,32 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
     TestValue("0/0 < 1/0", TYPE_BOOLEAN, false);
   }
 
-  void TestStringComparisons() {
-    TestValue<bool>("'abc' = 'abc'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abc' = 'abcd'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abc' != 'abcd'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abc' != 'abc'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abc' < 'abcd'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abcd' < 'abc'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abcd' < 'abcd'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abc' > 'abcd'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abcd' > 'abc'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abcd' > 'abcd'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abc' <= 'abcd'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abcd' <= 'abc'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abcd' <= 'abcd'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abc' >= 'abcd'", TYPE_BOOLEAN, false);
-    TestValue<bool>("'abcd' >= 'abc'", TYPE_BOOLEAN, true);
-    TestValue<bool>("'abcd' >= 'abcd'", TYPE_BOOLEAN, true);
+  void TestStringComparisons(const string& string_type) {
+    string abc = "cast('abc' as " + string_type + ")";
+    string abcd = "cast('abcd' as " + string_type + ")";
+    string empty = "cast('' as " + string_type + ")";
+
+    TestValue<bool>(abc + " = " + abc, TYPE_BOOLEAN, true);
+    TestValue<bool>(abc + " = " + abcd, TYPE_BOOLEAN, false);
+    TestValue<bool>(abc + " != " + abcd, TYPE_BOOLEAN, true);
+    TestValue<bool>(abc + " != " + abc, TYPE_BOOLEAN, false);
+    TestValue<bool>(abc + " < " + abcd, TYPE_BOOLEAN, true);
+    TestValue<bool>(abcd + " < " + abc, TYPE_BOOLEAN, false);
+    TestValue<bool>(abcd + " < " + abcd, TYPE_BOOLEAN, false);
+    TestValue<bool>(abc + " > " + abcd, TYPE_BOOLEAN, false);
+    TestValue<bool>(abcd + " > " + abc, TYPE_BOOLEAN, true);
+    TestValue<bool>(abcd + " > " + abcd, TYPE_BOOLEAN, false);
+    TestValue<bool>(abc + " <= " + abcd, TYPE_BOOLEAN, true);
+    TestValue<bool>(abcd + " <= " + abc, TYPE_BOOLEAN, false);
+    TestValue<bool>(abcd + " <= " + abcd, TYPE_BOOLEAN, true);
+    TestValue<bool>(abc + " >= " + abcd, TYPE_BOOLEAN, false);
+    TestValue<bool>(abcd + " >= " + abc, TYPE_BOOLEAN, true);
+    TestValue<bool>(abcd + " >= " + abcd, TYPE_BOOLEAN, true);
 
     // Test some empty strings
-    TestValue<bool>("'abcd' >= ''", TYPE_BOOLEAN, true);
-    TestValue<bool>("'' > ''", TYPE_BOOLEAN, false);
-    TestValue<bool>("'' = ''", TYPE_BOOLEAN, true);
+    TestValue<bool>(abcd + " >= " + empty, TYPE_BOOLEAN, true);
+    TestValue<bool>(empty + " > " + empty, TYPE_BOOLEAN, false);
+    TestValue<bool>(empty + " = " + empty, TYPE_BOOLEAN, true);
   }
 
   void TestDecimalComparisons() {
@@ -884,7 +917,8 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
       // Everything IS NOT DISTINCT FROM itself.
       for (int j = 0; j < sizeof(types) / sizeof(string); ++j) {
         const string operand = "cast(NULL as " + types[j] + ")";
-        TestValue(operand + ' ' + operators[i] + ' ' + operand, TYPE_BOOLEAN, is_equal);
+        TestValue(StrCat(operand, " ", operators[i], " ", operand), TYPE_BOOLEAN,
+                  is_equal);
       }
       for (int j = 0; j < sizeof(operands1) / sizeof(string); ++j) {
         TestValue(operands1[j] + ' ' + operators[i] + ' ' + operands1[j], TYPE_BOOLEAN,
@@ -1177,19 +1211,38 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
   void TestSingleLiteralConstruction(
       PrimitiveType type, const T& value, const string& string_val);
 
-  // Test casting stmt to all types.  Expected result is val.
-  template<typename T>
-  void TestCast(const string& stmt, T val, bool timestamp_out_of_range = false) {
+  // Test casting stmt to all types. 'min_integer_size' is the byte size of the smallest
+  // signed integer expected to be able to hold the value. 'float_out_of_range' should be
+  // set to true if the value does not fit in a single precision float. The expected
+  // result is 'val' for the types that can hold the value and error for other types.
+  template <typename T>
+  void TestCast(const string& stmt, T val, bool convert_lose_precision = false,
+      int min_integer_size = 1, bool float_out_of_range = false,
+      bool timestamp_out_of_range = false) {
     TestValue("cast(" + stmt + " as boolean)", TYPE_BOOLEAN, static_cast<bool>(val));
-    TestValue("cast(" + stmt + " as tinyint)", TYPE_TINYINT, static_cast<int8_t>(val));
-    TestValue("cast(" + stmt + " as smallint)", TYPE_SMALLINT, static_cast<int16_t>(val));
-    TestValue("cast(" + stmt + " as int)", TYPE_INT, static_cast<int32_t>(val));
-    TestValue("cast(" + stmt + " as integer)", TYPE_INT, static_cast<int32_t>(val));
-    TestValue("cast(" + stmt + " as bigint)", TYPE_BIGINT, static_cast<int64_t>(val));
-    TestValue("cast(" + stmt + " as float)", TYPE_FLOAT, static_cast<float>(val));
     TestValue("cast(" + stmt + " as double)", TYPE_DOUBLE, static_cast<double>(val));
     TestValue("cast(" + stmt + " as real)", TYPE_DOUBLE, static_cast<double>(val));
-    TestStringValue("cast(" + stmt + " as string)", lexical_cast<string>(val));
+    if (!convert_lose_precision) {
+      TestStringValue("cast(" + stmt + " as string)", lexical_cast<string>(val));
+    }
+
+    TestValueOrError("cast(" + stmt + " as tinyint)", TYPE_TINYINT,
+        static_cast<int8_t>(val), min_integer_size > sizeof(int8_t),
+        "value out of range for destination type.\n");
+    TestValueOrError("cast(" + stmt + " as smallint)", TYPE_SMALLINT,
+        static_cast<int16_t>(val), min_integer_size > sizeof(int16_t),
+        "value out of range for destination type.\n");
+    TestValueOrError("cast(" + stmt + " as int)", TYPE_INT,
+        static_cast<int32_t>(val), min_integer_size > sizeof(int32_t),
+        "value out of range for destination type.\n");
+    TestValueOrError("cast(" + stmt + " as integer)", TYPE_INT,
+        static_cast<int32_t>(val), min_integer_size > sizeof(int32_t),
+        "value out of range for destination type.\n");
+    TestValueOrError("cast(" + stmt + " as bigint)", TYPE_BIGINT,
+        static_cast<int64_t>(val), min_integer_size > sizeof(int64_t),
+        " value out of range for destination type.\n");
+    TestValueOrError("cast(" + stmt + " as float)", TYPE_FLOAT, static_cast<float>(val),
+        float_out_of_range, "value out of range for destination type.\n");
     if (!timestamp_out_of_range) {
       TestTimestampValue("cast(" + stmt + " as timestamp)", CreateTestTimestamp(val));
     } else {
@@ -1205,6 +1258,8 @@ class ExprTest : public testing::TestWithParam<std::tuple<bool, bool>> {
     return pool_.Add(
         UdfTestHarness::CreateTestContext(return_type, arg_types, state, pool));
   }
+
+  void TestBytes();
 };
 
 template<>
@@ -1232,23 +1287,37 @@ TimestampValue ExprTest::CreateTestTimestamp(int64_t val) {
   return TimestampValue::FromUnixTime(val, UTCPTR);
 }
 
-// Test casting 'stmt' to each of the native types.  The result should be 'val'
-// 'stmt' is a partial stmt that could be of any valid type.
-template<>
-void ExprTest::TestCast(const string& stmt, const char* val,
-    bool timestamp_out_of_range) {
+// Test casting 'stmt' to each of the native types. See the general template definition
+// for more information.
+template <>
+void ExprTest::TestCast(const string& stmt, const char* val, bool convert_lose_precision,
+    int min_integer_size, bool float_out_of_range, bool timestamp_out_of_range) {
   try {
     int8_t val8 = static_cast<int8_t>(lexical_cast<int16_t>(val));
 #if 0
     // Hive has weird semantics.  What do we want to do?
     TestValue(stmt + " as boolean)", TYPE_BOOLEAN, lexical_cast<bool>(val));
 #endif
-    TestValue("cast(" + stmt + " as tinyint)", TYPE_TINYINT, val8);
-    TestValue("cast(" + stmt + " as smallint)", TYPE_SMALLINT, lexical_cast<int16_t>(val));
-    TestValue("cast(" + stmt + " as int)", TYPE_INT, lexical_cast<int32_t>(val));
-    TestValue("cast(" + stmt + " as bigint)", TYPE_BIGINT, lexical_cast<int64_t>(val));
-    TestValue("cast(" + stmt + " as float)", TYPE_FLOAT, lexical_cast<float>(val));
+    TestValueOrError("cast(" + stmt + " as tinyint)", TYPE_TINYINT,
+        val8, min_integer_size > sizeof(int8_t),
+        "value out of range for destination type.\n");
+    TestValueOrError("cast(" + stmt + " as smallint)", TYPE_SMALLINT,
+        lexical_cast<int16_t>(val), min_integer_size > sizeof(int16_t),
+        "value out of range for destination type.\n");
+    TestValueOrError("cast(" + stmt + " as int)", TYPE_INT,
+        lexical_cast<int32_t>(val), min_integer_size > sizeof(int32_t),
+        "value out of range for destination type.\n");
+    TestValueOrError("cast(" + stmt + " as integer)", TYPE_INT,
+        lexical_cast<int32_t>(val), min_integer_size > sizeof(int32_t),
+        "value out of range for destination type.\n");
+    TestValueOrError("cast(" + stmt + " as bigint)", TYPE_BIGINT,
+        lexical_cast<int64_t>(val), min_integer_size > sizeof(int64_t),
+        "value out of range for destination type.\n");
+    TestValueOrError("cast(" + stmt + " as float)", TYPE_FLOAT, lexical_cast<float>(val),
+        float_out_of_range, "value out of range for destination type.\n");
+
     TestValue("cast(" + stmt + " as double)", TYPE_DOUBLE, lexical_cast<double>(val));
+    TestValue("cast(" + stmt + " as real)", TYPE_DOUBLE, lexical_cast<double>(val));
     TestStringValue("cast(" + stmt + " as string)", lexical_cast<string>(val));
   } catch (bad_lexical_cast& e) {
     EXPECT_TRUE(false) << e.what();
@@ -3164,7 +3233,10 @@ TEST_P(ExprTest, BinaryPredicates) {
   TestFixedPointComparisons<int64_t>(false);
   TestFloatingPointComparisons<float>(true);
   TestFloatingPointComparisons<double>(false);
-  TestStringComparisons();
+  TestStringComparisons("STRING");
+  TestStringComparisons("BINARY");
+  TestStringComparisons("VARCHAR(4)");
+  TestStringComparisons("CHAR(4)");
   TestDecimalComparisons();
   TestNullComparisons();
   TestDistinctFrom();
@@ -3201,24 +3273,28 @@ TEST_P(ExprTest, CastExprs) {
   TestCast("cast(0.0 as float)", 0.0f);
   TestCast("cast(5.0 as float)", 5.0f);
   TestCast("cast(-5.0 as float)", -5.0f);
-  TestCast("cast(0.1234567890123 as float)", 0.1234567890123f);
-  TestCast("cast(0.1234567890123 as float)", 0.123456791f); // same as above
-  TestCast("cast(0.00000000001234567890123 as float)", 0.00000000001234567890123f);
-  TestCast("cast(123456 as float)", 123456.0f);
+  TestCast("cast(0.1234567890123 as float)", 0.1234567890123f, true);
+  TestCast("cast(0.1234567890123 as float)", 0.123456791f, true); // same as above
+  TestStringValue("cast(cast(0.1234567890123 as float) as string)", "0.12345679");
+  TestCast("cast(0.00000000001234567890123 as float)", 0.00000000001234567890123f, true);
+  TestStringValue(
+      "cast(cast(0.00000000001234567890123 as float) as string)", "1.2345679e-11");
+  TestCast("cast(123456 as float)", 123456.0f, false, 4, false, false);
 
   // From http://en.wikipedia.org/wiki/Single-precision_floating-point_format
   // Min positive normal value
-  TestCast("cast(1.1754944e-38 as float)", 1.1754944e-38f);
+  TestCast("cast(1.1754944e-38 as float)", 1.1754944e-38f, true);
+  TestStringValue("cast(cast(1.1754944e-38 as float) as string)", "1.1754944e-38");
   // Max representable value
-  TestCast("cast(3.4028234e38 as float)", 3.4028234e38f, true);
-
+  TestCast("cast(3.4028234e38 as float)", 3.4028234e38f, true, 32, false, true);
+  TestStringValue("cast(cast(3.4028234e38 as float) as string)", "3.4028235e+38");
 
   // From Double
   TestCast("cast(0.0 as double)", 0.0);
   TestCast("cast(5.0 as double)", 5.0);
   TestCast("cast(-5.0 as double)", -5.0);
-  TestCast("cast(0.123e10 as double)", 0.123e10);
-  TestCast("cast(123.123e10 as double)", 123.123e10, true);
+  TestCast("cast(0.123e10 as double)", 0.123e10, false, 4, false, false);
+  TestCast("cast(123.123e10 as double)", 123.123e10, false, 8, false, true);
   TestCast("cast(1.01234567890123456789 as double)", 1.01234567890123456789);
   TestCast("cast(1.01234567890123456789 as double)", 1.0123456789012346); // same as above
   TestCast("cast(0.01234567890123456789 as double)", 0.01234567890123456789);
@@ -3227,14 +3303,18 @@ TEST_P(ExprTest, CastExprs) {
   // casting string to double
   TestCast("cast('0.43149576573887316' as double)", 0.43149576573887316);
   TestCast("cast('-0.43149576573887316' as double)", -0.43149576573887316);
-  TestCast("cast('0.123e10' as double)", 0.123e10);
-  TestCast("cast('123.123e10' as double)", 123.123e10, true);
+  TestCast("cast('0.123e10' as double)", 0.123e10, false, 4, false, false);
+  TestCast("cast('123.123e10' as double)", 123.123e10, false, 8, false, true);
   TestCast("cast('1.01234567890123456789' as double)", 1.01234567890123456789);
 
   // From http://en.wikipedia.org/wiki/Double-precision_floating-point_format
   // Min subnormal positive double
-  TestCast("cast(4.9406564584124654e-324 as double)", 4.9406564584124654e-324);
-  TestCast("cast('4.9406564584124654e-324' as double)", 4.9406564584124654e-324);
+  TestCast("cast(4.9406564584124654e-324 as double)", 4.9406564584124654e-324, true);
+  TestStringValue(
+      "cast(cast(4.9406564584124654e-324 as double) as string)", "4.94065645841247e-324");
+  TestCast("cast('4.9406564584124654e-324' as double)", 4.9406564584124654e-324, true);
+  TestStringValue("cast(cast('4.9406564584124654e-324' as double) as string)",
+      "4.94065645841247e-324");
   // Max subnormal double
   TestCast("cast(2.2250738585072009e-308 as double)", 2.2250738585072009e-308);
   TestCast("cast('2.2250738585072009e-308' as double)", 2.2250738585072009e-308);
@@ -3242,8 +3322,10 @@ TEST_P(ExprTest, CastExprs) {
   TestCast("cast(2.2250738585072014e-308 as double)", 2.2250738585072014e-308);
   TestCast("cast('2.2250738585072014e-308' as double)", 2.2250738585072014e-308);
   // Max Double
-  TestCast("cast(1.7976931348623157e+308 as double)", 1.7976931348623157e308, true);
-  TestCast("cast('1.7976931348623157e+308' as double)", 1.7976931348623157e308, true);
+  TestCast("cast(1.7976931348623157e+308 as double)", 1.7976931348623157e308, false, 128,
+      true, true);
+  TestCast("cast('1.7976931348623157e+308' as double)", 1.7976931348623157e308, false,
+      128, true, true);
 
   // From String
   TestCast("'0'", "0");
@@ -3447,6 +3529,26 @@ TEST_P(ExprTest, CastExprs) {
   TestIsNull("cast(cast(1180591620717411303425 as decimal(38, 0)) as timestamp)",
       TYPE_TIMESTAMP);
 
+  // Explicitly test the error message of an out-of-range double-to-integer conversion.
+  TestErrorString("cast(cast(500 as DOUBLE) as TINYINT)",
+      "Converting value 500 of type DOUBLE to TINYINT failed, "
+      "value out of range for destination type.\n");
+
+  // Explicitly test the error message of an out-of-range double-to-float conversion.
+  TestErrorString("cast(1e40 as FLOAT)",
+      "Converting value 1e+40 of type DOUBLE to FLOAT failed, "
+      "value out of range for destination type.\n");
+
+  // Nan and non-finite floating-point values converted to int.
+  TestErrorString("cast(cast((1/0) as FLOAT) as INT)",
+      "Non-finite value of type FLOAT cannot be converted to INT.\n");
+  TestErrorString("cast((1/0) as INT)",
+      "Non-finite value of type DOUBLE cannot be converted to INT.\n");
+  TestErrorString("cast(cast((0/0) as FLOAT) as INT)",
+      "NaN value of type FLOAT cannot be converted to INT.\n");
+  TestErrorString("cast((0/0) as INT)",
+      "NaN value of type DOUBLE cannot be converted to INT.\n");
+
   // Out of range String <--> Timestamp - invalid boundary cases.
   TestIsNull("cast('1399-12-31 23:59:59' as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast('10000-01-01 00:00:00' as timestamp)", TYPE_TIMESTAMP);
@@ -3502,6 +3604,81 @@ TEST_P(ExprTest, CastExprs) {
   TestValue<int16_t>("cast(10000000 as smallint)", TYPE_SMALLINT, val & 0xffff);
   TestValue<int16_t>("cast(-10000000 as smallint)", TYPE_SMALLINT, -val & 0xffff);
 #endif
+}
+
+// Test overflow and boundaries in case of narrowing conversions: from floating point to
+// integer types or from double to float.
+TEST_P(ExprTest, CastFloatingPointNarrowing) {
+  // TINYINT
+  // Valid values on the boundary.
+  constexpr int64_t int8_max = std::numeric_limits<int8_t>::max();
+  constexpr int64_t int8_min = std::numeric_limits<int8_t>::min();
+  TestValue(Substitute("cast(cast($0 as float) as tinyint)", int8_max),
+      TYPE_TINYINT, int8_max);
+  TestValue(Substitute("cast(cast($0 as float) as tinyint)", -int8_max),
+      TYPE_TINYINT, -int8_max);
+  TestValue(Substitute("cast(cast($0 as float) as tinyint)", int8_min),
+      TYPE_TINYINT, int8_min);
+
+  // Values outside the valid range.
+  TestError(Substitute("cast(cast($0 as float) as tinyint)", int8_max + 1));
+  TestError(Substitute("cast(cast($0 as float) as tinyint)", int8_min - 1));
+
+  // SMALLINT
+  // Valid values on the boundary.
+  constexpr int64_t int16_max = std::numeric_limits<int16_t>::max();
+  constexpr int64_t int16_min = std::numeric_limits<int16_t>::min();
+  TestValue(Substitute("cast(cast($0 as float) as smallint)", int16_max),
+      TYPE_SMALLINT, int16_max);
+  TestValue(Substitute("cast(cast($0 as float) as smallint)", -int16_max),
+      TYPE_SMALLINT, -int16_max);
+  TestValue(Substitute("cast(cast($0 as float) as smallint)", int16_min),
+      TYPE_SMALLINT, int16_min);
+
+  // Values outside the valid range.
+  TestError(Substitute("cast(cast($0 as float) as smallint)", int16_max + 1));
+  TestError(Substitute("cast(cast($0 as float) as smallint)", int16_min - 1));
+
+  // INT
+  // Valid values on the boundary.
+  constexpr int64_t int32_max = std::numeric_limits<int32_t>::max();
+  constexpr int64_t int32_min = std::numeric_limits<int32_t>::min();
+  TestValue(Substitute("cast(cast($0 as double) as int)", int32_max),
+      TYPE_INT, int32_max);
+  TestValue(Substitute("cast(cast($0 as double) as int)", -int32_max),
+      TYPE_INT, -int32_max);
+  TestValue(Substitute("cast(cast($0 as double) as int)", int32_min),
+      TYPE_INT, int32_min);
+
+  // Values outside the valid range.
+  TestError(Substitute("cast(cast($0 as double) as int)", int32_max + 1));
+  TestError(Substitute("cast(cast($0 as double) as int)", int32_min - 1));
+
+  // BIGINT
+  // Values outside the valid range: the limit values of BIGINT cannot be represented
+  // exactly as DOUBLE, and casting them to DOUBLE produces a value that is outside the
+  // range of BIGINT.
+  constexpr int64_t int64_max = std::numeric_limits<int64_t>::max();
+  constexpr int64_t int64_min = std::numeric_limits<int64_t>::min();
+  TestError(Substitute("cast(cast($0 as double) as bigint)", int64_max));
+  TestError(Substitute("cast(cast($0 as double) as bigint)", int64_min));
+
+  // DOUBLE to FLOAT
+  // Valid values on the boundary.
+  constexpr double float_max = std::numeric_limits<float>::max();
+  constexpr double float_min = std::numeric_limits<float>::lowest();
+  TestValue(Substitute("cast(cast($0 as double) as float)", float_max),
+      TYPE_FLOAT, float_max);
+  TestValue(Substitute("cast(cast($0 as double) as float)", float_min),
+      TYPE_FLOAT, float_min);
+
+  // Values outside the valid range.
+  // 'float_max + 1' is not representable as a float or double. We find the next
+  // representable double that is greater than 'float_max'.
+  const double next_double = std::nextafter(
+      float_max, std::numeric_limits<double>::max());
+  TestError(Substitute("cast(cast($0 as double) as float)", next_double));
+  TestError(Substitute("cast(cast($0 as double) as float)", -next_double));
 }
 
 // Test casting from/to Date.
@@ -3958,10 +4135,10 @@ TEST_P(ExprTest, InPredicate) {
   for(int_iter = min_int_values_.begin(); int_iter != min_int_values_.end();
       ++int_iter) {
     string& val = default_type_strs_[int_iter->first];
-    TestValue(val + " in (2, 3, " + val + ")", TYPE_BOOLEAN, true);
-    TestValue(val + " in (2, 3, 4)", TYPE_BOOLEAN, false);
-    TestValue(val + " not in (2, 3, " + val + ")", TYPE_BOOLEAN, false);
-    TestValue(val + " not in (2, 3, 4)", TYPE_BOOLEAN, true);
+    TestValue(StrCat(val, " in (2, 3, ", val, ")"), TYPE_BOOLEAN, true);
+    TestValue(StrCat(val, " in (2, 3, 4)"), TYPE_BOOLEAN, false);
+    TestValue(StrCat(val, " not in (2, 3, ", val, ")"), TYPE_BOOLEAN, false);
+    TestValue(StrCat(val, " not in (2, 3, 4)"), TYPE_BOOLEAN, true);
   }
 
   // Test floats.
@@ -3969,10 +4146,10 @@ TEST_P(ExprTest, InPredicate) {
   for(float_iter = min_float_values_.begin(); float_iter != min_float_values_.end();
       ++float_iter) {
     string& val = default_type_strs_[float_iter->first];
-    TestValue(val + " in (2, 3, " + val + ")", TYPE_BOOLEAN, true);
-    TestValue(val + " in (2, 3, 4)", TYPE_BOOLEAN, false);
-    TestValue(val + " not in (2, 3, " + val + ")", TYPE_BOOLEAN, false);
-    TestValue(val + " not in (2, 3, 4)", TYPE_BOOLEAN, true);
+    TestValue(StrCat(val, " in (2, 3, ", val, ")"), TYPE_BOOLEAN, true);
+    TestValue(StrCat(val, " in (2, 3, 4)"), TYPE_BOOLEAN, false);
+    TestValue(StrCat(val, " not in (2, 3, ", val, ")"), TYPE_BOOLEAN, false);
+    TestValue(StrCat(val, " not in (2, 3, 4)"), TYPE_BOOLEAN, true);
   }
 
   // Test bools.
@@ -4218,6 +4395,39 @@ TEST_P(ExprTest, StringFunctions) {
     TestErrorString(fn_name + "('foo', 'bar', 0.1, 1.01)",
         "jaro-winkler boost threshold values can range between 0.0 and 1.0\n");
   }
+
+  // Test prettyprint_bytes
+  TestStringValue("prettyprint_bytes(-1234)", "-1.21 KB");
+  TestStringValue("prettyprint_bytes(0)", "0");
+  TestStringValue("prettyprint_bytes(1)", "1.00 B");
+  TestStringValue("prettyprint_bytes(123)", "123.00 B");
+  TestStringValue("prettyprint_bytes(1024)", "1.00 KB");
+  TestStringValue("prettyprint_bytes(1234567)", "1.18 MB");
+  TestStringValue("prettyprint_bytes(1234567901)", "1.15 GB");
+  TestStringValue("prettyprint_bytes(12345679012345)", "11497.81 GB");
+  TestIsNull("prettyprint_bytes(NULL)", TYPE_STRING);
+
+  // Test at the type boundaries for tinyint.
+  TestStringValue("prettyprint_bytes(127)", "127.00 B");
+  TestStringValue("prettyprint_bytes(128)", "128.00 B");
+  TestStringValue("prettyprint_bytes(-128)", "-128.00 B");
+  TestStringValue("prettyprint_bytes(-129)", "-129.00 B");
+
+  // Test at the type boundaries for smallint.
+  TestStringValue("prettyprint_bytes(32767)", "32.00 KB");
+  TestStringValue("prettyprint_bytes(32768)", "32.00 KB");
+  TestStringValue("prettyprint_bytes(-32768)", "-32.00 KB");
+  TestStringValue("prettyprint_bytes(-32769)", "-32.00 KB");
+
+  // Test at the type boundaries for int.
+  TestStringValue("prettyprint_bytes(2147483647)", "2.00 GB");
+  TestStringValue("prettyprint_bytes(2147483648)", "2.00 GB");
+  TestStringValue("prettyprint_bytes(-2147483648)", "-2.00 GB");
+  TestStringValue("prettyprint_bytes(-2147483649)", "-2.00 GB");
+
+  // Test at the type boundaries for bigint.
+  TestStringValue("prettyprint_bytes(9223372036854775807)", "8589934592.00 GB");
+  TestStringValue("prettyprint_bytes(-9223372036854775808)", "-8589934592.00 GB");
 
   TestStringValue("substring('Hello', 1)", "Hello");
   TestStringValue("substring('Hello', -2)", "lo");
@@ -4556,6 +4766,63 @@ TEST_P(ExprTest, StringFunctions) {
   TestStringValue("btrim('æeioü','æü')", "eio");
   TestStringValue("btrim('\\\\abcdefg\\\\', 'ag\\\\')", "bcdef");
 
+  /// Test cases for TRIM UDF
+  // TRIM(where FROM string): trim space by default;
+  TestStringValue("trim(leading FROM '   1 2 3 4 5   ')", "1 2 3 4 5   ");
+  TestStringValue("trim(leAdiNG FrOm '  212  ')", "212  ");
+  TestStringValue("trim(leading from 'blackhole')", "blackhole");
+  TestStringValue("trim(trailing FroM '  13 1 3 4 6 1 24   ')", "  13 1 3 4 6 1 24");
+  TestStringValue("trim(tRAIlinG fROm '  1a 9b 4c 5d     ')", "  1a 9b 4c 5d");
+  TestStringValue("trim(trailing from '  abcdefg  ')", "  abcdefg");
+  TestStringValue("trim(bOTh frOm '   ab c d e f 1234  ')", "ab c d e f 1234");
+  TestStringValue("trim(both from '  aaaaaaaaa  ')", "aaaaaaaaa");
+  TestStringValue("trim(both from 'pulsar')", "pulsar");
+
+  // TRIM(string FROM string): trim from both sides by default;
+  TestStringValue("trim('1234' FroM '23471364134612413434')", "713641346");
+  TestStringValue("trim('abc' from 'abacdefg')", "defg");
+  TestStringValue("trim('xyz' fROm 'abcdabcdabc')", "abcdabcdabc");
+  TestStringValue("trim('aaaaabbbbbccccccccffffffffg' from 'abcdefg')", "de");
+  TestStringValue("trim('' fROM '  helloworld  ')", "  helloworld  ");
+  TestStringValue("trim(' ' from '  helloworld  ')", "helloworld");
+  TestStringValue("trim(NULL FROM '  helloworld  ')", "  helloworld  ");
+  TestStringValue("trim('both' FROM 'boneth')", "ne");
+
+  // TRIM(where string FROM string): regular test cases
+  // leading/trailing
+  TestStringValue("trim(leading 'rt' froM 'rrrrssssstttttt')", "ssssstttttt");
+  TestStringValue("trim(trailing '1234' FroM '23471364134612413434')", "234713641346");
+  TestStringValue("trim(TRAILING 'a0' from '0ac2aa0aa00000a')", "0ac2");
+  TestStringValue("trim(trailing 'rt' FROm 'rrrrssssstttttt')", "rrrrsssss");
+  TestStringValue("trim(tRAIlinG 'rt' FROM 'rrrrssssstttttt')", "rrrrsssss");
+  // both
+  TestStringValue("trim(both 'aaaaaaaaaaaaaaaaaaaaabg' from 'abcdefg')", "cdef");
+  TestStringValue("trim(bOTh 'a' from 'aaaaaaaaa')", "");
+  // Empty source strings return empty results
+  TestStringValue("trim(leading 'abc' from '')", "");
+  TestStringValue("trim(trailing 'xyzabcrst' from '')", "");
+  TestStringValue("trim(both 'aeiou' from '')", "");
+  // Null source strings return null results
+  TestIsNull("trim(leading '' from NULL)", TYPE_STRING);
+  TestIsNull("trim(trailing '' from NULL)", TYPE_STRING);
+  TestIsNull("trim(both 'aeiou' from NULL)", TYPE_STRING);
+  TestIsNull("trim(BoTh 'abc' from NULL)", TYPE_STRING);
+  // Special cases for string_expr nonterminal
+  TestStringValue("trim(both 'ao' from 'aaYYBBoo')", "YYBB");
+  TestStringValue("trim(both from '  YYBB ')", "YYBB");
+  TestStringValue("trim(+'aaoo' from 'aaYYBBoo')", "YYBB");
+  TestStringValue("trim(upper('a') from 'AAYYBB')", "YYBB");
+  TestStringValue(
+      "trim(replace('hello world', 'world', 'earth') from 'aaYYBBoo')",
+      "YYBB");
+  TestStringValue("trim(left('12ao5BY',5) from 'aaYYBBoo')", "YYBB");
+  TestStringValue("trim(right('BY54ao1',5) from 'aaYYBBoo')", "YYBB");
+  TestStringValue("trim(if((1=2) ,NULL, 'ao') from 'aaYYBBoo')", "YYBB");
+  TestStringValue("trim(cast(12.45 as string) from '1YYBB2')", "YYBB");
+  TestStringValue(
+      "trim(case when 1 = 2 then NULL else 'ao' end from 'aaYYBBoo')",
+      "YYBB");
+
   TestStringValue("space(0)", "");
   TestStringValue("space(-1)", "");
   TestStringValue("space(cast(1 as bigint))", " ");
@@ -4725,6 +4992,26 @@ TEST_P(ExprTest, StringFunctions) {
   TestIsNull("concat('a', 'b', NULL)", TYPE_STRING);
   TestStringValue("concat('', '', '')", "");
 
+  // Concat should work with BINARY the same way as with STRING
+  TestStringValue("concat(cast('a' as binary))", "a");
+  TestStringValue("concat(cast('a' as binary), cast('b' as binary))", "ab");
+  TestStringValue(
+      "concat(cast('a' as binary), cast('b' as binary), cast('cde' as binary))",
+      "abcde");
+  TestStringValue(
+      "concat(cast('a' as binary) , cast('b' as binary), "
+      "cast('cde' as binary), cast('fg' as binary))",
+      "abcdefg");
+  TestStringValue(
+       "concat(cast('a' as binary), cast('b' as binary), cast('cde' as binary), "
+       "cast('' as binary), cast('fg' as binary), cast('' as binary))",
+       "abcdefg");
+  TestIsNull("concat(cast(NULL as binary))", TYPE_STRING);
+  TestIsNull("concat(cast('a' as binary), NULL, cast('b' as binary))", TYPE_STRING);
+  TestIsNull("concat(cast('a' as binary), cast('b' as binary), NULL)", TYPE_STRING);
+  TestStringValue(
+      "concat(cast('' as binary), cast('' as binary), cast('' as binary))", "");
+
   TestStringValue("concat_ws(',', 'a')", "a");
   TestStringValue("concat_ws(',', 'a', 'b')", "a,b");
   TestStringValue("concat_ws(',', 'a', 'b', 'cde')", "a,b,cde");
@@ -4854,10 +5141,10 @@ TEST_P(ExprTest, StringBase64Coding) {
       string raw(length, ' ');
       for (int j = 0; j < length; ++j) raw[j] = rand() % 128;
       const string as_octal = StringToOctalLiteral(raw);
-      TestValue("length(base64encode('" + as_octal + "')) > length('" + as_octal + "')",
-          TYPE_BOOLEAN, true);
-      TestValue("base64decode(base64encode('" + as_octal + "')) = '" + as_octal + "'",
-          TYPE_BOOLEAN, true);
+      TestValue(StrCat("length(base64encode('", as_octal, "')) > length('", as_octal,
+           "')"), TYPE_BOOLEAN, true);
+      TestValue(StrCat("base64decode(base64encode('", as_octal + "')) = '", as_octal,
+           "'"), TYPE_BOOLEAN, true);
     }
   }
 }
@@ -5498,6 +5785,8 @@ TEST_P(ExprTest, MurmurHashFunction) {
   // changes behavior.
   EXPECT_EQ(-3190198453633110066, expected);
   TestValue("murmur_hash('hello world')", TYPE_BIGINT, expected);
+  // BINARY should return the same hash as STRING
+  TestValue("murmur_hash(cast('hello world' as binary))", TYPE_BIGINT, expected);
   s = string("");
   expected = HashUtil::MurmurHash2_64(s.data(), s.size(), HashUtil::MURMUR_DEFAULT_SEED);
   TestValue("murmur_hash('')", TYPE_BIGINT, expected);
@@ -5565,7 +5854,7 @@ TEST_P(ExprTest, SHAFunctions) {
   unsigned char sha384[SHA384_DIGEST_LENGTH];
   unsigned char sha512[SHA512_DIGEST_LENGTH];
 
-  if (FIPS_mode()) {
+  if (IsFIPSMode()) {
     TestError(sha1fn);
     TestError(sha2fn + ", 224)");
     TestError(sha2fn + ", 256)");
@@ -5592,7 +5881,7 @@ TEST_P(ExprTest, SHAFunctions) {
   TestStringValue(sha2fn + ", 512)", expected);
 
   // Test empty strings. Empty string is valid input and produces hash.
-  if (!FIPS_mode()) {
+  if (!IsFIPSMode()) {
     SHA1(input, 0, sha1);
     expected = ToHex(sha1, SHA_DIGEST_LENGTH);
     TestStringValue("sha1('')", expected);
@@ -5623,7 +5912,7 @@ TEST_P(ExprTest, SHAFunctions) {
 }
 
 TEST_P(ExprTest, MD5Function) {
-  if (FIPS_mode()) {
+  if (IsFIPSMode()) {
     TestError("md5('foo')");
   } else {
     std::string expected("1fdf956bdad98101171512d18eec3bcf");
@@ -5869,50 +6158,52 @@ TEST_P(ExprTest, MathConversionFunctions) {
     // First iteration is with bigint, second with string parameter.
     string q = (i == 0) ? "" : "'";
     // Invalid input: Base below -36 or above 36.
-    TestIsNull("conv(" + q + "10" + q + ", 10, 37)", TYPE_STRING);
-    TestIsNull("conv(" + q + "10" + q + ", 37, 10)", TYPE_STRING);
-    TestIsNull("conv(" + q + "10" + q + ", 10, -37)", TYPE_STRING);
-    TestIsNull("conv(" + q + "10" + q + ", -37, 10)", TYPE_STRING);
+    TestIsNull(StrCat("conv(", q, "10", q, ", 10, 37)"), TYPE_STRING);
+    TestIsNull(StrCat("conv(", q, "10", q, ", 37, 10)"), TYPE_STRING);
+    TestIsNull(StrCat("conv(", q, "10", q, ", 10, -37)"), TYPE_STRING);
+    TestIsNull(StrCat("conv(", q, "10", q, ", -37, 10)"), TYPE_STRING);
     // Invalid input: Base between -2 and 2.
-    TestIsNull("conv(" + q + "10" + q + ", 10, 1)", TYPE_STRING);
-    TestIsNull("conv(" + q + "10" + q + ", 1, 10)", TYPE_STRING);
-    TestIsNull("conv(" + q + "10" + q + ", 10, -1)", TYPE_STRING);
-    TestIsNull("conv(" + q + "10" + q + ", -1, 10)", TYPE_STRING);
+    TestIsNull(StrCat("conv(", q, "10", q, ", 10, 1)"), TYPE_STRING);
+    TestIsNull(StrCat("conv(", q, "10", q, ", 1, 10)"), TYPE_STRING);
+    TestIsNull(StrCat("conv(", q, "10", q, ", 10, -1)"), TYPE_STRING);
+    TestIsNull(StrCat("conv(", q, "10", q, ", -1, 10)"), TYPE_STRING);
     // Invalid input: Positive number but negative src base.
-    TestIsNull("conv(" + q + "10" + q + ", -10, 10)", TYPE_STRING);
+    TestIsNull(StrCat("conv(", q, "10", q, ", -10, 10)"), TYPE_STRING);
     // Test positive numbers.
-    TestStringValue("conv(" + q + "10" + q + ", 10, 10)", "10");
-    TestStringValue("conv(" + q + "10" + q + ", 2, 10)", "2");
-    TestStringValue("conv(" + q + "11" + q + ", 36, 10)", "37");
-    TestStringValue("conv(" + q + "11" + q + ", 36, 2)", "100101");
-    TestStringValue("conv(" + q + "100101" + q + ", 2, 36)", "11");
-    TestStringValue("conv(" + q + "0" + q + ", 10, 2)", "0");
+    TestStringValue(StrCat("conv(", q, "10", q, ", 10, 10)"), "10");
+    TestStringValue(StrCat("conv(", q, "10", q, ", 2, 10)"), "2");
+    TestStringValue(StrCat("conv(", q, "11", q, ", 36, 10)"), "37");
+    TestStringValue(StrCat("conv(", q, "11", q, ", 36, 2)"), "100101");
+    TestStringValue(StrCat("conv(", q, "100101", q, ", 2, 36)"), "11");
+    TestStringValue(StrCat("conv(", q, "0", q, ", 10, 2)"), "0");
     // Test for very large big int
-    TestStringValue("conv(" + q + "2061013007" + q + ", 16, 10)", "139066421255");
+    TestStringValue(StrCat("conv(", q, "2061013007", q, ", 16, 10)"), "139066421255");
     // Test negative numbers (tests from Hive).
     // If to_base is positive, the number should be handled as a 2's complement (64-bit).
-    TestStringValue("conv(" + q + "-641" + q + ", 10, -10)", "-641");
-    TestStringValue("conv(" + q + "1011" + q + ", 2, -16)", "B");
-    TestStringValue("conv(" + q + "-1" + q + ", 10, 16)", "FFFFFFFFFFFFFFFF");
-    TestStringValue("conv(" + q + "-15" + q + ", 10, 16)", "FFFFFFFFFFFFFFF1");
+    TestStringValue(StrCat("conv(", q, "-641", q, ", 10, -10)"), "-641");
+    TestStringValue(StrCat("conv(", q, "1011", q, ", 2, -16)"), "B");
+    TestStringValue(StrCat("conv(", q, "-1", q, ", 10, 16)"), "FFFFFFFFFFFFFFFF");
+    TestStringValue(StrCat("conv(", q, "-15", q, ", 10, 16)"), "FFFFFFFFFFFFFFF1");
     // Test digits that are not available in srcbase. We expect those digits
     // from left-to-right that can be interpreted in srcbase to form the result
     // (i.e., the paring bails only when it encounters a digit not in srcbase).
-    TestStringValue("conv(" + q + "17" + q + ", 7, 10)", "1");
-    TestStringValue("conv(" + q + "371" + q + ", 7, 10)", "3");
-    TestStringValue("conv(" + q + "371" + q + ", 7, 10)", "3");
-    TestStringValue("conv(" + q + "445" + q + ", 5, 10)", "24");
+    TestStringValue(StrCat("conv(", q, "17", q, ", 7, 10)"), "1");
+    TestStringValue(StrCat("conv(", q, "371", q, ", 7, 10)"), "3");
+    TestStringValue(StrCat("conv(", q, "371", q, ", 7, 10)"), "3");
+    TestStringValue(StrCat("conv(", q, "445", q, ", 5, 10)"), "24");
     // Test overflow (tests from Hive).
     // If a number is two large, the result should be -1 (if signed),
     // or MAX_LONG (if unsigned).
-    TestStringValue("conv(" + q + lexical_cast<string>(numeric_limits<int64_t>::max())
-        + q + ", 36, 16)", "FFFFFFFFFFFFFFFF");
-    TestStringValue("conv(" + q + lexical_cast<string>(numeric_limits<int64_t>::max())
-        + q + ", 36, -16)", "-1");
-    TestStringValue("conv(" + q + lexical_cast<string>(numeric_limits<int64_t>::min()+1)
-        + q + ", 36, 16)", "FFFFFFFFFFFFFFFF");
-    TestStringValue("conv(" + q + lexical_cast<string>(numeric_limits<int64_t>::min()+1)
-        + q + ", 36, -16)", "-1");
+    TestStringValue(StrCat("conv(", q,
+       lexical_cast<string>(numeric_limits<int64_t>::max()), q, ", 36, 16)"),
+       "FFFFFFFFFFFFFFFF");
+    TestStringValue(StrCat("conv(", q,
+       lexical_cast<string>(numeric_limits<int64_t>::max()), q, ", 36, -16)"), "-1");
+    TestStringValue(StrCat("conv(", q,
+       lexical_cast<string>(numeric_limits<int64_t>::min()+1), q, ", 36, 16)"),
+       "FFFFFFFFFFFFFFFF");
+    TestStringValue(StrCat("conv(", q,
+       lexical_cast<string>(numeric_limits<int64_t>::min()+1), q, ", 36, -16)"), "-1");
   }
   // Test invalid input strings that start with an invalid digit.
   // Hive returns "0" in such cases.
@@ -5943,14 +6234,8 @@ TEST_P(ExprTest, MathFunctions) {
   TestValue("abs(-32768)", TYPE_INT, 32768);
   TestValue("abs(32767)", TYPE_INT, 32767);
   TestValue("abs(32768)", TYPE_BIGINT, 32768);
-#ifndef __aarch64__
-  TestValue("abs(-1 * cast(pow(2, 31) as int))", TYPE_BIGINT, 2147483648);
-  TestValue("abs(cast(pow(2, 31) as int))", TYPE_BIGINT, 2147483648);
-#else
-  TestValue("abs(-1 * cast(pow(2, 31) as int))", TYPE_BIGINT, 2147483647);
-  TestValue("abs(cast(pow(2, 31) as int))", TYPE_BIGINT, 2147483647);
-#endif
-  TestValue("abs(2147483647)", TYPE_BIGINT, 2147483647);
+  TestError("abs(-1 * cast(pow(2, 31) as int))");
+  TestError("abs(cast(pow(2, 31) as int))");
   TestValue("abs(2147483647)", TYPE_BIGINT, 2147483647);
   TestValue("abs(-9223372036854775807)", TYPE_BIGINT,  9223372036854775807);
   TestValue("abs(9223372036854775807)", TYPE_BIGINT,  9223372036854775807);
@@ -6801,38 +7086,38 @@ TEST_P(ExprTest, TimestampFunctions) {
     const string& lt_max_interval =
         lexical_cast<string>(static_cast<int64_t>(0.9 * it->second));
     // Test that pushing a value beyond the max/min values results in a NULL.
-    TestIsNull(unit + "_add(cast('9999-12-31 23:59:59' as timestamp), "
-        + lt_max_interval + ")", TYPE_TIMESTAMP);
-    TestIsNull(unit + "_sub(cast('1400-01-01 00:00:00' as timestamp), "
-        + lt_max_interval + ")", TYPE_TIMESTAMP);
+    TestIsNull(StrCat(unit, "_add(cast('9999-12-31 23:59:59' as timestamp), "
+       , lt_max_interval, ")"), TYPE_TIMESTAMP);
+    TestIsNull(StrCat(unit, "_sub(cast('1400-01-01 00:00:00' as timestamp), "
+       , lt_max_interval, ")"), TYPE_TIMESTAMP);
 
     // Same as above but with edge case values of max int/long.
-    TestIsNull(unit + "_add(years_add(cast('9999-12-31 23:59:59' as timestamp), 1), "
-        + max_int + ")", TYPE_TIMESTAMP);
-    TestIsNull(unit + "_sub(cast('1400-01-01 00:00:00' as timestamp), " + max_int + ")",
-        TYPE_TIMESTAMP);
-    TestIsNull(unit + "_add(years_add(cast('9999-12-31 23:59:59' as timestamp), 1), "
-        + max_long + ")", TYPE_TIMESTAMP);
-    TestIsNull(unit + "_sub(cast('1400-01-01 00:00:00' as timestamp), " + max_long
-        + ")", TYPE_TIMESTAMP);
+    TestIsNull(StrCat(unit,"_add(years_add(cast('9999-12-31 23:59:59' as timestamp), 1), "
+       , max_int, ")"), TYPE_TIMESTAMP);
+    TestIsNull(StrCat(unit, "_sub(cast('1400-01-01 00:00:00' as timestamp), ",
+        max_int, ")"), TYPE_TIMESTAMP);
+    TestIsNull(StrCat(unit,"_add(years_add(cast('9999-12-31 23:59:59' as timestamp), 1), "
+       , max_long, ")"), TYPE_TIMESTAMP);
+    TestIsNull(StrCat(unit, "_sub(cast('1400-01-01 00:00:00' as timestamp), ", max_long
+       , ")"), TYPE_TIMESTAMP);
 
     // Test that adding/subtracting a value slightly less than the MAX_*_INTERVAL
     // can result in a non-NULL.
-    TestIsNotNull(unit + "_add(cast('1400-01-01 00:00:00' as timestamp), "
-        + lt_max_interval + ")", TYPE_TIMESTAMP);
-    TestIsNotNull(unit + "_sub(cast('9999-12-31 23:59:59' as timestamp), "
-        + lt_max_interval + ")", TYPE_TIMESTAMP);
+    TestIsNotNull(StrCat(unit, "_add(cast('1400-01-01 00:00:00' as timestamp), "
+       , lt_max_interval, ")"), TYPE_TIMESTAMP);
+    TestIsNotNull(StrCat(unit, "_sub(cast('9999-12-31 23:59:59' as timestamp), "
+       , lt_max_interval, ")"), TYPE_TIMESTAMP);
 
     // Test that adding/subtracting either results in NULL or a value more/less than
     // the original value.
-    TestValue("isnull(" + unit + "_add(" + year_5000 + ", " + max_int
-        + "), " + gt_year_5000 + ") > " + year_5000, TYPE_BOOLEAN, true);
-    TestValue("isnull(" + unit + "_sub(" + year_5000 + ", " + max_int
-        + "), " + lt_year_5000 + ") < " + year_5000, TYPE_BOOLEAN, true);
-    TestValue("isnull(" + unit + "_add(" + year_5000 + ", " + max_long
-        + "), " + gt_year_5000 + ") > " + year_5000, TYPE_BOOLEAN, true);
-    TestValue("isnull(" + unit + "_sub(" + year_5000 + ", " + max_long
-        + "), " + lt_year_5000 + ") < " + year_5000, TYPE_BOOLEAN, true);
+    TestValue(StrCat("isnull(", unit, "_add(", year_5000, ", ", max_int
+       , "), ", gt_year_5000, ") > ", year_5000), TYPE_BOOLEAN, true);
+    TestValue(StrCat("isnull(", unit, "_sub(", year_5000, ", ", max_int
+       , "), ", lt_year_5000, ") < ", year_5000), TYPE_BOOLEAN, true);
+    TestValue(StrCat("isnull(", unit, "_add(", year_5000, ", ", max_long
+       , "), ", gt_year_5000, ") > ", year_5000), TYPE_BOOLEAN, true);
+    TestValue(StrCat("isnull(", unit, "_sub(", year_5000, ", ", max_long
+       , "), ", lt_year_5000, ") < ", year_5000), TYPE_BOOLEAN, true);
   }
 
   // Regression test for IMPALA-2260, a seemingly non-edge case value results in an
@@ -6846,10 +7131,10 @@ TEST_P(ExprTest, TimestampFunctions) {
     // magnitude of the real max values so testing can start at max / 10.
     for (int64_t interval = it->second / 10; interval > 0; interval /= 10) {
       const string& sql_interval = lexical_cast<string>(interval);
-      TestIsNotNull(unit + "_add(cast('1400-01-01 00:00:00' as timestamp), "
-          + sql_interval + ")", TYPE_TIMESTAMP);
-      TestIsNotNull(unit + "_sub(cast('9999-12-31 23:59:59' as timestamp), "
-          + sql_interval + ")", TYPE_TIMESTAMP);
+      TestIsNotNull(StrCat(unit, "_add(cast('1400-01-01 00:00:00' as timestamp), "
+         , sql_interval, ")"), TYPE_TIMESTAMP);
+      TestIsNotNull(StrCat(unit, "_sub(cast('9999-12-31 23:59:59' as timestamp), "
+         , sql_interval, ")"), TYPE_TIMESTAMP);
     }
   }
 
@@ -6868,7 +7153,7 @@ TEST_P(ExprTest, TimestampFunctions) {
   // Test Unix epoch conversions again but now converting into local timestamp values.
   {
     ScopedTimeZoneOverride time_zone("PST8PDT");
-    ScopedExecOption use_local(executor_,
+    ScopedExecOption use_local(executor_.get(),
         "USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS=1");
     // Determine what the local time would have been when it was 1970-01-01 GMT
     ptime local_time_at_epoch = c_local_adjustor<ptime>::utc_to_local(from_time_t(0));
@@ -6953,6 +7238,25 @@ TEST_P(ExprTest, TimestampFunctions) {
   TestValue("dayofweek(cast('2011-12-24' as timestamp))", TYPE_INT, 7);
   TestStringValue(
       "to_date(cast('2011-12-22 09:10:11.12345678' as timestamp))", "2011-12-22");
+
+  // These expressions directly extract hour/minute/second/millis from STRING type
+  // to support these functions for timestamp strings without a date part (IMPALA-11355).
+  TestValue("hour('09:10:11.000000')", TYPE_INT, 9);
+  TestValue("minute('09:10:11.000000')", TYPE_INT, 10);
+  TestValue("second('09:10:11.000000')", TYPE_INT, 11);
+  TestValue("millisecond('09:10:11.123456')", TYPE_INT, 123);
+  TestValue("millisecond('09:10:11')", TYPE_INT, 0);
+  // Test the functions above with invalid inputs.
+  TestIsNull("hour('09:10:1')", TYPE_INT);
+  TestIsNull("hour('838:59:59')", TYPE_INT);
+  TestIsNull("minute('09-10-11')", TYPE_INT);
+  TestIsNull("second('09:aa:11.000000')", TYPE_INT);
+  TestIsNull("second('09:10:11pm')", TYPE_INT);
+  TestIsNull("millisecond('24:11:11.123')", TYPE_INT);
+  TestIsNull("millisecond('09:61:11.123')", TYPE_INT);
+  TestIsNull("millisecond('09:10:61.123')", TYPE_INT);
+  TestIsNull("millisecond('09:10:11.123aaa')", TYPE_INT);
+  TestIsNull("millisecond('')", TYPE_INT);
 
   // Check that timeofday() does not crash or return incorrect results
   TestIsNotNull("timeofday()", TYPE_STRING);
@@ -7070,7 +7374,8 @@ TEST_P(ExprTest, TimestampFunctions) {
       "as bigint)", TYPE_BIGINT, 1293872461);
   // We have some rounding errors going backend to front, so do it as a string.
   TestStringValue("cast(cast (to_utc_timestamp(cast('2011-01-01 01:01:01' "
-      "as timestamp), 'PST') as float) as string)", "1.29387251e+09");
+                  "as timestamp), 'PST') as float) as string)",
+      "1.2938725e+09");
   TestValue("cast(to_utc_timestamp(cast('2011-01-01 01:01:01' as timestamp), 'PST') "
       "as double)", TYPE_DOUBLE, 1.293872461E9);
   TestValue("cast(to_utc_timestamp(cast('2011-01-01 01:01:01.1' as timestamp), 'PST') "
@@ -7088,7 +7393,7 @@ TEST_P(ExprTest, TimestampFunctions) {
   // Tests from Hive. When casting from timestamp to numeric, timestamps are considered
   // to be local values.
   {
-    ScopedExecOption use_local(executor_,
+    ScopedExecOption use_local(executor_.get(),
         "USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS=1");
     ScopedTimeZoneOverride time_zone("PST8PDT");
     TestValue("cast(cast('2011-01-01 01:01:01' as timestamp) as boolean)", TYPE_BOOLEAN,
@@ -7103,7 +7408,8 @@ TEST_P(ExprTest, TimestampFunctions) {
         1293872461);
     // We have some rounding errors going backend to front, so do it as a string.
     TestStringValue("cast(cast(cast('2011-01-01 01:01:01' as timestamp) as float)"
-        " as string)", "1.29387251e+09");
+                    " as string)",
+        "1.2938725e+09");
     TestValue("cast(cast('2011-01-01 01:01:01' as timestamp) as double)", TYPE_DOUBLE,
         1.293872461E9);
     TestValue("cast(cast('2011-01-01 01:01:01.1' as timestamp) as double)", TYPE_DOUBLE,
@@ -7162,7 +7468,7 @@ TEST_P(ExprTest, TimestampFunctions) {
 
     // Check again with the flag enabled.
     {
-      ScopedExecOption use_local(executor_,
+      ScopedExecOption use_local(executor_.get(),
           "USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS=1");
       tm before = to_tm(posix_time::microsec_clock::local_time());
       unix_start_time = mktime(&before);
@@ -7177,7 +7483,7 @@ TEST_P(ExprTest, TimestampFunctions) {
   // Test that now() and current_timestamp() are reasonable.
   {
     ScopedTimeZoneOverride time_zone(TEST_TZ_WITHOUT_DST);
-    ScopedExecOption use_local(executor_,
+    ScopedExecOption use_local(executor_.get(),
         "USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS=1");
     const Timezone& local_tz = time_zone.GetTimezone();
 
@@ -7204,7 +7510,7 @@ TEST_P(ExprTest, TimestampFunctions) {
   // Test cast(unix_timestamp() as timestamp).
   {
     ScopedTimeZoneOverride time_zone(TEST_TZ_WITHOUT_DST);
-    ScopedExecOption use_local(executor_,
+    ScopedExecOption use_local(executor_.get(),
         "USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS=1");
     const Timezone& local_tz = time_zone.GetTimezone();
 
@@ -7228,9 +7534,9 @@ TEST_P(ExprTest, TimestampFunctions) {
     Status status = executor_->Exec(stmt, &result_types);
     EXPECT_TRUE(status.ok()) << "stmt: " << stmt << "\nerror: " << status.GetDetail();
     DCHECK(result_types.size() == 2);
-    EXPECT_EQ(TypeToOdbcString(TYPE_TIMESTAMP), result_types[0].type)
+    EXPECT_EQ(result_types[0].type, "timestamp")
         << "invalid type returned by now()";
-    EXPECT_EQ(TypeToOdbcString(TYPE_TIMESTAMP), result_types[1].type)
+    EXPECT_EQ(result_types[1].type, "timestamp")
         << "invalid type returned by utc_timestamp()";
     string result_row;
     status = executor_->FetchResult(&result_row);
@@ -8357,7 +8663,7 @@ TEST_P(ExprTest, DateFunctions) {
   // Test that current_date() is reasonable.
   {
     ScopedTimeZoneOverride time_zone(TEST_TZ_WITHOUT_DST);
-    ScopedExecOption use_local(executor_,
+    ScopedExecOption use_local(executor_.get(),
         "USE_LOCAL_TZ_FOR_UNIX_TIMESTAMP_CONVERSIONS=1");
     const Timezone& local_tz = time_zone.GetTimezone();
 
@@ -8386,6 +8692,9 @@ TEST_P(ExprTest, ConditionalFunctions) {
   TestValue("if(FALSE, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 8.8);
   TestStringValue("if(TRUE, 'abc', 'defgh')", "abc");
   TestStringValue("if(FALSE, 'abc', 'defgh')", "defgh");
+  TestStringValue("if(TRUE, cast('a' as binary), cast('b' as binary))", "a");
+  TestStringValue("if(FALSE, cast('a' as binary), cast('b' as binary))", "b");
+
   TimestampValue then_val = TimestampValue::FromUnixTime(1293872461, UTCPTR);
   TimestampValue else_val = TimestampValue::FromUnixTime(929387245, UTCPTR);
   TestTimestampValue("if(TRUE, cast('2011-01-01 09:01:01' as timestamp), "
@@ -8408,6 +8717,9 @@ TEST_P(ExprTest, ConditionalFunctions) {
   TestValue("nvl2(NULL, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 8.8);
   TestStringValue("nvl2('some string', 'abc', 'defgh')", "abc");
   TestStringValue("nvl2(NULL, 'abc', 'defgh')", "defgh");
+  TestStringValue(
+      "nvl2(cast('' as binary), cast('a' as binary), cast('b' as binary))", "a");
+  TestStringValue("nvl2(NULL, cast('a' as binary), cast('b' as binary))", "b");
   TimestampValue first_val = TimestampValue::FromUnixTime(1293872461, UTCPTR);
   TimestampValue second_val = TimestampValue::FromUnixTime(929387245, UTCPTR);
   TestTimestampValue("nvl2(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
@@ -8437,6 +8749,10 @@ TEST_P(ExprTest, ConditionalFunctions) {
   TestStringValue("nullif('abc', 'def')", "abc");
   TestIsNull("nullif(NULL, 'abc')", TYPE_STRING);
   TestStringValue("nullif('abc', NULL)", "abc");
+  TestIsNull("nullif(cast('a' as binary), cast('a' as binary))", TYPE_STRING);
+  TestStringValue("nullif(cast('a' as binary), cast('b' as binary))", "a");
+  TestIsNull("nullif(NULL, cast('a' as binary))", TYPE_STRING);
+  TestStringValue("nullif(cast('a' as binary), NULL)", "a");
   TestIsNull("nullif(cast('2011-01-01 09:01:01' as timestamp), "
       "cast('2011-01-01 09:01:01' as timestamp))", TYPE_TIMESTAMP);
   TimestampValue testlhs = TimestampValue::FromUnixTime(1293872461, UTCPTR);
@@ -8473,6 +8789,7 @@ TEST_P(ExprTest, ConditionalFunctions) {
     TestValue(f + "(NULL, cast(10.0 as float))", TYPE_FLOAT, 10.0f);
     TestValue(f + "(NULL, cast(10.0 as double))", TYPE_DOUBLE, 10.0);
     TestStringValue(f + "(NULL, 'abc')", "abc");
+    TestStringValue(f + "(NULL, cast('abc' as binary))", "abc");
     TestTimestampValue(f + "(NULL, " + default_timestamp_str_ + ")",
         default_timestamp_val_);
     TestDateValue(f + "(NULL, " + default_date_str_ + ")", default_date_val_);
@@ -8506,6 +8823,10 @@ TEST_P(ExprTest, ConditionalFunctions) {
   TestStringValue("coalesce(NULL, 'abc', NULL)", "abc");
   TestStringValue("coalesce('defgh', NULL, 'abc', NULL)", "defgh");
   TestStringValue("coalesce(NULL, NULL, NULL, 'abc', NULL, NULL)", "abc");
+  TestStringValue("coalesce(cast('a' as binary))", "a");
+  TestStringValue("coalesce(NULL, cast('a' as binary), NULL)", "a");
+  TestStringValue("coalesce(cast('a' as binary), NULL, cast('b' as binary), NULL)", "a");
+  TestStringValue("coalesce(NULL, NULL, NULL, cast('a' as binary), NULL, NULL)", "a");
   TimestampValue ats = TimestampValue::FromUnixTime(1293872461, UTCPTR);
   TimestampValue bts = TimestampValue::FromUnixTime(929387245, UTCPTR);
   TestTimestampValue("coalesce(cast('2011-01-01 09:01:01' as timestamp))", ats);
@@ -10618,7 +10939,7 @@ TEST_P(ExprTest, MaskTest) {
 }
 
 TEST_P(ExprTest, MaskHashTest) {
-  if (FIPS_mode()) {
+  if (IsFIPSMode()) {
     TestStringValue("mask_hash('TestString-123')",
         "f3a58111be6ecec11449ac44654e72376b7759883ea11723b6e51354d50436de"
         "645bd061cb5c2b07b68e15b7a7c342cac41f69b9c4efe19e810bbd7abf639a1c");
@@ -10705,6 +11026,7 @@ TEST_P(ExprTest, Utf8MaskTest) {
   executor_->PopExecOption();
 }
 
+
 TEST_P(ExprTest, BytesTest) {
   // Verifies Bytes(exp) counts number of bytes.
 
@@ -10714,7 +11036,25 @@ TEST_P(ExprTest, BytesTest) {
   TestValue("Bytes('你好 hello 你好')", TYPE_INT, 19);
   TestValue("Bytes('hello')", TYPE_INT, 5);
 
+  // BINARY uses "bytes" behind "length"
+  TestIsNull("Length(CAST(NULL AS BINARY))", TYPE_INT);
+  TestValue("Length(CAST('你好' AS BINARY))", TYPE_INT, 6);
+  TestValue("Length(CAST('你好hello' AS BINARY))", TYPE_INT, 11);
+  TestValue("Length(CAST('你好 hello 你好' AS BINARY))", TYPE_INT, 19);
+  TestValue("Length(CAST('hello' AS BINARY))", TYPE_INT, 5);
 }
+
+TEST_P(ExprTest, BytesTest) {
+  // Bytes should behave the same regardless of utf8_mode.
+  TestBytes();
+  executor_->PushExecOption("utf8_mode=true");
+  TestBytes();
+  executor_->PopExecOption();
+}
+
+
+
+
 TEST_P(ExprTest, Utf8Test) {
   // Verifies utf8_length() counts length by UTF-8 characters instead of bytes.
   // '你' and '好' are both encoded into 3 bytes.
@@ -10794,6 +11134,15 @@ TEST_P(ExprTest, Utf8Test) {
       "\U0001f467\u200d\U0001f467\u200d\U0001f468\u200d\U0001f468"
       "\u0bbf\u0ba8\u0940\u0928");
 
+  // Tests utf8_*trim() with UTF-8 characters.
+  TestStringValue("utf8_trim(' hello你好👋 ')", "hello你好👋");
+  TestStringValue("utf8_rtrim(' hello你好👋 ')", " hello你好👋");
+  TestStringValue("utf8_ltrim(' hello你好👋 ')", "hello你好👋 ");
+  TestStringValue("utf8_btrim(' hello你好👋 ')", "hello你好👋");
+  TestStringValue("utf8_rtrim('hello你好👋', '👋hello')", "hello你好");
+  TestStringValue("utf8_ltrim('hello你好👋', '👋hello')", "你好👋");
+  TestStringValue("utf8_btrim('hello你好👋', '👋hello')", "你好");
+
   executor_->PushExecOption("utf8_mode=true");
   // Each Chinese character is encoded into 3 bytes. But in UTF-8 mode, the positions
   // are counted by UTF-8 characters.
@@ -10856,12 +11205,403 @@ TEST_P(ExprTest, Utf8Test) {
   TestValue("locate('SQL', '最快的SQL引擎跑SQL', 0)", TYPE_INT, 0);
   TestValue("locate('SQL', '最快的SQL引擎跑SQL', -1)", TYPE_INT, 0);
   TestIsNull("locate('SQL', '最快的SQL引擎跑SQL', NULL)", TYPE_INT);
+
+  TestStringValue("upper('abcd áäèü')", "ABCD ÁÄÈÜ");
+  TestStringValue("lower('ABCD ÁÄÈÜ')", "abcd áäèü");
+  TestStringValue("initcap('abcd áäèü ABCD ÁÄÈÜ')",
+      "Abcd Áäèü Abcd Áäèü");
+
+  TestStringValue("upper('aáàâãäăāåąæ')", "AÁÀÂÃÄĂĀÅĄÆ");
+  TestStringValue("lower('AÁÀÂÃÄĂĀÅĄÆ')", "aáàâãäăāåąæ");
+  TestStringValue("initcap('AÁÀÂÃÄĂĀÅĄÆ')", "Aáàâãäăāåąæ");
+
+  TestStringValue("upper('eéèêëěēėę')", "EÉÈÊËĚĒĖĘ");
+  TestStringValue("lower('EÉÈÊËĚĒĖĘ')", "eéèêëěēėę");
+  TestStringValue("initcap('EÉÈÊËĚĒĖĘ')", "Eéèêëěēėę");
+
+  // The uppercase of "i" and "ı" are both "I". However, the lowercase of "I" is "i"
+  // because we don't support Turkish locale yet (IMPALA-11080).
+  // Due to the same reason, the lowercase of "İ" and "I" are both "i", but the uppercase
+  // of "i" is "I".
+  TestStringValue("upper('iíìîïīįı')", "IÍÌÎÏĪĮI");
+  TestStringValue("lower('IÍÌÎÏĪĮIİ')", "iíìîïīįii");
+  TestStringValue("initcap('IÍÌÎÏĪĮIİ')", "Iíìîïīįii");
+
+  TestStringValue("upper('oóòôõöőøœ')", "OÓÒÔÕÖŐØŒ");
+  TestStringValue("lower('OÓÒÔÕÖŐØŒ')", "oóòôõöőøœ");
+  TestStringValue("initcap('OÓÒÔÕÖŐØŒ')", "Oóòôõöőøœ");
+
+  TestStringValue("upper('uúùûüűū')", "UÚÙÛÜŰŪ");
+  TestStringValue("lower('UÚÙÛÜŰŪ')", "uúùûüűū");
+  TestStringValue("initcap('UÚÙÛÜŰŪ')", "Uúùûüűū");
+
+  // The uppercase of "đ" and "ð" are both "Đ", but the lowercase of "Đ" is "đ"
+  // due to the hard-coded locale, i.e. "en_US.UTF-8".
+  TestStringValue("upper('ýćčďđðģğķłļ')", "ÝĆČĎĐÐĢĞĶŁĻ");
+  TestStringValue("lower('ÝĆČĎĐĢĞĶŁĻ')", "ýćčďđģğķłļ");
+  TestStringValue("initcap('ÝĆČĎĐĢĞĶŁĻ')", "Ýćčďđģğķłļ");
+
+  TestStringValue("upper('ńñňņŋ')", "ŃÑŇŅŊ");
+  TestStringValue("lower('ŃÑŇŅŊ')", "ńñňņŋ");
+  TestStringValue("initcap('ŃÑŇŅŊ')", "Ńñňņŋ");
+
+  TestStringValue("upper('řśšşťŧþţżźž')", "ŘŚŠŞŤŦÞŢŻŹŽ");
+  TestStringValue("lower('ŘŚŠŞŤŦÞŢŻŹŽ')", "řśšşťŧþţżźž");
+  TestStringValue("initcap('ŘŚŠŞŤŦÞŢŻŹŽ')", "Řśšşťŧþţżźž");
+
+  // Tests with the null byte ('\0') in the middle. Explicitly create the expected
+  // results as std::string in case they are truncated at '\0'.
+  TestStringValue("upper('ábć\\0èfğ')", string("ÁBĆ\0ÈFĞ", 11));
+  TestStringValue("lower('ÁBĆ\\0ÈFĞ')", string("ábć\0èfğ", 11));
+  TestStringValue("initcap('ábć\\0ÈFĞ')", string("Ábć\0èfğ", 11));
+
+  // Tests *trim() with UTF-8 characters in UTF8_MODE.
+  TestStringValue("trim('  hello 你好 👋 ')", "hello 你好 👋");
+  TestStringValue("ltrim(' hello 你好 👋 ')", "hello 你好 👋 ");
+  TestStringValue("rtrim(' hello 你好 👋 ')", " hello 你好 👋");
+  TestStringValue("btrim(' hello 你好 👋 ')", "hello 你好 👋");
+
+  TestStringValue("ltrim('ÁáBbĆć', 'ÁBĆábć')", "");
+  TestStringValue("rtrim('price价格，', '，')", "price价格");
+
+  TestStringValue("rtrim('hello你好👋', '👋hello')", "hello你好");
+  TestStringValue("ltrim('hello你好👋', '👋hello')", "你好👋");
+  TestStringValue("btrim('hello你好👋', '👋hello')", "你好");
+
+  TestStringValue("rtrim('🍎🍐🍊🍋🍌', '🍌🍋🍐🍎')", "🍎🍐🍊");
+  TestStringValue("ltrim('🍎🍐🍊🍋🍌', '🍌🍋🍐🍎')", "🍊🍋🍌");
+  TestStringValue("btrim('🍎🍐🍊🍋🍌', '🍌🍋🍐🍎')", "🍊");
+
+  TestStringValue("btrim('water💧水вода', 'вода水💧water')", "");
+  TestStringValue("btrim('fire🔥火огонь', 'огонь火🔥fire')", "");
+
+  // There are 'Zero Width Joiner' between emojis.
+  TestStringValue("btrim('👨‍👩‍👧‍👦', '👧‍👦')", "👨‍👩");
+
   executor_->PopExecOption();
+}
+
+TEST_P(ExprTest, AiFunctionsTest) {
+  // Hack up a function context.
+  RuntimeState state(TQueryCtx(), ExecEnv::GetInstance());
+  MemTracker m;
+  MemPool pool(&m);
+  FunctionContext::TypeDesc str_desc;
+  str_desc.type = FunctionContext::Type::TYPE_STRING;
+  std::vector<FunctionContext::TypeDesc> v(3, str_desc);
+  FunctionContext* ctx = CreateUdfTestContext(str_desc, v, &state, &pool);
+  // dummy api key.
+  string secret_key("do_not_share");
+  AiFunctions::set_api_key(secret_key);
+  // valid endpoint
+  std::string_view openai_endpoint("https://api.openai.com/v1/chat/completions");
+  std::string_view azure_openai_endpoint(
+      "https://resource.openai.azure.com/openai/deployments/"
+      "deployment/completions?api-version=2024-02-01");
+  // empty jceks secret key
+  StringVal jceks_secret("");
+  // dummy model.
+  StringVal model("bot");
+  // prompt message.
+  StringVal prompt("hello!");
+  // additional params
+  StringVal json_params;
+  // impala options.
+  StringVal impala_options;
+  // dry_run to receive HTTP request header and body
+  bool dry_run = true;
+
+  // Test GetAiPlatformFromEndpoint
+  EXPECT_EQ(AiFunctions::AI_PLATFORM::OPEN_AI,
+      AiFunctions::GetAiPlatformFromEndpoint(openai_endpoint));
+  EXPECT_EQ(AiFunctions::AI_PLATFORM::AZURE_OPEN_AI,
+      AiFunctions::GetAiPlatformFromEndpoint(azure_openai_endpoint));
+  EXPECT_EQ(AiFunctions::AI_PLATFORM::UNSUPPORTED,
+      AiFunctions::GetAiPlatformFromEndpoint("https://qwerty.com"));
+
+  // Test fastpath
+  StringVal result =
+      AiFunctions::AiGenerateTextInternal<true, AiFunctions::AI_PLATFORM::OPEN_AI>(ctx,
+          FLAGS_ai_endpoint, prompt, StringVal::null(), StringVal::null(),
+          StringVal::null(), StringVal::null(), dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      string("https://api.openai.com/v1/chat/completions"
+             "\nContent-Type: application/json"
+             "\nAuthorization: Bearer do_not_share"
+             "\n{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":"
+             "\"hello!\"}]}"));
+
+  result =
+      AiFunctions::AiGenerateTextInternal<true, AiFunctions::AI_PLATFORM::AZURE_OPEN_AI>(
+          ctx, azure_openai_endpoint, prompt, StringVal::null(), StringVal::null(),
+          StringVal::null(), StringVal::null(), dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      string("https://resource.openai.azure.com/openai/deployments/"
+             "deployment/completions?api-version=2024-02-01"
+             "\nContent-Type: application/json"
+             "\napi-key: do_not_share"
+             "\n{\"messages\":[{\"role\":\"user\",\"content\":"
+             "\"hello!\"}]}"));
+
+  // Test endpoints.
+  // endpoints must begin with https.
+  result = AiFunctions::AiGenerateText(ctx, StringVal("http://ai.com"), prompt, model,
+      jceks_secret, json_params, impala_options);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      AiFunctions::AI_GENERATE_TXT_INVALID_PROTOCOL_ERROR);
+  // only OpenAI endpoints are supported.
+  result = AiFunctions::AiGenerateText(
+      ctx, "https://ai.com", prompt, model, jceks_secret, json_params, impala_options);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      AiFunctions::AI_GENERATE_TXT_UNSUPPORTED_ENDPOINT_ERROR);
+  // valid request using OpenAI endpoint.
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, jceks_secret, json_params, impala_options,
+      dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      string("https://api.openai.com/v1/chat/completions"
+             "\nContent-Type: application/json"
+             "\nAuthorization: Bearer do_not_share"
+             "\n{\"model\":\"bot\",\"messages\":[{\"role\":\"user\",\"content\":\"hello!"
+             "\"}]}"));
+
+  // Test prompt.
+  // prompt cannot be empty.
+  StringVal invalid_prompt("");
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, invalid_prompt, model, jceks_secret, json_params,
+      impala_options, dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      AiFunctions::AI_GENERATE_TXT_INVALID_PROMPT_ERROR);
+  result = AiFunctions::AiGenerateTextDefault(ctx, invalid_prompt);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      AiFunctions::AI_GENERATE_TXT_INVALID_PROMPT_ERROR);
+  // prompt cannot be null.
+  invalid_prompt = StringVal::null();
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, invalid_prompt, model, jceks_secret, json_params,
+      impala_options, dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      AiFunctions::AI_GENERATE_TXT_INVALID_PROMPT_ERROR);
+  result = AiFunctions::AiGenerateTextDefault(ctx, invalid_prompt);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      AiFunctions::AI_GENERATE_TXT_INVALID_PROMPT_ERROR);
+
+  // Test override/additional params
+  // invalid json results in error.
+  StringVal invalid_json_params("{\"temperature\": 0.49, \"stop\": [\"*\",::,]}");
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, jceks_secret, invalid_json_params,
+      impala_options, dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      AiFunctions::AI_GENERATE_TXT_JSON_PARSE_ERROR);
+  // valid json results in overriding existing params ('model'), and adding new parms
+  // like 'temperature' and 'stop'.
+  StringVal valid_json_params(
+      "{\"model\": \"gpt\", \"temperature\": 0.49, \"stop\": [\"*\", \"%\"]}");
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, jceks_secret, valid_json_params,
+      impala_options, dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      string("https://api.openai.com/v1/chat/completions"
+             "\nContent-Type: application/json"
+             "\nAuthorization: Bearer do_not_share"
+             "\n{\"model\":\"gpt\",\"messages\":[{\"role\":\"user\",\"content\":\"hello!"
+             "\"}],\"temperature\":0.49,\"stop\":[\"*\",\"%\"]}"));
+  // messages cannot be overriden, as they we constructed from the prompt.
+  StringVal forbidden_msg_override(
+      "{\"messages\": [{\"role\":\"system\",\"content\":\"howdy!\"}]}");
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, jceks_secret, forbidden_msg_override,
+      impala_options, dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      AiFunctions::AI_GENERATE_TXT_MSG_OVERRIDE_FORBIDDEN_ERROR);
+  // 'n != 1' cannot be overriden as additional params
+  StringVal forbidden_n_value("{\"n\": 2}");
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, jceks_secret, forbidden_n_value,
+      impala_options, dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      AiFunctions::AI_GENERATE_TXT_N_OVERRIDE_FORBIDDEN_ERROR);
+  // non integer value of 'n' cannot be overriden as additional params
+  StringVal forbidden_n_type("{\"n\": \"1\"}");
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, jceks_secret, forbidden_n_type, impala_options,
+      dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      AiFunctions::AI_GENERATE_TXT_N_OVERRIDE_FORBIDDEN_ERROR);
+  // accept 'n=1' override as additional params
+  StringVal allowed_n_override("{\"n\": 1}");
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, jceks_secret, allowed_n_override,
+      impala_options, dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      string("https://api.openai.com/v1/chat/completions"
+             "\nContent-Type: application/json"
+             "\nAuthorization: Bearer do_not_share"
+             "\n{\"model\":\"bot\",\"messages\":[{\"role\":\"user\",\"content\":\"hello!"
+             "\"}],\"n\":1}"));
+
+  // Test flag file options are used when input is empty/null
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, FLAGS_ai_endpoint, prompt, StringVal::null(), jceks_secret, json_params,
+      impala_options, dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      string("https://api.openai.com/v1/chat/completions"
+             "\nContent-Type: application/json"
+             "\nAuthorization: Bearer do_not_share"
+             "\n{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":"
+             "\"hello!\"}]}"));
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, FLAGS_ai_endpoint, prompt, StringVal(""), jceks_secret, json_params,
+      impala_options, dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      string("https://api.openai.com/v1/chat/completions"
+             "\nContent-Type: application/json"
+             "\nAuthorization: Bearer do_not_share"
+             "\n{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":"
+             "\"hello!\"}]}"));
+
+  // Test Impala options.
+  StringVal impala_options_payload("{\"payload\":\"testpayload\"}");
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, jceks_secret, json_params,
+      impala_options_payload, dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      string("https://api.openai.com/v1/chat/completions"
+             "\nContent-Type: application/json"
+             "\nAuthorization: Bearer do_not_share"
+             "\ntestpayload"));
+
+  // Test a not supported Impala option, doesn't affect the results.
+  StringVal impala_options_payload_extra(
+      "{\"payload\":\"testpayload\", "
+      "\"not_supported_key\":\"not_supported_content\"}");
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, jceks_secret, json_params,
+      impala_options_payload_extra, dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      string("https://api.openai.com/v1/chat/completions"
+             "\nContent-Type: application/json"
+             "\nAuthorization: Bearer do_not_share"
+             "\ntestpayload"));
+
+  // Test an Impala option with malformatted json.
+  StringVal impala_options_mal_formatted("{\"payload\":\"testpayload\", "
+                                         "malformatted_key:\"malformatted_content}");
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, jceks_secret, json_params,
+      impala_options_mal_formatted, dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      AiFunctions::AI_GENERATE_TXT_JSON_PARSE_ERROR);
+
+  // Test Impala options with payload exceeding 5MB.
+  string large_string(5 * 1024 * 1024 + 1, 'A');
+  string large_payload = "{\"payload\":\"" + large_string + "\"}";
+  StringVal impala_options_long(large_payload.c_str());
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, jceks_secret, json_params, impala_options_long,
+      dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      AiFunctions::AI_GENERATE_TXT_JSON_PARSE_ERROR);
+
+  // Test PLAIN credential type.
+  StringVal plain_token("test_token");
+  StringVal plain_token_options(
+      "{\"credential_type\":\"plain\",\"api_standard\":\"openai\"}");
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, plain_token, json_params, plain_token_options,
+      dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      string("https://api.openai.com/v1/chat/completions"
+             "\nContent-Type: application/json"
+             "\nAuthorization: Bearer test_token"
+             "\n{\"model\":\"bot\",\"messages\":[{\"role\":\"user\",\"content\":"
+             "\"hello!\"}]}"));
+
+  // Test PLAIN credential type with customized payload.
+  plain_token_options = StringVal("{\"credential_type\":\"plain\",\"api_standard\":"
+                                  "\"openai\", \"payload\":\"testpayload\"}");
+  result = AiFunctions::AiGenerateTextInternal<false, AiFunctions::AI_PLATFORM::OPEN_AI>(
+      ctx, openai_endpoint, prompt, model, plain_token, json_params, plain_token_options,
+      dry_run);
+  EXPECT_EQ(string(reinterpret_cast<char*>(result.ptr), result.len),
+      string("https://api.openai.com/v1/chat/completions"
+             "\nContent-Type: application/json"
+             "\nAuthorization: Bearer test_token"
+             "\ntestpayload"));
+
+  // Test OPEN AI's API response parsing
+  string content(
+      "A null-terminated string is a character string in a programming "
+      "language like C and C++ that ends with a null character (\'\\\\0\') . This "
+      "character represents the end of the string and is used to determine the "
+      "conclusion of the text. Essentially, it is a sequence of characters "
+      "followed by a null byte.");
+  std::ostringstream response;
+  response << "{\"id\": \"chatcmpl-9CGu8eeg1WKbKXGaNrCyHE38mQX90\","
+      << "\"object\": \"chat.completion\","
+      << "\"created\": 1712711944,"
+      << "\"model\": \"gpt-4-0613\","
+      << "\"choices\": ["
+      << "{"
+      << "\"index\": 0,"
+      << "\"message\": {"
+      << "\"role\": \"assistant\","
+      << "\"content\": " << "\"" << content << "\""
+      << "},"
+      << "\"logprobs\": null,"
+      << "\"finish_reason\": \"stop\""
+      << "}"
+      << "],"
+      << "\"usage\": {"
+      << "\"prompt_tokens\": 13,"
+      << "\"completion_tokens\": 60,"
+      << "\"total_tokens\": 73"
+      << "},"
+      << "\"system_fingerprint\": null}";
+  std::string res = AiFunctions::AiGenerateTextParseOpenAiResponse(response.str());
+  string from_null("(\'\\\\0\')");
+  string to_null("(\'\\0\')");
+  size_t pos = content.find(from_null);
+  content.replace(pos, from_null.length(), to_null);
+  EXPECT_EQ(res, content);
+
+  // resource cleanup
+  pool.FreeAll();
+  UdfTestHarness::CloseContext(ctx);
+  state.ReleaseResources();
+}
+
+TEST_P(ExprTest, AiFunctionsTestAdditionalSites) {
+  FLAGS_ai_additional_platforms = "ai-api.com , another-ai.org";
+  // Test existing endpoints.
+  EXPECT_EQ(AiFunctions::GetAiPlatformFromEndpoint(
+                "https://api.openai.com/v1/chat/completions", true),
+      AiFunctions::AI_PLATFORM::OPEN_AI);
+  EXPECT_EQ(AiFunctions::GetAiPlatformFromEndpoint(
+                "https://openai.azure.com/openai/deployments/", true),
+      AiFunctions::AI_PLATFORM::AZURE_OPEN_AI);
+
+  // Test additional added GENERAL ai platform sites.
+  EXPECT_EQ(
+      AiFunctions::GetAiPlatformFromEndpoint("https://ai-api.com/v1/generate", true),
+      AiFunctions::AI_PLATFORM::GENERAL);
+  EXPECT_EQ(
+      AiFunctions::GetAiPlatformFromEndpoint("https://another-ai.org/completions", true),
+      AiFunctions::AI_PLATFORM::GENERAL);
+  // Test unsupported endpoint.
+  EXPECT_EQ(AiFunctions::GetAiPlatformFromEndpoint("https://random-api.site", true),
+      AiFunctions::AI_PLATFORM::UNSUPPORTED);
+  // Test case sensitivity.
+  EXPECT_EQ(
+      AiFunctions::GetAiPlatformFromEndpoint("https://AI-API.COM/v1/generate", true),
+      AiFunctions::AI_PLATFORM::GENERAL);
 }
 
 } // namespace impala
 
-INSTANTIATE_TEST_CASE_P(Instantiations, ExprTest, ::testing::Values(
+INSTANTIATE_TEST_SUITE_P(Instantiations, ExprTest, ::testing::Values(
   //              disable_codegen  enable_expr_rewrites
   std::make_tuple(true,            false),
   std::make_tuple(false,           false),

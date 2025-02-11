@@ -158,8 +158,8 @@ Status FragmentInstanceState::Prepare() {
 
   // total_time_counter() is in the runtime_state_ so start it up now.
   SCOPED_TIMER(profile()->total_time_counter());
-  timings_profile_ =
-      RuntimeProfile::Create(obj_pool(), "Fragment Instance Lifecycle Timings");
+  timings_profile_ = RuntimeProfile::Create(
+      obj_pool(), RuntimeProfile::FRAGMENT_INSTANCE_LIFECYCLE_TIMINGS, false);
   profile()->AddChild(timings_profile_);
   SCOPED_TIMER(ADD_TIMER(timings_profile_, PREPARE_TIMER_NAME));
 
@@ -339,8 +339,8 @@ void FragmentInstanceState::GetStatusReport(FragmentInstanceExecStatusPB* instan
       if (rows_counter != nullptr) {
         summary_data->set_rows_returned(rows_counter->value());
         // row count stats for a join node
-        string hash_type = PrintThriftEnum(TPlanNodeType::HASH_JOIN_NODE);
-        string nested_loop_type = PrintThriftEnum(TPlanNodeType::NESTED_LOOP_JOIN_NODE);
+        string hash_type = PrintValue(TPlanNodeType::HASH_JOIN_NODE);
+        string nested_loop_type = PrintValue(TPlanNodeType::NESTED_LOOP_JOIN_NODE);
         if (node->name().rfind(hash_type, 0) == 0
             || node->name().rfind(nested_loop_type, 0) == 0) {
           per_join_rows_produced[node->metadata().plan_node_id] = rows_counter->value();

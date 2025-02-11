@@ -59,6 +59,8 @@ class ComparatorWrapper {
   }
 };
 
+class TupleRowComparator;
+
 /// TupleRowComparatorConfig contains the static state initialized from its corresponding
 /// thrift structure. It serves as an input for creating instances of the
 /// TupleRowComparator class.
@@ -102,8 +104,8 @@ class TupleRowComparatorConfig {
   std::vector<int8_t> nulls_first_;
 
   /// Codegened version of TupleRowComparator::Compare().
-  typedef int (*CompareFn)(ScalarExprEvaluator* const*, ScalarExprEvaluator* const*,
-      const TupleRow*, const TupleRow*);
+  typedef int (*CompareFn)(const TupleRowComparator*, ScalarExprEvaluator* const*,
+      ScalarExprEvaluator* const*, const TupleRow*, const TupleRow*);
   CodegenFnPtr<CompareFn> codegend_compare_fn_;
 
  private:
@@ -133,8 +135,14 @@ class TupleRowComparator {
   /// Release resources held by the ordering expressions' evaluators.
   void Close(RuntimeState* state);
 
+  /// 3-way comparator of lhs and rhs. Returns 0 if lhs==rhs
+  /// All exprs (ordering_exprs_lhs_ and ordering_exprs_rhs_) must have been prepared
+  /// and opened before calling this.
+  /// Force inlining because it tends not to be always inlined at callsites, even in
+  /// hot loops.
   int ALWAYS_INLINE Compare(const TupleRow* lhs, const TupleRow* rhs) const {
-    return Compare(nullptr, nullptr, lhs, rhs);
+    return Compare(
+        ordering_expr_evals_lhs_.data(), ordering_expr_evals_rhs_.data(), lhs, rhs);
   }
 
   int ALWAYS_INLINE Compare(const Tuple* lhs, const Tuple* rhs) const {
@@ -150,8 +158,19 @@ class TupleRowComparator {
   /// hot loops.
   bool ALWAYS_INLINE Less(const TupleRow* lhs, const TupleRow* rhs) const {
     return Compare(
-               ordering_expr_evals_lhs_.data(), ordering_expr_evals_rhs_.data(), lhs, rhs)
-        < 0;
+        ordering_expr_evals_lhs_.data(), ordering_expr_evals_rhs_.data(), lhs, rhs) < 0;
+  }
+
+  bool ALWAYS_INLINE LessCodegend(const TupleRow* lhs, const TupleRow* rhs) const {
+    if (codegend_compare_fn_non_atomic_ != nullptr) {
+      return codegend_compare_fn_non_atomic_(this,
+          ordering_expr_evals_lhs_.data(), ordering_expr_evals_rhs_.data(), lhs, rhs) < 0;
+    } else {
+      TupleRowComparatorConfig::CompareFn fn = codegend_compare_fn_.load();
+      if (fn != nullptr) codegend_compare_fn_non_atomic_ = fn;
+    }
+    return Compare(
+        ordering_expr_evals_lhs_.data(), ordering_expr_evals_rhs_.data(), lhs, rhs) < 0;
   }
 
   bool ALWAYS_INLINE Less(const Tuple* lhs, const Tuple* rhs) const {
@@ -173,6 +192,12 @@ class TupleRowComparator {
   static const char* LLVM_CLASS_NAME;
 
  protected:
+  TupleRowComparator(const std::vector<ScalarExpr*>& ordering_exprs,
+      const CodegenFnPtr<TupleRowComparatorConfig::CompareFn>& codegend_compare_fn)
+    : ordering_exprs_(ordering_exprs),
+      codegend_compare_fn_(codegend_compare_fn) {
+  }
+
   /// References to ordering expressions owned by the plan node which owns the
   /// TupleRowComparatorConfig used to create this instance.
   const std::vector<ScalarExpr*>& ordering_exprs_;
@@ -185,6 +210,7 @@ class TupleRowComparator {
   /// Reference to the codegened function pointer owned by the TupleRowComparatorConfig
   /// object that was used to create this instance.
   const CodegenFnPtr<TupleRowComparatorConfig::CompareFn>& codegend_compare_fn_;
+  mutable TupleRowComparatorConfig::CompareFn codegend_compare_fn_non_atomic_ = nullptr;
 
  private:
   /// Interpreted implementation of Compare().

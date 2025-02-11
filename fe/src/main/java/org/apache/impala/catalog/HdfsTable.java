@@ -19,9 +19,6 @@ package org.apache.impala.catalog;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.io.UnsupportedEncodingException;
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -37,7 +34,7 @@ import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
 import org.apache.avro.Schema;
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -48,19 +45,22 @@ import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.ForeignKeysRequest;
-import org.apache.hadoop.hive.metastore.api.MetaException;
+import org.apache.hadoop.hive.metastore.api.InvalidObjectException;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.PrimaryKeysRequest;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
+import org.apache.hadoop.hive.metastore.utils.FileUtils;
 import org.apache.hadoop.hive.serde.serdeConstants;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.NumericLiteral;
 import org.apache.impala.analysis.PartitionKeyValue;
+import org.apache.impala.catalog.events.MetastoreEventsProcessor;
 import org.apache.impala.catalog.HdfsPartition.FileBlock;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
+import org.apache.impala.catalog.iceberg.GroupedContentFiles;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.Pair;
@@ -94,11 +94,13 @@ import org.apache.impala.util.AcidUtils;
 import org.apache.impala.util.AvroSchemaConverter;
 import org.apache.impala.util.AvroSchemaUtils;
 import org.apache.impala.util.DebugUtils;
+import org.apache.impala.util.EventSequence;
 import org.apache.impala.util.FsPermissionCache;
 import org.apache.impala.util.FsPermissionChecker;
 import org.apache.impala.util.HdfsCachingUtil;
 import org.apache.impala.util.ListMap;
 import org.apache.impala.util.MetaStoreUtil;
+import org.apache.impala.util.NoOpEventSequence;
 import org.apache.impala.util.TAccessLevelUtil;
 import org.apache.impala.util.TResultRowBuilder;
 import org.apache.impala.util.ThreadNameAnnotator;
@@ -121,6 +123,8 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multiset;
 import com.google.common.collect.Sets;
+
+import static org.apache.impala.service.CatalogOpExecutor.FETCHED_LATEST_HMS_EVENT_ID;
 
 /**
  * Internal representation of table-related metadata of a file-resident table on a
@@ -207,6 +211,8 @@ public class HdfsTable extends Table implements FeFsTable {
   public static final String LOAD_DURATION_FILE_METADATA_ALL_PARTITIONS =
       "load-duration.all-partitions.file-metadata";
 
+  private static final THdfsPartition FAKE_THDFS_PARTITION = new THdfsPartition();
+
   // string to indicate NULL. set in load() from table properties
   private String nullColumnValue_;
 
@@ -239,6 +245,11 @@ public class HdfsTable extends Table implements FeFsTable {
   // Map of partition ids to HdfsPartitions.
   // Declared as protected to allow third party extension visibility.
   protected final Map<Long, HdfsPartition> partitionMap_ = new HashMap<>();
+
+  // The data and delete files of the table, for Iceberg tables only.
+  private GroupedContentFiles icebergFiles_;
+  // Whether the data and delete files of The Iceberg tables can be outside the location.
+  private boolean canDataBeOutsideOfTableLocation_;
 
   // Map of partition name to HdfsPartition object. Used for speeding up
   // table metadata loading. It is only populated if this table object is stored in
@@ -293,6 +304,13 @@ public class HdfsTable extends Table implements FeFsTable {
   // null in the case that this table is not transactional.
   protected MutableValidWriteIdList validWriteIds_ = null;
 
+  // The last committed compaction id in the table level. It will be sent as a filter to
+  // retrieve only the latest compaction that is not seen by this instance. This value is
+  // updated whenever a partition is added to the table so that it is guaranteed to be
+  // up-to-date.
+  // -1 means there is no previous compaction event or compaction is not supported.
+  private long lastCompactionId_ = -1;
+
   // Partitions are marked as "dirty" indicating there are in-progress modifications on
   // their metadata. The corresponding partition builder contains the new version of the
   // metadata so represents the in-progress modifications. The modifications will be
@@ -323,21 +341,35 @@ public class HdfsTable extends Table implements FeFsTable {
   // to determine if we can skip the table from the topic update.
   private long lastVersionSeenByTopicUpdate_ = -1;
 
+  public void setIcebergFiles(GroupedContentFiles icebergFiles) {
+    icebergFiles_ = icebergFiles;
+  }
+
+  public void setCanDataBeOutsideOfTableLocation(
+      boolean canDataBeOutsideOfTableLocation) {
+    canDataBeOutsideOfTableLocation_ = canDataBeOutsideOfTableLocation;
+  }
+
   // Represents a set of storage-related statistics aggregated at the table or partition
   // level.
   public final static class FileMetadataStats {
-    // Nuber of files in a table/partition.
-    public long numFiles;
+    // Number of files in a table/partition.
+    public long numFiles = 0;
     // Number of blocks in a table/partition.
-    public long numBlocks;
+    public long numBlocks = 0;
     // Total size (in bytes) of all files in a table/partition.
-    public long totalFileBytes;
+    public long totalFileBytes = 0;
 
-    // Unsets the storage stats to indicate that their values are unknown.
-    public void unset() {
-      numFiles = -1;
-      numBlocks = -1;
-      totalFileBytes = -1;
+    public FileMetadataStats() {}
+
+    /**
+     * This constructor allows third party extensions to instantiate a FileMetadataStats
+     * with a List of FileDescriptor's.
+     */
+    public FileMetadataStats(List<FileDescriptor> fds) {
+      for (HdfsPartition.FileDescriptor fd : fds) {
+        accumulate(fd);
+      }
     }
 
     // Initializes the values of the storage stats.
@@ -351,6 +383,25 @@ public class HdfsTable extends Table implements FeFsTable {
       numFiles = stats.numFiles;
       numBlocks = stats.numBlocks;
       totalFileBytes = stats.totalFileBytes;
+    }
+
+    public void merge(FileMetadataStats other) {
+      numFiles += other.numFiles;
+      numBlocks += other.numBlocks;
+      totalFileBytes += other.totalFileBytes;
+    }
+
+    public void remove(FileMetadataStats other) {
+      numFiles -= other.numFiles;
+      numBlocks -= other.numBlocks;
+      totalFileBytes -= other.totalFileBytes;
+    }
+
+    // Accumulate the statistics of the fd into this FileMetadataStats.
+    public void accumulate(FileDescriptor fd) {
+      numBlocks += fd.getNumFileBlocks();
+      totalFileBytes += fd.getFileLength();
+      ++numFiles;
     }
   }
 
@@ -376,6 +427,8 @@ public class HdfsTable extends Table implements FeFsTable {
     super(msTbl, db, name, owner);
     partitionLocationCompressor_ =
         new HdfsPartitionLocationCompressor(numClusteringCols_);
+    icebergFiles_ = new GroupedContentFiles();
+    canDataBeOutsideOfTableLocation_ = false;
   }
 
   @Override // FeFsTable
@@ -394,21 +447,6 @@ public class HdfsTable extends Table implements FeFsTable {
       }
     }
     return true;
-  }
-
-  /**
-   * Updates the storage stats of this table based on the partition information.
-   * This is used only for the frontend tests that do not spawn a separate Catalog
-   * instance.
-   */
-  public void computeHdfsStatsForTesting() {
-    Preconditions.checkState(fileMetadataStats_.numFiles == -1
-        && fileMetadataStats_.totalFileBytes == -1);
-    fileMetadataStats_.init();
-    for (HdfsPartition partition: partitionMap_.values()) {
-      fileMetadataStats_.numFiles += partition.getNumFileDescriptors();
-      fileMetadataStats_.totalFileBytes += partition.getSize();
-    }
   }
 
   @Override
@@ -623,6 +661,11 @@ public class HdfsTable extends Table implements FeFsTable {
     addColumnsFromFieldSchemas(fieldSchemas);
   }
 
+  private void addVirtualColumns() {
+    addVirtualColumn(VirtualColumn.INPUT_FILE_NAME);
+    addVirtualColumn(VirtualColumn.FILE_POSITION);
+  }
+
   /**
    * Clear the partitions of an HdfsTable and the associated metadata.
    * Declared as protected to allow third party extension visibility.
@@ -670,20 +713,24 @@ public class HdfsTable extends Table implements FeFsTable {
    * partition keys.
    */
   private long loadAllPartitions(IMetaStoreClient client, List<Partition> msPartitions,
-      org.apache.hadoop.hive.metastore.api.Table msTbl) throws IOException,
-      CatalogException {
+      org.apache.hadoop.hive.metastore.api.Table msTbl, EventSequence catalogTimeline)
+      throws IOException, CatalogException {
     Preconditions.checkNotNull(msTbl);
     final Clock clock = Clock.defaultClock();
     long startTime = clock.getTick();
     initializePartitionMetadata(msTbl);
-    FsPermissionCache permCache = preloadPermissionsCache(msPartitions);
+    FsPermissionCache permCache = preloadPermissionsCache(msPartitions, catalogTimeline);
 
     Path tblLocation = FileSystemUtil.createFullyQualifiedPath(getHdfsBaseDirPath());
     accessLevel_ = getAvailableAccessLevel(getFullName(), tblLocation, permCache);
+    catalogTimeline.markEvent("Got access level");
 
     List<HdfsPartition.Builder> partBuilders = new ArrayList<>();
     if (msTbl.getPartitionKeysSize() == 0) {
-      Preconditions.checkArgument(msPartitions == null || msPartitions.isEmpty());
+      // Legacy -> Iceberg migrated tables might have HMS partitions (HIVE-25894).
+      if (!IcebergTable.isIcebergTable(msTbl)) {
+        Preconditions.checkArgument(msPartitions == null || msPartitions.isEmpty());
+      }
       // This table has no partition key, which means it has no declared partitions.
       // We model partitions slightly differently to Hive - every file must exist in a
       // partition, so add a single partition with no keys which will get all the
@@ -698,11 +745,14 @@ public class HdfsTable extends Table implements FeFsTable {
         partBuilders.add(createPartitionBuilder(
             msPartition.getSd(), msPartition, permCache));
       }
+      // Most of the time spent in getAvailableAccessLevel() for each partition.
+      catalogTimeline.markEvent("Created partition builders");
     }
     // Load the file metadata from scratch.
     Timer.Context fileMetadataLdContext = getMetrics().getTimer(
         HdfsTable.LOAD_DURATION_FILE_METADATA_ALL_PARTITIONS).time();
-    loadFileMetadataForPartitions(client, partBuilders, /*isRefresh=*/false);
+    loadFileMetadataForPartitions(client, partBuilders, /*isRefresh=*/false,
+        catalogTimeline);
     fileMetadataLdContext.stop();
     for (HdfsPartition.Builder p : partBuilders) addPartition(p.build());
     return clock.getTick() - startTime;
@@ -721,13 +771,14 @@ public class HdfsTable extends Table implements FeFsTable {
 
   /**
    * Similar to
-   * {@link #loadFileMetadataForPartitions(IMetaStoreClient, Collection, boolean)}
-   * but without any injecting the debug actions.
+   * {@link #loadFileMetadataForPartitions(IMetaStoreClient, Collection, boolean, String,
+   * EventSequence)} but without any injecting the debug actions.
    */
   public long loadFileMetadataForPartitions(IMetaStoreClient client,
-      Collection<HdfsPartition.Builder> partBuilders, boolean isRefresh)
-      throws CatalogException {
-    return loadFileMetadataForPartitions(client, partBuilders, isRefresh, null);
+      Collection<HdfsPartition.Builder> partBuilders, boolean isRefresh,
+      EventSequence catalogTimeline) throws CatalogException {
+    return loadFileMetadataForPartitions(client, partBuilders, isRefresh, null,
+        catalogTimeline);
   }
 
   /**
@@ -740,10 +791,18 @@ public class HdfsTable extends Table implements FeFsTable {
    */
   private long loadFileMetadataForPartitions(IMetaStoreClient client,
       Collection<HdfsPartition.Builder> partBuilders, boolean isRefresh,
-      String debugActions) throws CatalogException {
+      String debugActions, EventSequence catalogTimeline) throws CatalogException {
     getMetrics().getCounter(NUM_LOAD_FILEMETADATA_METRIC).inc();
     final Clock clock = Clock.defaultClock();
     long startTime = clock.getTick();
+    catalogTimeline.markEvent(String.format("Start %s file metadata",
+        isRefresh ? "refreshing" : "loading"));
+
+    if (DebugUtils.hasDebugAction(debugActions,
+        DebugUtils.LOAD_FILE_METADATA_THROW_EXCEPTION)) {
+      throw new CatalogException("Threw a catalog exception due to the debug action " +
+          "during loading file metadata.");
+    }
 
     //TODO: maybe it'd be better to load the valid txn list in the context of a
     // transaction to have consistent valid write ids and valid transaction ids.
@@ -764,7 +823,8 @@ public class HdfsTable extends Table implements FeFsTable {
     // have refreshed the top-level table properties without refreshing the files.
     new ParallelFileMetadataLoader(getFileSystem(), partBuilders, validWriteIds_,
         validTxnList, Utils.shouldRecursivelyListPartitions(this),
-        getHostIndex(), debugActions, logPrefix).load();
+        getHostIndex(), debugActions, logPrefix, icebergFiles_,
+        canDataBeOutsideOfTableLocation_).load();
 
     // TODO(todd): would be good to log a summary of the loading process:
     // - how many block locations did we reuse/load individually/load via batch
@@ -779,6 +839,8 @@ public class HdfsTable extends Table implements FeFsTable {
           Iterables.size(partBuilders) - 3);
     }
 
+    catalogTimeline.markEvent(String.format("Loaded file metadata for %d partitions",
+        partBuilders.size()));
     long duration = clock.getTick() - startTime;
     LOG.info("Loaded file and block metadata for {} partitions: {}. Time taken: {}",
         getFullName(), partNames, PrintUtils.printTimeNs(duration));
@@ -790,7 +852,7 @@ public class HdfsTable extends Table implements FeFsTable {
    * permissions Impala has on the given path. If the path does not exist, recurses up
    * the path until a existing parent directory is found, and inherit access permissions
    * from that.
-   * Always returns READ_WRITE for S3, ADLS, GCS and COS files.
+   * Always returns READ_WRITE for S3, ADLS, GCS, COS files, and Ranger-enabled HDFS.
    */
   private static TAccessLevel getAvailableAccessLevel(String tableName,
       Path location, FsPermissionCache permCache) throws IOException {
@@ -824,6 +886,22 @@ public class HdfsTable extends Table implements FeFsTable {
    *              {@link #getAvailableAccessLevel(String, Path, FsPermissionCache)}
    */
   private static boolean assumeReadWriteAccess(FileSystem fs) {
+    // Avoid loading permissions in local catalog mode since they are not used in
+    // LocalFsTable. Remove this once we resolve IMPALA-7539.
+    if (BackendConfig.INSTANCE.isMinimalTopicMode()) return true;
+
+    // Authorization on Ranger-enabled HDFS can be managed via the HDFS policy
+    // repository, and thus it is possible to check the existence of necessary
+    // permissions via RPC to the Hadoop NameNode, or Ranger REST API. Before
+    // IMPALA-12994 is resolved, we assume the Impala service user has the READ_WRITE
+    // permission on all HDFS files in the case when Ranger is enabled in Impala.
+    // This also avoids significant overhead when the number of table partitions gets
+    // bigger.
+    if (FileSystemUtil.isDistributedFileSystem(fs) &&
+        BackendConfig.INSTANCE.getAuthorizationProvider().equalsIgnoreCase("ranger")) {
+      return true;
+    }
+
     // Avoid calling getPermissions() on file path for S3 files, as that makes a round
     // trip to S3. Also, the S3A connector is currently unable to manage S3 permissions,
     // so for now it is safe to assume that all files(objects) have READ_WRITE
@@ -853,6 +931,12 @@ public class HdfsTable extends Table implements FeFsTable {
     // So calling getPermissions() on COS files make no sense. Assume all COS files have
     // READ_WRITE permissions.
     if (FileSystemUtil.isCOSFileSystem(fs)) return true;
+
+    // In OSS, file owner and group are persisted, but the permissions model is not
+    // enforced. Authorization occurs at the level of the entire Aliyun account via Aliyun
+    // Resource Access Management.
+    // The append operation is not supported.
+    if (FileSystemUtil.isOSSFileSystem(fs)) return true;
     return false;
   }
 
@@ -870,9 +954,10 @@ public class HdfsTable extends Table implements FeFsTable {
    */
   public List<HdfsPartition> createAndLoadPartitions(IMetaStoreClient client,
       List<org.apache.hadoop.hive.metastore.api.Partition> msPartitions,
-      @Nullable Map<String, Long> msPartitionsToEventId) throws CatalogException {
+      @Nullable Map<String, Long> msPartitionsToEventId, EventSequence catalogTimeline)
+      throws CatalogException {
     List<HdfsPartition.Builder> addedPartBuilders = new ArrayList<>();
-    FsPermissionCache permCache = preloadPermissionsCache(msPartitions);
+    FsPermissionCache permCache = preloadPermissionsCache(msPartitions, catalogTimeline);
     for (org.apache.hadoop.hive.metastore.api.Partition partition: msPartitions) {
       HdfsPartition.Builder partBuilder = createPartitionBuilder(partition.getSd(),
           partition, permCache);
@@ -888,7 +973,8 @@ public class HdfsTable extends Table implements FeFsTable {
       partBuilder.setCreateEventId(eventId);
       addedPartBuilders.add(partBuilder);
     }
-    loadFileMetadataForPartitions(client, addedPartBuilders, /*isRefresh=*/false);
+    loadFileMetadataForPartitions(client, addedPartBuilders, /*isRefresh=*/false,
+        catalogTimeline);
     return addedPartBuilders.stream()
         .map(HdfsPartition.Builder::build)
         .collect(Collectors.toList());
@@ -962,9 +1048,9 @@ public class HdfsTable extends Table implements FeFsTable {
     if (partitionMap_.containsKey(partition.getId())) return false;
     if (partition.getFileFormat() == HdfsFileFormat.AVRO) hasAvroData_ = true;
     partitionMap_.put(partition.getId(), partition);
-    fileMetadataStats_.totalFileBytes += partition.getSize();
-    fileMetadataStats_.numFiles += partition.getNumFileDescriptors();
+    fileMetadataStats_.merge(partition.getFileMetadataStats());
     updatePartitionMdAndColStats(partition);
+    lastCompactionId_ = Math.max(lastCompactionId_, partition.getLastCompactionId());
     return true;
   }
 
@@ -1054,8 +1140,7 @@ public class HdfsTable extends Table implements FeFsTable {
   private HdfsPartition dropPartition(HdfsPartition partition,
       boolean removeCacheDirective) {
     if (partition == null) return null;
-    fileMetadataStats_.totalFileBytes -= partition.getSize();
-    fileMetadataStats_.numFiles -= partition.getNumFileDescriptors();
+    fileMetadataStats_.remove(partition.getFileMetadataStats());
     Preconditions.checkArgument(partition.getPartitionValues().size() ==
         numClusteringCols_);
     Long partitionId = partition.getId();
@@ -1140,33 +1225,54 @@ public class HdfsTable extends Table implements FeFsTable {
     prototypePartition_ = HdfsPartition.prototypePartition(this, hdfsStorageDescriptor);
   }
 
+  private void updateMetrics() {
+    long memUsageEstimate = 0;
+    int numPartitions = partitionMap_.values().size();
+    memUsageEstimate += numPartitions * PER_PARTITION_MEM_USAGE_BYTES;
+    FileMetadataStats newStats = new FileMetadataStats();
+    for (HdfsPartition partition: partitionMap_.values()) {
+      if (partition.hasIncrementalStats()) {
+        memUsageEstimate += getColumns().size() * STATS_SIZE_PER_COLUMN_BYTES;
+        hasIncrementalStats_ = true;
+      }
+      newStats.merge(partition.getFileMetadataStats());
+    }
+    fileMetadataStats_.set(newStats);
+    memUsageEstimate += fileMetadataStats_.numFiles * PER_FD_MEM_USAGE_BYTES +
+        fileMetadataStats_.numBlocks * PER_BLOCK_MEM_USAGE_BYTES;
+    setEstimatedMetadataSize(memUsageEstimate);
+    setNumFiles(fileMetadataStats_.numFiles);
+  }
+
   @Override
   public void load(boolean reuseMetadata, IMetaStoreClient client,
-      org.apache.hadoop.hive.metastore.api.Table msTbl, String reason)
-      throws TableLoadingException {
+      org.apache.hadoop.hive.metastore.api.Table msTbl, String reason,
+      EventSequence catalogTimeline) throws TableLoadingException {
     load(reuseMetadata, client, msTbl, /* loadPartitionFileMetadata */
         true, /* loadTableSchema*/true, false,
-        /* partitionsToUpdate*/null, null, null, reason);
+        /* partitionsToUpdate*/null, null, null, reason, catalogTimeline);
   }
 
   public void load(boolean reuseMetadata, IMetaStoreClient client,
-      org.apache.hadoop.hive.metastore.api.Table msTbl, boolean refreshUpdatedPartitions,
-      String reason) throws TableLoadingException {
-    load(reuseMetadata, client, msTbl, /* loadPartitionFileMetadata */
-        true, /* loadTableSchema*/true, refreshUpdatedPartitions,
-        /* partitionsToUpdate*/null, null, null, reason);
-  }
-
-  public void load(boolean reuseMetadata, IMetaStoreClient hiveClient,
       org.apache.hadoop.hive.metastore.api.Table msTbl,
-      boolean refreshUpdatedPartitions, String debugAction, String reason)
-      throws CatalogException {
-    load(reuseMetadata, hiveClient, msTbl, /* loadPartitionFileMetadata */
-        true, /* loadTableSchema*/true, refreshUpdatedPartitions,
-        /* partitionsToUpdate*/null, debugAction, null, reason);
+      boolean loadPartitionFileMetadata, boolean loadTableSchema,
+      boolean refreshUpdatedPartitions, @Nullable Set<String> partitionsToUpdate,
+      @Nullable String debugAction, @Nullable Map<String, Long> partitionToEventId,
+      String reason, EventSequence catalogTimeline) throws TableLoadingException {
+    load(new HdfsTableLoadParamsBuilder(client, msTbl)
+        .reuseMetadata(reuseMetadata)
+        .setLoadPartitionFileMetadata(loadPartitionFileMetadata)
+        .setLoadTableSchema(loadTableSchema)
+        .setRefreshUpdatedPartitions(refreshUpdatedPartitions)
+        .setPartitionsToUpdate(partitionsToUpdate)
+        .setDebugAction(debugAction).setReason(reason)
+        .setPartitionToEventId(partitionToEventId)
+        .setIsPreLoadForInsert(false)
+        .setCatalogTimeline(catalogTimeline).build());
   }
 
   /**
+   * See 'HdfsTableLoadParams' class for the argument list passed into this method.
    * Loads table metadata from the Hive Metastore.
    *
    * If 'reuseMetadata' is false, performs a full metadata load from the Hive Metastore,
@@ -1184,61 +1290,73 @@ public class HdfsTable extends Table implements FeFsTable {
    *
    * If 'loadTableSchema' is true, the table schema is loaded from the Hive Metastore.
    *
+   * If 'isPreLoadForInsert' is true, then we intend to refresh partitions from the Hive
+   * Metastore without reloading the file metadata(this is done in later steps) to ensure
+   * consistency while inserting into partitioned tables.
+   *
    * Existing file descriptors might be reused incorrectly if Hdfs rebalancer was
    * executed, as it changes the block locations but doesn't update the mtime (file
    * modification time).
    * If this occurs, user has to execute "invalidate metadata" to invalidate the
    * metadata cache of the table and trigger a fresh load.
    */
-  public void load(boolean reuseMetadata, IMetaStoreClient client,
-      org.apache.hadoop.hive.metastore.api.Table msTbl,
-      boolean loadParitionFileMetadata, boolean loadTableSchema,
-      boolean refreshUpdatedPartitions, Set<String> partitionsToUpdate,
-      @Nullable String debugAction, @Nullable Map<String, Long> partitionToEventId,
-      String reason) throws TableLoadingException {
+  public void load(HdfsTableLoadParams loadParams) throws TableLoadingException {
     final Timer.Context context =
         getMetrics().getTimer(Table.LOAD_DURATION_METRIC).time();
+    IMetaStoreClient msClient = loadParams.getMsClient();
+    org.apache.hadoop.hive.metastore.api.Table msTbl = loadParams.getMsTable();
+    EventSequence catalogTimeline = loadParams.getCatalogTimeline();
+    Set<String> partitionsToUpdate = loadParams.getPartitionsToUpdate();
     String annotation = String.format("%s metadata for %s%s partition(s) of %s.%s (%s)",
-        reuseMetadata ? "Reloading" : "Loading",
-        loadTableSchema ? "table definition and " : "",
+        loadParams.getIsReuseMetadata() ? "Reloading" : "Loading",
+        loadParams.getLoadTableSchema() ? "table definition and " : "",
         partitionsToUpdate == null ? "all" : String.valueOf(partitionsToUpdate.size()),
-        msTbl.getDbName(), msTbl.getTableName(), reason);
+        msTbl.getDbName(), msTbl.getTableName(),
+        loadParams.getReason());
     LOG.info(annotation);
     final Timer storageLdTimer =
         getMetrics().getTimer(Table.LOAD_DURATION_STORAGE_METADATA);
     storageMetadataLoadTime_ = 0;
+    Table.LOADING_TABLES.incrementAndGet();
     try (ThreadNameAnnotator tna = new ThreadNameAnnotator(annotation)) {
       // turn all exceptions into TableLoadingException
       msTable_ = msTbl;
       try {
-        if (loadTableSchema) {
+        if (loadParams.getLoadTableSchema()) {
             // set nullPartitionKeyValue from the hive conf.
           nullPartitionKeyValue_ =
-            MetaStoreUtil.getNullPartitionKeyValue(client).intern();
+            MetaStoreUtil.getNullPartitionKeyValue(msClient).intern();
           loadSchema(msTbl);
-          loadAllColumnStats(client);
-          loadConstraintsInfo(client, msTbl);
+          loadAllColumnStats(msClient, catalogTimeline);
+          loadConstraintsInfo(msClient, msTbl);
+          catalogTimeline.markEvent("Loaded table schema");
         }
-        loadValidWriteIdList(client);
+        loadValidWriteIdList(msClient);
         // Set table-level stats first so partition stats can inherit it.
         setTableStats(msTbl);
         // Load partition and file metadata
-        if (reuseMetadata) {
+        if (loadParams.getIsReuseMetadata()) {
           // Incrementally update this table's partitions and file metadata
-          Preconditions.checkState(
-              partitionsToUpdate == null || loadParitionFileMetadata);
+          if (!loadParams.getIsPreLoadForInsert()) {
+            Preconditions.checkState(partitionsToUpdate == null ||
+                loadParams.isLoadPartitionFileMetadata(), "Conflicts in " +
+                "'partitionsToUpdate' and 'loadPartitionFileMetadata'");
+          }
           storageMetadataLoadTime_ += updateMdFromHmsTable(msTbl);
           if (msTbl.getPartitionKeysSize() == 0) {
-            if (loadParitionFileMetadata) {
-              storageMetadataLoadTime_ += updateUnpartitionedTableFileMd(client,
-                  debugAction);
+            if (loadParams.isLoadPartitionFileMetadata()) {
+              storageMetadataLoadTime_ += updateUnpartitionedTableFileMd(
+                  msClient, loadParams.getDebugAction(),
+                  catalogTimeline);
             } else {  // Update the single partition stats in case table stats changes.
               updateUnpartitionedTableStats();
             }
           } else {
-            storageMetadataLoadTime_ += updatePartitionsFromHms(
-                client, partitionsToUpdate, loadParitionFileMetadata,
-                refreshUpdatedPartitions, partitionToEventId, debugAction);
+            storageMetadataLoadTime_ += updatePartitionsFromHms(msClient,
+                partitionsToUpdate, loadParams.isLoadPartitionFileMetadata(),
+                loadParams.getRefreshUpdatedPartitions(),
+                loadParams.getPartitionToEventId(), loadParams.getDebugAction(),
+                catalogTimeline, loadParams.getIsPreLoadForInsert());
           }
           LOG.info("Incrementally loaded table metadata for: " + getFullName());
         } else {
@@ -1247,14 +1365,17 @@ public class HdfsTable extends Table implements FeFsTable {
               getMetrics().getTimer(HdfsTable.LOAD_DURATION_ALL_PARTITIONS).time();
           // Load all partitions from Hive Metastore, including file metadata.
           List<org.apache.hadoop.hive.metastore.api.Partition> msPartitions =
-              MetaStoreUtil.fetchAllPartitions(
-                  client, db_.getName(), name_, NUM_PARTITION_FETCH_RETRIES);
+              MetaStoreUtil.fetchAllPartitions(msClient,
+                  msTbl, NUM_PARTITION_FETCH_RETRIES);
           LOG.info("Fetched partition metadata from the Metastore: " + getFullName());
-          storageMetadataLoadTime_ = loadAllPartitions(client, msPartitions, msTbl);
+          storageMetadataLoadTime_ = loadAllPartitions(msClient,
+              msPartitions, msTbl, catalogTimeline);
           allPartitionsLdContext.stop();
         }
-        if (loadTableSchema) setAvroSchema(client, msTbl);
-        fileMetadataStats_.unset();
+        if (loadParams.getLoadTableSchema()) {
+          setAvroSchema(msClient, msTbl, catalogTimeline);
+        }
+        updateMetrics();
         refreshLastUsedTime();
         // Make sure all the partition modifications are done.
         Preconditions.checkState(dirtyPartitions_.isEmpty());
@@ -1272,6 +1393,7 @@ public class HdfsTable extends Table implements FeFsTable {
             "warning threshold. Time: " + PrintUtils.printTimeNs(load_time_duration));
       }
       updateTableLoadingTime();
+      Table.LOADING_TABLES.decrementAndGet();
     }
   }
 
@@ -1323,17 +1445,16 @@ public class HdfsTable extends Table implements FeFsTable {
    * This is optimized for the case where few files have changed. See
    * {@link FileMetadataLoader#load} for details.
    */
-  private long updateUnpartitionedTableFileMd(IMetaStoreClient client, String debugAction)
-      throws CatalogException {
+  private long updateUnpartitionedTableFileMd(IMetaStoreClient client, String debugAction,
+      EventSequence catalogTimeline) throws CatalogException {
     Preconditions.checkState(getNumClusteringCols() == 0);
     if (LOG.isTraceEnabled()) {
       LOG.trace("update unpartitioned table: " + getFullName());
     }
+    // Step 1: fetch external metadata
     HdfsPartition oldPartition = Iterables.getOnlyElement(partitionMap_.values());
-    resetPartitions();
     org.apache.hadoop.hive.metastore.api.Table msTbl = getMetaStoreTable();
     Preconditions.checkNotNull(msTbl);
-    setPrototypePartition(msTbl.getSd());
     HdfsPartition.Builder partBuilder = createPartitionBuilder(msTbl.getSd(),
         /*msPartition=*/null, new FsPermissionCache());
     // Copy over the FDs from the old partition to the new one, so that
@@ -1345,7 +1466,10 @@ public class HdfsTable extends Table implements FeFsTable {
     // partition instance to local catalog coordinators.
     partBuilder.setPrevId(oldPartition.getId());
     long fileMdLoadTime = loadFileMetadataForPartitions(client,
-        ImmutableList.of(partBuilder), /*isRefresh=*/true, debugAction);
+        ImmutableList.of(partBuilder), /*isRefresh=*/true, debugAction, catalogTimeline);
+    // Step 2: update internal fields
+    resetPartitions();
+    setPrototypePartition(msTbl.getSd());
     setUnpartitionedTableStats(partBuilder);
     addPartition(partBuilder.build());
     return fileMdLoadTime;
@@ -1378,20 +1502,23 @@ public class HdfsTable extends Table implements FeFsTable {
   private long updatePartitionsFromHms(IMetaStoreClient client,
       Set<String> partitionsToUpdate, boolean loadPartitionFileMetadata,
       boolean refreshUpdatedPartitions, Map<String, Long> partitionToEventId,
-      String debugAction) throws Exception {
+      String debugAction, EventSequence catalogTimeline, boolean isPreLoadForInsert)
+      throws Exception {
     if (LOG.isTraceEnabled()) LOG.trace("Sync table partitions: " + getFullName());
     org.apache.hadoop.hive.metastore.api.Table msTbl = getMetaStoreTable();
     Preconditions.checkNotNull(msTbl);
     Preconditions.checkState(msTbl.getPartitionKeysSize() != 0);
-    Preconditions.checkState(loadPartitionFileMetadata || partitionsToUpdate == null);
+    if (!isPreLoadForInsert) {
+      Preconditions.checkState(loadPartitionFileMetadata || partitionsToUpdate == null);
+    }
     PartitionDeltaUpdater deltaUpdater;
     if (refreshUpdatedPartitions) {
       deltaUpdater = new PartBasedDeltaUpdater(client,
           loadPartitionFileMetadata, partitionsToUpdate, partitionToEventId,
-          debugAction);
+          debugAction, catalogTimeline);
     } else {
       deltaUpdater = new PartNameBasedDeltaUpdater(client, loadPartitionFileMetadata,
-          partitionsToUpdate, partitionToEventId, debugAction);
+          partitionsToUpdate, partitionToEventId, debugAction, catalogTimeline);
     }
     deltaUpdater.apply();
     return deltaUpdater.loadTimeForFileMdNs_;
@@ -1417,15 +1544,17 @@ public class HdfsTable extends Table implements FeFsTable {
     private final Set<String> partitionsToUpdate_;
     private final String debugAction_;
     protected final Map<String, Long> partitionToEventId_;
+    protected final EventSequence catalogTimeline_;
 
     PartitionDeltaUpdater(IMetaStoreClient client, boolean loadPartitionFileMetadata,
         Set<String> partitionsToUpdate, @Nullable Map<String, Long> partitionToEventId,
-        String debugAction) {
+        String debugAction, EventSequence catalogTimeline) {
       this.client_ = client;
       this.loadFileMd_ = loadPartitionFileMetadata;
       this.partitionsToUpdate_ = partitionsToUpdate;
       this.debugAction_ = debugAction;
-      partitionToEventId_ = partitionToEventId;
+      this.partitionToEventId_ = partitionToEventId;
+      this.catalogTimeline_ = catalogTimeline;
     }
 
     /**
@@ -1516,9 +1645,11 @@ public class HdfsTable extends Table implements FeFsTable {
           partitionsToLoadFiles = parts.stream().map(HdfsPartition.Builder::new)
               .collect(Collectors.toList());
         }
-        loadTimeForFileMdNs_ += loadFileMetadataForPartitions(client_,
-            partitionsToLoadFiles,/* isRefresh=*/true, debugAction_);
-        updatePartitions(partitionsToLoadFiles);
+        if (!partitionsToLoadFiles.isEmpty()) {
+          loadTimeForFileMdNs_ += loadFileMetadataForPartitions(client_,
+              partitionsToLoadFiles, /*isRefresh=*/true, debugAction_, catalogTimeline_);
+          updatePartitions(partitionsToLoadFiles);
+        }
       }
     }
 
@@ -1545,19 +1676,19 @@ public class HdfsTable extends Table implements FeFsTable {
     public PartBasedDeltaUpdater(
         IMetaStoreClient client, boolean loadPartitionFileMetadata,
         Set<String> partitionsToUpdate, Map<String, Long> partitionToEventId,
-        String debugAction) throws Exception {
+        String debugAction, EventSequence catalogTimeline) throws Exception {
       super(client, loadPartitionFileMetadata, partitionsToUpdate, partitionToEventId,
-          debugAction);
+          debugAction, catalogTimeline);
       Stopwatch sw = Stopwatch.createStarted();
       List<Partition> partitionList;
       if (partitionsToUpdate != null) {
         partitionList = MetaStoreUtil
             .fetchPartitionsByName(client, Lists.newArrayList(partitionsToUpdate),
-                db_.getName(), name_);
+                msTable_);
       } else {
         partitionList =
             MetaStoreUtil.fetchAllPartitions(
-                client_, db_.getName(), name_, NUM_PARTITION_FETCH_RETRIES);
+                client_, msTable_, NUM_PARTITION_FETCH_RETRIES);
       }
       LOG.debug("Time taken to fetch all partitions of table {}: {} msec", getFullName(),
           sw.stop().elapsed(TimeUnit.MILLISECONDS));
@@ -1618,7 +1749,8 @@ public class HdfsTable extends Table implements FeFsTable {
         }
       }
       return loadPartitionsFromMetastore(newMsPartitions,
-          /*inprogressPartBuilders=*/null, partitionToEventId_, client_);
+          /*inprogressPartBuilders=*/null, partitionToEventId_, client_,
+          catalogTimeline_);
     }
 
     @Override
@@ -1632,7 +1764,7 @@ public class HdfsTable extends Table implements FeFsTable {
       // we pass partitionToEventId argument as null below because updated partitions
       // partitions were preexisting before load and just modified from outside.
       return loadPartitionsFromMetastore(updatedPartitions, updatedPartBuilders,
-          null, client_);
+          null, client_, catalogTimeline_);
     }
   }
 
@@ -1649,9 +1781,9 @@ public class HdfsTable extends Table implements FeFsTable {
     public PartNameBasedDeltaUpdater(
         IMetaStoreClient client, boolean loadPartitionFileMetadata,
         Set<String> partitionsToUpdate, Map<String, Long> partitionToEventId,
-        String debugAction) throws Exception {
+        String debugAction, EventSequence catalogTimeline) throws Exception {
       super(client, loadPartitionFileMetadata, partitionsToUpdate, partitionToEventId,
-          debugAction);
+          debugAction, catalogTimeline);
       // Retrieve all the partition names from the Hive Metastore. We need this to
       // identify the delta between partitions of the local HdfsTable and the table entry
       // in the Hive Metastore. Note: This is a relatively "cheap" operation
@@ -1678,7 +1810,8 @@ public class HdfsTable extends Table implements FeFsTable {
       addedPartNames.addAll(Sets
           .difference(partitionNamesFromHms_, knownPartitionNames));
       return loadPartitionsFromMetastore(addedPartNames,
-          /*inprogressPartBuilders=*/null, partitionToEventId_, client_);
+          /*inprogressPartBuilders=*/null, partitionToEventId_, client_,
+          catalogTimeline_);
     }
 
     @Override
@@ -1687,7 +1820,7 @@ public class HdfsTable extends Table implements FeFsTable {
       // we pass partitionToEventId argument as null below because updated partitions
       // partitions were preexisting before load and just modified from outside.
       return loadPartitionsFromMetastore(updatedPartitionBuilders.keySet(),
-          updatedPartitionBuilders, null, client_);
+          updatedPartitionBuilders, null, client_, catalogTimeline_);
     }
   }
 
@@ -1718,6 +1851,17 @@ public class HdfsTable extends Table implements FeFsTable {
     return parts;
   }
 
+  /**
+   * Tracks the in-flight INSERT event id in the partition.
+   * @return false if the partition doesn't exist. Otherwise returns true.
+   */
+  public boolean addInflightInsertEventToPartition(String partName, long eventId) {
+    HdfsPartition partition = nameToPartitionMap_.get(partName);
+    if (partition == null) return false;
+    partition.addToVersionsForInflightEvents(/*isInsertEvent*/true, eventId);
+    return true;
+  }
+
   private void setUnpartitionedTableStats(HdfsPartition.Builder partBuilder) {
     Preconditions.checkState(numClusteringCols_ == 0);
     // For unpartitioned tables set the numRows in its single partition
@@ -1726,57 +1870,69 @@ public class HdfsTable extends Table implements FeFsTable {
   }
 
   /**
-   * Sets avroSchema_ if the table or any of the partitions in the table are stored
-   * as Avro. Additionally, this method also reconciles the schema if the column
-   * definitions from the metastore differ from the Avro schema.
+   * Checks if the table or any of the partitions in the table are stored as Avro.
+   * If so, calls setAvroSchemaInternal to set avroSchema_.
    */
-  private void setAvroSchema(IMetaStoreClient client,
-      org.apache.hadoop.hive.metastore.api.Table msTbl) throws Exception {
+  protected void setAvroSchema(IMetaStoreClient client,
+      org.apache.hadoop.hive.metastore.api.Table msTbl, EventSequence catalogTimeline)
+      throws Exception {
     Preconditions.checkState(isSchemaLoaded_);
     String inputFormat = msTbl.getSd().getInputFormat();
     String serDeLib = msTbl.getSd().getSerdeInfo().getSerializationLib();
     if (HdfsFileFormat.fromJavaClassName(inputFormat, serDeLib) == HdfsFileFormat.AVRO
         || hasAvroData_) {
-      // Look for Avro schema in TBLPROPERTIES and in SERDEPROPERTIES, with the latter
-      // taking precedence.
-      List<Map<String, String>> schemaSearchLocations = new ArrayList<>();
-      schemaSearchLocations.add(
-          getMetaStoreTable().getSd().getSerdeInfo().getParameters());
-      schemaSearchLocations.add(getMetaStoreTable().getParameters());
+      setAvroSchemaInternal(client, msTable_, catalogTimeline);
+    }
+  }
 
-      avroSchema_ = AvroSchemaUtils.getAvroSchema(schemaSearchLocations);
+  /**
+   * Sets avroSchema_. Additionally, this method also reconciles the schema if the column
+   * definitions from the metastore differ from the Avro schema.
+   */
+  protected void setAvroSchemaInternal(IMetaStoreClient client,
+      org.apache.hadoop.hive.metastore.api.Table msTbl, EventSequence catalogTimeline)
+      throws Exception {
+    // Look for Avro schema in TBLPROPERTIES and in SERDEPROPERTIES, with the latter
+    // taking precedence.
+    List<Map<String, String>> schemaSearchLocations = new ArrayList<>();
+    schemaSearchLocations.add(
+        getMetaStoreTable().getSd().getSerdeInfo().getParameters());
+    schemaSearchLocations.add(getMetaStoreTable().getParameters());
 
-      if (avroSchema_ == null) {
-        // No Avro schema was explicitly set in the table metadata, so infer the Avro
-        // schema from the column definitions.
-        Schema inferredSchema = AvroSchemaConverter.convertFieldSchemas(
-            msTbl.getSd().getCols(), getFullName());
-        avroSchema_ = inferredSchema.toString();
-        // NOTE: below we reconcile this inferred schema back into the table
-        // schema in the case of Avro-formatted tables. This has the side effect
-        // of promoting types like TINYINT to INT.
-      }
-      String serdeLib = msTbl.getSd().getSerdeInfo().getSerializationLib();
-      if (serdeLib == null ||
-          serdeLib.equals("org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe")) {
-        // If the SerDe library is null or set to LazySimpleSerDe or is null, it
-        // indicates there is an issue with the table metadata since Avro table need a
-        // non-native serde. Instead of failing to load the table, fall back to
-        // using the fields from the storage descriptor (same as Hive).
-        return;
-      } else {
-        List<FieldSchema> reconciledFieldSchemas = AvroSchemaUtils.reconcileAvroSchema(
-            msTbl, avroSchema_);
+    avroSchema_ = AvroSchemaUtils.getAvroSchema(schemaSearchLocations);
 
-        // Reset and update nonPartFieldSchemas_ to the reconciled colDefs.
-        nonPartFieldSchemas_.clear();
-        nonPartFieldSchemas_.addAll(reconciledFieldSchemas);
-        // Update the columns as per the reconciled colDefs and re-load stats.
-        clearColumns();
-        addColumnsFromFieldSchemas(msTbl.getPartitionKeys());
-        addColumnsFromFieldSchemas(nonPartFieldSchemas_);
-        loadAllColumnStats(client);
-      }
+    if (avroSchema_ == null) {
+      // No Avro schema was explicitly set in the table metadata, so infer the Avro
+      // schema from the column definitions.
+      Schema inferredSchema = AvroSchemaConverter.convertFieldSchemas(
+          msTbl.getSd().getCols(), getFullName());
+      avroSchema_ = inferredSchema.toString();
+      // NOTE: below we reconcile this inferred schema back into the table
+      // schema in the case of Avro-formatted tables. This has the side effect
+      // of promoting types like TINYINT to INT.
+    }
+    catalogTimeline.markEvent("Loaded avro schema");
+    String serdeLib = msTbl.getSd().getSerdeInfo().getSerializationLib();
+    if (serdeLib == null ||
+        serdeLib.equals("org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe")) {
+      // If the SerDe library is null or set to LazySimpleSerDe or is null, it
+      // indicates there is an issue with the table metadata since Avro table need a
+      // non-native serde. Instead of failing to load the table, fall back to
+      // using the fields from the storage descriptor (same as Hive).
+      return;
+    } else {
+      List<FieldSchema> reconciledFieldSchemas = AvroSchemaUtils.reconcileAvroSchema(
+          msTbl, avroSchema_);
+
+      // Reset and update nonPartFieldSchemas_ to the reconciled colDefs.
+      nonPartFieldSchemas_.clear();
+      nonPartFieldSchemas_.addAll(reconciledFieldSchemas);
+      // Update the columns as per the reconciled colDefs and re-load stats.
+      clearColumns();
+      addColumnsFromFieldSchemas(msTbl.getPartitionKeys());
+      addColumnsFromFieldSchemas(nonPartFieldSchemas_);
+      addVirtualColumns();
+      loadAllColumnStats(client, catalogTimeline);
     }
   }
 
@@ -1806,7 +1962,10 @@ public class HdfsTable extends Table implements FeFsTable {
     } else {
       addColumnsFromFieldSchemas(nonPartFieldSchemas_);
     }
+    addVirtualColumns();
     isSchemaLoaded_ = true;
+    LOG.info("Loaded {} columns from HMS. Actual columns: {}",
+        nonPartFieldSchemas_.size() + numClusteringCols_, colsByPos_.size());
   }
 
   /**
@@ -1820,23 +1979,23 @@ public class HdfsTable extends Table implements FeFsTable {
    */
   private long loadPartitionsFromMetastore(Set<String> partitionNames,
       Map<String, HdfsPartition.Builder> inprogressPartBuilders,
-      @Nullable Map<String, Long> partitionToEventId, IMetaStoreClient client)
-      throws Exception {
+      @Nullable Map<String, Long> partitionToEventId, IMetaStoreClient client,
+      EventSequence catalogTimeline) throws Exception {
     Preconditions.checkNotNull(partitionNames);
     if (partitionNames.isEmpty()) return 0;
     // Load partition metadata from Hive Metastore.
     List<Partition> msPartitions = new ArrayList<>(
         MetaStoreUtil.fetchPartitionsByName(
-            client, Lists.newArrayList(partitionNames), db_.getName(), name_));
+            client, Lists.newArrayList(partitionNames), msTable_));
     return loadPartitionsFromMetastore(msPartitions, inprogressPartBuilders,
-        partitionToEventId, client);
+        partitionToEventId, client, catalogTimeline);
   }
 
   private long loadPartitionsFromMetastore(List<Partition> msPartitions,
       Map<String, HdfsPartition.Builder> inprogressPartBuilders,
-      @Nullable Map<String, Long> partitionToEventId, IMetaStoreClient client)
-      throws Exception {
-    FsPermissionCache permCache = preloadPermissionsCache(msPartitions);
+      @Nullable Map<String, Long> partitionToEventId, IMetaStoreClient client,
+      EventSequence catalogTimeline) throws Exception {
+    FsPermissionCache permCache = preloadPermissionsCache(msPartitions, catalogTimeline);
     List<HdfsPartition.Builder> partBuilders = new ArrayList<>(msPartitions.size());
     for (org.apache.hadoop.hive.metastore.api.Partition msPartition: msPartitions) {
       String partName = FeCatalogUtils.getPartitionName(this, msPartition.getValues());
@@ -1853,15 +2012,22 @@ public class HdfsTable extends Table implements FeFsTable {
       }
       partBuilders.add(partBuilder);
     }
+    long latestEventId = MetastoreEventsProcessor.getCurrentEventIdNoThrow(client);
+    catalogTimeline.markEvent(FETCHED_LATEST_HMS_EVENT_ID + latestEventId);
     long fileMdLoadTime = loadFileMetadataForPartitions(client, partBuilders,
-        /* isRefresh=*/false);
+        /* isRefresh=*/false, catalogTimeline);
     for (HdfsPartition.Builder p : partBuilders) {
       if (inprogressPartBuilders == null) {
         addPartition(p.build());
       } else {
         updatePartition(p);
       }
+      if (latestEventId > -1) {
+        p.setLastRefreshEventId(latestEventId);
+      }
     }
+    LOG.info("Setting the latest refresh event id to {} for the loaded partitions for "
+        + "the table {}", latestEventId, getFullName());
     return fileMdLoadTime;
   }
 
@@ -1872,7 +2038,8 @@ public class HdfsTable extends Table implements FeFsTable {
    * be in the same parent directories, and we can bulk fetch the permissions with a
    * single round trip to the filesystem instead of individually looking up each.
    */
-  private FsPermissionCache preloadPermissionsCache(List<Partition> msPartitions) {
+  private FsPermissionCache preloadPermissionsCache(List<Partition> msPartitions,
+      EventSequence catalogTimeline) {
     FsPermissionCache permCache = new FsPermissionCache();
     // Only preload permissions if the number of partitions to be added is
     // large (3x) relative to the number of existing partitions. This covers
@@ -1886,7 +2053,8 @@ public class HdfsTable extends Table implements FeFsTable {
     // potentially fetch a bunch of irrelevant information about existing
     // partitions when we only want to know about a small number of newly-added
     // partitions.
-    if (msPartitions.size() < partitionMap_.size() * 3) return permCache;
+    // Using '<=' to skip unpartitioned tables, i.e. both sides are 0.
+    if (msPartitions.size() <= partitionMap_.size() * 3) return permCache;
 
     // TODO(todd): when HDFS-13616 (batch listing of multiple directories)
     // is implemented, we could likely implement this with a single round
@@ -1922,19 +2090,24 @@ public class HdfsTable extends Table implements FeFsTable {
         LOG.debug("Unable to bulk-load permissions for parent path: " + p, ioe);
       }
     }
+    catalogTimeline.markEvent(String.format(
+        "Preloaded permissions cache for %d partitions", msPartitions.size()));
     return permCache;
   }
 
   @Override
   protected List<String> getColumnNamesWithHmsStats() {
+    List<Column> columns = Lists.newArrayList(getNonClusteringColumns());
+    columns = filterColumnsNotStoredInHms(columns);
     List<String> ret = new ArrayList<>();
     // Only non-partition columns have column stats in the HMS.
-    for (Column column: getColumns().subList(numClusteringCols_, getColumns().size())) {
+    for (Column column: columns) {
       ret.add(column.getName().toLowerCase());
     }
     return ret;
   }
 
+  // TODO: why is there a single synchronized function?
   @Override
   protected synchronized void loadFromThrift(TTable thriftTable)
       throws TableLoadingException {
@@ -1951,9 +2124,21 @@ public class HdfsTable extends Table implements FeFsTable {
     try {
       if (hdfsTable.has_full_partitions) {
         for (THdfsPartition tPart : hdfsTable.getPartitions().values()) {
-          addPartition(new HdfsPartition.Builder(this, tPart.id)
-              .fromThrift(tPart)
-              .build());
+          HdfsPartition.Builder builder;
+          // This method is used in two places:
+          //  - legacy-catalog mode coordinators applying updates from catalogd
+          //  - catalogd importing a testcase file
+          // In the first case, coordinator should reuse the partition ids to be
+          // consistent with catalogd.
+          // In the second case, catalogd should generate the partition ids by itself
+          // since the ids generated by other catalogds might conflict with the local
+          // ones.
+          if (storedInImpaladCatalogCache_) {
+            builder = new HdfsPartition.Builder(this, tPart.id);
+          } else {
+            builder = new HdfsPartition.Builder(this);
+          }
+          addPartition(builder.fromThrift(tPart).build());
         }
       }
       prototypePartition_ =
@@ -1979,10 +2164,14 @@ public class HdfsTable extends Table implements FeFsTable {
   public void validatePartitions(Set<Long> expectedPartitionIds)
       throws TableLoadingException {
     if (!partitionMap_.keySet().equals(expectedPartitionIds)) {
+      Set<Long> missingIds = new HashSet<>(expectedPartitionIds);
+      missingIds.removeAll(partitionMap_.keySet());
+      Set<Long> staleIds = new HashSet<>(partitionMap_.keySet());
+      staleIds.removeAll(expectedPartitionIds);
       throw new TableLoadingException(String.format("Error applying incremental updates" +
-              " on table %s: missing partition ids %s, stale partition ids %s",
-          getFullName(), expectedPartitionIds.removeAll(partitionMap_.keySet()),
-          partitionMap_.keySet().removeAll(expectedPartitionIds)));
+              " on table %s. Missing partition ids: %s. Stale partition ids: %s. Total " +
+              "partitions: %d.",
+          getFullName(), missingIds, staleIds, partitionMap_.size()));
     }
   }
 
@@ -2004,6 +2193,16 @@ public class HdfsTable extends Table implements FeFsTable {
     TTable table = super.toThrift();
     table.setTable_type(TTableType.HDFS_TABLE);
     table.setHdfs_table(getTHdfsTable(ThriftObjectType.FULL, null));
+    return table;
+  }
+
+  @Override
+  public TTable toHumanReadableThrift() {
+    // Same as toThrift, but call getTHdfsTable with lower
+    // ThriftObjectType.DESCRIPTOR_ONLY.
+    TTable table = super.toThrift();
+    table.setTable_type(TTableType.HDFS_TABLE);
+    table.setHdfs_table(getTHdfsTable(ThriftObjectType.DESCRIPTOR_ONLY, null));
     return table;
   }
 
@@ -2034,7 +2233,7 @@ public class HdfsTable extends Table implements FeFsTable {
   }
 
   /**
-   * Just likes super.toMinimalTCatalogObject() but also contains the minimal catalog
+   * Just likes super.toMinimalTCatalogObject() but try to add the minimal catalog
    * objects of partitions in the returned result.
    */
   @Override
@@ -2043,19 +2242,54 @@ public class HdfsTable extends Table implements FeFsTable {
     if (!BackendConfig.INSTANCE.isIncrementalMetadataUpdatesEnabled()) {
       return catalogObject;
     }
-    catalogObject.getTable().setTable_type(TTableType.HDFS_TABLE);
-    THdfsTable hdfsTable = new THdfsTable(hdfsBaseDir_, getColumnNames(),
-        nullPartitionKeyValue_, nullColumnValue_,
-        /*idToPartition=*/ new HashMap<>(),
-        /*prototypePartition=*/ new THdfsPartition());
-    for (HdfsPartition part : partitionMap_.values()) {
-      hdfsTable.partitions.put(part.getId(), part.toMinimalTHdfsPartition());
+    // Try adding the partition ids and names if we can acquire the read lock.
+    // Use tryReadLock() to avoid being blocked by concurrent DDLs. It won't result in
+    // correctness issues if we return the result without the partition ids and names.
+    // The results are mainly used in two scenarios:
+    // 1. The result is added to catalog deleteLog for sending delete updates for
+    //    partitions. The delete update for the table is always sent so coordinators are
+    //    able to invalidate the HdfsTable object. This enforces the correctness.
+    //    However, not sending the deletes causes a leak of the topic values in
+    //    statestore if the topic keys (tableName+partName) are not reused anymore.
+    //    Note that topic keys are never deleted in the TopicEntryMap of statestore even
+    //    if we send the delete updates. So we already have a leak on catalog topic keys.
+    //    We can revisit this if we found statestore has memory issues.
+    // 2. The result is used in DDL/DML response for a removed/invalidated table.
+    //    Coordinators can still invalidate its cache since the table is sent (in the
+    //    parent implementation).
+    //    However, LocalCatalog coordinators can't immediately invalidate partitions of
+    //    a removed table. They will be cleared by the cache eviction policy since the
+    //    partitions of deleted tables won't be used anymore.
+    // TODO: synchronize the access on the partition map by using a finer-grained lock
+    if (!tryReadLock()) {
+      LOG.warn("Not returning the partition ids and names of table {} since not " +
+          "holding the table read lock", getFullName());
+      return catalogObject;
     }
-    hdfsTable.setHas_full_partitions(false);
-    // The minimal catalog object of partitions contain the partition names.
-    hdfsTable.setHas_partition_names(true);
-    catalogObject.getTable().setHdfs_table(hdfsTable);
-    return catalogObject;
+    try {
+      catalogObject.getTable().setTable_type(TTableType.HDFS_TABLE);
+      // Column names are unused by the consumers so use an empty list here.
+      THdfsTable hdfsTable = new THdfsTable(hdfsBaseDir_,
+          /*colNames=*/ Collections.emptyList(),
+          nullPartitionKeyValue_, nullColumnValue_,
+          /*idToPartition=*/ new HashMap<>(),
+          /*prototypePartition=*/ FAKE_THDFS_PARTITION);
+      for (HdfsPartition part : partitionMap_.values()) {
+        hdfsTable.partitions.put(part.getId(), part.toMinimalTHdfsPartition());
+      }
+      // Adds the recently dropped partitions that are not yet synced to the catalog
+      // topic.
+      for (HdfsPartition part : droppedPartitions_) {
+        hdfsTable.addToDropped_partitions(part.toMinimalTHdfsPartition());
+      }
+      hdfsTable.setHas_full_partitions(false);
+      // The minimal catalog object of partitions contain the partition names.
+      hdfsTable.setHas_partition_names(true);
+      catalogObject.getTable().setHdfs_table(hdfsTable);
+      return catalogObject;
+    } finally {
+      releaseReadLock();
+    }
   }
 
   /**
@@ -2255,61 +2489,23 @@ public class HdfsTable extends Table implements FeFsTable {
    * partitions in the refPartitions set (the backend doesn't need metadata for
    * unreferenced partitions). In addition, metadata that is not used by the backend will
    * be omitted.
-   *
-   * To prevent the catalog from hitting an OOM error while trying to
-   * serialize large partition incremental stats, we estimate the stats size and filter
-   * the incremental stats data from partition objects if the estimate exceeds
-   * --inc_stats_size_limit_bytes. This function also collects storage related statistics
-   *  (e.g. number of blocks, files, etc) in order to compute an estimate of the metadata
-   *  size of this table.
    */
   public THdfsTable getTHdfsTable(ThriftObjectType type, Set<Long> refPartitions) {
     if (type == ThriftObjectType.FULL) {
       // "full" implies all partitions should be included.
       Preconditions.checkArgument(refPartitions == null);
     }
-    long memUsageEstimate = 0;
-    int numPartitions =
-        (refPartitions == null) ? partitionMap_.values().size() : refPartitions.size();
-    memUsageEstimate += numPartitions * PER_PARTITION_MEM_USAGE_BYTES;
-    FileMetadataStats stats = new FileMetadataStats();
     Map<Long, THdfsPartition> idToPartition = new HashMap<>();
     for (HdfsPartition partition: partitionMap_.values()) {
       long id = partition.getId();
       if (refPartitions == null || refPartitions.contains(id)) {
         THdfsPartition tHdfsPartition = FeCatalogUtils.fsPartitionToThrift(
             partition, type);
-        if (partition.hasIncrementalStats()) {
-          memUsageEstimate += getColumns().size() * STATS_SIZE_PER_COLUMN_BYTES;
-          hasIncrementalStats_ = true;
-        }
-        if (type == ThriftObjectType.FULL) {
-          Preconditions.checkState(tHdfsPartition.isSetNum_blocks() &&
-              tHdfsPartition.isSetTotal_file_size_bytes());
-          stats.numBlocks += tHdfsPartition.getNum_blocks();
-          stats.numFiles +=
-              tHdfsPartition.isSetFile_desc() ? tHdfsPartition.getFile_desc().size() : 0;
-          stats.numFiles += tHdfsPartition.isSetInsert_file_desc() ?
-              tHdfsPartition.getInsert_file_desc().size() : 0;
-          stats.numFiles += tHdfsPartition.isSetDelete_file_desc() ?
-              tHdfsPartition.getDelete_file_desc().size() : 0;
-          stats.totalFileBytes += tHdfsPartition.getTotal_file_size_bytes();
-        }
         idToPartition.put(id, tHdfsPartition);
       }
     }
-    if (type == ThriftObjectType.FULL) fileMetadataStats_.set(stats);
-
     THdfsPartition prototypePartition = FeCatalogUtils.fsPartitionToThrift(
         prototypePartition_, ThriftObjectType.DESCRIPTOR_ONLY);
-
-    memUsageEstimate += fileMetadataStats_.numFiles * PER_FD_MEM_USAGE_BYTES +
-        fileMetadataStats_.numBlocks * PER_BLOCK_MEM_USAGE_BYTES;
-    if (type == ThriftObjectType.FULL) {
-      // These metrics only make sense when we are collecting a FULL object.
-      setEstimatedMetadataSize(memUsageEstimate);
-      setNumFiles(fileMetadataStats_.numFiles);
-    }
     THdfsTable hdfsTable = new THdfsTable(hdfsBaseDir_, getColumnNames(),
         getNullPartitionKeyValue(), nullColumnValue_, idToPartition, prototypePartition);
     hdfsTable.setAvroSchema(avroSchema_);
@@ -2448,7 +2644,7 @@ public class HdfsTable extends Table implements FeFsTable {
       FileStatus status = statuses.next();
       if (!status.isDirectory()) continue;
       Pair<String, LiteralExpr> keyValues =
-          getTypeCompatibleValue(status.getPath(), partitionKeys.get(depth));
+          getPartValueFromPath(status.getPath(), partitionKeys.get(depth));
       if (keyValues == null) continue;
 
       List<String> currentPartitionValues = Lists.newArrayList(partitionValues);
@@ -2466,12 +2662,15 @@ public class HdfsTable extends Table implements FeFsTable {
    * keys of this table. This is useful to convert the string values which are received
    * from metastore events to {@link LiteralExpr}.
    */
-  public List<LiteralExpr> getTypeCompatiblePartValues(List<String> values)
-      throws UnsupportedEncodingException {
+  public List<LiteralExpr> getTypeCompatiblePartValues(List<String> values) {
     List<LiteralExpr> result = new ArrayList<>();
     List<Column> partitionColumns = getClusteringColumns();
-    Preconditions.checkState(partitionColumns.size() == values.size());
-    for (int i=0; i<partitionColumns.size(); ++i) {
+    if (partitionColumns.size() != values.size()) {
+      LOG.error("Unmatched numbers of partition values: expected={}, actual={} for " +
+          "table: {}." , partitionColumns.size(), values.size(), getFullName());
+      return null;
+    }
+    for (int i = 0; i < partitionColumns.size(); ++i) {
       Pair<String, LiteralExpr> pair = getPartitionExprFromValue(values.get(i),
           partitionColumns.get(i).getType());
       if (pair == null) {
@@ -2491,8 +2690,8 @@ public class HdfsTable extends Table implements FeFsTable {
    * original value, the second element is the LiteralExpr created from the original
    * value.
    */
-  private Pair<String, LiteralExpr> getTypeCompatibleValue(Path path,
-      String partitionKey) throws UnsupportedEncodingException {
+  private Pair<String, LiteralExpr> getPartValueFromPath(
+      Path path, String partitionKey) {
     String partName[] = path.getName().split("=");
     if (partName.length != 2 || !partName[0].equals(partitionKey)) return null;
 
@@ -2500,23 +2699,22 @@ public class HdfsTable extends Table implements FeFsTable {
     Column column = getColumn(partName[0]);
     Preconditions.checkNotNull(column);
     Type type = column.getType();
-    return getPartitionExprFromValue(partName[1], type);
+    // URL decode the partition value since it may contain encoded URL.
+    String partValue = FileUtils.unescapePathName(partName[1]);
+    return getPartitionExprFromValue(partValue, type);
   }
 
   /**
    * Converts a given partition value to a {@link LiteralExpr} based on the type of the
    * partition column.
-   * @param partValue Value of the partition column
+   * @param value Value of the partition column
    * @param type Type of the partition column
    * @return Pair which contains the partition value and its equivalent
    * {@link LiteralExpr} according to the type provided.
-   * @throws UnsupportedEncodingException
    */
-  private Pair<String, LiteralExpr> getPartitionExprFromValue(String partValue, Type type)
-      throws UnsupportedEncodingException {
+  private Pair<String, LiteralExpr> getPartitionExprFromValue(
+      String value, Type type) {
     LiteralExpr expr;
-    // URL decode the partition value since it may contain encoded URL.
-    String value = URLDecoder.decode(partValue, StandardCharsets.UTF_8.name());
     if (!value.equals(getNullPartitionKeyValue())) {
       try {
         expr = LiteralExpr.createFromUnescapedStr(value, type);
@@ -2580,6 +2778,7 @@ public class HdfsTable extends Table implements FeFsTable {
     resultSchema.addToColumns(new TColumn("Format", Type.STRING.toThrift()));
     resultSchema.addToColumns(new TColumn("Incremental stats", Type.STRING.toThrift()));
     resultSchema.addToColumns(new TColumn("Location", Type.STRING.toThrift()));
+    resultSchema.addToColumns(new TColumn("EC Policy", Type.STRING.toThrift()));
 
     // Pretty print partitions and their stats.
     List<FeFsPartition> orderedPartitions = new ArrayList<>(
@@ -2643,6 +2842,7 @@ public class HdfsTable extends Table implements FeFsTable {
       rowBuilder.add(p.getFileFormat().toString());
       rowBuilder.add(String.valueOf(p.hasIncrementalStats()));
       rowBuilder.add(p.getLocation());
+      rowBuilder.add(FileSystemUtil.getErasureCodingPolicy(p.getLocationPath()));
       result.addToRows(rowBuilder.get());
     }
 
@@ -2667,7 +2867,7 @@ public class HdfsTable extends Table implements FeFsTable {
       }
       rowBuilder.add(totalNumFiles)
           .addBytes(totalBytes)
-          .addBytes(totalCachedBytes).add("").add("").add("").add("");
+          .addBytes(totalCachedBytes).add("").add("").add("").add("").add("");
       result.addToRows(rowBuilder.get());
     }
     return result;
@@ -2702,34 +2902,55 @@ public class HdfsTable extends Table implements FeFsTable {
 
   /**
    * Reloads the HdfsPartitions which correspond to the given partNames. Returns the
-   * number of partitions which were reloaded.
+   * number of partitions which were reloaded. This method also reloads file metadata
+   * of all the partitions for the given partNames
    */
   public int reloadPartitionsFromNames(IMetaStoreClient client,
       List<String> partNames, String reason) throws CatalogException {
+    return reloadPartitionsFromNames(-1L, client, partNames, reason,
+        FileMetadataLoadOpts.FORCE_LOAD);
+  }
+
+  /**
+   * Reloads the HdfsPartitions which correspond to the given partNames. Returns the
+   * number of partitions which were reloaded.
+   * fileMetadataLoadOpts: decides how to reload file metadata for the partitions
+   */
+  public int reloadPartitionsFromNames(long eventId, IMetaStoreClient client,
+      List<String> partNames, String reason, FileMetadataLoadOpts fileMetadataLoadOpts)
+      throws CatalogException {
     Preconditions.checkState(partNames != null && !partNames.isEmpty());
     LOG.info(String.format("Reloading partition metadata: %s %s (%s)",
         getFullName(), generateDebugStr(partNames, 3), reason));
     List<Partition> hmsPartitions;
     Map<Partition, HdfsPartition> hmsPartToHdfsPart = new HashMap<>();
     try {
-      hmsPartitions = client.getPartitionsByNames(getDb().getName(),
-          getName(), partNames);
+      hmsPartitions = MetaStoreUtil.fetchPartitionsByName(client, partNames, msTable_);
       for (Partition partition : hmsPartitions) {
+        if (partition.getValues().isEmpty()) {
+          LOG.error("EventId: {}, EventType: {}, Received partition with empty values:" +
+              " {}.\nThis table will be invalidated.", eventId, reason, partition);
+          throw new InvalidObjectException(String.format("Unmatched numbers of " +
+              "partition values: expected=%d, actual=%d for table:%s",
+              getClusteringColumns().size(), partition.getValues().size(),
+              getFullName()));
+        }
         List<LiteralExpr> partExprs = getTypeCompatiblePartValues(partition.getValues());
         HdfsPartition hdfsPartition = getPartition(partExprs);
         if (hdfsPartition != null) {
           hmsPartToHdfsPart.put(partition, hdfsPartition);
         }
       }
-      reloadPartitions(client, hmsPartToHdfsPart, true);
+      reloadPartitions(client, hmsPartToHdfsPart, fileMetadataLoadOpts,
+          NoOpEventSequence.INSTANCE);
       return hmsPartToHdfsPart.size();
-    } catch (NoSuchObjectException e) {
+    } catch (NoSuchObjectException | InvalidObjectException e) {
       // HMS throws a NoSuchObjectException if the table does not exist
       // in HMS anymore. In case the partitions don't exist in HMS it does not include
       // them in the result of getPartitionsByNames.
       throw new TableLoadingException(
           "Error when reloading partitions for table " + getFullName(), e);
-    } catch (TException | UnsupportedEncodingException e2) {
+    } catch (TException e2) {
       throw new CatalogException(
           "Unexpected error while retrieving partitions for table " + getFullName(), e2);
     }
@@ -2738,13 +2959,14 @@ public class HdfsTable extends Table implements FeFsTable {
   /**
    * Reload the HdfsPartitions which correspond to the given partitions.
    *
+   * @param eventId of the event from metastore
    * @param client is the HMS client to be used.
    * @param partsFromEvent Partition objects from the event.
    * @param loadFileMetadata If true, file metadata will be reloaded.
    * @param reason Reason for reloading the partitions for logging purposes.
    * @return the number of partitions which were reloaded.
    */
-  public int reloadPartitionsFromEvent(IMetaStoreClient client,
+  public int reloadPartitionsFromEvent(long eventId, IMetaStoreClient client,
       List<Partition> partsFromEvent, boolean loadFileMetadata, String reason)
       throws CatalogException {
     Preconditions.checkArgument(partsFromEvent != null
@@ -2753,22 +2975,50 @@ public class HdfsTable extends Table implements FeFsTable {
         + "held before reloadPartitionsFromEvent");
     LOG.info("Reloading partition metadata for table: {} ({})", getFullName(), reason);
     Map<Partition, HdfsPartition> hmsPartToHdfsPart = new HashMap<>();
-    try {
-      for (Partition partition : partsFromEvent) {
-        List<LiteralExpr> partExprs = getTypeCompatiblePartValues(partition.getValues());
-        HdfsPartition hdfsPartition = getPartition(partExprs);
-        // only reload partitions that have more recent write id
-        if (hdfsPartition != null &&
-            (!AcidUtils.isTransactionalTable(msTable_.getParameters())
-                || hdfsPartition.getWriteId() < partition.getWriteId())) {
-          hmsPartToHdfsPart.put(partition, hdfsPartition);
-        }
+    for (Partition partition : partsFromEvent) {
+      // If the partition values are empty, ignore the event as partition cannot be
+      // refetched
+      if (partition.getValues().isEmpty()) {
+        LOG.error("EventId: {}, EventType: {}, Received partition with empty values: " +
+            "{}.\nIgnoring reloading the partition.", eventId, reason, partition);
+        continue;
       }
-      reloadPartitions(client, hmsPartToHdfsPart, loadFileMetadata);
-      return hmsPartToHdfsPart.size();
-    } catch (UnsupportedEncodingException e) {
-      throw new CatalogException(
-          "Unexpected error while retrieving partitions for table " + getFullName(), e);
+      List<LiteralExpr> partExprs = getTypeCompatiblePartValues(partition.getValues());
+      HdfsPartition hdfsPartition = getPartition(partExprs);
+      // only reload partitions that have more recent write id
+      if (hdfsPartition != null
+          && (!AcidUtils.isTransactionalTable(msTable_.getParameters())
+              || hdfsPartition.getWriteId()
+                  <= MetastoreShim.getWriteIdFromMSPartition(partition))) {
+        hmsPartToHdfsPart.put(partition, hdfsPartition);
+      }
+    }
+    reloadPartitions(client, hmsPartToHdfsPart, loadFileMetadata,
+        NoOpEventSequence.INSTANCE);
+    return hmsPartToHdfsPart.size();
+  }
+
+  /**
+   * Reloads the metadata of partitions given by a map of HMS Partitions to existing (old)
+   * HdfsPartitions.
+   * @param hmsPartsToHdfsParts The map of HMS partition object to the old HdfsPartition.
+   *                            Every key-value in this map represents the HdfsPartition
+   *                            which needs to be removed from the table and
+   *                            reconstructed from the HMS partition key. If the
+   *                            value for a given partition key is null then nothing is
+   *                            removed and a new HdfsPartition is simply added.
+   * @param loadFileMetadata If true, file metadata for all hmsPartsToHdfsParts will be
+   *                        reloaded.
+   */
+  public void reloadPartitions(IMetaStoreClient client,
+      Map<Partition, HdfsPartition> hmsPartsToHdfsParts, boolean loadFileMetadata,
+      EventSequence catalogTimeline) throws CatalogException {
+    if (loadFileMetadata) {
+      reloadPartitions(client, hmsPartsToHdfsParts, FileMetadataLoadOpts.FORCE_LOAD,
+          catalogTimeline);
+    } else {
+      reloadPartitions(client, hmsPartsToHdfsParts, FileMetadataLoadOpts.NO_LOAD,
+          catalogTimeline);
     }
   }
 
@@ -2781,15 +3031,19 @@ public class HdfsTable extends Table implements FeFsTable {
    *                            reconstructed from the HMS partition key. If the
    *                            value for a given partition key is null then nothing is
    *                            removed and a new HdfsPartition is simply added.
-   * @param loadFileMetadata If true, file metadata will be reloaded.
+   * @param fileMetadataLoadOpts describes how to load file metadata
    */
   public void reloadPartitions(IMetaStoreClient client,
-      Map<Partition, HdfsPartition> hmsPartsToHdfsParts, boolean loadFileMetadata)
+      Map<Partition, HdfsPartition> hmsPartsToHdfsParts,
+      FileMetadataLoadOpts fileMetadataLoadOpts, EventSequence catalogTimeline)
       throws CatalogException {
     Preconditions.checkState(isWriteLockedByCurrentThread(), "Write Lock should be "
         + "held before reloadPartitions");
     FsPermissionCache permissionCache = new FsPermissionCache();
     Map<HdfsPartition.Builder, HdfsPartition> partBuilderToPartitions = new HashMap<>();
+    Set<HdfsPartition.Builder> partBuildersFileMetadataRefresh = new HashSet<>();
+    long latestEventId = MetastoreEventsProcessor.getCurrentEventIdNoThrow(client);
+    catalogTimeline.markEvent(FETCHED_LATEST_HMS_EVENT_ID + latestEventId);
     for (Map.Entry<Partition, HdfsPartition> entry : hmsPartsToHdfsParts.entrySet()) {
       Partition hmsPartition = entry.getKey();
       HdfsPartition oldPartition = entry.getValue();
@@ -2799,14 +3053,41 @@ public class HdfsTable extends Table implements FeFsTable {
           || HdfsPartition.comparePartitionKeyValues(
           oldPartition.getPartitionValues(), partBuilder.getPartitionValues()) == 0);
       if (oldPartition != null) {
+        partBuilder.setPrevId(oldPartition.getId());
         partBuilder.setFileDescriptors(oldPartition);
+        partBuilder.setCreateEventId(oldPartition.getCreateEventId());
+        partBuilder.setLastCompactionId(oldPartition.getLastCompactionId());
+      }
+      partBuilder.setLastRefreshEventId(latestEventId);
+      switch (fileMetadataLoadOpts) {
+        case FORCE_LOAD:
+          partBuildersFileMetadataRefresh.add(partBuilder);
+          break;
+        case LOAD_IF_SD_CHANGED:
+          if (oldPartition == null || !oldPartition.compareSd(hmsPartition.getSd()) ||
+              partBuilder.isMarkedCached()) {
+            partBuildersFileMetadataRefresh.add(partBuilder);
+          }
+          break;
+        case NO_LOAD:
+          // do nothing
+          break;
+        default:
+          throw new CatalogException("Invalid filemetadataOpts: " +
+              fileMetadataLoadOpts.name() + " in reloadPartitions()");
       }
       partBuilderToPartitions.put(partBuilder, oldPartition);
     }
-    if (loadFileMetadata) {
+    LOG.info("Setting the latest refresh event id to {} for the reloaded {} partitions",
+        latestEventId, partBuilderToPartitions.size());
+    if (!partBuildersFileMetadataRefresh.isEmpty()) {
+      LOG.info("for table {}, file metadataOps: {}, refreshing file metadata for {}"
+              + " out of {} partitions to reload in reloadPartitions()", getFullName(),
+          fileMetadataLoadOpts.name(), partBuildersFileMetadataRefresh.size(),
+          partBuilderToPartitions.size());
       // load file metadata in parallel
-      loadFileMetadataForPartitions(client, partBuilderToPartitions.keySet(),
-          /*isRefresh=*/true);
+      loadFileMetadataForPartitions(client, partBuildersFileMetadataRefresh,
+          /*isRefresh=*/true, catalogTimeline);
     }
     for (Map.Entry<HdfsPartition.Builder, HdfsPartition> entry :
         partBuilderToPartitions.entrySet()) {
@@ -2880,16 +3161,15 @@ public class HdfsTable extends Table implements FeFsTable {
       throws TableLoadingException {
     String tblFullName = getFullName();
     if (LOG.isTraceEnabled()) LOG.trace("Get valid writeIds for table: " + tblFullName);
-    ValidWriteIdList validWriteIds = null;
+    ValidWriteIdList validWriteIds;
     try {
       validWriteIds = MetastoreShim.fetchValidWriteIds(client, tblFullName);
-      if (LOG.isTraceEnabled()) {
-        LOG.trace("Valid writeIds: " + validWriteIds.writeToString());
-      }
+      LOG.info("Valid writeIds of table {}: {}", tblFullName,
+          validWriteIds.writeToString());
       return validWriteIds;
     } catch (Exception e) {
       throw new TableLoadingException(String.format("Error loading ValidWriteIds for " +
-          "table '%s'", getName()), e);
+          "table '%s'", tblFullName), e);
     }
   }
 
@@ -2960,6 +3240,10 @@ public class HdfsTable extends Table implements FeFsTable {
         throw new CatalogException("Unknown write id status " + status + " for table "
             + getFullName());
     }
+  }
+
+  public long getLastCompactionId() {
+    return lastCompactionId_;
   }
 
   /**

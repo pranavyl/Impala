@@ -69,44 +69,6 @@ DECLARE_string(hostname);
 
 namespace impala {
 
-#define PRINT_THRIFT_ENUM_IMPL(T) \
-  string PrintThriftEnum(const T::type& value) { \
-    map<int, const char*>::const_iterator it = _##T##_VALUES_TO_NAMES.find(value); \
-    return it == _##T##_VALUES_TO_NAMES.end() ? std::to_string(value) : it->second; \
-  }
-
-PRINT_THRIFT_ENUM_IMPL(QueryState)
-PRINT_THRIFT_ENUM_IMPL(Encoding)
-PRINT_THRIFT_ENUM_IMPL(TCatalogObjectType)
-PRINT_THRIFT_ENUM_IMPL(TCatalogOpType)
-PRINT_THRIFT_ENUM_IMPL(TDdlType)
-PRINT_THRIFT_ENUM_IMPL(TExplainLevel)
-PRINT_THRIFT_ENUM_IMPL(THdfsCompression)
-PRINT_THRIFT_ENUM_IMPL(THdfsFileFormat)
-PRINT_THRIFT_ENUM_IMPL(THdfsSeqCompressionMode)
-PRINT_THRIFT_ENUM_IMPL(TImpalaQueryOptions)
-PRINT_THRIFT_ENUM_IMPL(TJoinDistributionMode)
-PRINT_THRIFT_ENUM_IMPL(TJoinOp)
-PRINT_THRIFT_ENUM_IMPL(TKuduReadMode)
-PRINT_THRIFT_ENUM_IMPL(TMetricKind)
-PRINT_THRIFT_ENUM_IMPL(TParquetArrayResolution)
-PRINT_THRIFT_ENUM_IMPL(TSchemaResolutionStrategy)
-PRINT_THRIFT_ENUM_IMPL(TPlanNodeType)
-PRINT_THRIFT_ENUM_IMPL(TPrefetchMode)
-PRINT_THRIFT_ENUM_IMPL(TReplicaPreference)
-PRINT_THRIFT_ENUM_IMPL(TRuntimeFilterMode)
-PRINT_THRIFT_ENUM_IMPL(TRuntimeFilterType)
-PRINT_THRIFT_ENUM_IMPL(TSessionType)
-PRINT_THRIFT_ENUM_IMPL(TStmtType)
-PRINT_THRIFT_ENUM_IMPL(TUnit)
-PRINT_THRIFT_ENUM_IMPL(TParquetTimestampType)
-PRINT_THRIFT_ENUM_IMPL(TTransactionalType)
-PRINT_THRIFT_ENUM_IMPL(TEnabledRuntimeFilterTypes)
-PRINT_THRIFT_ENUM_IMPL(TMinmaxFilteringLevel)
-PRINT_THRIFT_ENUM_IMPL(TKuduReplicaSelection)
-PRINT_THRIFT_ENUM_IMPL(TMinmaxFilterFastCodePathMode)
-PRINT_THRIFT_ENUM_IMPL(TParquetBloomFilterWrite)
-
 string PrintId(const TUniqueId& id, const string& separator) {
   stringstream out;
   // Outputting the separator string resets the stream width.
@@ -118,6 +80,32 @@ string PrintId(const UniqueIdPB& id, const string& separator) {
   stringstream out;
   // Outputting the separator string resets the stream width.
   out << hex << setfill('0') << setw(16) << id.hi() << separator << setw(16) << id.lo();
+  return out.str();
+}
+
+static void my_i64tohex(int64_t w, char out[16]) {
+  static const char* digits = "0123456789abcdef";
+  for (size_t i = 0, j=60; i < 16; ++i, j -= 4) {
+    out[i] = digits[(w>>j) & 0x0f];
+  }
+}
+
+void PrintIdCompromised(const TUniqueId& id, char out[TUniqueIdBufferSize],
+    const char separator) {
+  my_i64tohex(id.hi, out);
+  out[16] = separator;
+  my_i64tohex(id.lo, out+17);
+}
+
+string PrintIdSet(const std::set<TUniqueId>& ids, const std::string& separator) {
+  stringstream out;
+  auto it = ids.begin();
+  while (it != ids.end()) {
+    out << PrintId(*it);
+    if (++it != ids.end()) {
+      out << separator;
+    }
+  }
   return out.str();
 }
 
@@ -286,6 +274,15 @@ string PrintNumericPath(const SchemaPath& path) {
     ss << path[i];
   }
   ss << "]";
+  return ss.str();
+}
+
+string PrintTableList(const vector<TTableName>& tbls) {
+  stringstream ss;
+  for (int i = 0; i < tbls.size(); ++i) {
+    if (i != 0) ss << ",";
+    ss << tbls[i].db_name << "." << tbls[i].table_name;
+  }
   return ss.str();
 }
 

@@ -108,7 +108,10 @@ function build() {
   fi
   if command -v apt-get > /dev/null; then
     apt-get update
-    apt-get install -y sudo git lsb-release python
+    # The 'python' package doesn't exist on Ubuntu 22, so this installs python3.
+    # TODO: It might not be necessary to install python here, as the container
+    # will invoke bootstrap_system.sh.
+    apt-get install -y sudo git python3
   elif grep 'release 8\.' /etc/redhat-release; then
     # WARNING: Install the following packages one by one!
     # Installing them in a common transaction breaks something inside yum/dnf,
@@ -161,7 +164,7 @@ function boot_container() {
   #
   # "sed -i" in place doesn't work on Docker, because /etc/hosts is a bind mount.
   sed -e /$(hostname)/d /etc/hosts > /tmp/hosts
-  echo "127.0.0.1 $(hostname -s) $(hostname)" >> /tmp/hosts
+  echo "127.0.0.1 $(hostname) $(hostname -s)" >> /tmp/hosts
   sudo cp /tmp/hosts /etc/hosts
 
   echo Hostname: $(hostname)
@@ -407,16 +410,9 @@ function test_suite() {
     SKIP_TOOLCHAIN_BOOTSTRAP=true ./buildall.sh -noclean -notests -asan
   fi
 
-  # BE tests don't require the minicluster, so we can run them directly.
+  # Build the BE test binaries if needed.
   if [[ $1 = BE_TEST* ]]; then
     make -j$(nproc) --load-average=$(nproc) be-test be-benchmarks
-    if ! bin/run-backend-tests.sh; then
-      echo "Tests $1 failed!"
-      return 1
-    else
-      echo "Tests $1 succeeded!"
-      return 0
-    fi
   fi
 
   if [[ $1 == RAT_CHECK ]]; then

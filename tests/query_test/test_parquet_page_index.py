@@ -17,7 +17,10 @@
 
 # Targeted Impala insert tests
 
+from __future__ import absolute_import, division, print_function
 import os
+import random
+import string
 
 from collections import namedtuple
 from subprocess import check_call
@@ -70,12 +73,13 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
     row_group = file_meta_data.row_groups[0]
     assert len(schemas) == len(row_group.columns)
     row_group_index = []
-    with open(parquet_file) as file_handle:
+    with open(parquet_file, 'rb') as file_handle:
       for column, schema in zip(row_group.columns, schemas):
         column_index_offset = column.column_index_offset
         column_index_length = column.column_index_length
         column_index = None
         if column_index_offset and column_index_length:
+          assert(column_index_offset >= 0 and column_index_length >= 0)
           column_index = read_serialized_object(ColumnIndex, file_handle,
                                                 column_index_offset, column_index_length)
         column_meta_data = column.meta_data
@@ -88,9 +92,11 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
         offset_index = None
         page_headers = []
         if offset_index_offset and offset_index_length:
+          assert(offset_index_offset >= 0 and offset_index_length >= 0)
           offset_index = read_serialized_object(OffsetIndex, file_handle,
                                                 offset_index_offset, offset_index_length)
           for page_loc in offset_index.page_locations:
+            assert(page_loc.offset >= 0 and page_loc.compressed_page_size >= 0)
             page_header = read_serialized_object(PageHeader, file_handle, page_loc.offset,
                                                  page_loc.compressed_page_size)
             page_headers.append(page_header)
@@ -164,7 +170,7 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
       if not null_page:
         page_min_value = decode_stats_value(column_info.schema, page_min_str)
         # If type is str, page_min_value might have been truncated.
-        if isinstance(page_min_value, basestring):
+        if isinstance(page_min_value, bytes):
           assert page_min_value >= column_min_value[:len(page_min_value)]
         else:
           assert page_min_value >= column_min_value
@@ -174,9 +180,9 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
       if not null_page:
         page_max_value = decode_stats_value(column_info.schema, page_max_str)
         # If type is str, page_max_value might have been truncated and incremented.
-        if (isinstance(page_max_value, basestring) and
-            len(page_max_value) == PAGE_INDEX_MAX_STRING_LENGTH):
-          max_val_prefix = page_max_value.rstrip('\0')
+        if (isinstance(page_max_value, bytes)
+            and len(page_max_value) == PAGE_INDEX_MAX_STRING_LENGTH):
+          max_val_prefix = page_max_value.rstrip(b'\0')
           assert max_val_prefix[:-1] <= column_max_value
         else:
           assert page_max_value <= column_max_value
@@ -337,6 +343,10 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
     self._ctas_table_and_verify_index(vector, unique_database,
         "functional_parquet", "widetable_1000_cols", tmpdir)
 
+    # Test table with 40001 distinct values that aligns full page with full dictionary.
+    self._ctas_table_and_verify_index(vector, unique_database,
+        "functional", "empty_parquet_page_source_impala10186", tmpdir)
+
   def test_max_string_values(self, vector, unique_database, tmpdir):
     """Test string values that are all 0xFFs or end with 0xFFs."""
 
@@ -379,7 +389,7 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
     column = row_group_indexes[0][0]
     assert len(column.column_index.max_values) == 1
     max_value = column.column_index.max_values[0]
-    assert max_value == 'aab'
+    assert max_value == b'aab'
 
   def test_row_count_limit(self, vector, unique_database, tmpdir):
     """Tests that we can set the page row count limit via a query option.
@@ -434,6 +444,39 @@ class TestHdfsParquetTableIndexWriter(ImpalaTestSuite):
       for column in row_group:
         assert column.offset_index is None
         assert column.column_index is None
+
+  def test_matched_page_and_dict_limits(self, vector, unique_database, tmpdir):
+    """Tests that we don't produce empty pages when the page and dictionary fill
+    simultaneously. Dictionary limit is 40000.
+    """
+    vector.get_value('exec_option')['parquet_page_row_count_limit'] = 20000
+
+    table_name = "empty_parquet_page_dict_limit"
+    qualified_table_name = "{0}.{1}".format(unique_database, table_name)
+    # Setting num_nodes = 1 ensures that the query is executed on the coordinator,
+    # resulting in a single parquet file being written.
+    vector.get_value('exec_option')['num_nodes'] = 1
+    query = ("create table {0} stored as parquet as select distinct l_orderkey as n "
+             "from tpch_parquet.lineitem order by l_orderkey limit 40001").format(
+        qualified_table_name)
+    self.execute_query(query, vector.get_value('exec_option'))
+
+    hdfs_path = get_fs_path('/test-warehouse/{0}.db/{1}/'.format(unique_database,
+        table_name))
+    self._validate_parquet_page_index(hdfs_path, tmpdir.join(qualified_table_name))
+
+  def test_row_count_limit_large_string(self, vector, unique_database, tmpdir):
+    """Tests that if we write a very large string after hitting page row count limit, we
+    don't write an empty page.
+    """
+    vector.get_value('exec_option')['parquet_page_row_count_limit'] = 2
+    string_tbl = 'string_table'
+    string_tbl_path = self._create_table_with_values_of_type("STRING", vector,
+        unique_database, string_tbl, "('a'), ('b'), ('{0}')".format(
+            ''.join([random.choice(string.ascii_letters + string.digits)
+                     for _ in range(64 * 1024 + 1)])))
+    self._validate_parquet_page_index(string_tbl_path, tmpdir.join(
+        "{0}.{1}".format(unique_database, string_tbl)))
 
   def test_nan_values_for_floating_types(self, vector, unique_database, tmpdir):
     """ IMPALA-7304: Impala doesn't write column index for floating-point columns

@@ -51,6 +51,11 @@ enum TPlanNodeType {
   KUDU_SCAN_NODE = 15
   CARDINALITY_CHECK_NODE = 16
   MULTI_AGGREGATION_NODE = 17
+  ICEBERG_DELETE_NODE = 18
+  ICEBERG_METADATA_SCAN_NODE = 19
+  TUPLE_CACHE_NODE = 20
+  SYSTEM_TABLE_SCAN_NODE = 21
+  ICEBERG_MERGE_NODE = 22
 }
 
 // phases of an execution node
@@ -129,13 +134,7 @@ struct TRuntimeFilterTargetDesc {
 enum TRuntimeFilterType {
   BLOOM = 0
   MIN_MAX = 1
-}
-
-// Enabled runtime filter types to be applied to scan nodes.
-enum TEnabledRuntimeFilterTypes {
-  BLOOM = 1
-  MIN_MAX = 2
-  ALL = 3
+  IN_LIST = 2
 }
 
 // The level of filtering of enabled min/max filters to be applied to Parquet scan nodes.
@@ -224,11 +223,21 @@ struct THdfsFileSplit {
   // last modified time of the file
   7: required i64 mtime
 
+  // Whether the HDFS file is stored with erasure coding.
+  8: optional bool is_erasure_coded
+
   // Hash of the partition's path. This must be hashed with a hash algorithm that is
   // consistent across different processes and machines. This is currently using
   // Java's String.hashCode(), which is consistent. For testing purposes, this can use
   // any consistent hash.
   9: required i32 partition_path_hash
+
+  // The absolute path of the file, it's used only when data files are outside of
+  // the Iceberg table location (IMPALA-11507).
+  10: optional string absolute_path
+
+  // Whether the HDFS file is stored with transparent data encryption.
+  11: optional bool is_encrypted
 }
 
 // Key range for single THBaseScanNode. Corresponds to HBaseKeyRangePB and should be kept
@@ -265,6 +274,10 @@ struct TFileSplitGeneratorSpec {
 
   // Hash of the partition path
   5: required i32 partition_path_hash
+
+  // True if only footer range (the last block in file) is needed.
+  // If True, is_splittable must also be True as well.
+  6: required bool is_footer_only
 }
 
 // Specification of an individual data range which is held in its entirety
@@ -274,6 +287,8 @@ struct TScanRange {
   1: optional THdfsFileSplit hdfs_file_split
   2: optional THBaseKeyRange hbase_key_range
   3: optional binary kudu_scan_token
+  4: optional binary file_metadata
+  5: optional bool is_system_scan
 }
 
 // Specification of an overlap predicate desc.
@@ -318,9 +333,8 @@ struct THdfsScanNode {
   // The conjuncts that are eligible for dictionary filtering.
   9: optional map<Types.TSlotId, list<i32>> dictionary_filter_conjuncts
 
-  // The byte offset of the slot for Parquet metadata if Parquet count star optimization
-  // is enabled.
-  10: optional i32 parquet_count_star_slot_offset
+  // The byte offset of the slot for counter if count star optimization is enabled.
+  10: optional i32 count_star_slot_offset
 
   // If true, the backend only needs to return one row per partition.
   11: optional bool is_partition_key_scan
@@ -333,6 +347,15 @@ struct THdfsScanNode {
 
   // The overlap predicates
   13: optional list<TOverlapPredicateDesc> overlap_predicate_descs
+
+  // For IcebergScanNodes that are the left children of an IcebergDeleteNode this stores
+  // the node ID of the right child.
+  14: optional Types.TPlanNodeId deleteFileScanNodeId
+
+  // Whether mt_dop should use deterministic scan range assignment. If true,
+  // each fragment instance has its own list of scan ranges. If false,
+  // the fragment instances use a shared queue.
+  15: optional bool deterministic_scanrange_assignment
 }
 
 struct TDataSourceScanNode {
@@ -382,12 +405,23 @@ struct TKuduScanNode {
   3: optional i32 count_star_slot_offset
 }
 
+struct TSystemTableScanNode {
+  1: required Types.TTupleId tuple_id
+  2: required CatalogObjects.TSystemTableName table_name
+}
+
 struct TEqJoinCondition {
   // left-hand side of "<a> = <b>"
   1: required Exprs.TExpr left;
   // right-hand side of "<a> = <b>"
   2: required Exprs.TExpr right;
-  // true if and only if operator is "<=>", also known as "IS NOT DISTINCT FROM"
+  // In SQL NULL values aren't equal to each other, in other words NULL == NULL is false.
+  // However, there are some cases when joining tables where we'd like to have the
+  // NULL == NULL comparison to return true. This flag is true in this case.
+  // One example is when we join Iceberg equality delete files to the data files where we
+  // want the NULLs in the delete files to match with the NULLs in the data files.
+  // Another example is when this operator is a "<=>", also known as "IS NOT DISTINCT
+  // FROM".
   3: required bool is_not_distinct_from;
 }
 
@@ -409,6 +443,9 @@ enum TJoinOp {
   RIGHT_ANTI_JOIN = 7
   FULL_OUTER_JOIN = 8
   CROSS_JOIN = 9
+
+  // Iceberg Delete operator is based on join operation
+  ICEBERG_DELETE_JOIN = 10
 }
 
 struct THashJoinNode {
@@ -429,6 +466,11 @@ struct TNestedLoopJoinNode {
   1: optional list<Exprs.TExpr> join_conjuncts
 }
 
+struct TIcebergDeleteNode {
+  // equi-join predicates
+  1: required list<TEqJoinCondition> eq_join_conjuncts
+}
+
 // Top-level struct for a join node. Elements that are shared between the different
 // join implementations are top-level variables and elements that are specific to a
 // join implementation live in a specialized struct.
@@ -444,6 +486,7 @@ struct TJoinNode {
   // One of these must be set.
   4: optional THashJoinNode hash_join_node
   5: optional TNestedLoopJoinNode nested_loop_join_node
+  6: optional TIcebergDeleteNode iceberg_delete_node
 }
 
 struct TAggregator {
@@ -664,6 +707,63 @@ struct TCardinalityCheckNode {
   1: required string display_statement
 }
 
+struct TIcebergMetadataScanNode {
+  // Tuple ID of the Tuple this scanner should scan.
+  1: required Types.TTupleId tuple_id
+  // Name of the FeIcebergTable that will be used for the metadata table scan.
+  2: required CatalogObjects.TTableName table_name
+  // The metadata table name specifies which metadata table has to be scanned.
+  3: required string metadata_table_name;
+}
+
+struct TTupleCacheNode {
+  // Compile-time cache key that includes a hashed representation of the entire subtree
+  // below this point in the plan.
+  1: required string compile_time_key
+  // To calculate the per-fragment key, this keeps track of scan nodes that feed
+  // into this node. The TupleCacheNode will hash the scan ranges for its fragment
+  // at runtime.
+  2: required list<i32> input_scan_node_ids;
+}
+
+enum TMergeCaseType {
+  UPDATE = 0
+  INSERT = 1
+  DELETE = 2
+}
+
+enum TMergeMatchType {
+  MATCHED = 0
+  NOT_MATCHED_BY_TARGET = 1
+  NOT_MATCHED_BY_SOURCE = 2
+}
+
+enum TIcebergMergeRowPresent {
+  BOTH = 0
+  SOURCE = 1
+  TARGET = 2
+}
+
+struct TIcebergMergeCase {
+  // Output expressions that will transform the values of the incoming
+  // merge result set.
+  1: required list<Exprs.TExpr> output_expressions
+  // Filter expressions whose are evaluated after matching the case.
+  2: optional list<Exprs.TExpr> filter_conjuncts
+  // Type of the merge case that reflects the operation in it.
+  3: required TMergeCaseType type
+  4: required TMergeMatchType match_type
+}
+
+struct TIcebergMergeNode {
+  1: required list<TIcebergMergeCase> cases
+  2: required Exprs.TExpr row_present
+  3: required list<Exprs.TExpr> position_meta_exprs
+  4: required list<Exprs.TExpr> partition_meta_exprs
+  5: required Types.TTupleId merge_action_tuple_id
+  6: required Types.TTupleId target_tuple_id
+}
+
 // See PipelineMembership in the frontend for details.
 struct TPipelineMembership {
   1: required Types.TPlanNodeId pipe_id
@@ -690,38 +790,44 @@ struct TPlanNode {
   // node is codegen'd if the backend supports it.
   8: required bool disable_codegen
 
-  27: required list<TPipelineMembership> pipelines
+  9: required list<TPipelineMembership> pipelines
 
   // one field per PlanNode subclass
-  9: optional THdfsScanNode hdfs_scan_node
-  10: optional THBaseScanNode hbase_scan_node
-  11: optional TKuduScanNode kudu_scan_node
-  12: optional TDataSourceScanNode data_source_node
-  13: optional TJoinNode join_node
+  10: optional THdfsScanNode hdfs_scan_node
+  11: optional THBaseScanNode hbase_scan_node
+  12: optional TKuduScanNode kudu_scan_node
+  13: optional TDataSourceScanNode data_source_node
+  14: optional TJoinNode join_node
   15: optional TAggregationNode agg_node
   16: optional TSortNode sort_node
   17: optional TUnionNode union_node
   18: optional TExchangeNode exchange_node
   19: optional TAnalyticNode analytic_node
   20: optional TUnnestNode unnest_node
+  21: optional TIcebergMetadataScanNode iceberg_scan_metadata_node
+  30: optional TIcebergMergeNode merge_node
 
   // Label that should be used to print this node to the user.
-  21: optional string label
+  22: optional string label
 
   // Additional details that should be printed to the user. This is node specific
   // e.g. table name, join strategy, etc.
-  22: optional string label_detail
+  23: optional string label_detail
 
   // Estimated execution stats generated by the planner.
-  23: optional ExecStats.TExecStats estimated_stats
+  24: optional ExecStats.TExecStats estimated_stats
 
   // Runtime filters assigned to this plan node
-  24: optional list<TRuntimeFilterDesc> runtime_filters
+  25: optional list<TRuntimeFilterDesc> runtime_filters
 
   // Resource profile for this plan node.
-  25: required ResourceProfile.TBackendResourceProfile resource_profile
+  26: required ResourceProfile.TBackendResourceProfile resource_profile
 
-  26: optional TCardinalityCheckNode cardinality_check_node
+  27: optional TCardinalityCheckNode cardinality_check_node
+
+  28: optional TTupleCacheNode tuple_cache_node
+
+  29: optional TSystemTableScanNode system_table_scan_node
 }
 
 // A flattened representation of a tree of PlanNodes, obtained by depth-first

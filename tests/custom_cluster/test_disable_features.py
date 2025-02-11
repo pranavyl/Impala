@@ -15,11 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import SkipIf
+from tests.common.skip import SkipIfFS
 
 
 class TestDisableFeatures(CustomClusterTestSuite):
@@ -29,12 +30,7 @@ class TestDisableFeatures(CustomClusterTestSuite):
   def get_workload(self):
     return 'functional-query'
 
-  @pytest.mark.execute_serially
-  @CustomClusterTestSuite.with_args("--enable_orc_scanner=false")
-  def test_disable_orc_scanner(self, vector):
-    self.run_test_case('QueryTest/disable-orc-scanner', vector)
-
-  @SkipIf.not_hdfs
+  @SkipIfFS.hdfs_caching
   @pytest.mark.execute_serially
   @UniqueDatabase.parametrize(sync_ddl=True)
   @CustomClusterTestSuite.with_args(
@@ -63,3 +59,8 @@ class TestDisableFeatures(CustomClusterTestSuite):
     self.execute_query_expect_failure(
         self.client,
         "select sum(id) over(order by id) from functional.alltypes having -1")
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args("--enable_json_scanner=false")
+  def test_disable_json_scanner(self, vector):
+    self.run_test_case('QueryTest/disable-json-scanner', vector)

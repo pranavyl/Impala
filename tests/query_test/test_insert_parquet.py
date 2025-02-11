@@ -17,10 +17,12 @@
 
 # Targeted Impala insert tests
 
+from __future__ import absolute_import, division, print_function
+from builtins import map, range, round
 import os
 
 from collections import namedtuple
-from datetime import (datetime, date)
+from datetime import datetime, date
 from decimal import Decimal
 from subprocess import check_call
 from parquet.ttypes import ColumnOrder, SortingColumn, TypeDefinedOrder, ConvertedType
@@ -28,12 +30,13 @@ from parquet.ttypes import ColumnOrder, SortingColumn, TypeDefinedOrder, Convert
 from tests.common.environ import impalad_basedir
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import (SkipIfEC, SkipIfIsilon, SkipIfLocal, SkipIfS3, SkipIfABFS,
-                               SkipIfADLS, SkipIfGCS, SkipIfCOS)
-from tests.common.test_dimensions import create_exec_option_dimension
+from tests.common.skip import SkipIfFS, SkipIfLocal
+from tests.common.test_dimensions import (
+    add_exec_option_dimension,
+    create_exec_option_dimension)
 from tests.common.test_result_verifier import verify_query_result_is_equal
 from tests.common.test_vector import ImpalaTestDimension
-from tests.util.filesystem_utils import get_fs_path
+from tests.util.filesystem_utils import get_fs_path, WAREHOUSE
 from tests.util.get_parquet_metadata import (decode_stats_value,
     get_parquet_metadata_from_hdfs_folder)
 
@@ -53,6 +56,9 @@ class RoundFloat():
     """Compares this objects's value to a numeral after rounding it."""
     return round(self.value, self.num_digits) == round(numeral, self.num_digits)
 
+  def __hash__(self):
+    return hash(round(self.value, self.num_digits))
+
 
 class TimeStamp():
   """Class to construct timestamps with a default format specifier."""
@@ -67,6 +73,9 @@ class TimeStamp():
     """Compares this objects's value to another timetuple."""
     return self.timetuple == other_timetuple
 
+  def __hash__(self):
+    return hash(self.timetuple)
+
 
 class Date():
   """Class to compare dates specified as year-month-day to dates specified as days since
@@ -77,6 +86,9 @@ class Date():
 
   def __eq__(self, other_days_since_eopch):
     return self.days_since_epoch == other_days_since_eopch
+
+  def __hash__(self):
+    return hash(self.days_since_epoch)
 
 
 ColumnStats = namedtuple('ColumnStats', ['name', 'min', 'max', 'null_count'])
@@ -105,24 +117,17 @@ class TestInsertParquetQueries(ImpalaTestSuite):
         cluster_sizes=[0], disable_codegen_options=[False], batch_sizes=[0],
         sync_ddl=[1]))
 
-    cls.ImpalaTestMatrix.add_dimension(
-        ImpalaTestDimension("compression_codec", *PARQUET_CODECS))
-    cls.ImpalaTestMatrix.add_dimension(
-        ImpalaTestDimension("file_size", *PARQUET_FILE_SIZES))
+    add_exec_option_dimension(cls, 'compression_codec', PARQUET_CODECS)
+    add_exec_option_dimension(cls, 'parquet_file_size', PARQUET_FILE_SIZES)
 
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('table_format').file_format == 'parquet')
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('table_format').compression_codec == 'none')
 
-  @SkipIfEC.oom
   @SkipIfLocal.multiple_impalad
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_insert_parquet(self, vector, unique_database):
-    vector.get_value('exec_option')['PARQUET_FILE_SIZE'] = \
-        vector.get_value('file_size')
-    vector.get_value('exec_option')['COMPRESSION_CODEC'] = \
-        vector.get_value('compression_codec')
     self.run_test_case('insert_parquet', vector, unique_database, multiple_impalad=True)
 
 
@@ -168,19 +173,15 @@ class TestInsertParquetInvalidCodec(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(create_exec_option_dimension(
         cluster_sizes=[0], disable_codegen_options=[False], batch_sizes=[0],
         sync_ddl=[1]))
-    cls.ImpalaTestMatrix.add_dimension(
-        ImpalaTestDimension("compression_codec", 'bzip2'))
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('table_format').file_format == 'parquet')
     cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('table_format').compression_codec == 'none')
 
   @SkipIfLocal.multiple_impalad
-  def test_insert_parquet_invalid_codec(self, vector):
-    vector.get_value('exec_option')['COMPRESSION_CODEC'] = \
-        vector.get_value('compression_codec')
-    self.run_test_case('QueryTest/insert_parquet_invalid_codec', vector,
-                       multiple_impalad=True)
+  def test_insert_parquet_invalid_codec(self, vector, unique_database):
+    """compression_codec option is set inside the .test file."""
+    self.run_test_case('QueryTest/insert_parquet_invalid_codec', vector, unique_database)
 
 
 class TestInsertParquetVerifySize(ImpalaTestSuite):
@@ -203,7 +204,7 @@ class TestInsertParquetVerifySize(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension("compression_codec", *PARQUET_CODECS))
 
-  @SkipIfIsilon.hdfs_block_size
+  @SkipIfFS.hdfs_block_size
   @SkipIfLocal.hdfs_client
   def test_insert_parquet_verify_size(self, vector, unique_database):
     # Test to verify that the result file size is close to what we expect.
@@ -212,7 +213,7 @@ class TestInsertParquetVerifySize(ImpalaTestSuite):
     location = get_fs_path("test-warehouse/{0}.db/{1}/"
                            .format(unique_database, tbl_name))
     create = ("create table {0} like tpch_parquet.orders stored as parquet"
-              .format(fq_tbl_name, location))
+              .format(fq_tbl_name))
     query = "insert overwrite {0} select * from tpch.orders".format(fq_tbl_name)
     block_size = 40 * 1024 * 1024
 
@@ -332,10 +333,10 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
     to have columns with different signed integer logical types. The test verifies
     that parquet file written by the hdfs parquet table writer using the generated
     file has the same column type metadata as the generated one."""
-    hdfs_path = (os.environ['DEFAULT_FS'] + "/test-warehouse/{0}.db/"
-                 "signed_integer_logical_types.parquet").format(unique_database)
-    self.filesystem_client.copy_from_local(os.environ['IMPALA_HOME'] +
-        '/testdata/data/signed_integer_logical_types.parquet', hdfs_path)
+    hdfs_path = "{1}/{0}.db/signed_integer_logical_types.parquet".\
+        format(unique_database, WAREHOUSE)
+    self.filesystem_client.copy_from_local(os.environ['IMPALA_HOME']
+        + '/testdata/data/signed_integer_logical_types.parquet', hdfs_path)
     # Create table with signed integer logical types
     src_tbl = "{0}.{1}".format(unique_database, "read_write_logical_type_src")
     create_tbl_stmt = """create table {0} like parquet "{1}"
@@ -343,7 +344,7 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
     result = self.execute_query_expect_success(self.client, create_tbl_stmt)
     # Check to see if the src_tbl column types matches the schema of the parquet
     # file from which it was generated
-    result_src = self.execute_query_expect_success(self.client, "describe %s" %src_tbl)
+    result_src = self.execute_query_expect_success(self.client, "describe %s" % src_tbl)
     for line in result_src.data:
       line_split = line.split()
       if line_split[0] == "id":
@@ -367,7 +368,7 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
     #      them.
     #   2. Ensuring that the column types in dst_tbl matches the column types in the
     #      schema of the parquet file that was used to generate the src_tbl
-    result = self.execute_query_expect_success(self.client, "show files in %s" %src_tbl)
+    result = self.execute_query_expect_success(self.client, "show files in %s" % src_tbl)
     hdfs_path = result.data[0].split("\t")[0]
     dst_tbl = "{0}.{1}".format(unique_database, "read_write_logical_type_dst")
     create_tbl_stmt = 'create table {0} like parquet "{1}"'.format(dst_tbl, hdfs_path)
@@ -428,7 +429,7 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
   def _check_only_one_member_var_is_set(obj, var_name):
     """Checks that 'var_name' is the only member of 'obj' that is not None. Useful to
     check Thrift unions."""
-    keys = [k for k, v in vars(obj).iteritems() if v is not None]
+    keys = [k for k, v in vars(obj).items() if v is not None]
     assert keys == [var_name]
 
   def _check_no_logical_type(self, schemas, column_name):
@@ -538,13 +539,7 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
   # by python to string. In both HS2 and beewax, it only handles float
   # precision uptil 16 decimal digits and test needs 17.
   # IMPALA-9365 describes why HS2 is not started on non-HDFS test env.
-  @SkipIfS3.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   def test_double_precision(self, vector, unique_database):
     # IMPALA-10654: Test inserting double into Parquet table retains the precision.
     src_tbl = "{0}.{1}".format(unique_database, "i10654_parquet")
@@ -558,13 +553,8 @@ class TestHdfsParquetTableWriter(ImpalaTestSuite):
     result = self.run_stmt_in_hive(select_stmt)
     assert result.split('\n')[1] == '-0.43149576573887316'
 
-@SkipIfIsilon.hive
-@SkipIfLocal.hive
-@SkipIfS3.hive
-@SkipIfGCS.hive
-@SkipIfCOS.hive
-@SkipIfABFS.hive
-@SkipIfADLS.hive
+
+@SkipIfFS.hive
 # TODO: Should we move this to test_parquet_stats.py?
 class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
 
@@ -630,7 +620,7 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
     return row_group_stats
 
   def _validate_parquet_stats(self, hdfs_path, tmp_dir, expected_values,
-                              skip_col_idxs = None):
+                              skip_col_idxs=None):
     """Validates that 'hdfs_path' contains exactly one parquet file and that the rowgroup
     statistics in that file match the values in 'expected_values'. Columns indexed by
     'skip_col_idx' are excluded from the verification of the expected values. 'tmp_dir'
@@ -648,7 +638,8 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
     num_columns = len(table_stats)
     assert num_columns == len(expected_values)
 
-    for col_idx, stats, expected in zip(range(num_columns), table_stats, expected_values):
+    for col_idx, stats, expected in zip(list(range(num_columns)),
+                                        table_stats, expected_values):
       if col_idx in skip_col_idxs:
         continue
       if not expected:
@@ -691,8 +682,8 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
         ColumnStats('bigint_col', 0, 90, 0),
         ColumnStats('float_col', 0, RoundFloat(9.9, 1), 0),
         ColumnStats('double_col', 0, RoundFloat(90.9, 1), 0),
-        ColumnStats('date_string_col', '01/01/09', '12/31/10', 0),
-        ColumnStats('string_col', '0', '9', 0),
+        ColumnStats('date_string_col', b'01/01/09', b'12/31/10', 0),
+        ColumnStats('string_col', b'0', b'9', 0),
         ColumnStats('timestamp_col', TimeStamp('2009-01-01 00:00:00.0'),
                     TimeStamp('2010-12-31 05:09:13.860000'), 0),
         ColumnStats('year', 2009, 2010, 0),
@@ -741,15 +732,15 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
     # Expected values for tpch_parquet.customer
     expected_min_max_values = [
         ColumnStats('c_custkey', 1, 150000, 0),
-        ColumnStats('c_name', 'Customer#000000001', 'Customer#000150000', 0),
-        ColumnStats('c_address', '   2uZwVhQvwA', 'zzxGktzXTMKS1BxZlgQ9nqQ', 0),
+        ColumnStats('c_name', b'Customer#000000001', b'Customer#000150000', 0),
+        ColumnStats('c_address', b'   2uZwVhQvwA', b'zzxGktzXTMKS1BxZlgQ9nqQ', 0),
         ColumnStats('c_nationkey', 0, 24, 0),
-        ColumnStats('c_phone', '10-100-106-1617', '34-999-618-6881', 0),
+        ColumnStats('c_phone', b'10-100-106-1617', b'34-999-618-6881', 0),
         ColumnStats('c_acctbal', Decimal('-999.99'), Decimal('9999.99'), 0),
-        ColumnStats('c_mktsegment', 'AUTOMOBILE', 'MACHINERY', 0),
-        ColumnStats('c_comment', ' Tiresias according to the slyly blithe instructions '
-                    'detect quickly at the slyly express courts. express dinos wake ',
-                    'zzle. blithely regular instructions cajol', 0),
+        ColumnStats('c_mktsegment', b'AUTOMOBILE', b'MACHINERY', 0),
+        ColumnStats('c_comment', b' Tiresias according to the slyly blithe instructions '
+                    b'detect quickly at the slyly express courts. express dinos wake ',
+                    b'zzle. blithely regular instructions cajol', 0),
     ]
 
     self._ctas_table_and_verify_stats(vector, unique_database, tmpdir.strpath,
@@ -759,13 +750,13 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
     """Test that we don't write min/max statistics for null columns. Ensure null_count
     is set for columns with null values."""
     expected_min_max_values = [
-        ColumnStats('a', 'a', 'a', 0),
-        ColumnStats('b', '', '', 0),
+        ColumnStats('a', b'a', b'a', 0),
+        ColumnStats('b', b'', b'', 0),
         ColumnStats('c', None, None, 1),
         ColumnStats('d', None, None, 1),
         ColumnStats('e', None, None, 1),
-        ColumnStats('f', 'a\x00b', 'a\x00b', 0),
-        ColumnStats('g', '\x00', '\x00', 0)
+        ColumnStats('f', b'a\x00b', b'a\x00b', 0),
+        ColumnStats('g', b'\x00', b'\x00', 0)
     ]
 
     self._ctas_table_and_verify_stats(vector, unique_database, tmpdir.strpath,
@@ -787,9 +778,9 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
         """.format(qualified_table_name)
     self.execute_query(insert_stmt)
     expected_min_max_values = [
-        ColumnStats('c3', 'abc', 'xy', 0),
-        ColumnStats('vc', 'abc banana', 'ghj xyz', 0),
-        ColumnStats('st', 'abc xyz', 'lorem ipsum', 0)
+        ColumnStats('c3', b'abc', b'xy', 0),
+        ColumnStats('vc', b'abc banana', b'ghj xyz', 0),
+        ColumnStats('st', b'abc xyz', b'lorem ipsum', 0)
     ]
     self._ctas_table_and_verify_stats(vector, unique_database, tmpdir.strpath,
                                       qualified_table_name, expected_min_max_values)
@@ -851,9 +842,9 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
 
     # Make sure that they don't overlap by ordering by the min value, then looking at
     # boundaries.
-    orderkey_stats.sort(key = lambda s: s.min)
-    for l, r in zip(orderkey_stats, orderkey_stats[1:]):
-      assert l.max <= r.min
+    orderkey_stats.sort(key=lambda s: s.min)
+    for left, right in zip(orderkey_stats, orderkey_stats[1:]):
+      assert left.max <= right.min
 
   def test_write_statistics_float_infinity(self, vector, unique_database, tmpdir):
     """Test that statistics for -inf and inf are written correctly."""
@@ -884,10 +875,10 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
 
     # Expected values for tpch_parquet.customer
     expected_min_max_values = [
-        ColumnStats('id', '8600000US00601', '8600000US999XX', 0),
-        ColumnStats('zip', '00601', '999XX', 0),
-        ColumnStats('description1', '\"00601 5-Digit ZCTA', '\"999XX 5-Digit ZCTA', 0),
-        ColumnStats('description2', ' 006 3-Digit ZCTA\"', ' 999 3-Digit ZCTA\"', 0),
+        ColumnStats('id', b'8600000US00601', b'8600000US999XX', 0),
+        ColumnStats('zip', b'00601', b'999XX', 0),
+        ColumnStats('description1', b'\"00601 5-Digit ZCTA', b'\"999XX 5-Digit ZCTA', 0),
+        ColumnStats('description2', b' 006 3-Digit ZCTA\"', b' 999 3-Digit ZCTA\"', 0),
         ColumnStats('income', 0, 189570, 29),
     ]
 
@@ -946,7 +937,7 @@ class TestHdfsParquetTableStatsWriter(ImpalaTestSuite):
     """Test that writing a Parquet table with too many columns results in an error."""
     num_cols = 12000
     query = "create table %s.wide stored as parquet as select \n" % unique_database
-    query += ", ".join(map(str, xrange(num_cols)))
+    query += ", ".join(map(str, range(num_cols)))
     query += ";\n"
     result = self.execute_query_expect_failure(self.client, query)
     assert "Minimum required block size must be less than 2GB" in str(result)

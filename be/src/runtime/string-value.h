@@ -26,45 +26,100 @@
 #include "udf/udf.h"
 #include "util/hash-util.h"
 #include "runtime/types.h"
+#include "runtime/smallable-string.h"
 
 namespace impala {
+
+class StringValueTest;
+class Tuple;
 
 /// The format of a string-typed slot.
 /// The returned StringValue of all functions that return StringValue
 /// shares its buffer with the parent.
 /// TODO: rename this to be less confusing with impala_udf::StringVal.
-struct __attribute__((__packed__)) StringValue {
+/// StringValues use SmallableStrings internally which adds on-demand
+/// Small String Optimization.
+class __attribute__((__packed__)) StringValue {
+public:
   /// The current limitation for a string instance is 1GB character data.
   /// See IMPALA-1619 for more details.
-  static const int MAX_LENGTH = (1 << 30);
+  static constexpr int MAX_LENGTH = (1 << 30);
 
-  /// TODO: change ptr to an offset relative to a contiguous memory block,
-  /// so that we can send row batches between nodes without having to swizzle
-  /// pointers
-  char* ptr;
-  int len;
+  using SimpleString = SmallableString::SimpleString;
 
-  StringValue(char* ptr, int len): ptr(ptr), len(len) {
+  StringValue() {}
+  StringValue(const StringValue& other): string_impl_(other.string_impl_) {}
+
+  StringValue(char* ptr, int len): string_impl_(ptr, len) {
     DCHECK_GE(len, 0);
     DCHECK_LE(len, MAX_LENGTH);
   }
-  StringValue(): ptr(NULL), len(0) {}
 
-  /// Construct a StringValue from 's'.  's' must be valid for as long as
-  /// this object is valid.
+  /// Construct a StringValue from 's'. 's' must be valid for as long as
+  /// this object is valid, unless 's' is short.
   explicit StringValue(const std::string& s)
-    : ptr(const_cast<char*>(s.c_str())), len(s.size()) {
-    DCHECK_LE(len, MAX_LENGTH);
-  }
+    : string_impl_(s) {}
 
-  /// Construct a StringValue from 's'.  's' must be valid for as long as
+  /// Construct a StringValue from 's'. 's' must be valid for as long as
   /// this object is valid.
   /// s must be a null-terminated string.  This constructor is to prevent
   /// accidental use of the version taking an std::string.
   explicit StringValue(const char* s)
-    : ptr(const_cast<char*>(s)), len(strlen(s)) {
-    DCHECK_LE(len, MAX_LENGTH);
+    : string_impl_(s) {}
+
+  /// Only valid to call if source's length is small enough. Returns a StringValue object
+  /// that is smallified.
+  static StringValue MakeSmallStringFrom(const StringValue& source) {
+    DCHECK_LE(source.Len(), SmallableString::SMALL_LIMIT);
+    StringValue sv(source);
+    sv.Smallify();
+    DCHECK(sv.IsSmall());
+    return sv;
   }
+
+  void Assign(const StringValue& other) { string_impl_.Assign(other.string_impl_); }
+
+  void Assign(char* ptr, int len) {
+    string_impl_.Assign(ptr, len);
+  }
+
+  void UnsafeAssign(char* ptr, int len) {
+    string_impl_.UnsafeAssign(ptr, len);
+  }
+
+  void Clear() { string_impl_.Clear(); }
+
+  bool IsSmall() const { return string_impl_.IsSmall(); }
+
+  int Len() const { return string_impl_.Len(); }
+
+  /// Returns the number of bytes needed outside the slot itself:
+  /// - if the length is too long to smallify, return length
+  /// - if the length is small enough to smallify:
+  ///   - if assume_smallify is true or the string is already smallified return 0
+  ///   - otherwise (not already smallified and assume_smallify is false) return length
+  int ExternalLen(bool assume_smallify) const {
+    return string_impl_.ExternalLen(assume_smallify);
+  }
+
+  /// Sets the length of this String object. Length can only be decreased.
+  void SetLen(int len) { return string_impl_.SetLen(len); }
+
+  char* Ptr() const { return string_impl_.Ptr(); }
+
+  /// We can only call this if the string is not smallified.
+  void SetPtr(char* ptr) { return string_impl_.SetPtr(ptr); }
+
+  // START IR FUNCTIONS
+  int IrLen() const;
+  char* IrPtr() const;
+  void IrSetLen(int len);
+  void IrAssign(char* ptr, int len);
+  void IrUnsafeAssign(char* ptr, int len);
+  void IrClear();
+  // END IR FUNCTIONS
+
+  SimpleString ToSimpleString() const { return string_impl_.ToSimpleString(); }
 
   /// Byte-by-byte comparison. Returns:
   /// this < other: -1
@@ -107,7 +162,7 @@ struct __attribute__((__packed__)) StringValue {
   inline StringValue Trim() const;
 
   void ToStringVal(impala_udf::StringVal* sv) const {
-    *sv = impala_udf::StringVal(reinterpret_cast<uint8_t*>(ptr), len);
+    *sv = impala_udf::StringVal(reinterpret_cast<uint8_t*>(Ptr()), Len());
   }
 
   // Treat up to first 8 bytes of the string as an 64-bit unsigned integer. If len is
@@ -125,24 +180,49 @@ struct __attribute__((__packed__)) StringValue {
   /// Returns number of characters in a char array (ignores trailing spaces)
   inline static int64_t UnpaddedCharLength(const char* cptr, int64_t len);
 
-  // Return the least smaller string 'result' such that 'result' < 'this'.
-  // The smallest string is "\x00". If no such string exists, return an empty string.
-  std::string LeastSmallerString() const;
+  // Return the largest smaller string 'result' such that 'result' < 'this'. If no such
+  // string exists, return an empty string. The smallest non-empty string is "\x00" and
+  // the absolute smallest string is the empty string.
+  std::string LargestSmallerString() const;
 
   // Return the least larger string 'result' such that 'this' < 'result'.
   std::string LeastLargerString() const;
 
   /// For C++/IR interop, we need to be able to look up types by name.
   static const char* LLVM_CLASS_NAME;
+
+private:
+  friend Tuple;
+  friend StringValueTest;
+  /// !!! THIS IS UNSAFE TO CALL ON EXISTING STRINGVALUE OBJECTS !!!
+  /// Please make sure you only invoke it for newly created StringValues, e.g. on the
+  /// target StringValue object of a deep copy operation.
+  /// Tries to apply Small String Optimization if possible. Returns 'true' on success,
+  /// 'false' otherwise. In the latter case the object remains unmodified.
+  /// !!! THIS IS UNSAFE TO CALL ON EXISTING STRINGVALUE OBJECTS !!!
+  bool Smallify() { return string_impl_.Smallify(); }
+
+  SmallableString string_impl_;
 };
 
 /// This function must be called 'hash_value' to be picked up by boost.
 inline std::size_t hash_value(const StringValue& v) {
-  return HashUtil::Hash(v.ptr, v.len, 0);
+  return HashUtil::Hash(v.Ptr(), v.Len(), 0);
 }
 
 std::ostream& operator<<(std::ostream& os, const StringValue& string_value);
 
+}
+
+/// With this specialization it is possbile to use StringValues in hash-based std
+/// containers (unordered_set, unordered_map) without the need of explicitly
+/// specifying the Hash template parameter.
+namespace std {
+  template <> struct hash<impala::StringValue> {
+    size_t operator()(const impala::StringValue& str) const {
+      return hash_value(str);
+    }
+  };
 }
 
 #endif

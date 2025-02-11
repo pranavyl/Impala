@@ -126,7 +126,7 @@ echo "Ranger DB   : ${RANGER_POLICY_DB}"
 
 pushd ${CONFIG_DIR}
 # Cleanup any existing files
-rm -f {core,hdfs,hbase,hive,yarn,mapred}-site.xml
+rm -f {core,hdfs,hbase,hive,ozone,yarn,mapred}-site.xml
 rm -f authz-provider.ini
 
 # Generate hive configs first so that schemaTool can be used to init the metastore schema
@@ -151,9 +151,20 @@ mkdir -p hive-site-events-cleanup
 rm -f hive-site-events-cleanup/hive-site.xml
 ln -s "${CONFIG_DIR}/hive-site_events_cleanup.xml" hive-site-events-cleanup/hive-site.xml
 
+export HIVE_VARIANT=housekeeping_on
+$IMPALA_HOME/bin/generate_xml_config.py hive-site.xml.py hive-site_housekeeping_on.xml
+mkdir -p hive-site-housekeeping-on
+rm -f hive-site-housekeeping-on/hive-site.xml
+ln -s "${CONFIG_DIR}/hive-site_housekeeping_on.xml" \
+    hive-site-housekeeping-on/hive-site.xml
+
 export HIVE_VARIANT=ranger_auth
 HIVE_RANGER_CONF_DIR=hive-site-ranger-auth
 $IMPALA_HOME/bin/generate_xml_config.py hive-site.xml.py hive-site_ranger_auth.xml
+
+# Cleanup pycache if created
+rm -rf __pycache__
+
 rm -rf $HIVE_RANGER_CONF_DIR
 mkdir -p $HIVE_RANGER_CONF_DIR
 ln -s "${CONFIG_DIR}/hive-site_ranger_auth.xml" $HIVE_RANGER_CONF_DIR/hive-site.xml
@@ -200,7 +211,7 @@ fi
 
 echo "Copying common conf files from local cluster:"
 CLUSTER_HADOOP_CONF_DIR=$(${CLUSTER_DIR}/admin get_hadoop_client_conf_dir)
-for file in core-site.xml hdfs-site.xml yarn-site.xml ; do
+for file in core-site.xml hdfs-site.xml ozone-site.xml yarn-site.xml ; do
   echo ... $file
   # These need to be copied instead of symlinked so that they can be accessed when the
   # directory is bind-mounted into /opt/impala/conf in docker containers.
@@ -232,6 +243,9 @@ popd
 RANGER_SERVER_CONF_DIR="${RANGER_HOME}/ews/webapp/WEB-INF/classes/conf"
 RANGER_SERVER_CONFDIST_DIR="${RANGER_HOME}/ews/webapp/WEB-INF/classes/conf.dist"
 RANGER_SERVER_LIB_DIR="${RANGER_HOME}/ews/webapp/WEB-INF/lib"
+RANGER_ADMIN_LOGBACK_CONF_FILE="${RANGER_SERVER_CONFDIST_DIR}/logback.xml"
+RANGER_ADMIN_LOG4J2_CONF_FILE="${RANGER_HOME}/ews/webapp/WEB-INF/log4j2.properties"
+RANGER_LOG_DIR="${IMPALA_CLUSTER_LOGS_DIR}/ranger"
 if [[ ! -d "${RANGER_SERVER_CONF_DIR}" ]]; then
     mkdir -p "${RANGER_SERVER_CONF_DIR}"
 fi
@@ -241,6 +255,21 @@ cp -f "${RANGER_TEST_CONF_DIR}/ranger-admin-env-logdir.sh" "${RANGER_SERVER_CONF
 cp -f "${RANGER_TEST_CONF_DIR}/ranger-admin-env-piddir.sh" "${RANGER_SERVER_CONF_DIR}"
 cp -f "${RANGER_SERVER_CONFDIST_DIR}/security-applicationContext.xml" \
     "${RANGER_SERVER_CONF_DIR}"
+# For Apache Ranger, we need logback.xml under ${RANGER_SERVER_CONF_DIR} so that the log
+# files like ranger-admin-$(hostname)-$(whoami).log could be created under
+# ${RANGER_LOG_DIR}.
+if [[ -f ${RANGER_ADMIN_LOGBACK_CONF_FILE} ]]; then
+  cp -f ${RANGER_ADMIN_LOGBACK_CONF_FILE} ${RANGER_SERVER_CONF_DIR}
+fi
+# For CDP Ranger, we change the value of the property 'log.dir' in the corresponding
+# log4j2.properties so that the log files like ranger-admin-server.log could be created
+# under ${RANGER_LOG_DIR}.
+if [[ -f ${RANGER_ADMIN_LOG4J2_CONF_FILE} ]]; then
+  # Use vertical bar instead of slash as the separator to prevent the slash(es) in
+  # ${RANGER_LOG_DIR} from interfering with the parsing of sed.
+  sed -i "s|property\.log\.dir=.*|property.log.dir=${RANGER_LOG_DIR}|g" \
+      ${RANGER_ADMIN_LOG4J2_CONF_FILE}
+fi
 
 # Prepend the following 5 URL's to the line starting with "<intercept-url pattern="/**"".
 # Before the end-to-end tests could be performed in a Kerberized environment

@@ -16,6 +16,10 @@
 // under the License.
 package org.apache.impala.catalog;
 
+import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -55,9 +59,8 @@ import org.apache.impala.util.TAccessLevelUtil;
 import org.apache.impala.util.TResultRowBuilder;
 import org.apache.thrift.TException;
 
-import com.google.common.base.Preconditions;
-import com.google.common.base.Joiner;
-import com.google.common.collect.Lists;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Frontend interface for interacting with a filesystem-backed table.
@@ -74,6 +77,16 @@ public interface FeFsTable extends FeTable {
   // TODO(henry): confirm that this is thread safe - cursory inspection of the class
   // and its usage in getFileSystem suggests it should be.
   public static final Configuration CONF = new Configuration();
+
+  // Internal table property that specifies the number of files in the table.
+  public static final String NUM_FILES = "numFiles";
+
+  // Internal table property that specifies the total size of the table.
+  public static final String TOTAL_SIZE = "totalSize";
+
+  // Internal table property that specifies the number of erasure coded files in the
+  // table.
+  public static final String NUM_ERASURE_CODED_FILES = "numFilesErasureCoded";
 
   /**
    * @return true if the table and all its partitions reside at locations which
@@ -175,7 +188,7 @@ public interface FeFsTable extends FeTable {
   Map<Long, ? extends PrunablePartition> getPartitionMap();
 
   /**
-   * @param the index of the target partitioning column
+   * @param col the index of the target partitioning column
    * @return a map from value to a set of partitions for which column 'col'
    * has that value.
    */
@@ -205,6 +218,16 @@ public interface FeFsTable extends FeTable {
       tableFs = (new Path(getLocation())).getFileSystem(CONF);
     } catch (IOException e) {
       throw new CatalogException("Invalid table path for table: " + getFullName(), e);
+    }
+    return tableFs;
+  }
+
+  public static FileSystem getFileSystem(Path filePath) throws CatalogException {
+    FileSystem tableFs;
+    try {
+      tableFs = filePath.getFileSystem(CONF);
+    } catch (IOException e) {
+      throw new CatalogException("Invalid path: " + filePath.toString(), e);
     }
     return tableFs;
   }
@@ -351,6 +374,9 @@ public interface FeFsTable extends FeTable {
    * these can become default methods of the interface.
    */
   abstract class Utils {
+
+    private final static Logger LOG = LoggerFactory.getLogger(Utils.class);
+
     // Table property key for skip.header.line.count
     public static final String TBL_PROP_SKIP_HEADER_LINE_COUNT = "skip.header.line.count";
 
@@ -421,7 +447,12 @@ public interface FeFsTable extends FeTable {
       resultSchema.addToColumns(new TColumn("Path", Type.STRING.toThrift()));
       resultSchema.addToColumns(new TColumn("Size", Type.STRING.toThrift()));
       resultSchema.addToColumns(new TColumn("Partition", Type.STRING.toThrift()));
+      resultSchema.addToColumns(new TColumn("EC Policy", Type.STRING.toThrift()));
       result.setRows(new ArrayList<>());
+
+      if (table instanceof FeIcebergTable) {
+        return FeIcebergTable.Utils.getIcebergTableFiles((FeIcebergTable) table, result);
+      }
 
       List<? extends FeFsPartition> orderedPartitions;
       if (partitionSet == null) {
@@ -437,9 +468,11 @@ public interface FeFsTable extends FeTable {
         Collections.sort(orderedFds);
         for (FileDescriptor fd: orderedFds) {
           TResultRowBuilder rowBuilder = new TResultRowBuilder();
-          rowBuilder.add(p.getLocation() + "/" + fd.getRelativePath());
+          String absPath = fd.getAbsolutePath(p.getLocation());
+          rowBuilder.add(absPath);
           rowBuilder.add(PrintUtils.printBytes(fd.getFileLength()));
           rowBuilder.add(p.getPartitionName());
+          rowBuilder.add(FileSystemUtil.getErasureCodingPolicy(new Path(absPath)));
           result.addToRows(rowBuilder.get());
         }
       }
@@ -459,7 +492,7 @@ public interface FeFsTable extends FeTable {
      *
      * TODO(IMPALA-9883): Fix this for full ACID tables.
      */
-    public static Map<HdfsScanNode.SampledPartitionMetadata, List<FileDescriptor>>
+    public static Map<Long, List<FileDescriptor>>
         getFilesSample(FeFsTable table, Collection<? extends FeFsPartition> inputParts,
             long percentBytes, long minSampleBytes, long randomSeed) {
       Preconditions.checkState(percentBytes >= 0 && percentBytes <= 100);
@@ -517,15 +550,14 @@ public interface FeFsTable extends FeTable {
       // selected.
       Random rnd = new Random(randomSeed);
       long selectedBytes = 0;
-      Map<HdfsScanNode.SampledPartitionMetadata, List<FileDescriptor>> result =
+      Map<Long, List<FileDescriptor>> result =
           new HashMap<>();
       while (selectedBytes < targetBytes && numFilesRemaining > 0) {
         int selectedIdx = Math.abs(rnd.nextInt()) % numFilesRemaining;
         FeFsPartition part = parts[selectedIdx];
-        HdfsScanNode.SampledPartitionMetadata sampledPartitionMetadata =
-            new HdfsScanNode.SampledPartitionMetadata(part.getId(), part.getFsType());
+        Long partId = Long.valueOf(part.getId());
         List<FileDescriptor> sampleFileIdxs = result.computeIfAbsent(
-            sampledPartitionMetadata, partMetadata -> Lists.newArrayList());
+            partId, id -> Lists.newArrayList());
         FileDescriptor fd = part.getFileDescriptors().get(fileIdxs[selectedIdx]);
         sampleFileIdxs.add(fd);
         selectedBytes += fd.getFileLength();
@@ -563,7 +595,7 @@ public interface FeFsTable extends FeTable {
       Set<String> keys = new HashSet<>();
       for (FieldSchema fs: table.getMetaStoreTable().getPartitionKeys()) {
         for (TPartitionKeyValue kv: partitionSpec) {
-          if (fs.getName().toLowerCase().equals(kv.getName().toLowerCase())) {
+          if (fs.getName().equalsIgnoreCase(kv.getName())) {
             targetValues.add(kv.getValue());
             // Same key was specified twice
             if (!keys.add(kv.getName().toLowerCase())) {
@@ -583,7 +615,9 @@ public interface FeFsTable extends FeTable {
       // match the values being searched for.
       for (PrunablePartition partition: table.getPartitions()) {
         List<LiteralExpr> partitionValues = partition.getPartitionValues();
-        Preconditions.checkState(partitionValues.size() == targetValues.size());
+        Preconditions.checkState(partitionValues.size() == targetValues.size(),
+            "Partition values not match in table %s: %s != %s",
+            table.getFullName(), partitionValues.size(), targetValues.size());
         boolean matchFound = true;
         for (int i = 0; i < targetValues.size(); ++i) {
           String value;
@@ -591,7 +625,9 @@ public interface FeFsTable extends FeTable {
             value = table.getNullPartitionKeyValue();
           } else {
             value = partitionValues.get(i).getStringValue();
-            Preconditions.checkNotNull(value);
+            Preconditions.checkNotNull(value,
+                "Got null string from non-null partition value of table %s: i=%s",
+                table.getFullName(), i);
             // See IMPALA-252: we deliberately map empty strings on to
             // NULL when they're in partition columns. This is for
             // backwards compatibility with Hive, and is clearly broken.

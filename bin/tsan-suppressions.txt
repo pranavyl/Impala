@@ -44,3 +44,6 @@ race:impala::RpcMgrKerberizedTest
 
 # TODO: IMPALA-9403: Allow TSAN to be set on codegen
 race:impala::HdfsColumnarScanner::ProcessScratchBatchCodegenOrInterpret
+
+# TODO: IMPALA-12757: TSAN flags lock-order-inversion during internal-server-test
+deadlock:impala::KrpcDataStreamSender::Channel::WaitForRpcLocked

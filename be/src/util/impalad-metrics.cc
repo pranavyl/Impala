@@ -59,6 +59,10 @@ const char* ImpaladMetricKeys::IO_MGR_SHORT_CIRCUIT_BYTES_READ =
     "impala-server.io-mgr.short-circuit-bytes-read";
 const char* ImpaladMetricKeys::IO_MGR_CACHED_BYTES_READ =
     "impala-server.io-mgr.cached-bytes-read";
+const char* ImpaladMetricKeys::IO_MGR_ENCRYPTED_BYTES_READ =
+    "impala-server.io-mgr.encrypted-bytes-read";
+const char* ImpaladMetricKeys::IO_MGR_ERASURE_CODED_BYTES_READ =
+    "impala-server.io-mgr.erasure-coded-bytes-read";
 const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_HIT_BYTES =
     "impala-server.io-mgr.remote-data-cache-hit-bytes";
 const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_HIT_COUNT =
@@ -79,6 +83,14 @@ const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_DROPPED_ENTRIES =
     "impala-server.io-mgr.remote-data-cache-dropped-entries";
 const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_INSTANT_EVICTIONS =
     "impala-server.io-mgr.remote-data-cache-instant-evictions";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_OUTSTANDING_BYTES =
+    "impala-server.io-mgr.remote-data-cache-async-writes-outstanding-bytes";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_NUM_ASYNC_WRITES_SUBMITTED =
+    "impala-server.io-mgr.remote-data-cache-num-async-writes-submitted";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_BYTES =
+    "impala-server.io-mgr.remote-data-cache-async-writes-dropped-bytes";
+const char* ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_ENTRIES =
+    "impala-server.io-mgr.remote-data-cache-async-writes-dropped-entries";
 const char* ImpaladMetricKeys::IO_MGR_BYTES_WRITTEN =
     "impala-server.io-mgr.bytes-written";
 const char* ImpaladMetricKeys::IO_MGR_NUM_CACHED_FILE_HANDLES =
@@ -102,6 +114,8 @@ const char* ImpaladMetricKeys::CATALOG_OBJECT_VERSION_LOWER_BOUND =
     "catalog.catalog-object-version-lower-bound";
 const char* ImpaladMetricKeys::CATALOG_TOPIC_VERSION = "catalog.curr-topic";
 const char* ImpaladMetricKeys::CATALOG_SERVICE_ID = "catalog.curr-serviceid";
+const char* ImpaladMetricKeys::ACTIVE_CATALOGD_ADDRESS =
+    "catalog.active-catalogd-address";
 const char* ImpaladMetricKeys::CATALOG_READY = "catalog.ready";
 const char* ImpaladMetricKeys::CATALOG_CACHE_AVG_LOAD_TIME =
     "catalog.cache.average-load-time";
@@ -124,6 +138,10 @@ const char* ImpaladMetricKeys::CATALOG_CACHE_REQUEST_COUNT =
     "catalog.cache.request-count";
 const char* ImpaladMetricKeys::CATALOG_CACHE_TOTAL_LOAD_TIME =
     "catalog.cache.total-load-time";
+const char* ImpaladMetricKeys::CATALOG_CACHE_ENTRY_MEDIAN_SIZE =
+    "catalog.cache.entry-median-size";
+const char* ImpaladMetricKeys::CATALOG_CACHE_ENTRY_99TH_SIZE =
+    "catalog.cache.entry-99th-size";
 const char* ImpaladMetricKeys::NUM_FILES_OPEN_FOR_INSERT =
     "impala-server.num-files-open-for-insert";
 const char* ImpaladMetricKeys::IMPALA_SERVER_NUM_OPEN_HS2_SESSIONS =
@@ -148,7 +166,21 @@ const char* ImpaladMetricKeys::HEDGED_READ_OPS =
     "impala-server.hedged-read-ops";
 const char* ImpaladMetricKeys::HEDGED_READ_OPS_WIN =
     "impala-server.hedged-read-ops-win";
+const char* ImpaladMetricKeys::COMPLETED_QUERIES_QUEUED =
+    "impala-server.completed-queries.queued";
+const char* ImpaladMetricKeys::COMPLETED_QUERIES_WRITTEN =
+    "impala-server.completed-queries.written";
+const char* ImpaladMetricKeys::COMPLETED_QUERIES_FAIL =
+    "impala-server.completed-queries.failure";
+const char* ImpaladMetricKeys::COMPLETED_QUERIES_SCHEDULED_WRITES =
+    "impala-server.completed-queries.scheduled-writes";
+const char* ImpaladMetricKeys::COMPLETED_QUERIES_MAX_RECORDS_WRITES =
+    "impala-server.completed-queries.max-records-writes";
+const char* ImpaladMetricKeys::COMPLETED_QUERIES_WRITE_DURATIONS =
+    "impala-server.completed-queries.write-durations";
 const char* ImpaladMetricKeys::DEBUG_ACTION_NUM_FAIL = "impala.debug_action.fail";
+const char* ImpaladMetricKeys::QUERY_LOG_EST_TOTAL_BYTES =
+    "impala-server.query-log-est-total-bytes";
 
 // These are created by impala-server during startup.
 // =======
@@ -167,6 +199,8 @@ IntCounter* ImpaladMetrics::IO_MGR_BYTES_READ = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_LOCAL_BYTES_READ = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_SHORT_CIRCUIT_BYTES_READ = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_CACHED_BYTES_READ = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_ENCRYPTED_BYTES_READ = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_ERASURE_CODED_BYTES_READ = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_HIT_BYTES = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_HIT_COUNT = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_MISS_BYTES = nullptr;
@@ -175,6 +209,12 @@ IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_NUM_WRITES = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_DROPPED_BYTES = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_DROPPED_ENTRIES = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_INSTANT_EVICTIONS = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_OUTSTANDING_BYTES =
+    nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_NUM_ASYNC_WRITES_SUBMITTED = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_BYTES = nullptr;
+IntCounter* ImpaladMetrics::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_ENTRIES =
+    nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_BYTES_WRITTEN = nullptr;
 IntCounter* ImpaladMetrics::IO_MGR_CACHED_FILE_HANDLES_REOPENED = nullptr;
 IntCounter* ImpaladMetrics::HEDGED_READ_OPS = nullptr;
@@ -188,6 +228,10 @@ IntCounter* ImpaladMetrics::CATALOG_CACHE_MISS_COUNT = nullptr;
 IntCounter* ImpaladMetrics::CATALOG_CACHE_REQUEST_COUNT = nullptr;
 IntCounter* ImpaladMetrics::CATALOG_CACHE_TOTAL_LOAD_TIME = nullptr;
 IntCounter* ImpaladMetrics::DEBUG_ACTION_NUM_FAIL = nullptr;
+IntCounter* ImpaladMetrics::COMPLETED_QUERIES_WRITTEN = nullptr;
+IntCounter* ImpaladMetrics::COMPLETED_QUERIES_FAIL = nullptr;
+IntCounter* ImpaladMetrics::COMPLETED_QUERIES_SCHEDULED_WRITES = nullptr;
+IntCounter* ImpaladMetrics::COMPLETED_QUERIES_MAX_RECORDS_WRITES = nullptr;
 
 // Gauges
 IntGauge* ImpaladMetrics::CATALOG_NUM_DBS = nullptr;
@@ -211,20 +255,26 @@ IntGauge* ImpaladMetrics::NUM_FILES_OPEN_FOR_INSERT = nullptr;
 IntGauge* ImpaladMetrics::NUM_QUERIES_REGISTERED = nullptr;
 IntGauge* ImpaladMetrics::RESULTSET_CACHE_TOTAL_NUM_ROWS = nullptr;
 IntGauge* ImpaladMetrics::RESULTSET_CACHE_TOTAL_BYTES = nullptr;
+IntGauge* ImpaladMetrics::QUERY_LOG_EST_TOTAL_BYTES = nullptr;
 DoubleGauge* ImpaladMetrics::CATALOG_CACHE_AVG_LOAD_TIME = nullptr;
 DoubleGauge* ImpaladMetrics::CATALOG_CACHE_HIT_RATE = nullptr;
 DoubleGauge* ImpaladMetrics::CATALOG_CACHE_LOAD_EXCEPTION_RATE = nullptr;
 DoubleGauge* ImpaladMetrics::CATALOG_CACHE_MISS_RATE = nullptr;
+DoubleGauge* ImpaladMetrics::CATALOG_CACHE_ENTRY_MEDIAN_SIZE = nullptr;
+DoubleGauge* ImpaladMetrics::CATALOG_CACHE_ENTRY_99TH_SIZE = nullptr;
+IntGauge* ImpaladMetrics::COMPLETED_QUERIES_QUEUED = nullptr;
 
 // Properties
 BooleanProperty* ImpaladMetrics::CATALOG_READY = nullptr;
 BooleanProperty* ImpaladMetrics::IMPALA_SERVER_READY = nullptr;
 StringProperty* ImpaladMetrics::IMPALA_SERVER_VERSION = nullptr;
 StringProperty* ImpaladMetrics::CATALOG_SERVICE_ID = nullptr;
+StringProperty* ImpaladMetrics::ACTIVE_CATALOGD_ADDRESS = nullptr;
 
 // Histograms
 HistogramMetric* ImpaladMetrics::QUERY_DURATIONS = nullptr;
 HistogramMetric* ImpaladMetrics::DDL_DURATIONS = nullptr;
+HistogramMetric* ImpaladMetrics::COMPLETED_QUERIES_WRITE_DURATIONS = nullptr;
 
 // Other
 StatsMetric<uint64_t, StatsType::MEAN>*
@@ -243,6 +293,8 @@ void ImpaladMetrics::InitCatalogMetrics(MetricGroup* m) {
       catalog_metrics->AddGauge(ImpaladMetricKeys::CATALOG_TOPIC_VERSION, 0);
   CATALOG_SERVICE_ID =
       catalog_metrics->AddProperty<string>(ImpaladMetricKeys::CATALOG_SERVICE_ID, "");
+  ACTIVE_CATALOGD_ADDRESS = catalog_metrics->AddProperty<string>(
+      ImpaladMetricKeys::ACTIVE_CATALOGD_ADDRESS, "");
   CATALOG_READY =
       catalog_metrics->AddProperty<bool>(ImpaladMetricKeys::CATALOG_READY, false);
   // CatalogdMetaProvider cache metrics. Valid only when --use_local_catalog is set.
@@ -271,6 +323,10 @@ void ImpaladMetrics::InitCatalogMetrics(MetricGroup* m) {
         catalog_metrics->AddCounter(ImpaladMetricKeys::CATALOG_CACHE_REQUEST_COUNT, 0);
     CATALOG_CACHE_TOTAL_LOAD_TIME =
         catalog_metrics->AddCounter(ImpaladMetricKeys::CATALOG_CACHE_TOTAL_LOAD_TIME, 0);
+    CATALOG_CACHE_ENTRY_MEDIAN_SIZE = catalog_metrics->AddDoubleGauge(
+        ImpaladMetricKeys::CATALOG_CACHE_ENTRY_MEDIAN_SIZE, 0);
+    CATALOG_CACHE_ENTRY_99TH_SIZE = catalog_metrics->AddDoubleGauge(
+        ImpaladMetricKeys::CATALOG_CACHE_ENTRY_99TH_SIZE, 0);
   }
 }
 
@@ -307,6 +363,8 @@ void ImpaladMetrics::CreateMetrics(MetricGroup* m) {
       ImpaladMetricKeys::RESULTSET_CACHE_TOTAL_NUM_ROWS, 0);
   RESULTSET_CACHE_TOTAL_BYTES = m->AddGauge(
       ImpaladMetricKeys::RESULTSET_CACHE_TOTAL_BYTES, 0);
+  QUERY_LOG_EST_TOTAL_BYTES =
+      m->AddGauge(ImpaladMetricKeys::QUERY_LOG_EST_TOTAL_BYTES, 0);
 
   // Initialize scan node metrics
   NUM_RANGES_PROCESSED = m->AddCounter(
@@ -317,6 +375,16 @@ void ImpaladMetrics::CreateMetrics(MetricGroup* m) {
   // Initialize insert metrics
   NUM_FILES_OPEN_FOR_INSERT = m->AddGauge(
       ImpaladMetricKeys::NUM_FILES_OPEN_FOR_INSERT, 0);
+
+  // Initialize completed queries metrics.
+  COMPLETED_QUERIES_QUEUED = m->AddGauge(ImpaladMetricKeys::COMPLETED_QUERIES_QUEUED, 0);
+  COMPLETED_QUERIES_WRITTEN = m->AddCounter(
+      ImpaladMetricKeys::COMPLETED_QUERIES_WRITTEN, 0);
+  COMPLETED_QUERIES_FAIL = m->AddCounter(ImpaladMetricKeys::COMPLETED_QUERIES_FAIL, 0);
+  COMPLETED_QUERIES_SCHEDULED_WRITES = m->AddCounter(
+      ImpaladMetricKeys::COMPLETED_QUERIES_SCHEDULED_WRITES, 0);
+  COMPLETED_QUERIES_MAX_RECORDS_WRITES = m->AddCounter(
+      ImpaladMetricKeys::COMPLETED_QUERIES_MAX_RECORDS_WRITES, 0);
 
   // Initialize IO mgr metrics
   IO_MGR_METRICS = m->GetOrCreateChildGroup("io-mgr");
@@ -341,6 +409,10 @@ void ImpaladMetrics::CreateMetrics(MetricGroup* m) {
       ImpaladMetricKeys::IO_MGR_LOCAL_BYTES_READ, 0);
   IO_MGR_CACHED_BYTES_READ = IO_MGR_METRICS->AddCounter(
       ImpaladMetricKeys::IO_MGR_CACHED_BYTES_READ, 0);
+  IO_MGR_ENCRYPTED_BYTES_READ = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_ENCRYPTED_BYTES_READ, 0);
+  IO_MGR_ERASURE_CODED_BYTES_READ = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_ERASURE_CODED_BYTES_READ, 0);
   IO_MGR_SHORT_CIRCUIT_BYTES_READ = IO_MGR_METRICS->AddCounter(
       ImpaladMetricKeys::IO_MGR_SHORT_CIRCUIT_BYTES_READ, 0);
   IO_MGR_BYTES_WRITTEN = IO_MGR_METRICS->AddCounter(
@@ -366,6 +438,14 @@ void ImpaladMetrics::CreateMetrics(MetricGroup* m) {
       ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_DROPPED_ENTRIES, 0);
   IO_MGR_REMOTE_DATA_CACHE_INSTANT_EVICTIONS = IO_MGR_METRICS->AddCounter(
       ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_INSTANT_EVICTIONS, 0);
+  IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_OUTSTANDING_BYTES = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_OUTSTANDING_BYTES, 0);
+  IO_MGR_REMOTE_DATA_CACHE_NUM_ASYNC_WRITES_SUBMITTED = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_NUM_ASYNC_WRITES_SUBMITTED, 0);
+  IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_BYTES = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_BYTES, 0);
+  IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_ENTRIES = IO_MGR_METRICS->AddCounter(
+      ImpaladMetricKeys::IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_ENTRIES, 0);
 
   IO_MGR_CACHED_FILE_HANDLES_HIT_RATIO =
       StatsMetric<uint64_t, StatsType::MEAN>::CreateAndRegister(IO_MGR_METRICS,
@@ -382,6 +462,9 @@ void ImpaladMetrics::CreateMetrics(MetricGroup* m) {
       MetricDefs::Get(ImpaladMetricKeys::QUERY_DURATIONS), FIVE_HOURS_IN_MS, 3));
   DDL_DURATIONS = m->RegisterMetric(new HistogramMetric(
       MetricDefs::Get(ImpaladMetricKeys::DDL_DURATIONS), FIVE_HOURS_IN_MS, 3));
+  COMPLETED_QUERIES_WRITE_DURATIONS = m->RegisterMetric(new HistogramMetric(
+      MetricDefs::Get(ImpaladMetricKeys::COMPLETED_QUERIES_WRITE_DURATIONS),
+      FIVE_HOURS_IN_MS, 3));
 
   // Initialize Hedged read metrics
   HEDGED_READ_OPS = m->AddCounter(ImpaladMetricKeys::HEDGED_READ_OPS, 0);

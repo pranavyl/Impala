@@ -17,6 +17,8 @@
 #
 # Tests for query expiration.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 import re
 import threading
@@ -27,21 +29,26 @@ from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 class TestQueryExpiration(CustomClusterTestSuite):
   """Tests query expiration logic"""
 
-  def _check_num_executing(self, impalad, expected):
+  def _check_num_executing(self, impalad, expected, expect_waiting=0):
     in_flight_queries = impalad.service.get_in_flight_queries()
     # Guard against too few in-flight queries.
     assert expected <= len(in_flight_queries)
-    actual = 0
+    actual = waiting = 0
     for query in in_flight_queries:
       if query["executing"]:
         actual += 1
       else:
         assert query["waiting"]
-    assert actual == expected, '%s out of %s queries with expected (%s) status' \
+        waiting += 1
+    assert actual == expected, '%s out of %s queries executing (expected %s)' \
         % (actual, len(in_flight_queries), expected)
+    assert waiting == expect_waiting, '%s out of %s queries waiting (expected %s)' \
+        % (waiting, len(in_flight_queries), expect_waiting)
 
   @pytest.mark.execute_serially
-  @CustomClusterTestSuite.with_args("--idle_query_timeout=8 --logbuflevel=-1")
+  @CustomClusterTestSuite.with_args(
+      impalad_args="--idle_query_timeout=8",
+      disable_log_buffering=True)
   def test_query_expiration(self, vector):
     """Confirm that single queries expire if not fetched"""
     impalad = self.cluster.get_first_impalad()
@@ -56,7 +63,7 @@ class TestQueryExpiration(CustomClusterTestSuite):
 
     # This query will hit a lower time limit.
     client.execute("SET EXEC_TIME_LIMIT_S=3")
-    time_limit_expire_handle = client.execute_async(query1);
+    time_limit_expire_handle = client.execute_async(query1)
     handles.append(time_limit_expire_handle)
 
     # This query will hit a lower idle timeout instead of the default timeout or time
@@ -73,30 +80,46 @@ class TestQueryExpiration(CustomClusterTestSuite):
     handles.append(default_timeout_expire_handle2)
     self._check_num_executing(impalad, len(handles))
 
+    # Run a query that fails, and will timeout due to client inactivity.
+    client.execute("SET QUERY_TIMEOUT_S=1")
+    client.execute('SET MEM_LIMIT=1')
+    exception_handle = client.execute_async("select count(*) from functional.alltypes")
+    client.execute('SET MEM_LIMIT=1g')
+    handles.append(exception_handle)
+
     before = time()
     sleep(4)
 
-    # Queries with timeout or time limit of 1 should have expired, other queries should
+    # Queries with timeout or time limit < 4 should have expired, other queries should
     # still be running.
-    assert num_expired + 2 == impalad.service.get_metric_value(
+    assert num_expired + 3 == impalad.service.get_metric_value(
       'impala-server.num-queries-expired')
     assert (client.get_state(short_timeout_expire_handle) ==
             client.QUERY_STATES['EXCEPTION'])
     assert (client.get_state(time_limit_expire_handle) ==
             client.QUERY_STATES['EXCEPTION'])
+    assert (client.get_state(exception_handle) == client.QUERY_STATES['EXCEPTION'])
     assert (client.get_state(default_timeout_expire_handle) ==
             client.QUERY_STATES['FINISHED'])
     assert (client.get_state(default_timeout_expire_handle2) ==
             client.QUERY_STATES['FINISHED'])
+    # The query cancelled by exec_time_limit_s should be waiting to be closed.
+    self._check_num_executing(impalad, 2, 1)
     self.__expect_expired(client, query1, short_timeout_expire_handle,
-        "Query [0-9a-f]+:[0-9a-f]+ expired due to client inactivity \(timeout is 3s000ms\)")
+        r"Query [0-9a-f]+:[0-9a-f]+ expired due to "
+        + r"client inactivity \(timeout is 3s000ms\)")
     self.__expect_expired(client, query1, time_limit_expire_handle,
-        "Query [0-9a-f]+:[0-9a-f]+ expired due to execution time limit of 3s000ms")
+        r"Query [0-9a-f]+:[0-9a-f]+ expired due to execution time limit of 3s000ms")
+    self.__expect_expired(client, query1, exception_handle,
+        r"minimum memory reservation is greater than memory available.*\nQuery "
+        + r"[0-9a-f]+:[0-9a-f]+ expired due to client inactivity \(timeout is 1s000ms\)")
     self._check_num_executing(impalad, 2)
+    # Both queries with query_timeout_s < 4 should generate this message.
     self.assert_impalad_log_contains('INFO', "Expiring query due to client inactivity: "
-        "[0-9a-f]+:[0-9a-f]+, last activity was at: \d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d")
+        r"[0-9a-f]+:[0-9a-f]+, last activity was at: \d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d",
+        2)
     self.assert_impalad_log_contains('INFO',
-        "Expiring query [0-9a-f]+:[0-9a-f]+ due to execution time limit of 3s")
+        r"Expiring query [0-9a-f]+:[0-9a-f]+ due to execution time limit of 3s")
 
     # Wait until the remaining queries expire. The time limit query will have hit
     # expirations but only one should be counted.
@@ -122,14 +145,23 @@ class TestQueryExpiration(CustomClusterTestSuite):
 
     # Confirm that no extra expirations happened
     assert impalad.service.get_metric_value('impala-server.num-queries-expired') \
-        == len(handles)
+        == num_expired + len(handles)
     self._check_num_executing(impalad, 0)
     for handle in handles:
       try:
         client.close_query(handle)
-      except Exception, e:
+        assert False, "Close should always throw an exception"
+      except Exception as e:
         # We fetched from some cancelled handles above, which unregistered the queries.
-        assert 'Invalid or unknown query handle' in str(e)
+        # Expired queries always return their exception, so will not be invalid/unknown.
+        if handle is time_limit_expire_handle:
+          assert 'Invalid or unknown query handle' in str(e)
+        else:
+          if handle is exception_handle:
+            # Error should return original failure and timeout message
+            assert 'minimum memory reservation is greater than memory available' in str(e)
+          assert re.search(
+              r'Query [0-9a-f]{16}:[0-9a-f]{16} expired due to client inactivity', str(e))
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args("--idle_query_timeout=0")
@@ -172,7 +204,7 @@ class TestQueryExpiration(CustomClusterTestSuite):
     try:
       client.fetch(query, handle)
       assert False
-    except Exception, e:
+    except Exception as e:
       assert re.search(exception_regex, str(e))
 
   def __expect_client_state(self, client, handle, expected_state, timeout=0.1):
@@ -222,7 +254,7 @@ class TestQueryExpiration(CustomClusterTestSuite):
         try:
           result = self.client.execute("SELECT SLEEP(2500)")
           assert "Expected to hit time limit"
-        except Exception, e:
+        except Exception as e:
           self.exception = e
 
     class NonExpiringTimeLimitThread(threading.Thread):
@@ -245,14 +277,14 @@ class TestQueryExpiration(CustomClusterTestSuite):
     num_expired = impalad.service.get_metric_value('impala-server.num-queries-expired')
     non_expiring_threads = \
         [NonExpiringQueryThread(impalad.service.create_beeswax_client())
-         for _ in xrange(5)]
+         for _ in range(5)]
     expiring_threads = [ExpiringQueryThread(impalad.service.create_beeswax_client())
-                        for _ in xrange(5)]
+                        for _ in range(5)]
     time_limit_threads = [TimeLimitThread(impalad.service.create_beeswax_client())
-                        for _ in xrange(5)]
+                        for _ in range(5)]
     non_expiring_time_limit_threads = [
         NonExpiringTimeLimitThread(impalad.service.create_beeswax_client())
-        for _ in xrange(5)]
+        for _ in range(5)]
     all_threads = non_expiring_threads + expiring_threads + time_limit_threads +\
         non_expiring_time_limit_threads
     for t in all_threads:
@@ -272,3 +304,31 @@ class TestQueryExpiration(CustomClusterTestSuite):
     for t in non_expiring_time_limit_threads:
       assert t.success
       assert t.data[0] == '7300' # Number of rows in alltypes.
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args()
+  def test_query_expiration_no_deadlock(self):
+    """Regression test for IMPALA-13313: Confirm that queries do not deadlock when one is
+    expiring while another starts."""
+    impalad = self.cluster.get_first_impalad()
+    num_expired = impalad.service.get_metric_value('impala-server.num-queries-expired')
+
+    handle = self.execute_query_async("SELECT SLEEP(1000000)",
+        {'query_timeout_s': '1', 'debug_action': 'EXPIRE_INACTIVE_QUERY:SLEEP@3000'})
+
+    before = time()
+
+    # Prior to fixing IMPALA-13313, this query would enter a deadlock with the expiration
+    # for the previous query, and both would be unable to finish.
+    result = self.execute_query("SELECT 1", {
+        'query_timeout_s': '10',
+        'debug_action': 'SET_QUERY_INFLIGHT_EXPIRATION:SLEEP@5000'})
+    assert result.success
+
+    impalad.service.wait_for_metric_value('impala-server.num-queries-expired',
+                                          num_expired + 1)
+
+    assert time() - before < 10
+
+    self.__expect_client_state(self.client, handle,
+                               self.client.QUERY_STATES['EXCEPTION'])

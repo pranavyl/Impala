@@ -21,6 +21,7 @@ import java.io.File;
 import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.URL;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -33,12 +34,9 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.impala.authorization.User;
 import org.apache.impala.common.ByteUnits;
-import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
-import org.apache.impala.common.JniUtil;
 import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.thrift.TErrorCode;
-import org.apache.impala.thrift.TPoolConfigParams;
 import org.apache.impala.thrift.TPoolConfig;
 import org.apache.impala.thrift.TResolveRequestPoolParams;
 import org.apache.impala.thrift.TResolveRequestPoolResult;
@@ -68,7 +66,7 @@ import com.google.common.collect.Lists;
  * Yarn {@link AllocationFileLoaderService} and the Llama configuration uses a subclass of
  * the {@link FileWatchService}. There are two different mechanisms because there is
  * different parsing/configuration code for the allocation file and the Llama
- * configuration (which is a regular Hadoop conf file so it can use the
+ * configuration (which is a regular Hadoop conf file, so it can use the
  * {@link Configuration} class). start() and stop() will start/stop watching and reloading
  * both of these files.
  *
@@ -123,6 +121,12 @@ public class RequestPoolService {
   // Key for specifying the "Max mt_dop" configuration of the pool
   private final static String MAX_MT_DOP = "impala.admission-control.max-mt-dop";
 
+  // Keys for the pool max query cpu core per node and coordinator respectively.
+  private final static String MAX_QUERY_CPU_CORE_PER_NODE_LIMIT =
+      "impala.admission-control.max-query-cpu-core-per-node-limit";
+  private final static String MAX_QUERY_CPU_CORE_COORDINATOR_LIMIT =
+      "impala.admission-control.max-query-cpu-core-coordinator-limit";
+
   // String format for a per-pool configuration key. First parameter is the key for the
   // default, e.g. MAX_PLACED_RESERVATIONS_KEY, and the second parameter is the
   // pool name.
@@ -132,7 +136,7 @@ public class RequestPoolService {
   @VisibleForTesting
   final AllocationFileLoaderService allocLoader_;
 
-  // Provides access to the fair scheduler allocation file. An AtomicReference becaus it
+  // Provides access to the fair scheduler allocation file. An AtomicReference because it
   // is reset when the allocation configuration file changes and other threads access it.
   private final AtomicReference<AllocationConfiguration> allocationConf_;
 
@@ -286,6 +290,8 @@ public class RequestPoolService {
     stopInternal();
   }
 
+  public boolean isRunning() { return running_.get(); }
+
   /**
    * Stops the RequestPoolService instance without checking the running state. Only
    * called by stop() (which is only used in tests) or by start() if a failure occurs.
@@ -363,6 +369,11 @@ public class RequestPoolService {
     long maxMemoryMb = allocationConf_.get().getMaxResources(pool).getMemory();
     result.setMax_mem_resources(
         maxMemoryMb == Integer.MAX_VALUE ? -1 : maxMemoryMb * ByteUnits.MEGABYTE);
+    Map<String, Integer> userQueryLimits = allocationConf_.get().getUserQueryLimits(pool);
+    result.setUser_query_limits(userQueryLimits);
+    Map<String, Integer> groupQueryLimits =
+        allocationConf_.get().getGroupQueryLimits(pool);
+    result.setGroup_query_limits(groupQueryLimits);
     if (conf_ == null) {
       result.setMax_requests(MAX_PLACED_RESERVATIONS_DEFAULT);
       result.setMax_queued(MAX_QUEUED_RESERVATIONS_DEFAULT);
@@ -388,16 +399,25 @@ public class RequestPoolService {
           getPoolConfigValue(currentConf, pool, CLAMP_MEM_LIMIT_QUERY_OPTION, true));
       result.setMax_mt_dop(
           getPoolConfigValue(currentConf, pool, MAX_MT_DOP, -1));
+      result.setMax_query_cpu_core_per_node_limit(
+          getPoolConfigValue(currentConf, pool, MAX_QUERY_CPU_CORE_PER_NODE_LIMIT, 0L));
+      result.setMax_query_cpu_core_coordinator_limit(getPoolConfigValue(
+          currentConf, pool, MAX_QUERY_CPU_CORE_COORDINATOR_LIMIT, 0L));
     }
     if (LOG.isTraceEnabled()) {
       LOG.debug("getPoolConfig(pool={}): max_mem_resources={}, max_requests={},"
               + " max_queued={},  queue_timeout_ms={}, default_query_options={},"
               + " max_query_mem_limit={}, min_query_mem_limit={},"
-              + " clamp_mem_limit_query_option={}",
+              + " clamp_mem_limit_query_option={}, max_query_cpu_core_per_node_limit={},"
+              + " max_query_cpu_core_coordinator_limit={}"
+              + " user_query_limits={}"
+              + " group_query_limits={}",
           pool, result.max_mem_resources, result.max_requests, result.max_queued,
           result.queue_timeout_ms, result.default_query_options,
           result.max_query_mem_limit, result.min_query_mem_limit,
-          result.clamp_mem_limit_query_option);
+          result.clamp_mem_limit_query_option, result.max_query_cpu_core_per_node_limit,
+          result.max_query_cpu_core_coordinator_limit, result.user_query_limits,
+          result.group_query_limits);
     }
     return result;
   }

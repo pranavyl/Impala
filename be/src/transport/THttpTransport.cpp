@@ -19,6 +19,7 @@
 
 #include <sstream>
 
+#include "rpc/thrift-util.h"
 #include "transport/THttpTransport.h"
 
 #include "common/logging.h"
@@ -34,7 +35,8 @@ const char* THttpTransport::CRLF = "\r\n";
 const int THttpTransport::CRLF_LEN = 2;
 
 THttpTransport::THttpTransport(std::shared_ptr<TTransport> transport)
-  : transport_(transport),
+  : TVirtualTransport(transport->getConfiguration()),
+    transport_(move(transport)),
     origin_(""),
     readHeaders_(true),
     readWholeBodyForAuth_(false),
@@ -282,7 +284,7 @@ void THttpTransport::write(const uint8_t* buf, uint32_t len) {
   writeBuffer_.write(buf, len);
 }
 
-const std::string THttpTransport::getOrigin() {
+const std::string THttpTransport::getOrigin() const {
   std::ostringstream oss;
   if (!origin_.empty()) {
     oss << origin_ << ", ";

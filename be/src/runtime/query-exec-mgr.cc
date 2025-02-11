@@ -53,6 +53,8 @@ DEFINE_int32(query_exec_mgr_cancellation_thread_pool_size, 1,
     "(Advanced) Size of the QueryExecMgr thread-pool processing cancellations due to "
     "coordinator failure");
 
+DECLARE_int32(krpc_port);
+
 const uint32_t QUERY_EXEC_MGR_MAX_CANCELLATION_QUEUE_SIZE = 65536;
 
 QueryExecMgr::QueryExecMgr() {
@@ -78,6 +80,10 @@ Status QueryExecMgr::StartQuery(const ExecQueryFInstancesRequestPB* request,
   bool dummy;
   QueryState* qs =
       GetOrCreateQueryState(query_ctx, request->per_backend_mem_limit(), &dummy);
+  RETURN_IF_ERROR(DebugAction(query_ctx.client_request.query_options.debug_action,
+      "QUERY_STATE_BEFORE_INIT_GLOBAL"));
+  RETURN_IF_ERROR(DebugAction(query_ctx.client_request.query_options.debug_action,
+      "QUERY_STATE_BEFORE_INIT", {std::to_string(FLAGS_krpc_port)}));
   Status status = qs->Init(request, fragment_info);
   if (!status.ok()) {
     qs->ReleaseBackendResourceRefcount(); // Release refcnt acquired in Init().
@@ -261,7 +267,7 @@ void QueryExecMgr::CancelQueriesForFailedCoordinators(
 
 void QueryExecMgr::CancelFromThreadPool(const QueryCancellationTask& cancellation_task) {
   QueryState* qs = cancellation_task.GetQueryState();
-  VLOG(1) << "CancelFromThreadPool(): cancel query " << qs->query_id();
+  VLOG(1) << "CancelFromThreadPool(): cancel query " << PrintId(qs->query_id());
   qs->Cancel();
   qs->is_coord_active_.Store(false);
   ReleaseQueryState(qs);

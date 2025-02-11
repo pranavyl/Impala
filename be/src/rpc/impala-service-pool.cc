@@ -23,7 +23,7 @@
 #include <vector>
 #include <glog/logging.h>
 
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "gutil/strings/numbers.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
@@ -38,6 +38,7 @@
 #include "kudu/util/trace.h"
 #include "runtime/exec-env.h"
 #include "runtime/mem-tracker.h"
+#include "service/data-stream-service.h"
 #include "util/pretty-printer.h"
 #include "util/thread.h"
 
@@ -59,14 +60,14 @@ const char * ImpalaServicePool::RPC_QUEUE_OVERFLOW_METRIC_KEY =
 
 ImpalaServicePool::ImpalaServicePool(const scoped_refptr<kudu::MetricEntity>& entity,
     int service_queue_length, kudu::rpc::GeneratedServiceIf* service,
-    MemTracker* service_mem_tracker, const TNetworkAddress& address,
+    MemTracker* service_mem_tracker, const NetworkAddressPB& address,
     MetricGroup* rpc_metrics)
   : service_mem_tracker_(service_mem_tracker),
     service_(service),
     service_queue_(service_queue_length),
     incoming_queue_time_(METRIC_impala_incoming_queue_time.Instantiate(entity)),
-    hostname_(address.hostname),
-    port_(SimpleItoa(address.port)) {
+    hostname_(address.hostname()),
+    port_(SimpleItoa(address.port())) {
   DCHECK(service_mem_tracker_ != nullptr);
   const TMetricDef& overflow_metric_def =
       MetricDefs::Get(RPC_QUEUE_OVERFLOW_METRIC_KEY, service_->service_name());
@@ -189,13 +190,25 @@ kudu::Status ImpalaServicePool::QueueInboundCall(
     // usage.
     unique_lock<SpinLock> mem_tracker_lock(mem_tracker_lock_);
     if (UNLIKELY(service_mem_tracker_->AnyLimitExceeded(MemLimit::HARD))) {
-      // Discards the transfer early so the transfer size drops to 0. This is to ensure
-      // the MemTracker::Release() call in FailAndReleaseRpc() is correct as we haven't
-      // called MemTracker::Consume() at this point.
-      mem_tracker_lock.unlock();
-      c->DiscardTransfer();
-      RejectTooBusy(c);
-      return kudu::Status::OK();
+      if (c->remote_method().method_name() == DataStreamService::END_DATA_STREAM) {
+        // EndDataStream operations use very little memory and help free up other
+        // resources, so ignore memory hard limit and always add them to the queue. This
+        // can help complete queries earlier when under heavy load that would otherwise
+        // drop the requests and require them to be retried.
+        LOG(WARNING) << "Admitting " << c->remote_method().method_name()
+            << " request on " << service_->service_name()
+            << "from " << c->remote_address().ToString()
+            << " to complete query despite exceeding memory limit; memory consumption is "
+            << PrettyPrinter::Print(service_mem_tracker_->consumption(), TUnit::BYTES);
+      } else {
+        // Discards the transfer early so the transfer size drops to 0. This is to ensure
+        // the MemTracker::Release() call in FailAndReleaseRpc() is correct as we haven't
+        // called MemTracker::Consume() at this point.
+        mem_tracker_lock.unlock();
+        c->DiscardTransfer();
+        RejectTooBusy(c);
+        return kudu::Status::OK();
+      }
     }
     service_mem_tracker_->Consume(transfer_size);
   }

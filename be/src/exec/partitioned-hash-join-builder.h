@@ -82,7 +82,9 @@ class PhjBuilderConfig : public JoinBuilderConfig {
   std::vector<ScalarExpr*> build_exprs_;
 
   /// is_not_distinct_from_[i] is true if and only if the ith equi-join predicate is IS
-  /// NOT DISTINCT FROM, rather than equality.
+  /// NOT DISTINCT FROM, rather than equality. This is the case when IS NOT DISTINCT FROM
+  /// is explicitly used as a join predicate or when joining Iceberg equality delete
+  /// files to data files.
   /// Set in InitExprsAndFilters() and constant thereafter.
   std::vector<bool> is_not_distinct_from_;
 
@@ -541,6 +543,9 @@ class PhjBuilder : public JoinBuilder {
 
   std::string DebugString() const;
 
+  /// Unregisters one probe thread from the barrier
+  void UnregisterThreadFromBarrier() const;
+
   /// Computes the minimum reservation required to execute the spilling partitioned
   /// hash algorithm successfully for any input size (assuming enough disk space is
   /// available for spilled rows). This includes buffers used by the build side,
@@ -707,7 +712,7 @@ class PhjBuilder : public JoinBuilder {
   /// row-backing resources to it.
   void CloseAndDeletePartitions(RowBatch* row_batch);
 
-  /// For each filter in filters_, allocate a bloom_filter from the fragment-local
+  /// For each filter in filters_, allocate a runtime_filter from the fragment-local
   /// RuntimeFilterBank and store it in runtime_filters_ to populate during the build
   /// phase.
   void AllocateRuntimeFilters();

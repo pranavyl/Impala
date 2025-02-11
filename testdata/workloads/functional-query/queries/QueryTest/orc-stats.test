@@ -330,14 +330,11 @@ aggregation(SUM, RowsRead): 100
 ====
 ---- QUERY
 # Test on predicate x < min_val for decimal(9,0).
-# Due to ORC-517 not included in the current Hive version (3.1.3000.7.2.12.0-104),
-# the ORC files have wrong statistics on d1 column showing that its minimum is 0.
-# So we still see RowsRead=5 here.
 select count(*) from functional_orc_def.decimal_tbl where d1 < 1234
 ---- RESULTS
 0
 ---- RUNTIME_PROFILE
-aggregation(SUM, RowsRead): 5
+aggregation(SUM, RowsRead): 0
 ====
 ---- QUERY
 select count(*) from functional_orc_def.decimal_tbl where d1 < 0
@@ -518,7 +515,7 @@ aggregation(SUM, RowsRead): 310
 ====
 ---- QUERY
 select count(*) from functional_orc_def.date_tbl
-where date_part in ("2017-11-27", "1399-06-27") and date_col < '0001-06-19';
+where date_part in ("2017-11-27", "1399-06-27") and date_col < '0001-06-21';
 ---- RESULTS
 0
 ---- RUNTIME_PROFILE
@@ -526,7 +523,7 @@ aggregation(SUM, RowsRead): 0
 ====
 ---- QUERY
 select count(*) from functional_orc_def.date_tbl
-where date_part in ("2017-11-27", "1399-06-27") and date_col <= '0001-06-19';
+where date_part in ("2017-11-27", "1399-06-27") and date_col <= '0001-06-21';
 ---- RESULTS
 1
 ---- RUNTIME_PROFILE
@@ -604,11 +601,11 @@ aggregation(SUM, RowsRead): 7300
 ---- QUERY
 # Test on a larger ORC file that has multiple stripes and each stripe has multiple row
 # groups.
-select count(*) from tpch_orc_def.lineitem where l_orderkey = 1609411;
+select count(*) from tpch_orc_def.orders where o_orderkey = 1;
 ---- RESULTS
-7
+1
 ---- RUNTIME_PROFILE
-aggregation(SUM, RowsRead): 13501
+aggregation(SUM, RowsRead): 10000
 ====
 ---- QUERY
 # Test pushing down IN-list predicate with literals outside the value range.
@@ -725,7 +722,7 @@ aggregation(SUM, RowsRead): 0
 ====
 ---- QUERY
 select count(*) from functional_orc_def.date_tbl
-where date_part in ("2017-11-27", "1399-06-27") and date_col in ('0001-06-19', '2018-12-31');
+where date_part in ("2017-11-27", "1399-06-27") and date_col in ('0001-06-21', '2018-12-31');
 ---- RESULTS
 2
 ---- RUNTIME_PROFILE
@@ -734,11 +731,9 @@ aggregation(SUM, RowsRead): 13
 ---- QUERY
 # Test pushing down IN-list predicate with literals outside the value range. Explicitly cast
 # the literals so FE won't wrap 'd1' as casting to INT, so the predicate can be pushed down.
-# Due to ORC-517 not included in the current Hive version (3.1.3000.7.2.12.0-104),
-# the ORC files have wrong statistics on d1 column showing that its minimum is 0. So here we
-# use -1 to be smaller than it. The max of d1 is 132842 so we use 132843.
+# The min and max of d1 are 1234 and 132842 so we use 1233 and 132843.
 select count(*) from functional_orc_def.decimal_tbl
-where d1 in (cast(-1 as decimal(9,0)), cast(132843 as decimal(9,0)));
+where d1 in (cast(1233 as decimal(9,0)), cast(132843 as decimal(9,0)));
 ---- RESULTS
 0
 ---- RUNTIME_PROFILE
@@ -860,4 +855,12 @@ select count(*) from functional_orc_def.decimal_tbl where d4 is null;
 0
 ---- RUNTIME_PROFILE
 aggregation(SUM, RowsRead): 0
+====
+---- QUERY
+# Regression test for ORC-1304
+select s2.id from functional_orc_def.empty_stream_tbl where s1.id = 100;
+---- RESULTS
+NULL
+---- TYPES
+INT
 ====

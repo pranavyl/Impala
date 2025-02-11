@@ -34,6 +34,10 @@ class FileSystemUtil {
   /// Returns Status::OK if successful, or a runtime error with a message otherwise.
   static Status RemoveAndCreateDirectory(const std::string& directory) WARN_UNUSED_RESULT;
 
+  /// Create the specified directory and any ancestor directories that do not exist yet.
+  /// Returns Status::OK if successful, or a runtime error with a message otherwise.
+  static Status CreateDirectory(const string& directory) WARN_UNUSED_RESULT;
+
   /// Create a file at the specified path.
   static Status CreateFile(const std::string& file_path) WARN_UNUSED_RESULT;
 
@@ -87,6 +91,16 @@ class FileSystemUtil {
   /// canonicalized paths.
   static bool GetRelativePath(const std::string& path, const std::string& start,
       std::string* relpath);
+
+  /// Finds the first file matching the supplied 'regex' in 'path', or returns empty
+  /// string; matches the behavior of paths specified in Java CLASSPATH for JARs.
+  /// If 'path' is a file, returns 'path' if 'regex' matches its filename.
+  /// If 'path' is a directory, returns the absolute path for a match if 'regex' matches
+  /// any files in that directory.
+  /// If 'path' ends with a wildcard - as in "/lib/*" - it will treat path as a directory
+  /// excluding the wildcard.
+  static Status FindFileInPath(string path, const std::string& regex,
+      std::string* result);
 
   /// Ext filesystem on certain kernel versions may result in inconsistent metadata after
   /// punching holes in files. The filesystem may require fsck repair on next reboot.

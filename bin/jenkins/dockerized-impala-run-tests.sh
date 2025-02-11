@@ -28,19 +28,26 @@ DOCKER_NETWORK="test-impala-cluster"
 # Helper to source impala-config.sh, which may have unbound variables
 source_impala_config() {
   set +u
-  . ./bin/impala-config.sh
+  . ./bin/impala-config.sh > /dev/null 2>&1
   set -u
 }
 
+source_impala_config
+
 onexit() {
+  # Get the logs from all docker containers
+  DOCKER_LOGS_DIR="${IMPALA_HOME}/logs/docker_logs"
+  mkdir -p "${DOCKER_LOGS_DIR}"
+  for container in $(docker ps -a -q); do
+    docker logs ${container} > "${DOCKER_LOGS_DIR}/${container}.log" 2>&1 || true
+  done
+
   # Clean up docker containers and networks that may have been created by
   # these tests.
   docker rm -f $(docker ps -a -q) || true
   docker network rm $DOCKER_NETWORK || true
 }
 trap onexit EXIT
-
-source_impala_config
 
 # Check that docker is running and that our user can interact with it.
 docker run hello-world
@@ -73,7 +80,18 @@ start-impala-cluster.py --kill
 # Build the docker images required to start the cluster.
 # parquet-reader and impala-profile-tool are needed for e2e tests but not built for
 # non-test build.
-make -j ${IMPALA_BUILD_THREADS} docker_debug_images parquet-reader impala-profile-tool
+IMAGE_TYPE=docker_debug
+case ${IMPALA_DOCKER_JAVA:-8} in
+  11)
+    IMAGE_TYPE=${IMAGE_TYPE}_java11
+    ;;
+  17)
+    IMAGE_TYPE=${IMAGE_TYPE}_java17
+    ;;
+  *)
+    ;;
+esac
+make -j ${IMPALA_BUILD_THREADS} ${IMAGE_TYPE}_images parquet-reader impala-profile-tool
 
 source_impala_config
 

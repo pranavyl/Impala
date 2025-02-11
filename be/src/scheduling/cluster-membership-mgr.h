@@ -56,10 +56,6 @@ class SchedulerWrapper;
 /// subscriber is recovering from a connection failure. This allows other backends to
 /// re-register with the statestore after a statestore restart.
 ///
-/// TODO(IMPALA-8484): Allow specifying executor groups during backend startup. Currently
-/// only one executor group named "default" exists. All backends are part of that group
-/// and it's the only group available for scheduling.
-///
 /// The class also allows the local backend (ImpalaServer), the local Frontend and the
 /// AdmissionController to register callbacks to receive notifications of changes to the
 /// cluster membership. Note: The notifications for blacklisted executors are not sent
@@ -79,9 +75,11 @@ class ClusterMembershipMgr {
   /// Maps backend IDs to backend descriptors.
   typedef std::unordered_map<std::string, BackendDescriptorPB> BackendIdMap;
 
-  /// Maps executor group names to executor groups. For now, only a default group exists
-  /// and all executors are part of that group.
+  /// Maps executor group names to executor groups.
   typedef std::unordered_map<std::string, ExecutorGroup> ExecutorGroups;
+
+  /// Empty group name when query use coordinator only.
+  static const std::string EMPTY_GROUP_NAME;
 
   // A snapshot of the current cluster membership. The ClusterMembershipMgr maintains a
   // consistent copy of this and updates it atomically when the membership changes.
@@ -90,6 +88,10 @@ class ClusterMembershipMgr {
   struct Snapshot {
     Snapshot() = default;
     Snapshot(const Snapshot&) = default;
+    /// Returns an executor group of all non-quiescing coordinators in the cluster.
+    ExecutorGroup GetCoordinators() const;
+    /// Returns the addresses of all non-quiescing coordinators in the cluster.
+    std::vector<TNetworkAddress> GetCoordinatorAddresses() const;
     /// The current backend descriptor of the local backend.
     BeDescSharedPtr local_be_desc;
     /// Map from unique backend ID to BackendDescriptorPB for all known backends,
@@ -123,7 +125,7 @@ class ClusterMembershipMgr {
 
   /// A callback to provide the latest snapshot of cluster membership whenever there are
   /// any changes to the membership.
-  typedef std::function<void(SnapshotPtr)> UpdateCallbackFn;
+  typedef std::function<void(const SnapshotPtr&)> UpdateCallbackFn;
 
   ClusterMembershipMgr(std::string local_backend_id, StatestoreSubscriber* subscriber,
       MetricGroup* metrics);
@@ -192,7 +194,7 @@ class ClusterMembershipMgr {
 
   /// Notifies all registered callbacks of the latest changes to the membership by sending
   /// them the latest cluster membership snapshot.
-  void NotifyListeners(SnapshotPtr snapshot);
+  void NotifyListeners(const SnapshotPtr& snapshot);
 
   /// Atomically replaces a membership snapshot with a new copy.
   void SetState(const SnapshotPtr& new_state);
@@ -284,8 +286,11 @@ class ClusterMembershipMgr {
   /// 'current_membership_lock_'.
   mutable std::mutex callback_fn_lock_;
 
+  std::string membership_topic_name_;
+
   friend class impala::test::SchedulerWrapper;
   friend class ClusterMembershipMgrUnitTest_TestPopulateExpectedExecGroupSets_Test;
+  friend class AdmissionControllerTest;
 };
 
 /// Helper method to populate a thrift request object 'update_req' for cluster membership
@@ -294,7 +299,7 @@ class ClusterMembershipMgr {
 /// The frontend uses cluster membership information to determine whether it expects the
 /// scheduler to assign local or remote reads. It also uses the number of executors to
 /// determine the join type (partitioned vs broadcast).
-void PopulateExecutorMembershipRequest(ClusterMembershipMgr::SnapshotPtr& snapshot,
+void PopulateExecutorMembershipRequest(const ClusterMembershipMgr::SnapshotPtr& snapshot,
     const std::vector<TExecutorGroupSet>& expected_exec_group_sets,
     TUpdateExecutorMembershipRequest& update_req);
 

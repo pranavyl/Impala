@@ -24,16 +24,13 @@ namespace impala {
 
 class CatalogServiceClientWrapper : public CatalogServiceClient {
  public:
-  CatalogServiceClientWrapper(
-      std::shared_ptr<::apache::thrift::protocol::TProtocol> prot)
-    : CatalogServiceClient(prot) {
-  }
+  CatalogServiceClientWrapper(std::shared_ptr<::apache::thrift::protocol::TProtocol> prot)
+    : CatalogServiceClient(move(prot)) {}
 
   CatalogServiceClientWrapper(
       std::shared_ptr<::apache::thrift::protocol::TProtocol> iprot,
       std::shared_ptr<::apache::thrift::protocol::TProtocol> oprot)
-    : CatalogServiceClient(iprot, oprot) {
-  }
+    : CatalogServiceClient(move(iprot), move(oprot)) {}
 
 /// We intentionally disable this clang warning as we intend to hide the
 /// the same-named functions defined in the base class.
@@ -109,6 +106,30 @@ class CatalogServiceClientWrapper : public CatalogServiceClient {
     send_UpdateTableUsage(req);
     *send_done = true;
     recv_UpdateTableUsage(_return);
+  }
+
+  void GetNullPartitionName(TGetNullPartitionNameResponse& _return,
+      const TGetNullPartitionNameRequest& req, bool* send_done) {
+    DCHECK(!*send_done);
+    send_GetNullPartitionName(req);
+    *send_done = true;
+    recv_GetNullPartitionName(_return);
+  }
+
+  void GetLatestCompactions(TGetLatestCompactionsResponse& _return,
+      const TGetLatestCompactionsRequest& req, bool* send_done) {
+    DCHECK(!*send_done);
+    send_GetLatestCompactions(req);
+    *send_done = true;
+    recv_GetLatestCompactions(_return);
+  }
+
+  void SetEventProcessorStatus(TSetEventProcessorStatusResponse& _return,
+      const TSetEventProcessorStatusRequest& req, bool* send_done) {
+    DCHECK(!*send_done);
+    send_SetEventProcessorStatus(req);
+    *send_done = true;
+    recv_SetEventProcessorStatus(_return);
   }
 #pragma clang diagnostic pop
 };

@@ -27,12 +27,14 @@ import java.util.Set;
 import org.apache.impala.catalog.ArrayType;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
+import org.apache.impala.catalog.IcebergTimeTravelTable;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.IdGenerator;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.JniUtil;
+import org.apache.impala.common.ThriftSerializationCtx;
 import org.apache.impala.thrift.TColumnType;
 import org.apache.impala.thrift.TDescriptorTable;
 import org.apache.impala.thrift.TDescriptorTableSerialized;
@@ -55,6 +57,9 @@ public class DescriptorTable {
   // Table id 0 is reserved for it. Set in QueryStmt.analyze() that produces a table sink,
   // e.g. InsertStmt.analyze(), ModifyStmt.analyze().
   private FeTable targetTable_;
+  // Sometimes we have multiple target tables (e.g. Iceberg UPDATEs), in which case
+  // we can reserve multiple ids for the target tables.
+  private final Map<FeTable, Integer> additionalTargetTableIds_ = new HashMap<>();
   // For each table, the set of partitions that are referenced by at least one
   // scan range.
   private final Map<FeTable, Set<Long>> referencedPartitionsPerTable_ = new HashMap<>();
@@ -111,6 +116,12 @@ public class DescriptorTable {
 
   public void setTargetTable(FeTable table) { targetTable_ = table; }
 
+  public int addTargetTable(FeTable table) {
+    int id = nextTableId_++;
+    additionalTargetTableIds_.put(table, id);
+    return id;
+  }
+
   /**
    * Find the set of referenced partitions for the given table.  Allocates a set if
    * none has been allocated for the table yet.
@@ -141,22 +152,21 @@ public class DescriptorTable {
       SlotDescriptor slotDesc = getSlotDesc(id);
       if (slotDesc.isMaterialized()) continue;
       slotDesc.setIsMaterialized(true);
+      // If we are inside a struct, we need to materialise all enclosing struct
+      // SlotDescriptors, otherwise these descriptors will be hanging in the air.
+      materializeParentStructSlots(slotDesc);
       // Don't add the TupleDescriptor that is for struct children.
       if (slotDesc.getParent().getParentSlotDesc() == null) {
         affectedTuples.add(slotDesc.getParent());
       }
-      if (slotDesc.getType().isStructType()) {
-        TupleDescriptor childrenTuple = slotDesc.getItemTupleDesc();
-        Preconditions.checkNotNull(childrenTuple);
-        Preconditions.checkState(childrenTuple.getSlots().size() > 0);
-        List<SlotId> childrenIds = Lists.newArrayList();
-        for (SlotDescriptor childSlot : childrenTuple.getSlots()) {
-          childrenIds.add(childSlot.getId());
-        }
-        markSlotsMaterialized(childrenIds);
-      }
     }
     return affectedTuples;
+  }
+
+  private void materializeParentStructSlots(SlotDescriptor desc) {
+    for (SlotDescriptor slotDesc : desc.getEnclosingStructSlotDescs()) {
+      slotDesc.setIsMaterialized(true);
+    }
   }
 
   /**
@@ -174,6 +184,7 @@ public class DescriptorTable {
    */
   public TDescriptorTable toThrift() {
     TDescriptorTable result = new TDescriptorTable();
+    ThriftSerializationCtx serialCtx = new ThriftSerializationCtx();
     // Maps from base table to its table id used in the backend.
     Map<FeTable, Integer> tableIdMap = new HashMap<>();
     // Used to check table level consistency
@@ -182,6 +193,12 @@ public class DescriptorTable {
     if (targetTable_ != null) {
       tableIdMap.put(targetTable_, TABLE_SINK_ID);
       referencedTables.put(targetTable_.getTableName(), targetTable_);
+    }
+    for (Map.Entry<FeTable, Integer> tableIdEntry :
+        additionalTargetTableIds_.entrySet()) {
+      FeTable targetTable = tableIdEntry.getKey();
+      tableIdMap.put(targetTable, tableIdEntry.getValue());
+      referencedTables.put(targetTable.getTableName(), targetTable);
     }
     for (TupleDescriptor tupleDesc: tupleDescs_.values()) {
       // inline view of a non-constant select has a non-materialized tuple descriptor
@@ -194,7 +211,7 @@ public class DescriptorTable {
         // Verify table level consistency in the same query by checking that references to
         // the same Table refer to the same table instance.
         FeTable checkTable = referencedTables.get(tblName);
-        Preconditions.checkState(checkTable == null || table == checkTable);
+        Preconditions.checkState(checkTable == null || isSameTableRef(table, checkTable));
         if (tableId == null) {
           tableId = nextTableId_++;
           tableIdMap.put(table, tableId);
@@ -205,20 +222,36 @@ public class DescriptorTable {
       // currently are several situations in which we send materialized tuples without
       // a mem layout to the BE, e.g., when unnesting unions or when replacing plan
       // trees with an EmptySetNode.
-      result.addToTupleDescriptors(tupleDesc.toThrift(tableId));
+      result.addToTupleDescriptors(tupleDesc.toThrift(tableId, serialCtx));
       // Only serialize materialized slots
       for (SlotDescriptor slotD: tupleDesc.getMaterializedSlots()) {
-        result.addToSlotDescriptors(slotD.toThrift());
+        result.addToSlotDescriptors(slotD.toThrift(serialCtx));
       }
     }
     for (FeTable tbl: tableIdMap.keySet()) {
       Set<Long> referencedPartitions = null; // null means include all partitions.
       // We don't know which partitions are needed for INSERT, so do not prune partitions.
-      if (tbl != targetTable_) referencedPartitions = getReferencedPartitions(tbl);
+      if (tbl != targetTable_ && !additionalTargetTableIds_.containsKey(tbl)) {
+        referencedPartitions = getReferencedPartitions(tbl);
+      }
       result.addToTableDescriptors(
           tbl.toThriftDescriptor(tableIdMap.get(tbl), referencedPartitions));
     }
     return result;
+  }
+
+  /**
+   * @return true if the two tables are the same.
+   * For Iceberg Time Travel tables we compare the underlying base table.
+   */
+  private boolean isSameTableRef(FeTable first, FeTable second) {
+    if (first instanceof IcebergTimeTravelTable) {
+      first = ((IcebergTimeTravelTable) first).getBase();
+    }
+    if (second instanceof IcebergTimeTravelTable) {
+      second = ((IcebergTimeTravelTable) second).getBase();
+    }
+    return first == second;
   }
 
   public TDescriptorTableSerialized toSerializedThrift() throws ImpalaException {

@@ -29,8 +29,8 @@ import java.util.Set;
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.BoolLiteral;
+import org.apache.impala.analysis.DateLiteral;
 import org.apache.impala.analysis.Expr;
-import org.apache.impala.analysis.ExprSubstitutionMap;
 import org.apache.impala.analysis.InPredicate;
 import org.apache.impala.analysis.IsNullPredicate;
 import org.apache.impala.analysis.LiteralExpr;
@@ -39,11 +39,14 @@ import org.apache.impala.analysis.NumericLiteral;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.StringLiteral;
+import org.apache.impala.analysis.TableRef;
 import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.common.InternalException;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TKuduReplicaSelection;
@@ -127,12 +130,23 @@ public class KuduScanNode extends ScanNode {
   // for Kudu primary keys by enabling small query optimization.
   boolean isPointLookupQuery_ = false;
 
+  // It is used to indicate current kudu predicate should not be removed from conjuncts.
+  // If the current predicate is a comparison predicate with ambiguous timestamp, it may
+  // need to check again after actually scanning. For example, if we have two rows with
+  // column 'ts' 01:40:00(Local, UTC is 05:40:00) and 01:20:00(Local, UTC is 06:20:00),
+  // and the predicate 'ts' < 01:30:00(Local, convert to UTC is 05:30:00 or 06:30:00), we
+  // should push ts < 06:30:00(UTC) to Kudu to avoid missing the row with ts
+  // 01:20:00(Local, UTC is 06:20:00) and also need to filter out the row with ts
+  // 01:40:00(Local, UTC is 05:40:00) after actually scanning.
+  boolean currentPredicateNeedCheckAgain_ = false;
+
   public KuduScanNode(PlanNodeId id, TupleDescriptor desc, List<Expr> conjuncts,
-      MultiAggregateInfo aggInfo) {
+      MultiAggregateInfo aggInfo, TableRef kuduTblRef) {
     super(id, desc, "SCAN KUDU");
     kuduTable_ = (FeKuduTable) desc_.getTable();
     conjuncts_ = conjuncts;
     aggInfo_ = aggInfo;
+    tableNumRowsHint_ = kuduTblRef.getTableNumRowsHint();
   }
 
   @Override
@@ -304,7 +318,8 @@ public class KuduScanNode extends ScanNode {
   protected void computeNumNodes(Analyzer analyzer) {
     ExecutorMembershipSnapshot cluster = ExecutorMembershipSnapshot.getCluster();
     final int maxInstancesPerNode = getMaxInstancesPerNode(analyzer);
-    final int maxPossibleInstances = cluster.numExecutors() * maxInstancesPerNode;
+    final int maxPossibleInstances =
+        analyzer.numExecutorsForPlanning() * maxInstancesPerNode;
     int totalNodes = 0;
     int totalInstances = 0;
     int numLocalRanges = 0;
@@ -347,10 +362,12 @@ public class KuduScanNode extends ScanNode {
         // hosts that hold replica for those ranges.
         int numLocalNodes = Math.min(numLocalRanges, localRangeCounts.size());
         // The remote ranges are round-robined across all the impalads.
-        int numRemoteNodes = Math.min(numRemoteRanges, cluster.numExecutors());
+        int numRemoteNodes =
+            Math.min(numRemoteRanges, analyzer.numExecutorsForPlanning());
         // The local and remote assignments may overlap, but we don't know by how much
         // so conservatively assume no overlap.
-        totalNodes = Math.min(numLocalNodes + numRemoteNodes, cluster.numExecutors());
+        totalNodes =
+            Math.min(numLocalNodes + numRemoteNodes, analyzer.numExecutorsForPlanning());
 
         int numLocalInstances = Math.min(numLocalRanges, totalLocalParallelism);
         totalInstances = Math.min(numLocalInstances + numRemoteRanges,
@@ -371,8 +388,9 @@ public class KuduScanNode extends ScanNode {
     super.computeStats(analyzer);
     computeNumNodes(analyzer);
 
-    // Update the cardinality
-    inputCardinality_ = cardinality_ = kuduTable_.getNumRows();
+    // Update the cardinality, hint value will be used when table has no stats.
+    inputCardinality_ = cardinality_ =
+        kuduTable_.getNumRows() == -1 ? tableNumRowsHint_ : kuduTable_.getNumRows();
     if (isPointLookupQuery_) {
       // Adjust input and output cardinality for point lookup.
       // Planner don't create KuduScanNode for query with closure "limit 0" so
@@ -387,6 +405,11 @@ public class KuduScanNode extends ScanNode {
     if (LOG.isTraceEnabled()) {
       LOG.trace("computeStats KuduScan: cardinality=" + Long.toString(cardinality_));
     }
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    processingCost_ = computeScanProcessingCost(queryOptions);
   }
 
   @Override
@@ -409,7 +432,7 @@ public class KuduScanNode extends ScanNode {
         kudu_scanner_thread_max_estimated_bytes;
     long mem_estimate_per_thread = Math.min(getNumMaterializedSlots(desc_) *
         estimated_bytes_per_column_per_thread, max_estimated_bytes_per_thread);
-    useMtScanNode_ = queryOptions.mt_dop > 0;
+    useMtScanNode_ = Planner.useMTFragment(queryOptions);
     nodeResourceProfile_ = new ResourceProfileBuilder()
         .setMemEstimateBytes(mem_estimate_per_thread * maxScannerThreads)
         .setThreadReservation(useMtScanNode_ ? 0 : 1).build();
@@ -481,7 +504,11 @@ public class KuduScanNode extends ScanNode {
               primaryKeyColsInEqualPred) ||
           tryConvertInListKuduPredicate(analyzer, rpcTable, predicate) ||
           tryConvertIsNullKuduPredicate(analyzer, rpcTable, predicate)) {
-        it.remove();
+        if (currentPredicateNeedCheckAgain_) {
+          currentPredicateNeedCheckAgain_ = false;
+        } else {
+          it.remove();
+        }
       }
     }
     if (primaryKeyColsInEqualPred.size() >= 1 &&
@@ -553,26 +580,38 @@ public class KuduScanNode extends ScanNode {
             ((StringLiteral)literal).getUnescapedValue());
         break;
       }
+      case BINARY: {
+        kuduPredicate = KuduPredicate.newComparisonPredicate(column, op,
+            ((StringLiteral)literal).getUnescapedValue().getBytes());
+        break;
+      }
       case TIMESTAMP: {
         try {
           // TODO: Simplify when Impala supports a 64-bit TIMESTAMP type.
-          // TODO(IMPALA-10850): interpret timestamps in local timezone.
-          kuduPredicate = KuduPredicate.newComparisonPredicate(column, op,
-              ExprUtil.utcTimestampToUnixTimeMicros(analyzer, literal));
+          kuduPredicate = analyzer.getQueryOptions().isConvert_kudu_utc_timestamps() ?
+              convertLocalTimestampBinaryKuduPredicate(analyzer, column, op, literal) :
+              KuduPredicate.newComparisonPredicate(column, op,
+                  ExprUtil.utcTimestampToUnixTimeMicros(analyzer, literal));
         } catch (Exception e) {
           LOG.info("Exception converting Kudu timestamp predicate: " + expr.toSql(), e);
           return false;
         }
         break;
       }
+      case DATE:
+        kuduPredicate = KuduPredicate.newComparisonPredicate(column, op,
+            ((DateLiteral)literal).getValue());
+        break;
       case DECIMAL: {
         kuduPredicate = KuduPredicate.newComparisonPredicate(column, op,
             ((NumericLiteral)literal).getValue());
         break;
       }
-      default: break;
+      default:
+        //All supported types are covered, should not reach default case
+        Preconditions.checkState(false);
     }
-    if (kuduPredicate == null) return false;
+    Preconditions.checkState(kuduPredicate != null);
 
     kuduConjuncts_.add(predicate);
     kuduPredicates_.add(kuduPredicate);
@@ -583,6 +622,54 @@ public class KuduScanNode extends ScanNode {
     }
 
     return true;
+  }
+
+  private KuduPredicate convertLocalTimestampBinaryKuduPredicate(Analyzer analyzer,
+      ColumnSchema column, ComparisonOp op, LiteralExpr literal)
+      throws AnalysisException, InternalException {
+    Long preUnixTimeMicros =
+        ExprUtil.localTimestampToUnixTimeMicros(analyzer, literal, true);
+    Long postUnixTimeMicros =
+        ExprUtil.localTimestampToUnixTimeMicros(analyzer, literal, false);
+    // If the timestamp is not a valid local timestamp, EQUAL predicate should be always
+    // false. For other comparison predicates, we could use the transition point time as
+    // a common value for comparison.
+    if (preUnixTimeMicros == null || postUnixTimeMicros == null) {
+      if (preUnixTimeMicros == null) return null; // should not happen
+      if (op == ComparisonOp.EQUAL) {
+        // An empty IN LIST predicate is always false.
+        return KuduPredicate.newInListPredicate(column, Lists.newArrayList());
+      } else {
+        postUnixTimeMicros = preUnixTimeMicros;
+      }
+    }
+    // If the timestamp is unique, create the predicate normally.
+    if (preUnixTimeMicros.equals(postUnixTimeMicros)) {
+      return KuduPredicate.newComparisonPredicate(column, op, preUnixTimeMicros);
+    }
+    // If the timestamp is ambiguous, we should convert EQUAL predicate to an IN LIST
+    // predicate that include all ambiguous values. For comparison predicates, we need to
+    // use a larger range of possible values for comparison to avoid missing rows.
+    // Additionally, set currentPredicateNeedCheckAgain_ to true to indicate that the
+    // predicate should not removed from the conjuncts_ list.
+    switch (op) {
+      case EQUAL: return KuduPredicate.newInListPredicate(column,
+          Lists.newArrayList(preUnixTimeMicros, postUnixTimeMicros));
+      case LESS:
+      case LESS_EQUAL: {
+        currentPredicateNeedCheckAgain_ = true;
+        return KuduPredicate.newComparisonPredicate(column, op,
+            postUnixTimeMicros);
+      }
+      case GREATER:
+      case GREATER_EQUAL: {
+        currentPredicateNeedCheckAgain_ = true;
+        return KuduPredicate.newComparisonPredicate(column, op,
+            preUnixTimeMicros);
+      }
+      default:
+        throw new InternalException("Unexpected operator: " + op);
+    }
   }
 
   /**
@@ -612,7 +699,11 @@ public class KuduScanNode extends ScanNode {
 
       Object value = getKuduInListValue(analyzer, literal);
       if (value == null) return false;
-      values.add(value);
+      if (value instanceof List) {
+        values.addAll((List<?>) value);
+      } else {
+        values.add(value);
+      }
     }
 
     String colName = ((KuduColumn) ref.getDesc().getColumn()).getKuduName();
@@ -655,6 +746,10 @@ public class KuduScanNode extends ScanNode {
    * Return the value of the InList child expression 'e' as an Object that can be
    * added to a KuduPredicate. If the Expr is not supported by Kudu or the type doesn't
    * match the expected PrimitiveType 'type', null is returned.
+   * Additionally, if the query option 'convert_kudu_utc_timestamps' is enabled and when
+   * the expression 'e' is converted from a local timestamp to a UTC timestamp, it is
+   * invalid or ambiguous, the method will return either an empty list or a list
+   * containing two ambiguous values.
    */
   private static Object getKuduInListValue(Analyzer analyzer, LiteralExpr e) {
     switch (e.getType().getPrimitiveType()) {
@@ -669,6 +764,21 @@ public class KuduScanNode extends ScanNode {
       case TIMESTAMP: {
         try {
           // TODO: Simplify when Impala supports a 64-bit TIMESTAMP type.
+          if (analyzer.getQueryOptions().isConvert_kudu_utc_timestamps()) {
+            Long preUnixTimeMicros =
+                ExprUtil.localTimestampToUnixTimeMicros(analyzer, e, true);
+            Long postUnixTimeMicros =
+                ExprUtil.localTimestampToUnixTimeMicros(analyzer, e, false);
+            // If the timestamp is invalid in local time, return empty list.
+            if (preUnixTimeMicros == null || postUnixTimeMicros == null) {
+              if (preUnixTimeMicros == null) return null; // should not happen
+              return Lists.newArrayList();
+            }
+            // If the timestamp is unique, return the unique value.
+            if (preUnixTimeMicros.equals(postUnixTimeMicros)) return preUnixTimeMicros;
+            // If the timestamp is ambiguous, return a list of the two possible values.
+            return Lists.newArrayList(preUnixTimeMicros, postUnixTimeMicros);
+          }
           return ExprUtil.utcTimestampToUnixTimeMicros(analyzer, e);
         } catch (Exception ex) {
           LOG.info("Exception converting Kudu timestamp expr: " + e.toSql(), ex);

@@ -25,6 +25,8 @@
 
 #include "common/names.h"
 
+DECLARE_bool(clamp_query_mem_limit_backend_mem_limit);
+
 DEFINE_bool_hidden(use_dedicated_coordinator_estimates, true,
     "Hidden option to fall back to legacy memory estimation logic for dedicated"
     " coordinators wherein the same per backend estimate is used for both coordinators "
@@ -49,7 +51,8 @@ void FInstanceScheduleState::AddScanRanges(
 
 FragmentScheduleState::FragmentScheduleState(
     const TPlanFragment& fragment, FragmentExecParamsPB* exec_params)
-  : is_coord_fragment(false), fragment(fragment), exec_params(exec_params) {
+  : scan_range_assignment{}, is_root_coord_fragment(false),
+    fragment(fragment), exec_params(exec_params) {
   exec_params->set_fragment_idx(fragment.idx);
 }
 
@@ -88,10 +91,10 @@ void ScheduleState::Init() {
         it->second, query_schedule_pb_->add_fragment_exec_params());
   }
 
-  // mark coordinator fragment
+  // mark root coordinator fragment
   const TPlanFragment& root_fragment = request_.plan_exec_info[0].fragments[0];
   if (RequiresCoordinatorFragment()) {
-    fragment_schedule_states_[root_fragment.idx].is_coord_fragment = true;
+    fragment_schedule_states_[root_fragment.idx].is_root_coord_fragment = true;
     // the coordinator instance gets index 0, generated instance ids start at 1
     next_instance_id_ = CreateInstanceId(next_instance_id_, 1);
   }
@@ -191,7 +194,7 @@ void ScheduleState::Validate() const {
     DCHECK_GT(fragment_state.instance_states.size(), 0) << fragment_state.fragment;
   }
 
-  // Check that all backends have instances, except possibly the coordaintor backend.
+  // Check that all backends have instances, except possibly the coordinator backend.
   for (const auto& elem : per_backend_schedule_states_) {
     const BackendExecParamsPB* be_params = elem.second.exec_params;
     DCHECK(!be_params->instance_params().empty() || be_params->is_coord_backend());
@@ -216,6 +219,11 @@ int64_t ScheduleState::GetPerExecutorMemoryEstimate() const {
 int64_t ScheduleState::GetDedicatedCoordMemoryEstimate() const {
   DCHECK(request_.__isset.dedicated_coord_mem_estimate);
   return request_.dedicated_coord_mem_estimate;
+}
+
+bool ScheduleState::GetIsTrivialQuery() const {
+  DCHECK(request_.__isset.is_trivial_query);
+  return request_.is_trivial_query;
 }
 
 void ScheduleState::IncNumScanRanges(int64_t delta) {
@@ -251,91 +259,169 @@ bool ScheduleState::UseDedicatedCoordEstimates() const {
   return false;
 }
 
-void ScheduleState::UpdateMemoryRequirements(const TPoolConfig& pool_cfg) {
+void ScheduleState::CompareMaxBackendMemToAdmit(
+    const int64_t new_limit, const MemLimitSourcePB source) {
+  DCHECK(query_schedule_pb_->has_per_backend_mem_to_admit());
+  if (query_schedule_pb_->per_backend_mem_to_admit() < new_limit) {
+    query_schedule_pb_->set_per_backend_mem_to_admit(new_limit);
+    query_schedule_pb_->set_per_backend_mem_to_admit_source(source);
+  }
+}
+
+void ScheduleState::CompareMinBackendMemToAdmit(
+    const int64_t new_limit, const MemLimitSourcePB source) {
+  DCHECK(query_schedule_pb_->has_per_backend_mem_to_admit());
+  if (query_schedule_pb_->per_backend_mem_to_admit() > new_limit) {
+    query_schedule_pb_->set_per_backend_mem_to_admit(new_limit);
+    query_schedule_pb_->set_per_backend_mem_to_admit_source(source);
+  }
+}
+
+void ScheduleState::CompareMaxCoordinatorMemToAdmit(
+    const int64_t new_limit, const MemLimitSourcePB source) {
+  DCHECK(query_schedule_pb_->has_coord_backend_mem_to_admit());
+  if (query_schedule_pb_->coord_backend_mem_to_admit() < new_limit) {
+    query_schedule_pb_->set_coord_backend_mem_to_admit(new_limit);
+    query_schedule_pb_->set_coord_backend_mem_to_admit_source(source);
+  }
+}
+
+void ScheduleState::CompareMinCoordinatorMemToAdmit(
+    const int64_t new_limit, const MemLimitSourcePB source) {
+  DCHECK(query_schedule_pb_->has_coord_backend_mem_to_admit());
+  if (query_schedule_pb_->coord_backend_mem_to_admit() > new_limit) {
+    query_schedule_pb_->set_coord_backend_mem_to_admit(new_limit);
+    query_schedule_pb_->set_coord_backend_mem_to_admit_source(source);
+  }
+}
+
+void ScheduleState::UpdateMemoryRequirements(const TPoolConfig& pool_cfg,
+    int64_t coord_mem_limit_admission, int64_t executor_mem_limit_admission) {
   // If the min_query_mem_limit and max_query_mem_limit are not set in the pool config
   // then it falls back to traditional(old) behavior, which means that, it sets the
   // mem_limit if it is set in the query options, else sets it to -1 (no limit).
-  bool mimic_old_behaviour =
+  const bool mimic_old_behaviour =
       pool_cfg.min_query_mem_limit == 0 && pool_cfg.max_query_mem_limit == 0;
-  bool use_dedicated_coord_estimates = UseDedicatedCoordEstimates();
+  const bool use_dedicated_coord_estimates = UseDedicatedCoordEstimates();
 
-  int64_t per_backend_mem_to_admit = 0;
-  int64_t coord_backend_mem_to_admit = 0;
+  query_schedule_pb_->set_per_backend_mem_to_admit(0);
+  query_schedule_pb_->set_per_backend_mem_to_admit_source(MemLimitSourcePB::NO_LIMIT);
+  query_schedule_pb_->set_coord_backend_mem_to_admit(0);
+  query_schedule_pb_->set_coord_backend_mem_to_admit_source(MemLimitSourcePB::NO_LIMIT);
   bool is_mem_limit_set = false;
   if (query_options().__isset.mem_limit && query_options().mem_limit > 0) {
-    per_backend_mem_to_admit = query_options().mem_limit;
-    coord_backend_mem_to_admit = query_options().mem_limit;
+    query_schedule_pb_->set_per_backend_mem_to_admit(query_options().mem_limit);
+    query_schedule_pb_->set_per_backend_mem_to_admit_source(
+        MemLimitSourcePB::QUERY_OPTION_MEM_LIMIT);
+    query_schedule_pb_->set_coord_backend_mem_to_admit(query_options().mem_limit);
+    query_schedule_pb_->set_coord_backend_mem_to_admit_source(
+        MemLimitSourcePB::QUERY_OPTION_MEM_LIMIT);
     is_mem_limit_set = true;
   }
 
   if (!is_mem_limit_set) {
-    per_backend_mem_to_admit = GetPerExecutorMemoryEstimate();
-    coord_backend_mem_to_admit = use_dedicated_coord_estimates ?
-        GetDedicatedCoordMemoryEstimate() :
-        GetPerExecutorMemoryEstimate();
+    query_schedule_pb_->set_per_backend_mem_to_admit(GetPerExecutorMemoryEstimate());
+    query_schedule_pb_->set_per_backend_mem_to_admit_source(
+        MemLimitSourcePB::QUERY_PLAN_PER_HOST_MEM_ESTIMATE);
+    if (use_dedicated_coord_estimates) {
+      query_schedule_pb_->set_coord_backend_mem_to_admit(
+          GetDedicatedCoordMemoryEstimate());
+      query_schedule_pb_->set_coord_backend_mem_to_admit_source(
+          MemLimitSourcePB::QUERY_PLAN_DEDICATED_COORDINATOR_MEM_ESTIMATE);
+    } else {
+      query_schedule_pb_->set_coord_backend_mem_to_admit(GetPerExecutorMemoryEstimate());
+      query_schedule_pb_->set_coord_backend_mem_to_admit_source(
+          MemLimitSourcePB::QUERY_PLAN_PER_HOST_MEM_ESTIMATE);
+    }
     VLOG(3) << "use_dedicated_coord_estimates=" << use_dedicated_coord_estimates
-            << " coord_backend_mem_to_admit=" << coord_backend_mem_to_admit
-            << " per_backend_mem_to_admit=" << per_backend_mem_to_admit;
+            << " coord_backend_mem_to_admit="
+            << query_schedule_pb_->coord_backend_mem_to_admit()
+            << " per_backend_mem_to_admit="
+            << query_schedule_pb_->per_backend_mem_to_admit();
     if (!mimic_old_behaviour) {
       int64_t min_mem_limit_required =
           ReservationUtil::GetMinMemLimitFromReservation(largest_min_reservation());
-      per_backend_mem_to_admit = max(per_backend_mem_to_admit, min_mem_limit_required);
+      CompareMaxBackendMemToAdmit(
+          min_mem_limit_required, MemLimitSourcePB::ADJUSTED_PER_HOST_MEM_ESTIMATE);
       int64_t min_coord_mem_limit_required =
           ReservationUtil::GetMinMemLimitFromReservation(coord_min_reservation());
-      coord_backend_mem_to_admit =
-          max(coord_backend_mem_to_admit, min_coord_mem_limit_required);
+      CompareMaxCoordinatorMemToAdmit(min_coord_mem_limit_required,
+          MemLimitSourcePB::ADJUSTED_DEDICATED_COORDINATOR_MEM_ESTIMATE);
     }
   }
 
   if (!is_mem_limit_set || pool_cfg.clamp_mem_limit_query_option) {
     if (pool_cfg.min_query_mem_limit > 0) {
-      per_backend_mem_to_admit =
-          max(per_backend_mem_to_admit, pool_cfg.min_query_mem_limit);
+      CompareMaxBackendMemToAdmit(pool_cfg.min_query_mem_limit,
+          MemLimitSourcePB::POOL_CONFIG_MIN_QUERY_MEM_LIMIT);
       if (!use_dedicated_coord_estimates || is_mem_limit_set) {
         // The minimum mem limit option does not apply to dedicated coordinators -
         // this would result in over-reserving of memory. Treat coordinator and
         // executor mem limits the same if the query option was explicitly set.
-        coord_backend_mem_to_admit =
-            max(coord_backend_mem_to_admit, pool_cfg.min_query_mem_limit);
+        CompareMaxCoordinatorMemToAdmit(pool_cfg.min_query_mem_limit,
+            MemLimitSourcePB::POOL_CONFIG_MIN_QUERY_MEM_LIMIT);
       }
     }
     if (pool_cfg.max_query_mem_limit > 0) {
-      per_backend_mem_to_admit =
-          min(per_backend_mem_to_admit, pool_cfg.max_query_mem_limit);
-      coord_backend_mem_to_admit =
-          min(coord_backend_mem_to_admit, pool_cfg.max_query_mem_limit);
+      CompareMinBackendMemToAdmit(pool_cfg.max_query_mem_limit,
+          MemLimitSourcePB::POOL_CONFIG_MAX_QUERY_MEM_LIMIT);
+      CompareMinCoordinatorMemToAdmit(pool_cfg.max_query_mem_limit,
+          MemLimitSourcePB::POOL_CONFIG_MAX_QUERY_MEM_LIMIT);
     }
   }
 
-  // Cap the memory estimate at the amount of physical memory available. The user's
-  // provided value or the estimate from planning can each be unreasonable.
-  per_backend_mem_to_admit = min(per_backend_mem_to_admit, MemInfo::physical_mem());
-  coord_backend_mem_to_admit = min(coord_backend_mem_to_admit, MemInfo::physical_mem());
+  // Enforce the MEM_LIMIT_COORDINATORS query option if MEM_LIMIT is not specified.
+  const bool is_mem_limit_coordinators_set =
+      query_options().__isset.mem_limit_coordinators
+      && query_options().mem_limit_coordinators > 0;
+  if (!is_mem_limit_set && is_mem_limit_coordinators_set) {
+    query_schedule_pb_->set_coord_backend_mem_to_admit(
+        query_options().mem_limit_coordinators);
+    query_schedule_pb_->set_coord_backend_mem_to_admit_source(
+        MemLimitSourcePB::QUERY_OPTION_MEM_LIMIT_COORDINATORS);
+  }
 
+  // Enforce the MEM_LIMIT_EXECUTORS query option if MEM_LIMIT is not specified.
+  const bool is_mem_limit_executors_set = query_options().__isset.mem_limit_executors
+      && query_options().mem_limit_executors > 0;
+  if (!is_mem_limit_set && is_mem_limit_executors_set) {
+    query_schedule_pb_->set_per_backend_mem_to_admit(query_options().mem_limit_executors);
+    query_schedule_pb_->set_per_backend_mem_to_admit_source(
+        MemLimitSourcePB::QUERY_OPTION_MEM_LIMIT_EXECUTORS);
+  }
+
+  // Cap the memory estimate at the backend's memory limit for admission. The user's
+  // provided value or the estimate from planning can each be unreasonable.
+  if (FLAGS_clamp_query_mem_limit_backend_mem_limit) {
+    CompareMinBackendMemToAdmit(
+        executor_mem_limit_admission, MemLimitSourcePB::HOST_MEM_TRACKER_LIMIT);
+    CompareMinCoordinatorMemToAdmit(
+        coord_mem_limit_admission, MemLimitSourcePB::HOST_MEM_TRACKER_LIMIT);
+  }
   // If the query is only scheduled to run on the coordinator.
   if (per_backend_schedule_states_.size() == 1 && RequiresCoordinatorFragment()) {
-    per_backend_mem_to_admit = 0;
+    query_schedule_pb_->set_per_backend_mem_to_admit(0);
+    query_schedule_pb_->set_per_backend_mem_to_admit_source(
+        MemLimitSourcePB::COORDINATOR_ONLY_OPTIMIZATION);
   }
 
-  int64_t per_backend_mem_limit;
-  if (mimic_old_behaviour && !is_mem_limit_set) {
-    per_backend_mem_limit = -1;
+  if (mimic_old_behaviour && !is_mem_limit_set && !is_mem_limit_executors_set
+      && !is_mem_limit_coordinators_set) {
+    query_schedule_pb_->set_per_backend_mem_limit(-1);
     query_schedule_pb_->set_coord_backend_mem_limit(-1);
   } else {
-    per_backend_mem_limit = per_backend_mem_to_admit;
-    query_schedule_pb_->set_coord_backend_mem_limit(coord_backend_mem_to_admit);
+    query_schedule_pb_->set_per_backend_mem_limit(
+        query_schedule_pb_->per_backend_mem_to_admit());
+    query_schedule_pb_->set_coord_backend_mem_limit(
+        query_schedule_pb_->coord_backend_mem_to_admit());
   }
+  query_schedule_pb_->set_cluster_mem_est(GetClusterMemoryToAdmit());
 
-  // Finally, enforce the MEM_LIMIT_EXECUTORS query option if MEM_LIMIT is not specified.
-  if (!is_mem_limit_set && query_options().__isset.mem_limit_executors
-      && query_options().mem_limit_executors > 0) {
-    per_backend_mem_to_admit = query_options().mem_limit_executors;
-    per_backend_mem_limit = per_backend_mem_to_admit;
-  }
-
-  query_schedule_pb_->set_coord_backend_mem_to_admit(coord_backend_mem_to_admit);
-  query_schedule_pb_->set_per_backend_mem_limit(per_backend_mem_limit);
-  query_schedule_pb_->set_per_backend_mem_to_admit(per_backend_mem_to_admit);
+  // Validate fields are set.
+  DCHECK(query_schedule_pb_->has_per_backend_mem_to_admit());
+  DCHECK(query_schedule_pb_->has_coord_backend_mem_to_admit());
+  DCHECK(query_schedule_pb_->has_per_backend_mem_to_admit_source());
+  DCHECK(query_schedule_pb_->has_coord_backend_mem_to_admit_source());
 }
 
 void ScheduleState::set_executor_group(string executor_group) {

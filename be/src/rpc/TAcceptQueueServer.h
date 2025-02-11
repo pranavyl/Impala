@@ -23,7 +23,7 @@
 #define IMPALA_RPC_TACCEPTQUEUESERVER_H
 
 #include <thrift/concurrency/Monitor.h>
-#include <thrift/concurrency/Thread.h>
+#include <thrift/concurrency/ThreadFactory.h>
 #include <thrift/server/TServer.h>
 #include <thrift/transport/TServerTransport.h>
 
@@ -63,7 +63,8 @@ class TAcceptQueueServer : public TServer {
       const std::shared_ptr<TProtocolFactory>& protocolFactory,
       const std::shared_ptr<ThreadFactory>& threadFactory,
       const std::string& name, int32_t maxTasks = 0,
-      int64_t queue_timeout_ms = 0, int64_t idle_poll_period_ms = 0);
+      int64_t queue_timeout_ms = 0, int64_t idle_poll_period_ms = 0,
+      bool is_external_facing = true);
 
   ~TAcceptQueueServer() override = default;
 
@@ -84,13 +85,12 @@ class TAcceptQueueServer : public TServer {
   // This is the work function for the thread pool, which does the work of setting up the
   // connection and starting a thread to handle it. Will block if there are currently
   // maxTasks_ connections and maxTasks_ is non-zero.
-  void SetupConnection(std::shared_ptr<TAcceptQueueEntry> entry);
+  void SetupConnection(TAcceptQueueEntry* entry);
 
   // Helper function to close a client connection in case of server side errors.
   void CleanupAndClose(const std::string& error,
-      std::shared_ptr<TTransport> input,
-      std::shared_ptr<TTransport> output,
-      std::shared_ptr<TTransport> client);
+      const std::shared_ptr<TTransport>& io_transport,
+      const std::shared_ptr<TTransport>& client);
 
   std::shared_ptr<ThreadFactory> threadFactory_;
   volatile bool stop_ = false;
@@ -129,6 +129,11 @@ class TAcceptQueueServer : public TServer {
   /// wakes up to check if the connection should be closed due to inactivity. If 0, no
   /// polling happens.
   int64_t idle_poll_period_ms_;
+
+  /// Whether this is interacting with external untrusted clients. If true, this
+  /// uses ThriftExternalRpcMaxMessageSize(). If false, this uses the
+  /// ThriftInternalRpcMaxMessageSize().
+  bool is_external_facing_;
 };
 
 } // namespace server

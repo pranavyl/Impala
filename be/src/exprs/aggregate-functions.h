@@ -37,6 +37,8 @@ using impala_udf::StringVal;
 using impala_udf::DecimalVal;
 using impala_udf::DateVal;
 
+static constexpr double FLOATING_POINT_ERROR_THRESHOLD = -1E-8;
+
 /// Collection of builtin aggregate functions. Aggregate functions implement
 /// the various phases of the aggregation: Init(), Update(), Serialize(), Merge(),
 /// and Finalize(). Not all functions need to implement all of the steps and
@@ -63,6 +65,68 @@ class AggregateFunctions {
   /// StringVal Serialize/Finalize function that copies and frees src
   static StringVal StringValSerializeOrFinalize(
       FunctionContext* ctx, const StringVal& src);
+
+  /// Implementation of Regr_Count()
+  static void RegrCountUpdate(FunctionContext*, const DoubleVal& src1,
+      const DoubleVal& src2, BigIntVal* dst);
+  static void RegrCountRemove(FunctionContext*, const DoubleVal& src1,
+      const DoubleVal& src2, BigIntVal* dst);
+  static void TimestampRegrCountUpdate(FunctionContext*,
+      const TimestampVal& src1, const TimestampVal& src2, BigIntVal* dst);
+  static void TimestampRegrCountRemove(FunctionContext*,
+      const TimestampVal& src1, const TimestampVal& src2, BigIntVal* dst);
+
+  /// Implementation of regr_slope() and regr_intercept()
+  static void RegrSlopeInit(FunctionContext* ctx, StringVal* dst);
+  static void RegrSlopeUpdate(FunctionContext* ctx, const DoubleVal& src1,
+      const DoubleVal& src2, StringVal* dst);
+  static void RegrSlopeRemove(FunctionContext* ctx, const DoubleVal& src1,
+      const DoubleVal& src2, StringVal* dst);
+  static void TimestampRegrSlopeUpdate(FunctionContext* ctx,
+      const TimestampVal& src1, const TimestampVal& src2, StringVal* dst);
+  static void TimestampRegrSlopeRemove(FunctionContext* ctx,
+      const TimestampVal& src1, const TimestampVal& src2, StringVal* dst);
+  static void RegrSlopeMerge(FunctionContext* ctx, const StringVal& src, StringVal* dst);
+  static DoubleVal RegrSlopeGetValue(FunctionContext* ctx, const StringVal& src);
+  static DoubleVal RegrSlopeFinalize(FunctionContext* ctx, const StringVal& src);
+  static DoubleVal RegrInterceptGetValue(FunctionContext* ctx, const StringVal& src);
+  static DoubleVal RegrInterceptFinalize(FunctionContext* ctx, const StringVal& src);
+
+  /// Implementation of Corr()
+  static void CorrInit(FunctionContext* ctx, StringVal* dst);
+  static void CorrUpdate(FunctionContext* ctx, const DoubleVal& src1,
+      const DoubleVal& src2, StringVal* dst);
+  static void CorrRemove(FunctionContext* ctx, const DoubleVal& src1,
+      const DoubleVal& src2, StringVal* dst);
+  static void TimestampCorrUpdate(FunctionContext* ctx,
+      const TimestampVal& src1, const TimestampVal& src2, StringVal* dst);
+  static void TimestampCorrRemove(FunctionContext* ctx,
+      const TimestampVal& src1, const TimestampVal& src2, StringVal* dst);
+  static void CorrMerge(FunctionContext* ctx, const StringVal& src, StringVal* dst);
+  static DoubleVal CorrGetValue(FunctionContext* ctx, const StringVal& src);
+  static DoubleVal CorrFinalize(FunctionContext* ctx, const StringVal& src);
+
+  /// Implementation of regr_r2()
+  static DoubleVal Regr_r2GetValue(FunctionContext* ctx, const StringVal& src);
+  static DoubleVal Regr_r2Finalize(FunctionContext* ctx, const StringVal& src);
+
+  /// Implementation of Covar_samp() and Covar_pop()
+  static void CovarInit(FunctionContext* ctx, StringVal* dst);
+  static void CovarUpdate(FunctionContext* ctx, const DoubleVal& src1,
+      const DoubleVal& src2, StringVal* dst);
+  static void CovarRemove(FunctionContext* ctx, const DoubleVal& src1,
+      const DoubleVal& src2, StringVal* dst);
+  static void TimestampCovarUpdate(FunctionContext* ctx,
+      const TimestampVal& src1, const TimestampVal& src2, StringVal* dst);
+  static void TimestampCovarRemove(FunctionContext* ctx,
+      const TimestampVal& src1, const TimestampVal& src2, StringVal* dst);
+  static void CovarMerge(FunctionContext* ctx, const StringVal& src, StringVal* dst);
+  static DoubleVal CovarSampleGetValue(FunctionContext* ctx, const StringVal& src);
+  static DoubleVal CovarPopulationGetValue(FunctionContext* ctx, const StringVal& src);
+  static DoubleVal CovarSampleFinalize(FunctionContext* ctx,
+      const StringVal& src);
+  static DoubleVal CovarPopulationFinalize(FunctionContext* ctx,
+      const StringVal& src);
 
   /// Implementation of Count and Count(*)
   static void CountUpdate(FunctionContext*, const AnyVal& src, BigIntVal* dst);

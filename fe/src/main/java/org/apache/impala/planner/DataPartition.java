@@ -19,6 +19,7 @@ package org.apache.impala.planner;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
@@ -56,7 +57,8 @@ public class DataPartition {
 
   private DataPartition(TPartitionType type) {
     Preconditions.checkState(type == TPartitionType.UNPARTITIONED
-        || type == TPartitionType.RANDOM);
+        || type == TPartitionType.RANDOM
+        || type == TPartitionType.DIRECTED);
     type_ = type;
     partitionExprs_ = new ArrayList<>();
   }
@@ -66,6 +68,8 @@ public class DataPartition {
 
   public final static DataPartition RANDOM =
       new DataPartition(TPartitionType.RANDOM);
+
+  public final static DataPartition DIRECTED = new DataPartition(TPartitionType.DIRECTED);
 
   public static DataPartition hashPartitioned(List<Expr> exprs) {
     return new DataPartition(TPartitionType.HASH_PARTITIONED, exprs);
@@ -99,6 +103,11 @@ public class DataPartition {
     DataPartition other = (DataPartition) obj;
     if (type_ != other.type_) return false;
     return Expr.equalLists(partitionExprs_, other.partitionExprs_);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(type_, partitionExprs_);
   }
 
   public String debugString() {

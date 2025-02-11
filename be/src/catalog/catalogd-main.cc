@@ -17,6 +17,7 @@
 //
 // This file contains the main() function for the catalog daemon process,
 
+#include <gflags/gflags.h>
 #include <jni.h>
 
 #include "catalog/catalog-server.h"
@@ -36,6 +37,8 @@
 #include "util/openssl-util.h"
 
 DECLARE_int32(catalog_service_port);
+DECLARE_bool(enable_workload_mgmt);
+DECLARE_int32(metrics_webserver_port);
 DECLARE_int32(webserver_port);
 DECLARE_int32(state_store_subscriber_port);
 DECLARE_string(ssl_server_certificate);
@@ -43,15 +46,24 @@ DECLARE_string(ssl_private_key);
 DECLARE_string(ssl_private_key_password_cmd);
 DECLARE_string(ssl_cipher_list);
 DECLARE_string(ssl_minimum_version);
-
 #include "common/names.h"
 
 using namespace impala;
 using namespace apache::thrift;
 
 int CatalogdMain(int argc, char** argv) {
-  FLAGS_webserver_port = 25020;
-  FLAGS_state_store_subscriber_port = 23020;
+  // Set webserver_port as 25020 and state_store_subscriber_port as 23020 for catalogd
+  // if and only if these two ports had not been set explicitly in command line.
+  // An Impala cluster could be launched with more than one catalogd instances when
+  // CatalogD HA is enabled. These two ports should be set explicitly in command line
+  // with different values for each catalogd instance when launching a mini-cluster.
+  if (google::GetCommandLineFlagInfoOrDie("webserver_port").is_default) {
+    FLAGS_webserver_port = 25020;
+  }
+  if (google::GetCommandLineFlagInfoOrDie("state_store_subscriber_port").is_default) {
+    FLAGS_state_store_subscriber_port = 23020;
+  }
+
   InitCommonRuntime(argc, argv, true);
   InitFeSupport();
 
@@ -61,7 +73,10 @@ int CatalogdMain(int argc, char** argv) {
 
   CatalogServer catalog_server(daemon_env.metrics());
   ABORT_IF_ERROR(catalog_server.Start());
-  catalog_server.RegisterWebpages(daemon_env.webserver());
+  catalog_server.RegisterWebpages(daemon_env.webserver(), false);
+  if (FLAGS_metrics_webserver_port > 0) {
+    catalog_server.RegisterWebpages(daemon_env.metrics_webserver(), true);
+  }
   std::shared_ptr<TProcessor> processor(
       new CatalogServiceProcessor(catalog_server.thrift_iface()));
   std::shared_ptr<TProcessorEventHandler> event_handler(
@@ -70,6 +85,8 @@ int CatalogdMain(int argc, char** argv) {
 
   ThriftServer* server;
   ThriftServerBuilder builder("CatalogService", processor, FLAGS_catalog_service_port);
+  // Mark this as an internal service to use a more permissive Thrift max message size
+  builder.is_external_facing(false);
 
   if (IsInternalTlsConfigured()) {
     SSLProtocol ssl_version;
@@ -85,6 +102,16 @@ int CatalogdMain(int argc, char** argv) {
   ABORT_IF_ERROR(server->Start());
   catalog_server.MarkServiceAsStarted();
   LOG(INFO) << "CatalogService started on port: " << FLAGS_catalog_service_port;
+
+  if (FLAGS_enable_workload_mgmt) {
+    if (catalog_server.WaitForCatalogReady()) {
+      ABORT_IF_ERROR(catalog_server.InitWorkloadManagement());
+    } else {
+      LOG(INFO) << "Skipping workload management initialization since catalogd HA is "
+                << "enabled and this catalogd is not active";
+    }
+  }
+
   server->Join();
 
   return 0;

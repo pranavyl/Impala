@@ -27,6 +27,7 @@ import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -36,7 +37,7 @@ import java.util.Map;
 
 import org.apache.impala.testutil.ImpalaJdbcClient;
 import org.apache.impala.testutil.TestUtils;
-import org.apache.impala.util.Metrics;
+import org.apache.impala.testutil.WebClient;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.Test;
@@ -298,6 +299,20 @@ public class JdbcTest extends JdbcTestBase {
     assertTrue(rs.next());
     assertEquals("Incorrect type", Types.VARCHAR, rs.getInt("DATA_TYPE"));
     assertEquals(32, rs.getInt("COLUMN_SIZE"));
+    assertFalse(rs.next());
+    rs.close();
+
+    // validate BINARY column
+    rs = con_.getMetaData().getColumns(null, "functional", "binary_tbl", null);
+    assertTrue(rs.next());
+    assertEquals("Incorrect type", Types.INTEGER, rs.getInt("DATA_TYPE"));
+    assertEquals(10, rs.getInt("COLUMN_SIZE"));
+    assertTrue(rs.next());
+    assertEquals("Incorrect type", Types.VARCHAR, rs.getInt("DATA_TYPE"));
+    assertEquals(Integer.MAX_VALUE, rs.getInt("COLUMN_SIZE"));
+    assertTrue(rs.next());
+    assertEquals("Incorrect type", Types.BINARY, rs.getInt("DATA_TYPE"));
+    assertEquals(Integer.MAX_VALUE, rs.getInt("COLUMN_SIZE"));
     assertFalse(rs.next());
     rs.close();
 
@@ -601,7 +616,7 @@ public class JdbcTest extends JdbcTestBase {
   @Test
   public void testConcurrentSessionMixedIdleTimeout() throws Exception {
     // Test for concurrent idle sessions' expiration with mixed timeout durations.
-    Metrics metrics = new Metrics();
+    WebClient client = new WebClient();
 
     List<Integer> timeoutPeriods = Arrays.asList(0, 3, 15);
     List<Connection> connections = new ArrayList<>();
@@ -612,9 +627,9 @@ public class JdbcTest extends JdbcTestBase {
           createConnection(ImpalaJdbcClient.getNoAuthConnectionStr(connectionType_)));
     }
 
-    Long numOpenSessions = (Long)metrics.getMetric(
+    Long numOpenSessions = (Long)client.getMetric(
         "impala-server.num-open-hiveserver2-sessions");
-    Long numExpiredSessions = (Long)metrics.getMetric(
+    Long numExpiredSessions = (Long)client.getMetric(
         "impala-server.num-sessions-expired");
 
     for (int i = 0; i < connections.size(); ++i) {
@@ -628,9 +643,9 @@ public class JdbcTest extends JdbcTestBase {
       lastTimeSessionActive.add(System.currentTimeMillis() / 1000);
     }
 
-    assertEquals(numOpenSessions, (Long)metrics.getMetric(
+    assertEquals(numOpenSessions, (Long)client.getMetric(
         "impala-server.num-open-hiveserver2-sessions"));
-    assertEquals(numExpiredSessions, (Long)metrics.getMetric(
+    assertEquals(numExpiredSessions, (Long)client.getMetric(
         "impala-server.num-sessions-expired"));
 
     for (int timeout : timeoutPeriods) {
@@ -665,9 +680,9 @@ public class JdbcTest extends JdbcTestBase {
         }
       }
 
-      assertEquals(numOpenSessions, (Long)metrics.getMetric(
+      assertEquals(numOpenSessions, (Long)client.getMetric(
           "impala-server.num-open-hiveserver2-sessions"));
-      assertEquals(numExpiredSessions, (Long)metrics.getMetric(
+      assertEquals(numExpiredSessions, (Long)client.getMetric(
           "impala-server.num-sessions-expired"));
     }
 
@@ -677,6 +692,30 @@ public class JdbcTest extends JdbcTestBase {
 
     for (Connection connection : connections) {
       assertNull("Connection is not null", connection);
+    }
+  }
+
+  /**
+   * test the query options in connection URL take effect.
+   */
+  @Test
+  public void testSetQueryOptionsInConnectionURL() throws Exception {
+    String divideZeroSQL = "SELECT CAST(1 AS DECIMAL)/0";
+    String connStr = ImpalaJdbcClient.getNoAuthConnectionStr(connectionType_);
+    connStr += "?DECIMAL_V2=false";
+    try (Connection connection = createConnection(connStr)) {
+      Statement stmt = connection.createStatement();
+      try (ResultSet rs = stmt.executeQuery(divideZeroSQL);) {
+        // DECIMAL_V2=false, no exception is expected to be thrown
+        rs.next();
+      }
+      stmt.execute("SET DECIMAL_V2=true");
+      try (ResultSet rs = stmt.executeQuery(divideZeroSQL);) {
+        // DECIMAL_V2=true, an exception is expected to be thrown
+        rs.next();
+      } catch (SQLException e) {
+        assertTrue(e.getMessage().contains("UDF ERROR: Cannot divide decimal by zero"));
+      }
     }
   }
 }

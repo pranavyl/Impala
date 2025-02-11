@@ -158,6 +158,8 @@ class RequestContext {
   int64_t bytes_read_local() const { return bytes_read_local_.Load(); }
   int64_t bytes_read_short_circuit() const { return bytes_read_short_circuit_.Load(); }
   int64_t bytes_read_dn_cache() const { return bytes_read_dn_cache_.Load(); }
+  int64_t bytes_read_encrypted() const { return bytes_read_encrypted_.Load(); }
+  int64_t bytes_read_ec() const { return bytes_read_ec_.Load(); }
   int num_remote_ranges() const { return num_remote_ranges_.Load(); }
   int64_t unexpected_remote_bytes() const { return unexpected_remote_bytes_.Load(); }
 
@@ -171,6 +173,25 @@ class RequestContext {
 
   void set_bytes_read_counter(RuntimeProfile::Counter* bytes_read_counter) {
     bytes_read_counter_ = bytes_read_counter;
+  }
+
+  void set_read_use_mem_counter(RuntimeProfile::Counter* read_use_mem_counter) {
+    read_use_mem_counter_ = read_use_mem_counter;
+  }
+
+  void set_bytes_read_use_mem_counter(
+      RuntimeProfile::Counter* bytes_read_use_mem_counter) {
+    bytes_read_use_mem_counter_ = bytes_read_use_mem_counter;
+  }
+
+  void set_read_use_local_disk_counter(
+      RuntimeProfile::Counter* read_use_local_disk_counter) {
+    read_use_local_disk_counter_ = read_use_local_disk_counter;
+  }
+
+  void set_bytes_read_use_local_disk_counter(
+      RuntimeProfile::Counter* bytes_read_use_local_disk_counter) {
+    bytes_read_use_local_disk_counter_ = bytes_read_use_local_disk_counter;
   }
 
   void set_read_timer(RuntimeProfile::Counter* read_timer) { read_timer_ = read_timer; }
@@ -338,6 +359,18 @@ class RequestContext {
   /// Total bytes read for this reader
   RuntimeProfile::Counter* bytes_read_counter_ = nullptr;
 
+  /// Total read from mem buffer for this reader
+  RuntimeProfile::Counter* read_use_mem_counter_ = nullptr;
+
+  /// Total bytes read from mem buffer for this reader
+  RuntimeProfile::Counter* bytes_read_use_mem_counter_ = nullptr;
+
+  /// Total read from local disk buffer for this reader
+  RuntimeProfile::Counter* read_use_local_disk_counter_ = nullptr;
+
+  /// Total bytes read from local disk buffer for this reader
+  RuntimeProfile::Counter* bytes_read_use_local_disk_counter_ = nullptr;
+
   /// Total time spent in hdfs reading
   RuntimeProfile::Counter* read_timer_ = nullptr;
 
@@ -367,6 +400,12 @@ class RequestContext {
 
   /// Total number of bytes read from date node cache, updated at end of each range scan
   AtomicInt64 bytes_read_dn_cache_{0};
+
+  /// Total number of encrypted bytes read
+  AtomicInt64 bytes_read_encrypted_{0};
+
+  /// Total number of erasure-coded bytes read
+  AtomicInt64 bytes_read_ec_{0};
 
   /// Total number of bytes from remote reads that were expected to be local.
   AtomicInt64 unexpected_remote_bytes_{0};

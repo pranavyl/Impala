@@ -42,6 +42,7 @@
 namespace impala {
 
 const char* Tuple::LLVM_CLASS_NAME = "class.impala::Tuple";
+const char* Tuple::CodegenTypes::LLVM_CLASS_NAME = "struct.impala::Tuple::CodegenTypes";
 const char* SlotOffsets::LLVM_CLASS_NAME = "struct.impala::SlotOffsets";
 
 const char* Tuple::MATERIALIZE_EXPRS_SYMBOL = "MaterializeExprsILb0ELb0";
@@ -49,21 +50,21 @@ const char* Tuple::MATERIALIZE_EXPRS_NULL_POOL_SYMBOL = "MaterializeExprsILb0ELb
 
 Tuple* const Tuple::POISON = reinterpret_cast<Tuple*>(42L);
 
-int64_t Tuple::TotalByteSize(const TupleDescriptor& desc) const {
+int64_t Tuple::TotalByteSize(const TupleDescriptor& desc, bool assume_smallify) const {
   int64_t result = desc.byte_size();
   if (!desc.HasVarlenSlots()) return result;
-  result += VarlenByteSize(desc);
+  result += VarlenByteSize(desc, assume_smallify);
   return result;
 }
 
-int64_t Tuple::VarlenByteSize(const TupleDescriptor& desc) const {
+int64_t Tuple::VarlenByteSize(const TupleDescriptor& desc, bool assume_smallify) const {
   int64_t result = 0;
   vector<SlotDescriptor*>::const_iterator slot = desc.string_slots().begin();
   for (; slot != desc.string_slots().end(); ++slot) {
     DCHECK((*slot)->type().IsVarLenStringType());
     if (IsNull((*slot)->null_indicator_offset())) continue;
     const StringValue* string_val = GetStringSlot((*slot)->tuple_offset());
-    result += string_val->len;
+    result += string_val->ExternalLen(assume_smallify);
   }
 
   slot = desc.collection_slots().begin();
@@ -74,14 +75,15 @@ int64_t Tuple::VarlenByteSize(const TupleDescriptor& desc) const {
     uint8_t* coll_data = coll_value->ptr;
     const TupleDescriptor& item_desc = *(*slot)->children_tuple_descriptor();
     for (int i = 0; i < coll_value->num_tuples; ++i) {
-      result += reinterpret_cast<Tuple*>(coll_data)->TotalByteSize(item_desc);
+      Tuple* tuple = reinterpret_cast<Tuple*>(coll_data);
+      result += tuple->TotalByteSize(item_desc, assume_smallify);
       coll_data += item_desc.byte_size();
     }
   }
   return result;
 }
 
-Tuple* Tuple::DeepCopy(const TupleDescriptor& desc, MemPool* pool) {
+Tuple* Tuple::DeepCopy(const TupleDescriptor& desc, MemPool* pool) const {
   Tuple* result = reinterpret_cast<Tuple*>(pool->Allocate(desc.byte_size()));
   DeepCopy(result, desc, pool);
   return result;
@@ -90,9 +92,13 @@ Tuple* Tuple::DeepCopy(const TupleDescriptor& desc, MemPool* pool) {
 // TODO: the logic is very similar to the other DeepCopy implementation aside from how
 // memory is allocated - can we templatise it somehow to avoid redundancy without runtime
 // overhead.
-void Tuple::DeepCopy(Tuple* dst, const TupleDescriptor& desc, MemPool* pool) {
-  memcpy(dst, this, desc.byte_size());
-  if (desc.HasVarlenSlots()) dst->DeepCopyVarlenData(desc, pool);
+void Tuple::DeepCopy(Tuple* dst, const TupleDescriptor& desc, MemPool* pool) const {
+  if (desc.HasVarlenSlots()) {
+    memcpy(dst, this, desc.byte_size());
+    dst->DeepCopyVarlenData(desc, pool);
+  } else {
+    memcpy(dst, this, desc.byte_size());
+  }
 }
 
 void Tuple::DeepCopyVarlenData(const TupleDescriptor& desc, MemPool* pool) {
@@ -102,9 +108,12 @@ void Tuple::DeepCopyVarlenData(const TupleDescriptor& desc, MemPool* pool) {
     DCHECK((*slot)->type().IsVarLenStringType());
     if (IsNull((*slot)->null_indicator_offset())) continue;
     StringValue* string_v = GetStringSlot((*slot)->tuple_offset());
-    char* string_copy = reinterpret_cast<char*>(pool->Allocate(string_v->len));
-    Ubsan::MemCpy(string_copy, string_v->ptr, string_v->len);
-    string_v->ptr = string_copy;
+    // It is safe to smallify at this point as DeepCopyVarlenData is called on the new
+    // tuple which can be modified.
+    if (string_v->Smallify()) continue;
+    char* string_copy = reinterpret_cast<char*>(pool->Allocate(string_v->Len()));
+    Ubsan::MemCpy(string_copy, string_v->Ptr(), string_v->Len());
+    string_v->SetPtr(string_copy);
   }
 
   for (vector<SlotDescriptor*>::const_iterator slot = desc.collection_slots().begin();
@@ -128,12 +137,14 @@ void Tuple::DeepCopyVarlenData(const TupleDescriptor& desc, MemPool* pool) {
 }
 
 void Tuple::DeepCopy(const TupleDescriptor& desc, char** data, int* offset,
-                     bool convert_ptrs) {
+                     bool convert_ptrs) const {
   Tuple* dst = reinterpret_cast<Tuple*>(*data);
   memcpy(dst, this, desc.byte_size());
   *data += desc.byte_size();
   *offset += desc.byte_size();
-  if (desc.HasVarlenSlots()) dst->DeepCopyVarlenData(desc, data, offset, convert_ptrs);
+  if (desc.HasVarlenSlots()) {
+    dst->DeepCopyVarlenData(desc, data, offset, convert_ptrs);
+  }
 }
 
 void Tuple::DeepCopyVarlenData(const TupleDescriptor& desc, char** data, int* offset,
@@ -144,10 +155,14 @@ void Tuple::DeepCopyVarlenData(const TupleDescriptor& desc, char** data, int* of
     if (IsNull((*slot)->null_indicator_offset())) continue;
 
     StringValue* string_v = GetStringSlot((*slot)->tuple_offset());
-    Ubsan::MemCpy(*data, string_v->ptr, string_v->len);
-    string_v->ptr = convert_ptrs ? reinterpret_cast<char*>(*offset) : *data;
-    *data += string_v->len;
-    *offset += string_v->len;
+    // It is safe to smallify at this point as DeepCopyVarlenData is called on the new
+    // tuple which can be modified.
+    if (string_v->Smallify()) continue;
+    unsigned int len = string_v->Len();
+    Ubsan::MemCpy(*data, string_v->Ptr(), len);
+    string_v->SetPtr(convert_ptrs ? reinterpret_cast<char*>(*offset) : *data);
+    *data += len;
+    *offset += len;
   }
 
   slot = desc.collection_slots().begin();
@@ -169,8 +184,8 @@ void Tuple::DeepCopyVarlenData(const TupleDescriptor& desc, char** data, int* of
     // Copy per-tuple varlen data if necessary.
     if (!item_desc.HasVarlenSlots()) continue;
     for (int i = 0; i < coll_value->num_tuples; ++i) {
-      reinterpret_cast<Tuple*>(coll_data)->DeepCopyVarlenData(
-          item_desc, data, offset, convert_ptrs);
+      Tuple* dst_item = reinterpret_cast<Tuple*>(coll_data);
+      dst_item->DeepCopyVarlenData(item_desc, data, offset, convert_ptrs);
       coll_data += item_desc.byte_size();
     }
   }
@@ -183,8 +198,9 @@ void Tuple::ConvertOffsetsToPointers(const TupleDescriptor& desc, uint8_t* tuple
     if (IsNull((*slot)->null_indicator_offset())) continue;
 
     StringValue* string_val = GetStringSlot((*slot)->tuple_offset());
-    int offset = reinterpret_cast<intptr_t>(string_val->ptr);
-    string_val->ptr = reinterpret_cast<char*>(tuple_data + offset);
+    if (string_val->IsSmall()) continue;
+    int offset = reinterpret_cast<intptr_t>(string_val->Ptr());
+    string_val->SetPtr(reinterpret_cast<char*>(tuple_data + offset));
   }
 
   slot = desc.collection_slots().begin();
@@ -217,12 +233,41 @@ void Tuple::SetNullIndicators(NullIndicatorOffset offset, int64_t num_tuples,
   }
 }
 
-template <bool COLLECT_STRING_VALS, bool NO_POOL>
+// Note: 'noexcept' is added because otherwise in LLVM code this function is called with
+// the 'invoke' instruction, not the 'call' instruction. This is bad because we can't
+// replace functions called with 'invoke' with a codegen'd function.
+//
+// The 'invoke' instruction is for functions that can throw exceptions. It would be chosen
+// here - if we didn't add 'noexcept' - because std::vector<...> (the actual type of
+// 'non_null_string_values' and 'non_null_collection_values') can throw if it fails to
+// allocate memory when it tries to grow. If a noexcept function throws, std::terminate()
+// is called (so no Undefined Behaviour).
+//
+// Currently the hand-crafted function we replace this function with doesn't use the
+// vectors (COLLECT_VAR_LEN_VALS is always false), so no exception will be thrown in
+// codegen code.
+//
+// In interpreted mode, if we crash because of std::terminate(), it is the same as what we
+// did before changing the type of these parameters to std::vector<...>: vector resizing
+// was done in the caller, but there was no catch block for it. This will also be the case
+// if the hand-crafted function in codegen code starts using the vectors.
+template <bool COLLECT_VAR_LEN_VALS, bool NO_POOL>
 void Tuple::MaterializeExprs(TupleRow* row, const TupleDescriptor& desc,
     ScalarExprEvaluator* const* evals, MemPool* pool,
-    StringValue** non_null_string_values, int* total_string_lengths,
-    int* num_non_null_string_values) {
+    CodegenTypes::StringValuePtrVecType* non_null_string_values,
+    CodegenTypes::CollValuePtrAndSizeVecType* non_null_collection_values,
+    int* total_varlen_lengths,
+    int* num_non_null_string_values, int* num_non_null_collection_values) noexcept {
+  if constexpr (COLLECT_VAR_LEN_VALS) {
+    DCHECK(non_null_string_values != nullptr);
+    DCHECK(non_null_collection_values != nullptr);
+    DCHECK(total_varlen_lengths != nullptr);
+    DCHECK(num_non_null_string_values != nullptr);
+    DCHECK(num_non_null_collection_values != nullptr);
+  }
+
   ClearNullBits(desc);
+
   // Evaluate the materialize_expr_evals and place the results in the tuple.
   for (int i = 0; i < desc.slots().size(); ++i) {
     SlotDescriptor* slot_desc = desc.slots()[i];
@@ -232,22 +277,31 @@ void Tuple::MaterializeExprs(TupleRow* row, const TupleDescriptor& desc,
     DCHECK(slot_desc->type().type == TYPE_NULL ||
         slot_desc->type() == evals[i]->root().type());
     void* src = evals[i]->GetValue(row);
-    if (src != NULL) {
-      vector<StringValue*> string_values;
-      RawValue::Write<COLLECT_STRING_VALS>(src, this, slot_desc, pool, &string_values);
-      if (string_values.size() > 0) {
-        for (StringValue* string_val : string_values) {
-          *(non_null_string_values++) = string_val;
-          *total_string_lengths += string_val->len;
-        }
-        (*num_non_null_string_values) += string_values.size();
+
+    const size_t old_num_string_values = COLLECT_VAR_LEN_VALS ?
+        non_null_string_values->size() : 0;
+    const size_t old_num_collection_values = COLLECT_VAR_LEN_VALS ?
+        non_null_collection_values->size() : 0;
+    RawValue::Write<COLLECT_VAR_LEN_VALS>(src, this, slot_desc, pool,
+        non_null_string_values, non_null_collection_values);
+
+    if constexpr (COLLECT_VAR_LEN_VALS) {
+      const size_t new_num_string_values = non_null_string_values->size();
+      for (size_t i = old_num_string_values; i < new_num_string_values; i++) {
+        const StringValue* string_val = (*non_null_string_values)[i];
+        DCHECK(!string_val->IsSmall());
+        *total_varlen_lengths += string_val->Len();
       }
-    } else {
-      if (slot_desc->type().IsStructType()) {
-        SetStructToNull(slot_desc);
-      } else {
-        SetNull(slot_desc->null_indicator_offset());
+      (*num_non_null_string_values) += new_num_string_values - old_num_string_values;
+
+      const size_t new_num_collection_values = non_null_collection_values->size();
+      for (size_t i = old_num_collection_values; i < new_num_collection_values; i++) {
+        const pair<CollectionValue*, int64_t>& collection_val_pair =
+            (*non_null_collection_values)[i];
+        *total_varlen_lengths += collection_val_pair.second;
       }
+      (*num_non_null_collection_values) +=
+          new_num_collection_values - old_num_collection_values;
     }
   }
 }
@@ -277,66 +331,79 @@ char* Tuple::AllocateStrings(const char* err_ctx, RuntimeState* state,
 // Codegens an unrolled version of MaterializeExprs(). Uses codegen'd exprs and slot
 // writes. If 'pool' is non-NULL, string data is copied into it.
 //
-// Example IR for materializing a string column with non-NULL 'pool':
+// Example IR for materializing a string column with non-NULL 'pool', produced by the
+// following query:
+//   select l_comment
+//   from tpch.lineitem
+//   order by l_comment
+//   limit 10;
 //
-// ; Function Attrs: alwaysinline
+//
 // define void @MaterializeExprs(%"class.impala::Tuple"* %opaque_tuple,
 //     %"class.impala::TupleRow"* %row, %"class.impala::TupleDescriptor"* %desc,
-//     %"class.impala::ScalarExprEvaluator"** %materialize_expr_evals,
+//     %"class.impala::ScalarExprEvaluator"** %slot_materialize_expr_evals,
 //     %"class.impala::MemPool"* %pool,
-//     %"struct.impala::StringValue"** %non_null_string_values,
-//     i32* %total_string_lengths, i32* %num_non_null_string_values) #34 {
+//     %"class.std::vector.1154"* %non_null_string_values,
+//     %"class.std::vector.1159"* %non_null_collection_values, i32* %total_varlen_lengths,
+//     i32* %num_non_null_string_values, i32* %num_non_null_collection_values) #50 {
 // entry:
-//   %tuple = bitcast %"class.impala::Tuple"* %opaque_tuple to
-//       <{ %"struct.impala::StringValue", i8 }>*
+//   %tuple = bitcast %"class.impala::Tuple"* %opaque_tuple
+//       to <{ %"struct.impala::StringValue", i8 }>*
 //   %int8_ptr = bitcast <{ %"struct.impala::StringValue", i8 }>* %tuple to i8*
-//   %null_bytes_ptr = getelementptr inbounds i8, i8* %int8_ptr, i32 16
+//   %null_bytes_ptr = getelementptr inbounds i8, i8* %int8_ptr, i32 12
 //   call void @llvm.memset.p0i8.i64(i8* %null_bytes_ptr, i8 0, i64 1, i32 0, i1 false)
-//   %0 = getelementptr %"class.impala::ExprContext"*,
-//       %"class.impala::ExprContext"** %materialize_expr_ctxs, i32 0
-//   %expr_ctx = load %"class.impala::ExprContext"*, %"class.impala::ExprContext"** %0
-//   %src = call { i64, i8* } @"impala::StringFunctions::UpperWrapper"(
-//        %"class.impala::ExprContext"* %expr_ctx, %"class.impala::TupleRow"* %row)
+//   %0 = getelementptr %"class.impala::ScalarExprEvaluator"*,
+//       %"class.impala::ScalarExprEvaluator"** %slot_materialize_expr_evals, i32 0
+//   %expr_eval = load %"class.impala::ScalarExprEvaluator"*,
+//       %"class.impala::ScalarExprEvaluator"** %0
+//   %src = call { i64, i8* } @GetSlotRef.4(
+//       %"class.impala::ScalarExprEvaluator"* %expr_eval,
+//       %"class.impala::TupleRow"* %row)
+//   ; -- generated by CodegenAnyVal::ToReadWriteInfo() and
+//   ; -- SlotDescriptor::CodegenWriteToSlot()
+//   br label %entry1
+//
+// entry1:                                           ; preds = %entry
 //   %1 = extractvalue { i64, i8* } %src, 0
-//   ; ----- generated by CodegenAnyVal::WriteToSlot() ----------------------------------
 //   %is_null = trunc i64 %1 to i1
 //   br i1 %is_null, label %null, label %non_null
 //
-// non_null:                                         ; preds = %entry
-//   %slot = getelementptr inbounds <{ %"struct.impala::StringValue", i8 }>,
-//       <{ %"struct.impala::StringValue", i8 }>* %tuple, i32 0, i32 0
+// non_null:                                         ; preds = %entry1
 //   %2 = extractvalue { i64, i8* } %src, 0
 //   %3 = ashr i64 %2, 32
 //   %4 = trunc i64 %3 to i32
+//   %src2 = extractvalue { i64, i8* } %src, 1
+//   %slot = getelementptr inbounds <{ %"struct.impala::StringValue", i8 }>,
+//       <{ %"struct.impala::StringValue", i8 }>* %tuple, i32 0, i32 0
 //   %5 = insertvalue %"struct.impala::StringValue" zeroinitializer, i32 %4, 1
 //   %6 = sext i32 %4 to i64
-//   %new_ptr = call i8* @_ZN6impala7MemPool8AllocateILb0EEEPhli(
+//   %new_coll_val_ptr = call i8* @_ZN6impala7MemPool8AllocateILb0EEEPhli(
 //       %"class.impala::MemPool"* %pool, i64 %6, i32 8)
-//   %src1 = extractvalue { i64, i8* } %src, 1
-//   call void @llvm.memcpy.p0i8.p0i8.i32(
-//       i8* %new_ptr, i8* %src1, i32 %4, i32 0, i1 false)
-//   %7 = insertvalue %"struct.impala::StringValue" %5, i8* %new_ptr, 0
+//   call void @llvm.memcpy.p0i8.p0i8.i32(i8* %new_coll_val_ptr, i8* %src2, i32 %4, i32 0,
+//       i1 false)
+//   %7 = insertvalue %"struct.impala::StringValue" %5, i8* %new_coll_val_ptr, 0
 //   store %"struct.impala::StringValue" %7, %"struct.impala::StringValue"* %slot
 //   br label %end_write
 //
-// null:                                             ; preds = %entry
+// null:                                             ; preds = %entry1
 //   %8 = bitcast <{ %"struct.impala::StringValue", i8 }>* %tuple to i8*
-//   %null_byte_ptr = getelementptr inbounds i8, i8* %8, i32 16
+//   %null_byte_ptr = getelementptr inbounds i8, i8* %8, i32 12
 //   %null_byte = load i8, i8* %null_byte_ptr
 //   %null_bit_set = or i8 %null_byte, 1
 //   store i8 %null_bit_set, i8* %null_byte_ptr
 //   br label %end_write
 //
 // end_write:                                        ; preds = %null, %non_null
-//   ; ----- end CodegenAnyVal::WriteToSlot() -------------------------------------------
+//   ; -- end CodegenAnyVal::ToReadWriteInfo() and SlotDescriptor::CodegenWriteToSlot()
 //   ret void
 // }
-Status Tuple::CodegenMaterializeExprs(LlvmCodeGen* codegen, bool collect_string_vals,
+Status Tuple::CodegenMaterializeExprs(LlvmCodeGen* codegen, bool collect_varlen_vals,
     const TupleDescriptor& desc, const vector<ScalarExpr*>& slot_materialize_exprs,
     bool use_mem_pool, llvm::Function** fn) {
-  // Only support 'collect_string_vals' == false for now.
-  if (collect_string_vals) {
-    return Status("CodegenMaterializeExprs() collect_string_vals == true NYI");
+  // Only support 'collect_varlen_vals' == false for now.
+  // TODO IMPALA-12068: implement it for 'collect_varlen_vals' == true too.
+  if (collect_varlen_vals) {
+    return Status("CodegenMaterializeExprs() collect_varlen_vals == true NYI");
   }
   llvm::LLVMContext& context = codegen->context();
 
@@ -353,45 +420,55 @@ Status Tuple::CodegenMaterializeExprs(LlvmCodeGen* codegen, bool collect_string_
 
   // Construct function signature (this must exactly match the actual signature since it's
   // used in xcompiled IR). With 'pool':
-  // void MaterializeExprs(Tuple* tuple, TupleRow* row, TupleDescriptor* desc,
-  //     ScalarExprEvaluator** slot_materialize_exprs, MemPool* pool,
-  //     StringValue** non_null_string_values, int* total_string_lengths)
+  // void MaterializeExprs(Tuple* opaque_tuple, TupleRow* row,
+  //     const TupleDescriptor& desc, ScalarExprEvaluator* const* evals, MemPool* pool,
+  //     CodegenTypes::StringValuePtrVecType* non_null_string_values,
+  //     CodegenTypes::CollValuePtrAndSizeVecType* non_null_collection_values,
+  //     int* total_varlen_lengths, int* num_non_null_string_values,
+  //     int* num_non_null_collection_values);
   llvm::PointerType* opaque_tuple_type = codegen->GetStructPtrType<Tuple>();
   llvm::PointerType* row_type = codegen->GetStructPtrType<TupleRow>();
   llvm::PointerType* desc_type = codegen->GetStructPtrType<TupleDescriptor>();
   llvm::PointerType* expr_evals_type =
       codegen->GetStructPtrPtrType<ScalarExprEvaluator>();
   llvm::PointerType* pool_type = codegen->GetStructPtrType<MemPool>();
-  llvm::PointerType* string_values_type = codegen->GetStructPtrPtrType<StringValue>();
+  llvm::Type* string_values_type =
+      CodegenTypes::getStringValuePtrVecType(codegen)->getPointerTo();
+  llvm::Type* coll_values_and_sizes_type =
+      CodegenTypes::getCollValuePtrAndSizeVecType(codegen)->getPointerTo();
   llvm::PointerType* int_ptr_type = codegen->i32_ptr_type();
+
   LlvmCodeGen::FnPrototype prototype(codegen, "MaterializeExprs", codegen->void_type());
   prototype.AddArgument("opaque_tuple", opaque_tuple_type);
   prototype.AddArgument("row", row_type);
   prototype.AddArgument("desc", desc_type);
-  prototype.AddArgument("slot_materialize_exprs", expr_evals_type);
+  prototype.AddArgument("slot_materialize_expr_evals", expr_evals_type);
   prototype.AddArgument("pool", pool_type);
   prototype.AddArgument("non_null_string_values", string_values_type);
-  prototype.AddArgument("total_string_lengths", int_ptr_type);
+  prototype.AddArgument("non_null_collection_values", coll_values_and_sizes_type);
+  prototype.AddArgument("total_varlen_lengths", int_ptr_type);
   prototype.AddArgument("num_non_null_string_values", int_ptr_type);
+  prototype.AddArgument("num_non_null_collection_values", int_ptr_type);
 
   LlvmBuilder builder(context);
-  llvm::Value* args[8];
+  llvm::Value* args[10];
   *fn = prototype.GeneratePrototype(&builder, args);
   llvm::Value* opaque_tuple_arg = args[0];
   llvm::Value* row_arg = args[1];
   // llvm::Value* desc_arg = args[2]; // unused
   llvm::Value* expr_evals_arg = args[3];
   llvm::Value* pool_arg = args[4];
-  // The followings arguments are unused as 'collect_string_vals' is false.
+  // The followings arguments are unused as 'collect_varlen_vals' is false.
   // llvm::Value* non_null_string_values_arg = args[5]; // unused
-  // llvm::Value* total_string_lengths_arg = args[6]; // unused
-  // llvm::Value* num_non_null_string_values_arg = args[7]; // unused
+  // llvm::Value* non_null_collection_values_arg = args[6]; // unused
+  // llvm::Value* total_varlen_lengths_arg = args[7]; // unused
+  // llvm::Value* num_non_null_string_values_arg = args[8]; // unused
+  // llvm::Value* num_non_null_collection_values_arg = args[9]; // unused
 
   // Cast the opaque Tuple* argument to the generated struct type
   llvm::Type* tuple_struct_type = desc.GetLlvmStruct(codegen);
-  if (tuple_struct_type == NULL) {
-    return Status("CodegenMaterializeExprs(): failed to generate tuple desc");
-  }
+  DCHECK(tuple_struct_type != nullptr);
+
   llvm::PointerType* tuple_type = codegen->GetPtrType(tuple_struct_type);
   llvm::Value* tuple = builder.CreateBitCast(opaque_tuple_arg, tuple_type, "tuple");
 
@@ -412,7 +489,9 @@ Status Tuple::CodegenMaterializeExprs(LlvmCodeGen* codegen, bool collect_string_
         slot_materialize_exprs[i]->type(), materialize_expr_fns[i], expr_args, "src");
 
     // Write expr result 'src' to slot
-    src.WriteToSlot(*slot_desc, tuple, use_mem_pool ? pool_arg : nullptr);
+    CodegenAnyValReadWriteInfo read_write_info = src.ToReadWriteInfo();
+    slot_desc->CodegenWriteToSlot(
+        read_write_info, tuple, use_mem_pool ? pool_arg : nullptr);
   }
   builder.CreateRetVoid();
   // TODO: if pool != NULL, OptimizeFunctionWithExprs() is inlining the Allocate()
@@ -487,12 +566,26 @@ llvm::Constant* SlotOffsets::ToIR(LlvmCodeGen* codegen) const {
           codegen->GetI32Constant(tuple_offset)});
 }
 
+llvm::Type* Tuple::CodegenTypes::getStringValuePtrVecType(LlvmCodeGen* codegen) {
+  llvm::StructType* codegenTypes = codegen->GetStructType<Tuple::CodegenTypes>();
+  return codegenTypes->getElementType(0);
+}
+
+llvm::Type* Tuple::CodegenTypes::getCollValuePtrAndSizeVecType(LlvmCodeGen* codegen) {
+  llvm::StructType* codegenTypes = codegen->GetStructType<Tuple::CodegenTypes>();
+  return codegenTypes->getElementType(1);
+}
+
 template void Tuple::MaterializeExprs<false, false>(TupleRow*, const TupleDescriptor&,
-    ScalarExprEvaluator* const*, MemPool*, StringValue**, int*, int*);
+    ScalarExprEvaluator* const*, MemPool*, Tuple::CodegenTypes::StringValuePtrVecType*,
+    Tuple::CodegenTypes::CollValuePtrAndSizeVecType*, int*, int*, int*);
 template void Tuple::MaterializeExprs<false, true>(TupleRow*, const TupleDescriptor&,
-    ScalarExprEvaluator* const*, MemPool*, StringValue**, int*, int*);
+    ScalarExprEvaluator* const*, MemPool*, Tuple::CodegenTypes::StringValuePtrVecType*,
+    Tuple::CodegenTypes::CollValuePtrAndSizeVecType*, int*, int*, int*);
 template void Tuple::MaterializeExprs<true, false>(TupleRow*, const TupleDescriptor&,
-    ScalarExprEvaluator* const*, MemPool*, StringValue**, int*, int*);
+    ScalarExprEvaluator* const*, MemPool*, Tuple::CodegenTypes::StringValuePtrVecType*,
+    Tuple::CodegenTypes::CollValuePtrAndSizeVecType*, int*, int*, int*);
 template void Tuple::MaterializeExprs<true, true>(TupleRow*, const TupleDescriptor&,
-    ScalarExprEvaluator* const*, MemPool*, StringValue**, int*, int*);
+    ScalarExprEvaluator* const*, MemPool*, Tuple::CodegenTypes::StringValuePtrVecType*,
+    Tuple::CodegenTypes::CollValuePtrAndSizeVecType*, int*, int*, int*);
 }

@@ -102,6 +102,9 @@ bool HdfsScanner::EvalRuntimeFilter(int i, TupleRow* row) {
   const FilterContext* ctx = filter_ctxs_[i];
   ++stats->total_possible;
   if (stats->enabled_for_row && ctx->filter->HasFilter()) {
+    // Evaluating IN-list filter is much slower than evaluating the corresponding bloom
+    // filter. Skip it until we improve its performance.
+    if (ctx->filter->is_in_list_filter()) return true;
     ++stats->considered;
     if (!ctx->Eval(row)) {
       ++stats->rejected;
@@ -121,9 +124,9 @@ bool HdfsScanner::TextConverterWriteSlotInterpretedIR(HdfsScanner* hdfs_scanner,
     need_escape = true;
   }
 
-  SlotDescriptor* desc = hdfs_scanner->scan_node_->materialized_slots()[slot_idx];
-  return hdfs_scanner->text_converter_->WriteSlot(desc, tuple, data, len, copy_string,
-      need_escape, pool);
+  SlotDescriptor* slot_desc = hdfs_scanner->scan_node_->materialized_slots()[slot_idx];
+  return hdfs_scanner->text_converter_->WriteSlot(slot_desc, tuple, data, len,
+       copy_string, need_escape, pool);
 }
 
 // Define the string parsing functions for llvm.  Stamp out the templated functions

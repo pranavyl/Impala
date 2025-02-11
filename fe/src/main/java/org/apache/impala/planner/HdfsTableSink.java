@@ -41,10 +41,8 @@ import org.apache.impala.thrift.TTableSinkType;
 import org.apache.impala.util.BitUtil;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Sets;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,9 +66,24 @@ public class HdfsTableSink extends TableSink {
   public static final long PARQUET_BLOOM_FILTER_MAX_BYTES = 128 * 1024 * 1024;
   public static final long PARQUET_BLOOM_FILTER_MIN_BYTES = 64;
 
+  // Minimum total writes in bytes that individual HdfsTableSink should aim.
+  // Used to estimate parallelism of writer fragment in DistributedPlanner.java.
+  // This is set to match with HDFS_BLOCK_SIZE in hdfs-parquet-table-writer.h.
+  public static final int MIN_WRITE_BYTES = 256 * 1024 * 1024;
+
   // Default number of partitions used for computeResourceProfile() in the absence of
   // column stats.
   protected final long DEFAULT_NUM_PARTITIONS = 10;
+
+  // Coefficiencts for estimating insert CPU processing cost. Derived from benchmarking.
+  // Cost per byte for Parquet inserts
+  private static final double COST_COEFFICIENT_PARQUET_BYTES_INSERTED = 0.1170;
+  // Fixed cost for Parquet inserts
+  private static final double PARQUET_FIXED_INSERT_COST = 3954235.0;
+  // Cost per byte for non-Parquet inserts (benchmarks used TEXT format)
+  private static final double COST_COEFFICIENT_DEFAULT_BYTES_INSERTED = 0.2916;
+  // Fixed cost for non-Parquet inserts (benchmarks used TEXT format)
+  private static final double DEFAULT_FIXED_INSERT_COST = 3621898.0;
 
   // Exprs for computing the output partition(s).
   protected final List<Expr> partitionKeyExprs_;
@@ -143,6 +156,37 @@ public class HdfsTableSink extends TableSink {
   }
 
   @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    PlanNode inputNode = fragment_.getPlanRoot();
+    long cardinality = Math.max(0, inputNode.getCardinality());
+    float avgRowDataSize = inputNode.getAvgRowSizeWithoutPad();
+    long estBytesInserted = (long) Math.ceil(avgRowDataSize * (double) cardinality);
+    double totalCost = 0.0F;
+    FeFsTable table = (FeFsTable) targetTable_;
+    String fileFormat;
+    Set<HdfsFileFormat> formats = table.getFileFormats();
+    if (formats.contains(HdfsFileFormat.PARQUET)
+        || formats.contains(HdfsFileFormat.ICEBERG)) {
+      fileFormat = "PARQUET";
+      // Use cost coefficients measured for Parquet format.
+      totalCost = (estBytesInserted * COST_COEFFICIENT_PARQUET_BYTES_INSERTED)
+          + PARQUET_FIXED_INSERT_COST;
+    } else {
+      fileFormat = "NON-PARQUET";
+      // Use default cost coefficients measured with TEXT format.
+      // TODO: Improve estimates for other formats
+      totalCost = (estBytesInserted * COST_COEFFICIENT_DEFAULT_BYTES_INSERTED)
+          + DEFAULT_FIXED_INSERT_COST;
+    }
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("HdfsTableSink insert CPU cost estimate: " + totalCost
+          + ", File Format: " + fileFormat + ", Cardinality: " + cardinality
+          + ", Estimated Bytes Inserted: " + estBytesInserted);
+    }
+    processingCost_ = ProcessingCost.basicCost(getLabel(), totalCost);
+  }
+
+  @Override
   public void computeResourceProfile(TQueryOptions queryOptions) {
     PlanNode inputNode = fragment_.getPlanRoot();
     int numInstances = fragment_.getNumInstances();
@@ -155,7 +199,7 @@ public class HdfsTableSink extends TableSink {
       numBufferedPartitionsPerInstance = 1;
     } else {
       numBufferedPartitionsPerInstance =
-          fragment_.getPerInstanceNdv(queryOptions.getMt_dop(), partitionKeyExprs_);
+          fragment_.getPerInstanceNdv(partitionKeyExprs_, false);
       if (numBufferedPartitionsPerInstance == -1) {
         numBufferedPartitionsPerInstance = DEFAULT_NUM_PARTITIONS;
       }
@@ -220,15 +264,17 @@ public class HdfsTableSink extends TableSink {
         targetTable_.getFullName(), overwriteStr, partitionKeyStr));
     // Report the total number of partitions, independent of the number of nodes
     // and the data partition of the fragment executing this sink.
-    if (explainLevel.ordinal() > TExplainLevel.MINIMAL.ordinal()) {
-      long totalNumPartitions = Expr.getNumDistinctValues(partitionKeyExprs_);
-      if (totalNumPartitions == -1) {
-        output.append(detailPrefix + "partitions=unavailable");
-      } else {
-        output.append(detailPrefix + "partitions="
-            + (totalNumPartitions == 0 ? 1 : totalNumPartitions));
+    if (!(targetTable_ instanceof FeIcebergTable)) {
+      if (explainLevel.ordinal() > TExplainLevel.MINIMAL.ordinal()) {
+        long totalNumPartitions = Expr.getNumDistinctValues(partitionKeyExprs_);
+        if (totalNumPartitions == -1) {
+          output.append(detailPrefix + "partitions=unavailable");
+        } else {
+          output.append(detailPrefix + "partitions="
+              + (totalNumPartitions == 0 ? 1 : totalNumPartitions));
+        }
+        output.append("\n");
       }
-      output.append("\n");
     }
     if (explainLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
       output.append(detailPrefix + "output exprs: ")
@@ -350,7 +396,7 @@ public class HdfsTableSink extends TableSink {
   /**
    * Return an estimate of the number of nodes the fragment with this sink will
    * run on. This is based on the number of nodes set for the plan root and has an
-   * upper limit set by the MAX_HDFS_WRITER query option.
+   * upper limit set by the MAX_FS_WRITERS query option.
    */
   public int getNumNodes() {
     int num_nodes = getFragment().getPlanRoot().getNumNodes();
@@ -365,7 +411,7 @@ public class HdfsTableSink extends TableSink {
   /**
    * Return an estimate of the number of instances the fragment with this sink
    * will run on. This is based on the number of instances set for the plan root
-   * and has an upper limit set by the MAX_HDFS_WRITER query option.
+   * and has an upper limit set by the MAX_FS_WRITERS query option.
    */
   public int getNumInstances() {
     int num_instances = getFragment().getPlanRoot().getNumInstances();
@@ -373,5 +419,48 @@ public class HdfsTableSink extends TableSink {
       num_instances =  Math.min(num_instances, maxHdfsSinks_);
     }
     return num_instances;
+  }
+
+  @Override
+  public void computeRowConsumptionAndProductionToCost() {
+    super.computeRowConsumptionAndProductionToCost();
+    fragment_.setFixedInstanceCount(fragment_.getNumInstances());
+  }
+
+  /**
+   * Estimate such that each writer will work on at least MIN_WRITE_BYTES of rows.
+   * However, if this is a partitioned insert, the output volume will be divided
+   * into several partitions. In that case, consider totalNumPartitions so that
+   * total num writers is close to totalNumPartitions.
+   */
+  public static int bytesBasedNumWriters(int numInputNodes, int maxNumWriters,
+      boolean isPartitioned, long totalNumPartitions, long inputCardinality,
+      double avgRowSize) {
+    Preconditions.checkArgument(maxNumWriters > 0);
+    Preconditions.checkArgument(inputCardinality >= 0);
+    Preconditions.checkArgument(avgRowSize >= 0);
+    if (inputCardinality == 0) return 1;
+    long byteBasedNumWriters = (long) Math.round(
+        (avgRowSize / HdfsTableSink.MIN_WRITE_BYTES) * inputCardinality);
+
+    if (isPartitioned && totalNumPartitions > 0) {
+      // This is a partitioned insert and totalNumPartitions is known.
+      // Utilize all input nodes if possible, but do not schedule more writers than
+      // partitions, except if there is only 1 partition.
+      if (totalNumPartitions == 1) {
+        // Force colocation between input fragment and writer fragment.
+        // Note that we are risking writing more files than needed here to gain
+        // performance by not shuffling.
+        byteBasedNumWriters = numInputNodes;
+      } else {
+        long minWriters = Math.min(numInputNodes, totalNumPartitions);
+        long maxWriters = totalNumPartitions;
+        byteBasedNumWriters = Math.max(minWriters, byteBasedNumWriters);
+        byteBasedNumWriters = Math.min(maxWriters, byteBasedNumWriters);
+      }
+    }
+
+    // Cap it at most maxNumWriters and at least one writer.
+    return (int) Math.max(1, Math.min(maxNumWriters, byteBasedNumWriters));
   }
 }

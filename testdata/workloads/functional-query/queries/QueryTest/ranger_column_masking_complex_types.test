@@ -45,7 +45,7 @@ select id, nested_struct.a from complextypestbl
 BIGINT,INT
 ====
 ---- QUERY
-# Test resolving nested columns in expending star expression.
+# Test resolving nested columns in expanding star expression.
 select id, nested_struct.* from complextypestbl
 ---- RESULTS
 100,1
@@ -58,6 +58,125 @@ select id, nested_struct.* from complextypestbl
 800,-1
 ---- TYPES
 BIGINT,INT
+====
+---- QUERY
+# Test resolving nested columns in expanding star expression.
+select nested_struct.* from complextypestbl
+---- RESULTS
+1
+NULL
+NULL
+NULL
+NULL
+NULL
+7
+-1
+---- TYPES
+INT
+====
+---- QUERY
+# Test resolving nested columns in expanding star expression.
+set EXPAND_COMPLEX_TYPES=1;
+select nested_struct.* from complextypestbl
+---- RESULTS
+-1,'[-1]','{"d":[[{"e":-1,"f":"nonnullable"}]]}','{}'
+1,'[1]','{"d":[[{"e":10,"f":"aaa"},{"e":-10,"f":"bbb"}],[{"e":11,"f":"c"}]]}','{"foo":{"h":{"i":[1.1]}}}'
+NULL,'[null]','{"d":[[{"e":null,"f":null},{"e":10,"f":"aaa"},{"e":null,"f":null},{"e":-10,"f":"bbb"},{"e":null,"f":null}],[{"e":11,"f":"c"},null],[],null]}','{"g1":{"h":{"i":[2.2,null]}},"g2":{"h":{"i":[]}},"g3":null,"g4":{"h":{"i":null}},"g5":{"h":null}}'
+NULL,'NULL','{"d":[]}','{}'
+NULL,'NULL','{"d":null}','NULL'
+NULL,'NULL','NULL','{"foo":{"h":{"i":[2.2,3.3]}}}'
+NULL,'NULL','NULL','NULL'
+7,'[2,3,null]','{"d":[[],[null],null]}','NULL'
+---- TYPES
+INT,STRING,STRING,STRING
+====
+---- QUERY
+# Test resolving explicit STAR path on a nested struct column inside array
+select id, nested_arr.item.*
+from complextypestbl t,
+  t.nested_struct.c.d arr,
+  arr.item nested_arr;
+---- RESULTS
+100,10,'aaa'
+100,-10,'bbb'
+100,11,'c'
+200,NULL,'NULL'
+200,10,'aaa'
+200,NULL,'NULL'
+200,-10,'bbb'
+200,NULL,'NULL'
+200,11,'c'
+200,NULL,'NULL'
+700,NULL,'NULL'
+800,-1,'nonnullable'
+---- TYPES
+BIGINT,INT,STRING
+====
+---- QUERY
+# Test resolving explicit STAR path on a nested struct column inside array
+select nested_arr.item.*
+from complextypestbl t,
+  t.nested_struct.c.d arr,
+  arr.item nested_arr;
+---- RESULTS
+10,'aaa'
+-10,'bbb'
+11,'c'
+NULL,'NULL'
+10,'aaa'
+NULL,'NULL'
+-10,'bbb'
+NULL,'NULL'
+11,'c'
+NULL,'NULL'
+NULL,'NULL'
+-1,'nonnullable'
+---- TYPES
+INT,STRING
+====
+---- QUERY
+# Test resolving implicit STAR path on a nested struct column inside array
+select id, nested_arr.*
+from complextypestbl t,
+  t.nested_struct.c.d arr,
+  arr.item nested_arr;
+---- RESULTS
+100,10,'aaa'
+100,-10,'bbb'
+100,11,'c'
+200,NULL,'NULL'
+200,10,'aaa'
+200,NULL,'NULL'
+200,-10,'bbb'
+200,NULL,'NULL'
+200,11,'c'
+200,NULL,'NULL'
+700,NULL,'NULL'
+800,-1,'nonnullable'
+---- TYPES
+BIGINT,INT,STRING
+====
+---- QUERY
+# Test resolving explicit STAR path on a nested struct column inside array
+select nested_arr.*
+from complextypestbl t,
+  t.nested_struct.c.d arr,
+  arr.item nested_arr;
+---- RESULTS
+10,'aaa'
+-10,'bbb'
+11,'c'
+NULL,'NULL'
+10,'aaa'
+NULL,'NULL'
+-10,'bbb'
+NULL,'NULL'
+11,'c'
+NULL,'NULL'
+NULL,'NULL'
+-1,'nonnullable'
+---- TYPES
+INT,STRING
 ====
 ---- QUERY
 # Test resolving nested column in function.
@@ -615,4 +734,33 @@ where (t2.id + t3.id + t3.nested_struct.a = 201 or t2.nested_struct.a is null)
 100,1
 ---- TYPES
 INT,INT
+====
+---- QUERY
+select id, a.item from complextypes_arrays_only_view v, v.int_array a;
+---- RESULTS
+100,1
+100,2
+100,3
+200,NULL
+200,1
+200,2
+200,NULL
+200,3
+200,NULL
+800,-1
+---- TYPES
+BIGINT,INT
+====
+---- QUERY
+select id, a.key, a.value from complextypes_maps_view v, v.int_map a;
+---- RESULTS
+100,'k1',1
+100,'k2',100
+200,'k1',2
+200,'k2',NULL
+700,'k1',NULL
+700,'k3',NULL
+800,'k1',-1
+---- TYPES
+BIGINT,STRING,INT
 ====

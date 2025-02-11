@@ -15,13 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+import distro
 import json
 import logging
 import os
 import pytest
 import re
 import requests
-import platform
 
 LOG = logging.getLogger('tests.common.environ')
 test_start_cluster_args = os.environ.get("TEST_START_CLUSTER_ARGS", "")
@@ -46,16 +47,12 @@ if os.path.isfile(IMPALA_LOCAL_VERSION_INFO):
   if IMPALA_LOCAL_BUILD_VERSION is None:
     raise Exception("Could not find VERSION in {0}".format(IMPALA_LOCAL_VERSION_INFO))
 
-# Check if it is Red Hat/CentOS Linux
-distribution = platform.linux_distribution()
-distname = distribution[0].lower()
-version = distribution[1]
-IS_REDHAT_6_DERIVATIVE = False
+# Check if it is Red Hat/CentOS/Rocky/AlmaLinux Linux
 IS_REDHAT_DERIVATIVE = False
-if distname.find('centos') or distname.find('red hat'):
+# Python >= 3.8 removed platform.linux_distribution(). This now uses the 'distro'
+# package, which provides equivalent functionality across Python versions.
+if distro.id() in ['rhel', 'rocky', 'centos', 'almalinux']:
   IS_REDHAT_DERIVATIVE = True
-  if len(re.findall('^6\.*', version)) > 0:
-    IS_REDHAT_6_DERIVATIVE = True
 
 # Find the likely BuildType of the running Impala. Assume it's found through the path
 # $IMPALA_HOME/be/build/latest as a fallback.
@@ -80,6 +77,8 @@ else:
   MANAGED_WAREHOUSE_DIR = 'test-warehouse'
 EXTERNAL_WAREHOUSE_DIR = 'test-warehouse'
 
+IS_APACHE_HIVE = os.environ.get("USE_APACHE_HIVE", False) == 'true'
+
 # Resolve any symlinks in the path.
 impalad_basedir = \
     os.path.realpath(os.path.join(IMPALA_HOME, 'be/build', build_type_dir)).rstrip('/')
@@ -92,8 +91,23 @@ kernel_release = os.uname()[2]
 kernel_version_regex = re.compile(r'(\d+)\.(\d+)\.(\d+)\-(\d+).*')
 kernel_version_match = kernel_version_regex.match(kernel_release)
 if kernel_version_match is not None and len(kernel_version_match.groups()) == 4:
-  kernel_version = map(lambda x: int(x), list(kernel_version_match.groups()))
+  kernel_version = [int(x) for x in list(kernel_version_match.groups())]
 IS_BUGGY_EL6_KERNEL = 'el6' in kernel_release and kernel_version < [2, 6, 32, 674]
+
+# Detect if we're testing a different JDK than we used to build and start minicluster.
+IS_TEST_JDK = os.environ.get("TEST_JAVA_HOME_OVERRIDE",
+                             os.environ.get("TEST_JDK_VERSION", "")) != ""
+
+# Detect if we are testing with tuple cache enabled.
+IS_TUPLE_CACHE = (
+    os.getenv("TUPLE_CACHE_DIR", "") != ""
+    and os.getenv("TUPLE_CACHE_CAPACITY", "") != ""
+)
+
+# Detect if we are testing with tuple cache correctness check enabled.
+IS_TUPLE_CACHE_CORRECT_CHECK = (
+    os.getenv("TUPLE_CACHE_DEBUG_DUMP_DIR", "") != ""
+)
 
 class ImpalaBuildFlavors:
   """
@@ -105,6 +119,8 @@ class ImpalaBuildFlavors:
   ADDRESS_SANITIZER = 'address_sanitizer'
   # ./buildall.sh
   DEBUG = 'debug'
+  # ./buildall.sh -debug_noopt
+  DEBUG_NOOPT = 'debug_noopt'
   # ./buildall.sh -release
   RELEASE = 'release'
   # ./buildall.sh -codecoverage
@@ -122,8 +138,8 @@ class ImpalaBuildFlavors:
   # ./buildall.sh -full_ubsan
   UBSAN_FULL = 'ubsan_full'
 
-  VALID_BUILD_TYPES = [ADDRESS_SANITIZER, DEBUG, CODE_COVERAGE_DEBUG, RELEASE,
-      CODE_COVERAGE_RELEASE, TIDY, TSAN, TSAN_FULL, UBSAN, UBSAN_FULL]
+  VALID_BUILD_TYPES = [ADDRESS_SANITIZER, DEBUG, DEBUG_NOOPT, CODE_COVERAGE_DEBUG,
+       RELEASE, CODE_COVERAGE_RELEASE, TIDY, TSAN, TSAN_FULL, UBSAN, UBSAN_FULL]
 
 
 class LinkTypes:
@@ -366,7 +382,6 @@ class ImpalaTestClusterProperties(object):
     """Checks whether we use local catalog."""
     try:
       key = "use_local_catalog"
-      # --use_local_catalog is hidden so does not appear in JSON if disabled.
       return key in self.runtime_flags and self.runtime_flags[key]["current"] == "true"
     except Exception:
       if self.is_remote_cluster():

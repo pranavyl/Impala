@@ -25,6 +25,7 @@
 
 namespace impala {
 
+class FileMetadataUtils;
 class RuntimeState;
 class TQueryOptions;
 
@@ -140,9 +141,11 @@ struct SchemaNode {
 class ParquetSchemaResolver {
  public:
   ParquetSchemaResolver(const HdfsTableDescriptor& tbl_desc,
+      const FileMetadataUtils& file_metadata_utils,
       TSchemaResolutionStrategy::type fallback_schema_resolution,
       TParquetArrayResolution::type array_resolution)
     : tbl_desc_(tbl_desc),
+      file_metadata_utils_(file_metadata_utils),
       fallback_schema_resolution_(fallback_schema_resolution),
       array_resolution_(array_resolution),
       filename_(NULL) {}
@@ -155,14 +158,16 @@ class ParquetSchemaResolver {
     filename_ = filename;
     // Use FIELD_ID-based column resolution for Iceberg tables if possible.
     const auto& schema = file_metadata->schema;
-    if (tbl_desc_.IsIcebergTable() && schema.size() > 1) {
+    Status status = CreateSchemaTree(file_metadata->schema, &schema_);
+    if (tbl_desc_.IsIcebergTable()) {
+      fallback_schema_resolution_ = TSchemaResolutionStrategy::type::FIELD_ID;
+
       // schema[0] is the 'root', schema[1] is the first column.
-      const parquet::SchemaElement& first_column = schema[1];
-      if (first_column.__isset.field_id) {
-        fallback_schema_resolution_ = TSchemaResolutionStrategy::type::FIELD_ID;
+      if (schema.size() > 1 && !schema[1].__isset.field_id) {
+        RETURN_IF_ERROR(GenerateFieldIDs());
       }
     }
-    return CreateSchemaTree(file_metadata->schema, &schema_);
+    return status;
   }
 
   /// Traverses 'schema_' according to 'path', returning the result in 'node'. If 'path'
@@ -191,6 +196,9 @@ class ParquetSchemaResolver {
   /// An arbitrary limit on the number of children per schema node we support.
   /// Used to sanity-check Parquet schemas.
   static const int SCHEMA_NODE_CHILDREN_SANITY_LIMIT = 64 * 1024;
+
+  /// Invalid ID used to signal corrupted file
+  static const int INVALID_ID = -1;
 
   /// Maps from the array-resolution policy to the ordered array encodings that should
   /// be tried during path resolution. All entries have the ONE_LEVEL encoding at the end
@@ -226,6 +234,7 @@ class ParquetSchemaResolver {
   /// then the index of the first match is returned.
   int FindChildWithName(SchemaNode* node, const std::string& name) const;
   /// Returns the index of 'node's child with 'field id' for Iceberg tables.
+  /// Return -1 if the file is corrupted
   int FindChildWithFieldId(SchemaNode* node, const int& field_id) const;
 
   /// The ResolvePathHelper() logic for arrays.
@@ -236,15 +245,28 @@ class ParquetSchemaResolver {
   Status ResolveMap(const SchemaPath& path, int idx, SchemaNode** node,
       bool* missing_field) const;
 
+  /// The ResolvePathHelper() logic for structs.
+  Status ResolveStruct(const SchemaNode& node, const ColumnType& col_type,
+      const SchemaPath& path, int idx) const;
+
   /// The ResolvePathHelper() logic for scalars (just does validation since there's no
   /// more actual work to be done).
   Status ValidateScalarNode(const SchemaNode& node, const ColumnType& col_type,
       const SchemaPath& path, int idx) const;
 
+  /// Generates field ids for the columns in the same order as Iceberg. The traversal is
+  /// preorder, but the assigned field IDs are not. When a node is visited, its child
+  /// nodes are assigned an ID, hence the difference.
+  Status GenerateFieldIDs();
+
+  inline int GetGeneratedFieldID(SchemaNode* node) const;
+
   const HdfsTableDescriptor& tbl_desc_;
+  const FileMetadataUtils& file_metadata_utils_;
   TSchemaResolutionStrategy::type fallback_schema_resolution_;
   const TParquetArrayResolution::type array_resolution_;
   const char* filename_;
+  std::unordered_map<SchemaNode*, int32_t> schema_node_to_field_id_;
 
   /// Root node of our internal schema representation populated in Init().
   SchemaNode schema_;

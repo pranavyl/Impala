@@ -21,15 +21,20 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.DataSourceTable;
+import org.apache.impala.catalog.FeDataSourceTable;
 import org.apache.impala.catalog.FeHBaseTable;
 import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TAlterTableAddColsParams;
 import org.apache.impala.thrift.TAlterTableParams;
 import org.apache.impala.thrift.TAlterTableType;
+import org.apache.impala.util.KuduUtil;
 
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 
@@ -52,6 +57,9 @@ public class AlterTableAddColsStmt extends AlterTableStmt {
   }
 
   @Override
+  public String getOperation() { return "ADD COLUMNS"; }
+
+  @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     super.analyze(analyzer);
     FeTable t = getTargetTable();
@@ -72,7 +80,9 @@ public class AlterTableAddColsStmt extends AlterTableStmt {
     // are all valid and unique, and that none of the columns conflict with
     // partition columns.
     Set<String> colNames = new HashSet<>();
-    for (ColumnDef c: columnDefs_) {
+    Iterator<ColumnDef> iterator = columnDefs_.iterator();
+    while (iterator.hasNext()){
+      ColumnDef c = iterator.next();
       c.analyze(analyzer);
       String colName = c.getColName().toLowerCase();
       if (existingPartitionKeys.contains(colName)) {
@@ -81,9 +91,15 @@ public class AlterTableAddColsStmt extends AlterTableStmt {
       }
 
       Column col = t.getColumn(colName);
-      if (col != null && !ifNotExists_) {
-        throw new AnalysisException("Column already exists: " + colName);
-      } else if (!colNames.add(colName)) {
+      if (col != null) {
+        if (!ifNotExists_) {
+          throw new AnalysisException("Column already exists: " + colName);
+        }
+        // remove the existing column
+        iterator.remove();
+        continue;
+      }
+      if (!colNames.add(colName)) {
         throw new AnalysisException("Duplicate column name: " + colName);
       }
 
@@ -93,8 +109,9 @@ public class AlterTableAddColsStmt extends AlterTableStmt {
               c.toString());
         }
         if (c.isPrimaryKey()) {
-          throw new AnalysisException("Cannot add a primary key using an ALTER TABLE " +
-              "ADD COLUMNS statement: " + c.toString());
+          throw new AnalysisException("Cannot add a " +
+              KuduUtil.getPrimaryKeyString(c.isPrimaryKeyUnique()) +
+              " using an ALTER TABLE ADD COLUMNS statement: " + c.toString());
         }
         if (c.isExplicitNotNullable() && !c.hasDefaultValue()) {
           throw new AnalysisException("A new non-null column must have a default " +
@@ -103,6 +120,11 @@ public class AlterTableAddColsStmt extends AlterTableStmt {
       } else if (c.hasKuduOptions()) {
         throw new AnalysisException("The specified column options are only supported " +
             "in Kudu tables: " + c.toString());
+      } else if (t instanceof FeDataSourceTable) {
+        if (!DataSourceTable.isSupportedColumnType(c.getType())) {
+          throw new AnalysisException("Tables stored by JDBC do not support the " +
+              "column type: " + c.getType());
+        }
       }
     }
   }

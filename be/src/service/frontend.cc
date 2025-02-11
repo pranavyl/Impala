@@ -82,6 +82,33 @@ DEFINE_bool(enable_shell_based_groups_mapping_support, false,
 DEFINE_string(kudu_master_hosts, "", "Specifies the default Kudu master(s). The given "
     "value should be a comma separated list of hostnames or IP addresses; ports are "
     "optional.");
+DEFINE_bool(enable_kudu_impala_hms_check, true, "By default this flag is true. If "
+    "enabled checks that Kudu and Impala are using the same HMS instance(s).");
+DEFINE_string(jni_frontend_class, "org/apache/impala/service/JniFrontend", "By default "
+    "the JniFrontend class included in the repository is used as the frontend interface. "
+    "This option allows the class to be overridden by a third party module. The "
+    "overridden class needs to contain all the methods in the methods[] variable, so "
+    "most implementations should make their class a child of JniFrontend and "
+    "override only relevant methods.");
+DEFINE_bool(allow_catalog_cache_op_from_masked_users, false, "Whether to allow table "
+    "level catalog-cache operations, i.e. REFRESH/INVALIDATE METADATA <table>, from users"
+    " that have associate Ranger masking policies on the table. By default, such "
+    "operations are blocked since such users are considered read-only users. Note that "
+    "checking column masking policies requires loading column info of the table, which "
+    "could slow down simple commands like INVALIDATE METADATA <table>");
+DEFINE_int32(dbcp_max_conn_pool_size, 8,
+    "The maximum number of active connections that can be allocated from a DBCP "
+    "connection pool at the same time, or -1 for no limit. DBCP connection pools are "
+    "created when accessing remote RDBMS for external JDBC tables. This setting applies "
+    "to all DBCP connection pools created on the coordinator.");
+DEFINE_int32(dbcp_max_wait_millis_for_conn, -1,
+    "The maximum number of milliseconds that DBCP connection pool will wait (when "
+    "there are no available connections) for a connection to be returned before "
+    "throwing an exception, or -1 to wait indefinitely. 0 means immediately throwing "
+    "exception if there are no available connections in the pool.");
+DEFINE_int32(dbcp_data_source_idle_timeout_s, 300,
+    "Timeout value in seconds for idle DBCP DataSource objects in cache. It only takes "
+    "effect when query option 'clean_dbcp_ds_cache' is set as false.");
 
 Frontend::Frontend() {
   JniMethodDescriptor methods[] = {
@@ -96,6 +123,7 @@ Frontend::Frontend() {
     {"updateExecutorMembership", "([B)V", &update_membership_id_},
     {"getCatalogMetrics", "()[B", &get_catalog_metrics_id_},
     {"getTableNames", "([B)[B", &get_table_names_id_},
+    {"getMetadataTableNames", "([B)[B", &get_metadata_table_names_id_},
     {"describeDb", "([B)[B", &describe_db_id_},
     {"describeTable", "([B)[B", &describe_table_id_},
     {"showCreateTable", "([B)Ljava/lang/String;", &show_create_table_id_},
@@ -105,12 +133,15 @@ Frontend::Frontend() {
     {"getFunctions", "([B)[B", &get_functions_id_},
     {"getTableHistory", "([B)[B", &get_table_history_id_},
     {"getCatalogObject", "([B)[B", &get_catalog_object_id_},
+    {"getCatalogTable", "([B)Lorg/apache/impala/catalog/FeTable;",
+        &get_catalog_table_id_},
     {"getRoles", "([B)[B", &show_roles_id_},
     {"getPrincipalPrivileges", "([B)[B", &get_principal_privileges_id_},
     {"execHiveServer2MetadataOp", "([B)[B", &exec_hs2_metadata_op_id_},
     {"setCatalogIsReady", "()V", &set_catalog_is_ready_id_},
     {"waitForCatalog", "()V", &wait_for_catalog_id_},
     {"loadTableData", "([B)[B", &load_table_data_id_},
+    {"convertTable", "([B)V", &convertTable},
     {"getTableFiles", "([B)[B", &get_table_files_id_},
     {"showCreateFunction", "([B)Ljava/lang/String;", &show_create_function_id_},
     {"buildTestDescriptorTable", "([B)[B", &build_test_descriptor_table_id_},
@@ -125,17 +156,26 @@ Frontend::Frontend() {
     {"commitKuduTransaction", "([B)V", &commit_kudu_txn_}
   };
 
+  JniMethodDescriptor staticMethods[] = {
+    {"getSecretFromKeyStore", "([B)Ljava/lang/String;", &get_secret_from_key_store_}
+  };
+
   JNIEnv* jni_env = JniUtil::GetJNIEnv();
   JniLocalFrame jni_frame;
   ABORT_IF_ERROR(jni_frame.push(jni_env));
 
   // create instance of java class JniFrontend
-  jclass fe_class = jni_env->FindClass("org/apache/impala/service/JniFrontend");
+  fe_class_ = jni_env->FindClass(FLAGS_jni_frontend_class.c_str());
   ABORT_IF_EXC(jni_env);
 
   uint32_t num_methods = sizeof(methods) / sizeof(methods[0]);
   for (int i = 0; i < num_methods; ++i) {
-    ABORT_IF_ERROR(JniUtil::LoadJniMethod(jni_env, fe_class, &(methods[i])));
+    ABORT_IF_ERROR(JniUtil::LoadJniMethod(jni_env, fe_class_, &(methods[i])));
+  };
+
+  num_methods = sizeof(staticMethods) / sizeof(staticMethods[0]);
+  for (int i = 0; i < num_methods; ++i) {
+    ABORT_IF_ERROR(JniUtil::LoadStaticJniMethod(jni_env, fe_class_, &(staticMethods[i])));
   };
 
   jbyteArray cfg_bytes;
@@ -144,7 +184,7 @@ Frontend::Frontend() {
   // Pass in whether this is a backend test, so that the Frontend can avoid certain
   // unnecessary initialization that introduces dependencies on a running minicluster.
   jboolean is_be_test = TestInfo::is_be_test();
-  jobject fe = jni_env->NewObject(fe_class, fe_ctor_, cfg_bytes, is_be_test);
+  jobject fe = jni_env->NewObject(fe_class_, fe_ctor_, cfg_bytes, is_be_test);
   ABORT_IF_EXC(jni_env);
   ABORT_IF_ERROR(JniUtil::LocalToGlobalRef(jni_env, fe, &fe_));
 }
@@ -169,6 +209,9 @@ Status Frontend::DescribeTable(const TDescribeTableParams& params,
   tparams.__set_output_style(params.output_style);
   if (params.__isset.table_name) tparams.__set_table_name(params.table_name);
   if (params.__isset.result_struct) tparams.__set_result_struct(params.result_struct);
+  if (params.__isset.metadata_table_name) {
+    tparams.__set_metadata_table_name(params.metadata_table_name);
+  }
   tparams.__set_session(session);
   return JniUtil::CallJniMethod(fe_, describe_table_id_, tparams, response);
 }
@@ -187,11 +230,31 @@ Status Frontend::GetCatalogMetrics(TGetCatalogMetricsResult* resp) {
 
 Status Frontend::GetTableNames(const string& db, const string* pattern,
     const TSessionState* session, TGetTablesResult* table_names) {
+    set<TImpalaTableType::type> table_types = set<TImpalaTableType::type>();
+    return GetTableNames(db, pattern, session, table_types, table_names);
+}
+
+Status Frontend::GetTableNames(const string& db, const string* pattern,
+    const TSessionState* session, const set<TImpalaTableType::type>& table_types,
+    TGetTablesResult* table_names) {
   TGetTablesParams params;
   params.__set_db(db);
-  if (pattern != NULL) params.__set_pattern(*pattern);
-  if (session != NULL) params.__set_session(*session);
+  params.__set_table_types(table_types);
+  if (pattern != nullptr) params.__set_pattern(*pattern);
+  if (session != nullptr) params.__set_session(*session);
   return JniUtil::CallJniMethod(fe_, get_table_names_id_, params, table_names);
+}
+
+Status Frontend::GetMetadataTableNames(const string& db, const string& table_name,
+    const string* pattern, const TSessionState* session,
+    TGetTablesResult* metadata_table_names) {
+  TGetMetadataTablesParams params;
+  params.__set_db(db);
+  params.__set_tbl(table_name);
+  if (pattern != nullptr) params.__set_pattern(*pattern);
+  if (session != nullptr) params.__set_session(*session);
+  return JniUtil::CallJniMethod(fe_, get_metadata_table_names_id_, params,
+      metadata_table_names);
 }
 
 Status Frontend::GetDbs(const string* pattern, const TSessionState* session,
@@ -242,6 +305,10 @@ Status Frontend::ShowRoles(const TShowRolesParams& params, TShowRolesResult* res
 Status Frontend::GetCatalogObject(const TCatalogObject& req,
     TCatalogObject* resp) {
   return JniUtil::CallJniMethod(fe_, get_catalog_object_id_, req, resp);
+}
+
+Status Frontend::GetCatalogTable(const TTableName& table_name, jobject* result) {
+  return JniUtil::CallJniMethod(fe_, get_catalog_table_id_, table_name, result);
 }
 
 Status Frontend::GetExecRequest(
@@ -357,4 +424,15 @@ Status Frontend::AbortKuduTransaction(const TUniqueId& query_id) {
 
 Status Frontend::CommitKuduTransaction(const TUniqueId& query_id) {
   return JniUtil::CallJniMethod(fe_, commit_kudu_txn_, query_id);
+}
+
+Status Frontend::Convert(const TExecRequest& request) {
+  return JniUtil::CallJniMethod(fe_, convertTable, request);
+}
+
+Status Frontend::GetSecretFromKeyStore(const string& secret_key, string* secret) {
+  TStringLiteral secret_key_t;
+  secret_key_t.__set_value(secret_key);
+  return JniUtil::CallStaticJniMethod(fe_class_, get_secret_from_key_store_, secret_key_t,
+      secret);
 }

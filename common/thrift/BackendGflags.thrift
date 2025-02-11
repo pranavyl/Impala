@@ -23,6 +23,13 @@ enum TReservedWordsVersion {
   IMPALA_3_0 = 1
 }
 
+
+// Options for Geospatial function library support
+enum TGeospatialLibrary{
+  NONE,
+  HIVE_ESRI
+}
+
 // Used to pass gflags from backend to frontend, JniCatalog and JniFrontend
 // Attributes without comments correspond to gflags
 struct TBackendGflags {
@@ -74,7 +81,7 @@ struct TBackendGflags {
 
   24: required i64 min_buffer_size
 
-  25: required bool enable_orc_scanner
+  // REMOVED: 25: required bool enable_orc_scanner
 
   26: required string authorized_proxy_group_config
 
@@ -223,4 +230,90 @@ struct TBackendGflags {
   99: required bool auto_check_compaction
 
   100: required bool enable_sync_to_latest_event_on_ddls
+
+  101: required bool pull_table_types_and_comments
+
+  102: required bool use_hms_column_order_for_hbase_tables
+
+  103: required string ignored_dir_prefix_list
+
+  104: required bool enable_kudu_impala_hms_check
+
+  105: required bool enable_reload_events
+
+  106: required TGeospatialLibrary geospatial_library
+
+  107: required double query_cpu_count_divisor
+
+  108: required bool processing_cost_use_equal_expr_weight
+
+  109: required i64 min_processing_per_thread
+
+  110: required bool skip_resource_checking_on_last_executor_group_set
+
+  111: required i64 thrift_rpc_max_message_size
+
+  112: required string file_metadata_reload_properties
+
+  113: required double scan_range_cost_factor
+
+  114: required bool use_jamm_weigher
+
+  115: required i32 iceberg_reload_new_files_threshold
+
+  116: required bool enable_skipping_older_events;
+
+  117: required bool enable_json_scanner
+
+  118: required double max_filter_error_rate_from_full_scan
+
+  119: required i32 local_catalog_cache_concurrency_level
+
+  120: required i32 catalog_operation_log_size
+
+  121: required string hostname
+
+  122: required bool allow_catalog_cache_op_from_masked_users
+
+  123: required bool iceberg_allow_datafiles_in_table_location_only
+
+  124: required i32 topic_update_log_gc_frequency
+
+  125: required string debug_actions
+
+  126: required bool invalidate_metadata_on_event_processing_failure
+
+  127: required bool invalidate_global_metadata_on_event_processing_failure
+
+  128: required string inject_process_event_failure_event_types
+
+  129: required double inject_process_event_failure_ratio
+
+  130: required bool enable_workload_mgmt
+
+  131: required string query_log_table_name
+
+  132: required double query_cpu_root_factor
+
+  133: required string default_skipped_hms_event_types
+
+  134: required string common_hms_event_types
+
+  135: required i32 dbcp_max_conn_pool_size
+
+  136: required i32 dbcp_max_wait_millis_for_conn
+
+  137: required i32 dbcp_data_source_idle_timeout
+
+  138: required bool is_release_build
+
+  139: required bool enable_catalogd_ha
+
+  140: required bool iceberg_always_allow_merge_on_read_operations
+
+  141: required i64 data_stream_sender_buffer_size_used_by_planner
+
+  142: required bool enable_reading_puffin_stats
+
+  143: required string injected_group_members_debug_only
 }

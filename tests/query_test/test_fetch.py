@@ -15,13 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import re
 
 from time import sleep
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3
 from tests.common.test_dimensions import extend_exec_option_dimension
-from tests.util.parse_util import parse_duration_string_ms
+from tests.util.parse_util import parse_duration_string_ms, \
+    parse_duration_string_ns, get_time_summary_stats_counter
 
 
 class TestFetch(ImpalaTestSuite):
@@ -65,11 +66,94 @@ class TestFetch(ImpalaTestSuite):
       materialization_timer = re.search("RowMaterializationTimer: (.*)", runtime_profile)
       assert materialization_timer and len(materialization_timer.groups()) == 1 and \
           parse_duration_string_ms(materialization_timer.group(1)) > 1000
+      rpc_count = int(re.search("RPCCount: ([0-9]+)", runtime_profile).group(1))
+      assert rpc_count >= 5 and rpc_count <= 9
+
+      rpc_read_timer = re.search("RPCReadTimer: (.*)", runtime_profile)
+      assert rpc_read_timer and len(rpc_read_timer.groups()) == 1
+      rpc_read_ns = parse_duration_string_ns(rpc_read_timer.group(1))
+      assert 0 < rpc_read_ns and rpc_read_ns < 1000000
+
+      rpc_write_timer = re.search("RPCWriteTimer: (.*)", runtime_profile)
+      assert rpc_write_timer and len(rpc_write_timer.groups()) == 1
+      rpc_write_ns = parse_duration_string_ns(rpc_write_timer.group(1))
+      assert 0 < rpc_write_ns and rpc_write_ns < 10000000
+
+      create_result_time = re.search("CreateResultSetTime: (.*)", runtime_profile)
+      assert create_result_time and len(create_result_time.groups()) == 1
+      create_result_ms = parse_duration_string_ms(create_result_time.group(1))
+      assert 2400 < create_result_ms and create_result_ms < 2600
+
     finally:
       self.client.close_query(handle)
 
+  def test_client_fetch_time_stats(self, vector):
+    num_rows = 27
+    query = "select sleep(10) from functional.alltypes limit {0}".format(num_rows)
+    handle = self.execute_query_async(query, vector.get_value('exec_option'))
+    try:
+      # Wait until the query is 'FINISHED' and results are available for fetching.
+      self.wait_for_state(handle, self.client.QUERY_STATES['FINISHED'], 30)
 
-@SkipIfS3.variable_listing_times
+      # This loop will do 6 fetches that contain data and a final fetch with
+      # no data. The last fetch is after eos has been set, so it does not count.
+      rows_fetched = 0
+      while True:
+        result = self.client.fetch(query, handle, max_rows=5)
+        assert result.success
+        rows_fetched += len(result.data)
+        # If no rows are returned, we are done.
+        if len(result.data) == 0:
+          break
+        sleep(0.1)
+
+      # After fetching all rows, sleep before closing the query. This should not
+      # count as client wait time, because the query is already done.
+      sleep(2.5)
+    finally:
+      self.client.close_query(handle)
+
+    runtime_profile = self.client.get_runtime_profile(handle)
+    summary_stats = get_time_summary_stats_counter("ClientFetchWaitTimeStats",
+                                                   runtime_profile)
+    assert len(summary_stats) == 1
+    assert summary_stats[0].total_num_values == 6
+    # The 2.5 second sleep should not count, so the max must be less than 2.5 seconds.
+    assert summary_stats[0].max_value < 2500000000
+    assert summary_stats[0].min_value > 0
+
+  def test_client_fetch_time_stats_incomplete(self, vector):
+    num_rows = 27
+    query = "select sleep(10) from functional.alltypes limit {0}".format(num_rows)
+    handle = self.execute_query_async(query, vector.get_value('exec_option'))
+    try:
+      # Wait until the query is 'FINISHED' and results are available for fetching.
+      self.wait_for_state(handle, self.client.QUERY_STATES['FINISHED'], 30)
+
+      # This loop will do 5 fetches for a total of 25 rows. This is incomplete.
+      for i in range(5):
+        result = self.client.fetch(query, handle, max_rows=5)
+        assert result.success
+        sleep(0.1)
+
+      # Sleep before closing the query. For an incomplete fetch, this still counts
+      # towards the query time, so this does show up in the counters.
+      sleep(2.5)
+    finally:
+      self.client.close_query(handle)
+
+    runtime_profile = self.client.get_runtime_profile(handle)
+
+    summary_stats = get_time_summary_stats_counter("ClientFetchWaitTimeStats",
+                                                   runtime_profile)
+    assert len(summary_stats) == 1
+    # There are 5 fetches and the finalization sample for a total of 6.
+    assert summary_stats[0].total_num_values == 6
+    # The 2.5 second sleep does count for an incomplete fetch, verify the max is higher.
+    assert summary_stats[0].max_value >= 2500000000
+    assert summary_stats[0].min_value > 0
+
+
 class TestFetchAndSpooling(ImpalaTestSuite):
   """Tests that apply when result spooling is enabled or disabled."""
 
@@ -80,7 +164,8 @@ class TestFetchAndSpooling(ImpalaTestSuite):
     # Parquet files.
     cls.ImpalaTestMatrix.add_constraint(lambda v:
         v.get_value('table_format').file_format == 'parquet')
-    extend_exec_option_dimension(cls, 'spool_query_results', 'true')
+    # spool_query_results is set as true by default.
+    extend_exec_option_dimension(cls, 'spool_query_results', 'false')
 
   @classmethod
   def get_workload(cls):
@@ -91,10 +176,10 @@ class TestFetchAndSpooling(ImpalaTestSuite):
     the PLAN_ROOT_SINK section of the runtime profile."""
     num_rows = 10
     if ('spool_query_results' in vector.get_value('exec_option') and
-          bool(vector.get_value('exec_option')['spool_query_results'])):
-      vector.get_value('exec_option')['debug_action'] = "BPRS_BEFORE_ADD_BATCH:SLEEP@1000"
-    else:
+          vector.get_value('exec_option')['spool_query_results'] == 'false'):
       vector.get_value('exec_option')['debug_action'] = "BPRS_BEFORE_ADD_ROWS:SLEEP@1000"
+    else:
+      vector.get_value('exec_option')['debug_action'] = "BPRS_BEFORE_ADD_BATCH:SLEEP@1000"
     result = self.execute_query("select id from functional.alltypes limit {0}"
         .format(num_rows), vector.get_value('exec_option'))
     assert "RowsSent: {0} ({0})".format(num_rows) in result.runtime_profile

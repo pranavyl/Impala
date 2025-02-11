@@ -190,6 +190,22 @@ under the License.
             </row>
             <row>
               <entry>
+                <p> -E or </p>
+                <p>--vertical </p>
+              </entry>
+              <entry rev="2.0.0">
+                <p>
+                  vertical=true
+                </p>
+              </entry>
+              <entry>
+                <p>
+                  Print the output of a query (rows) vertically, no effects if <codeph>-B</codeph> is specified. Added in Impala 4.2.
+                </p>
+              </entry>
+            </row>
+            <row>
+              <entry>
                 <p> -p or </p>
                 <p>--show_profiles </p>
               </entry>
@@ -585,6 +601,17 @@ under the License.
                   of Impala using the <codeph>'hs2'</codeph> or
                     <codeph>'hs2-http'</codeph> option.</p><p>Beeswax support is
                   deprecated and will be removed in the future.</p></entry>
+            </row>
+            <row rev="4.2.0 IMPALA-10660">
+              <entry>--hs2_fp_format=<varname>HS2_FP_FORMAT</varname></entry>
+              <entry>hs2_fp_format=<varname>HS2_FP_FORMAT</varname></entry>
+              <entry>
+                Sets the printing format specification for floating point values when using HS2
+                protocol. The default behaviour makes the values handled by Python's str() built-in
+                method. Use '16G' to match Beeswax protocol's floating-point output format
+
+                This feature is available in <keyword keyref="impala42_full"/> and higher.
+              </entry>
             </row>
           </tbody>
         </tgroup>

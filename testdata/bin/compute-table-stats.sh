@@ -26,16 +26,19 @@ setup_report_build_error
 . ${IMPALA_HOME}/bin/impala-config.sh > /dev/null 2>&1
 
 # TODO: We need a better way of managing how these get set. See IMPALA-4346
-IMPALAD=${IMPALAD:-localhost:21000}
+IMPALAD_HS2=${IMPALAD_HS2:-localhost:21050}
 
-COMPUTE_STATS_SCRIPT="${IMPALA_HOME}/tests/util/compute_table_stats.py --impalad=${IMPALAD}"
+COMPUTE_STATS_SCRIPT="${IMPALA_HOME}/tests/util/compute_table_stats.py\
+    --impalad=${IMPALAD_HS2}"
 
 # Run compute stats over as many of the tables used in the Planner tests as possible.
 ${COMPUTE_STATS_SCRIPT} --db_names=functional\
     --table_names="alltypes,alltypesagg,alltypesaggmultifilesnopart,alltypesaggnonulls,
     alltypessmall,alltypestiny,jointbl,dimtbl,stringpartitionkey,nulltable,nullrows,
     date_tbl,chars_medium,part_strings_with_quotes,alltypes_date_partition,
-    alltypes_date_partition_2"
+    alltypes_date_partition_2,mv1_alltypes_jointbl,binary_tbl,binary_tbl_big"
+${COMPUTE_STATS_SCRIPT} --db_names=functional_parquet \
+    --table_names="unique_with_nulls"
 
 # We cannot load HBase on s3 and isilon yet.
 if [ "${TARGET_FILESYSTEM}" = "hdfs" ]; then
@@ -44,5 +47,8 @@ if [ "${TARGET_FILESYSTEM}" = "hdfs" ]; then
 fi
 ${COMPUTE_STATS_SCRIPT} --db_names=tpch,tpch_parquet,tpch_orc_def \
     --table_names=customer,lineitem,nation,orders,part,partsupp,region,supplier
-${COMPUTE_STATS_SCRIPT} --db_names=tpch_nested_parquet,tpcds,tpcds_parquet
-${COMPUTE_STATS_SCRIPT} --db_names=functional_kudu,tpch_kudu
+${COMPUTE_STATS_SCRIPT} --db_names="tpch_nested_parquet,tpch_kudu,tpcds,tpcds_parquet,\
+    tpcds_partitioned_parquet_snap"
+${COMPUTE_STATS_SCRIPT} --db_names=functional_kudu \
+    --exclude_table_names="alltypesagg,manynulls"
+

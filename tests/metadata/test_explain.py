@@ -17,6 +17,7 @@
 
 # Functional tests running EXPLAIN statements.
 #
+from __future__ import absolute_import, division, print_function
 import re
 
 from tests.common.impala_test_suite import ImpalaTestSuite
@@ -26,7 +27,6 @@ from tests.util.filesystem_utils import WAREHOUSE
 # Tests the different explain levels [0-3] on a few queries.
 # TODO: Clean up this test to use an explain level test dimension and appropriate
 # result sub-sections for the expected explain plans.
-@SkipIfEC.fix_later
 class TestExplain(ImpalaTestSuite):
   # Value for the num_scanner_threads query option to ensure that the memory estimates of
   # scan nodes are consistent even when run on machines with different numbers of cores.
@@ -53,18 +53,21 @@ class TestExplain(ImpalaTestSuite):
     self.run_test_case('QueryTest/explain-level0', vector)
 
   @SkipIfNotHdfsMinicluster.plans
+  @SkipIfEC.contain_full_explain
   def test_explain_level1(self, vector):
     vector.get_value('exec_option')['num_scanner_threads'] = self.NUM_SCANNER_THREADS
     vector.get_value('exec_option')['explain_level'] = 1
     self.run_test_case('QueryTest/explain-level1', vector)
 
   @SkipIfNotHdfsMinicluster.plans
+  @SkipIfEC.contain_full_explain
   def test_explain_level2(self, vector):
     vector.get_value('exec_option')['num_scanner_threads'] = self.NUM_SCANNER_THREADS
     vector.get_value('exec_option')['explain_level'] = 2
     self.run_test_case('QueryTest/explain-level2', vector)
 
   @SkipIfNotHdfsMinicluster.plans
+  @SkipIfEC.contain_full_explain
   def test_explain_level3(self, vector):
     vector.get_value('exec_option')['num_scanner_threads'] = self.NUM_SCANNER_THREADS
     vector.get_value('exec_option')['explain_level'] = 3
@@ -210,8 +213,8 @@ class TestExplainEmptyPartition(ImpalaTestSuite):
       "ALTER TABLE %s.empty_partition ADD PARTITION (p=NULL)" % self.TEST_DB_NAME)
     # Put an empty file in the partition so we have > 0 files, but 0 rows
     self.filesystem_client.create_file(
-        "test-warehouse/%s.db/empty_partition/p=__HIVE_DEFAULT_PARTITION__/empty" %
-        self.TEST_DB_NAME, "")
+        "{1}/{0}.db/empty_partition/p=__HIVE_DEFAULT_PARTITION__/empty".
+        format(self.TEST_DB_NAME, WAREHOUSE), "")
     self.client.execute("REFRESH %s.empty_partition" % self.TEST_DB_NAME)
     self.client.execute("COMPUTE STATS %s.empty_partition" % self.TEST_DB_NAME)
     assert "NULL\t0\t1" in str(
@@ -224,8 +227,8 @@ class TestExplainEmptyPartition(ImpalaTestSuite):
     # that its lack of stats is correctly identified
     self.client.execute(
       "ALTER TABLE %s.empty_partition ADD PARTITION (p=1)" % self.TEST_DB_NAME)
-    self.filesystem_client.create_file("test-warehouse/%s.db/empty_partition/p=1/rows" %
-                                 self.TEST_DB_NAME, "1")
+    self.filesystem_client.create_file(
+        "{1}/{0}.db/empty_partition/p=1/rows".format(self.TEST_DB_NAME, WAREHOUSE), "1")
     self.client.execute("REFRESH %s.empty_partition" % self.TEST_DB_NAME)
     explain_result = str(
       self.client.execute("EXPLAIN SELECT * FROM %s.empty_partition" % self.TEST_DB_NAME))

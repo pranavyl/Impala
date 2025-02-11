@@ -18,9 +18,10 @@
 package org.apache.impala.catalog;
 
 import java.sql.SQLException;
-import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
 import org.apache.hadoop.hive.common.ValidWriteIdList;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.common.InternalException;
@@ -36,11 +37,14 @@ import org.apache.impala.thrift.TGetPartialCatalogObjectRequest;
 import org.apache.impala.thrift.TGetPartialCatalogObjectResponse;
 import org.apache.impala.thrift.THdfsFileDesc;
 import org.apache.impala.thrift.THdfsTable;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TPartialPartitionInfo;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableInfoSelector;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.util.AcidUtils;
+import org.apache.impala.util.EventSequence;
+import org.apache.impala.util.NoOpEventSequence;
 import org.apache.thrift.TDeserializer;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
@@ -50,7 +54,9 @@ import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestName;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -76,6 +82,9 @@ public class PartialCatalogInfoWriteIdTest {
   private static final String testPartitionedTbl = "insert_only_partitioned";
   private static final String testAcidTblName = "test_full_acid";
 
+  @Rule
+  public TestName name = new TestName();
+
   @BeforeClass
   public static void setupTestEnv() throws SQLException, ClassNotFoundException {
     catalog_ = CatalogServiceTestCatalog.create();
@@ -94,6 +103,7 @@ public class PartialCatalogInfoWriteIdTest {
 
   @Before
   public void createTestTbls() throws Exception {
+    LOG.info("Creating test tables for {}", name.getMethodName());
     Stopwatch st = Stopwatch.createStarted();
     ImpalaJdbcClient client = ImpalaJdbcClient
         .createClientUsingHiveJdbcDriver();
@@ -113,7 +123,7 @@ public class PartialCatalogInfoWriteIdTest {
           st.stop().elapsed(TimeUnit.MILLISECONDS));
       client.close();
     }
-    catalog_.reset();
+    catalog_.reset(NoOpEventSequence.INSTANCE);
   }
 
   private static String getTblProperties() {
@@ -207,8 +217,8 @@ public class PartialCatalogInfoWriteIdTest {
     ValidWriteIdList validWriteIdList = getValidWriteIdList(testDbName, testTblName);
     // now insert into the table to advance the writeId
     executeHiveSql("insert into " + getTestTblName() + " values (2)");
-    catalog_.invalidateTable(new TTableName(testDbName, testTblName), new Reference<>()
-      , new Reference<>());
+    catalog_.invalidateTable(new TTableName(testDbName, testTblName), new Reference<>(),
+        new Reference<>(), NoOpEventSequence.INSTANCE);
     Table tblAfterReload = catalog_.getOrLoadTable(testDbName, testTblName, "test", null);
     long tblVersion = tblAfterReload.getCatalogVersion();
     // issue a request which is older than what we have in catalog
@@ -536,7 +546,8 @@ public class PartialCatalogInfoWriteIdTest {
         "insert into " + getTestFullAcidTblName() + " " + partition + " values (1)");
     executeHiveSql("delete from " + getTestFullAcidTblName() + " where c1 = 1");
     // add incompleteTable so that the table will be loaded
-    catalog_.addIncompleteTable(testDbName, testAcidTblName);
+    catalog_.addIncompleteTable(testDbName, testAcidTblName, TImpalaTableType.TABLE,
+        /*tblComment*/null);
     // After major compaction, the partition should return only base file
     testFileMetadataAfterCompaction(testAcidTblName, partition, true, 1);
   }
@@ -551,7 +562,8 @@ public class PartialCatalogInfoWriteIdTest {
         "insert into " + getTestFullAcidTblName() + " " + partition + " values (1)");
     executeHiveSql("delete from " + getTestFullAcidTblName() + " where c1 = 1");
     // add incompleteTable so that the table will be loaded
-    catalog_.addIncompleteTable(testDbName, testAcidTblName);
+    catalog_.addIncompleteTable(testDbName, testAcidTblName, TImpalaTableType.TABLE,
+        /*tblComment*/null);
     // After minor compaction, the partition should return one delta file and one delete
     // delta file
     testFileMetadataAfterCompaction(testAcidTblName, partition, false, 2);
@@ -600,13 +612,26 @@ public class PartialCatalogInfoWriteIdTest {
     int afterFileCount = afterPartitionInfo.getFile_descriptorsSize()
         + afterPartitionInfo.getInsert_file_descriptorsSize()
         + afterPartitionInfo.getDelete_file_descriptorsSize();
-    Assert.assertEquals(expectedFileCount, afterFileCount);
+    String message = "Actual file_descriptors:\n" +
+        getPathsFromFileDescriptors(afterPartitionInfo.getFile_descriptors()) +
+        "\nActual insert_file_descriptors:\n" +
+        getPathsFromFileDescriptors(afterPartitionInfo.getInsert_file_descriptors()) +
+        "\nActual delete_file_descriptors:\n" +
+        getPathsFromFileDescriptors(afterPartitionInfo.getDelete_file_descriptors());
+    Assert.assertEquals(message, expectedFileCount, afterFileCount);
     long numMissesAfterMinor =
         getMetricCount(testDbName, tableName, HdfsTable.FILEMETADATA_CACHE_MISS_METRIC);
     long numHitsAfterMinor =
         getMetricCount(testDbName, tableName, HdfsTable.FILEMETADATA_CACHE_HIT_METRIC);
     Assert.assertEquals(numHits + 1, numHitsAfterMinor);
     Assert.assertEquals(numMisses, numMissesAfterMinor);
+  }
+
+  private List<String> getPathsFromFileDescriptors(List<THdfsFileDesc> fileDescriptors) {
+    return fileDescriptors.stream()
+        .map(HdfsPartition.FileDescriptor::fromThrift)
+        .map(HdfsPartition.FileDescriptor::getPath)
+        .collect(Collectors.toList());
   }
 
   /**
@@ -678,7 +703,7 @@ public class PartialCatalogInfoWriteIdTest {
         + "functional_orc_def.alltypes");
     executeHiveSql("delete from " + getTestFullAcidTblName()
         + " where id % 2 = 0");
-    catalog_.reset();
+    catalog_.reset(NoOpEventSequence.INSTANCE);
     Table tbl = catalog_.getOrLoadTable(testDbName, testAcidTblName, "test", null);
     Assert.assertFalse("Table must be loaded", tbl instanceof IncompleteTable);
     ValidWriteIdList olderWriteIdList = getValidWriteIdList(testDbName, testAcidTblName);
@@ -826,7 +851,7 @@ public class PartialCatalogInfoWriteIdTest {
    */
   private long getTableId(String db, String tbl) throws TException {
     try (MetaStoreClient client = catalog_.getMetaStoreClient()) {
-      return client.getHiveClient().getTable(db, tbl).getId();
+      return MetastoreShim.getTableId(client.getHiveClient().getTable(db, tbl));
     }
   }
 
@@ -863,7 +888,7 @@ public class PartialCatalogInfoWriteIdTest {
 
   private void invalidateTbl(String db, String tbl) throws CatalogException {
     catalog_.invalidateTable(new TTableName(db, tbl), new Reference<>(),
-      new Reference<>());
+      new Reference<>(), NoOpEventSequence.INSTANCE);
     Assert.assertTrue("Table must not be loaded",
       catalog_.getTable(db, tbl) instanceof IncompleteTable);
   }

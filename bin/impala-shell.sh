@@ -28,7 +28,6 @@ PYTHONPATH=${PYTHONPATH}:${IMPALA_HOME}/bin
 
 # Default version of thrift for the impala-shell is thrift >= 0.11.0.
 PYTHONPATH=${PYTHONPATH}:${SHELL_HOME}/gen-py
-IMPALA_THRIFT_PY_VERSION=${IMPALA_THRIFT_VERSION}
 
 THRIFT_PY_ROOT="${IMPALA_TOOLCHAIN_PACKAGES_HOME}/thrift-${IMPALA_THRIFT_PY_VERSION}"
 
@@ -38,7 +37,8 @@ export LD_LIBRARY_PATH=":$(PYTHONPATH=${PYTHONPATH} \
 
 IMPALA_PY_DIR="$(dirname "$0")/../infra/python"
 IMPALA_PY_ENV_DIR="${IMPALA_PY_DIR}/env-gcc${IMPALA_GCC_VERSION}"
-IMPALA_PYTHON_EXECUTABLE="${IMPALA_PY_ENV_DIR}/bin/python"
+# Allow overriding the python executable
+IMPALA_PYTHON_EXECUTABLE="${IMPALA_PYTHON_EXECUTABLE:-${IMPALA_PY_ENV_DIR}/bin/python}"
 
 for PYTHON_LIB_DIR in ${THRIFT_PY_ROOT}/python/lib{64,}; do
   [[ -d ${PYTHON_LIB_DIR} ]] || continue
@@ -50,6 +50,15 @@ done
 # Note that this uses the external system python executable
 PYTHONPATH=${PYTHONPATH} python "${IMPALA_PY_DIR}/bootstrap_virtualenv.py"
 
+# Enable remote debugging if port was specified via environment variable
+if [[ ${IMPALA_SHELL_DEBUG_PORT:-0} -ne 0 ]]; then
+  echo "installing debugpy if needed"
+  ${IMPALA_PY_ENV_DIR}/bin/pip install debugpy
+  echo "impala python shell waiting for remote debugging connection on port" \
+       "${IMPALA_SHELL_DEBUG_PORT}"
+  EXTRA_ARGS=" -m debugpy --listen ${IMPALA_SHELL_DEBUG_PORT} --wait-for-client"
+fi
+
 # This uses the python executable in the impala python env
 PYTHONIOENCODING='utf-8' PYTHONPATH=${PYTHONPATH} \
-  exec "${IMPALA_PYTHON_EXECUTABLE}" ${SHELL_HOME}/impala_shell.py "$@"
+  exec "${IMPALA_PYTHON_EXECUTABLE}" ${EXTRA_ARGS:-} ${SHELL_HOME}/impala_shell.py "$@"

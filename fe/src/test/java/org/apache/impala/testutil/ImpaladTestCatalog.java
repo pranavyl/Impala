@@ -33,6 +33,8 @@ import org.apache.impala.catalog.Role;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.User;
 import org.apache.impala.thrift.TPrivilege;
+import org.apache.impala.thrift.TUniqueId;
+import org.apache.impala.util.NoOpEventSequence;
 import org.apache.impala.util.PatternMatcher;
 
 import java.util.HashSet;
@@ -109,7 +111,9 @@ public class ImpaladTestCatalog extends ImpaladCatalog {
   /**
    * Reloads all metadata from the source catalog.
    */
-  public void reset() throws CatalogException { srcCatalog_.reset(); }
+  public void reset() throws CatalogException {
+    srcCatalog_.reset(NoOpEventSequence.INSTANCE);
+  }
 
   /**
    * Returns the Table for the given name, loading the table's metadata if necessary.
@@ -131,9 +135,6 @@ public class ImpaladTestCatalog extends ImpaladCatalog {
     }
     Preconditions.checkNotNull(newTbl);
     Preconditions.checkState(newTbl.isLoaded());
-    if (newTbl instanceof HdfsTable) {
-      ((HdfsTable) newTbl).computeHdfsStatsForTesting();
-    }
     db.addTable(newTbl);
     return newTbl;
   }
@@ -143,7 +144,7 @@ public class ImpaladTestCatalog extends ImpaladCatalog {
    * this catalog from this thread without involving the catalogd/statestored.
    */
   @Override
-  public void prioritizeLoad(Set<TableName> tableNames) {
+  public void prioritizeLoad(Set<TableName> tableNames, TUniqueId queryId) {
     for (TableName tbl: tableNames) getOrLoadTable(tbl.getDb(), tbl.getTbl());
   }
 

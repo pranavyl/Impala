@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-cmake_minimum_required(VERSION 3.2.3)
+cmake_minimum_required(VERSION 3.22)
 
 # This is a Kudu-specific flag that disables Kudu targets that are test-only.
 set(NO_TESTS 1)
@@ -35,6 +35,13 @@ set(IMPALA_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
 
 # Build compile commands database
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Codegen-dependent executables need to be linked with -rdynamic; otherwise LLVM
+# can't find dependent symbols at runtime.
+#
+# Rather than setting ENABLE_EXPORTS for each target, this enables it by default,
+# as most backend tests depend on codegen. See CMake CMP0065 for more information.
+set(CMAKE_ENABLE_EXPORTS ON)
 
 # generate CTest input files
 enable_testing()
@@ -87,6 +94,18 @@ function(set_dep_root NAME)
       PARENT_SCOPE)
 endfunction()
 
+# Helper function that, given a package name and target component, constructs the
+# package_target_ROOT variable based on the version number extracted from the
+# environment. Mainly used for thrift resolution.
+function(set_dep_root_for_target NAME TARGET)
+  string(TOLOWER ${NAME} NAME_LOWER)
+  string(TOLOWER ${TARGET} TARGET_LOWER)
+  string(REPLACE "_" "-" NAME_LOWER ${NAME_LOWER})
+  set(VAL_NAME "IMPALA_${NAME}_${TARGET}_VERSION")
+  set(${NAME}_${TARGET}_ROOT $ENV{IMPALA_TOOLCHAIN_PACKAGES_HOME}/${NAME_LOWER}-$ENV{${VAL_NAME}}
+      PARENT_SCOPE)
+endfunction()
+
 # Define root path for all dependencies, this is in the form of
 # set_dep_root(PACKAGE) ->
 #   PACKAGE_ROOT set to $ENV{IMPALA_TOOLCHAIN_PACKAGES_HOME}/PACKAGE-$ENV{IMPALA_PACKAGE_VERSION}
@@ -101,7 +120,8 @@ set_dep_root(GCC)
 set_dep_root(GFLAGS)
 set_dep_root(GLOG)
 set_dep_root(GPERFTOOLS)
-set_dep_root(GTEST)
+set(GTEST_ROOT
+    $ENV{IMPALA_TOOLCHAIN_PACKAGES_HOME}/googletest-$ENV{IMPALA_GTEST_VERSION})
 set_dep_root(JWT_CPP)
 set_dep_root(LIBEV)
 set_dep_root(LIBUNWIND)
@@ -117,17 +137,26 @@ set(PROTOBUF_CLANG_ROOT
 set_dep_root(RE2)
 set_dep_root(RAPIDJSON)
 set_dep_root(SNAPPY)
-set_dep_root(THRIFT)
+set_dep_root_for_target(THRIFT CPP)
+set_dep_root_for_target(THRIFT JAVA)
+set_dep_root_for_target(THRIFT PY)
 set_dep_root(ZLIB)
 set_dep_root(CCTZ)
 set_dep_root(CURL)
 set_dep_root(CALLONCEHACK)
+set_dep_root(CLOUDFLAREZLIB)
 
 # The boost-cmake project hasn't been maintained for years. Let's make sure we
 # don't accidentally use it if it can be found.
 set(Boost_NO_BOOST_CMAKE ON)
 
-set(Boost_USE_STATIC_LIBS NOT ${BUILD_SHARED_LIBS})
+# Make Boost follow the preference of shared libraries vs static libraries.
+if(BUILD_SHARED_LIBS)
+  set(Boost_USE_STATIC_LIBS OFF)
+else()
+  set(Boost_USE_STATIC_LIBS ON)
+endif()
+# Always use the static Boost runtime
 set(Boost_USE_STATIC_RUNTIME ON)
 
 # Newer versions of boost (including the version in toolchain) don't build separate
@@ -166,31 +195,28 @@ function(IMPALA_ADD_THIRDPARTY_LIB NAME HEADER STATIC_LIB SHARED_LIB)
     ADD_THIRDPARTY_LIB(${NAME} SHARED_LIB ${SHARED_LIB})
   else()
     ADD_THIRDPARTY_LIB(${NAME} STATIC_LIB ${STATIC_LIB})
+    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+      if ("${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN" OR
+          "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN_FULL")
+        # UBSAN builds on ARM require that gcc is included last to cover several symbols
+        # omitted in libgcc_s, which is required because we use -rtlib=compiler-rt to
+        # work around https://bugs.llvm.org/show_bug.cgi?id=16404.
+        target_link_libraries(${NAME} INTERFACE gcc)
+      endif()
+    endif()
   endif()
 endfunction()
 
 
-find_package(Boost REQUIRED COMPONENTS thread regex filesystem system date_time random locale)
+find_package(Boost REQUIRED COMPONENTS thread regex filesystem system date_time random locale serialization)
 # Mark Boost as a system header to avoid compile warnings.
 include_directories(SYSTEM ${Boost_INCLUDE_DIRS})
 message(STATUS "Boost include dir: " ${Boost_INCLUDE_DIRS})
-message(STATUS "Boost libraries: " ${Boost_LIBRARIES})
+message(STATUS "Boost libraries: ${Boost_LIBRARIES}")
 
-# If at all possible, try to link with system OpenSSL in an attempt to match what the
-# platform that this build might ultimately be deployed on. If no suitable OpenSSL is
-# found, use the toolchain version - but beware that Impala will then fail to start if
-# deployed on a system with a lower version.
-find_package(OpenSSL 1.0.1 QUIET)
-if (NOT ${OPENSSL_FOUND})
-  set_dep_root(OPENSSL)
-  set(OPENSSL_FOUND ON)
-  set(OPENSSL_INCLUDE_DIR ${OPENSSL_ROOT}/include)
-  set(OPENSSL_SSL_LIBRARY ${OPENSSL_ROOT}/lib/libssl.so)
-  set(OPENSSL_CRYPTO_LIBRARY ${OPENSSL_ROOT}/lib/libcrypto.so)
-  set(OPENSSL_VERSION $ENV{IMPALA_OPENSSL_VERSION})
-  message(STATUS "System OpenSSL not found. Defaulting to toolchain version in"
-    " ${OPENSSL_ROOT_DIR}")
-endif()
+# Use OpenSSL from the system, because that is the closest match to the version that this
+# build will use when it is deployed.
+find_package(OpenSSL 1.0.2 REQUIRED)
 
 # OpenSSL, being a security dependency, is always dynamically linked.
 IMPALA_ADD_THIRDPARTY_LIB(openssl_ssl ${OPENSSL_INCLUDE_DIR} "" ${OPENSSL_SSL_LIBRARY})
@@ -199,6 +225,9 @@ IMPALA_ADD_THIRDPARTY_LIB(openssl_crypto "" "" ${OPENSSL_CRYPTO_LIBRARY})
 find_package(Bzip2 REQUIRED)
 IMPALA_ADD_THIRDPARTY_LIB(bzip2 ${BZIP2_INCLUDE_DIR} ${BZIP2_STATIC_LIBRARIES} "")
 
+if ($ENV{IMPALA_USE_CLOUDFLARE_ZLIB} STREQUAL "true")
+  set(ZLIB_ROOT ${CLOUDFLAREZLIB_ROOT})
+endif()
 find_package(Zlib REQUIRED)
 IMPALA_ADD_THIRDPARTY_LIB(zlib ${ZLIB_INCLUDE_DIR} ${ZLIB_STATIC_LIBRARIES}
   ${ZLIB_SHARED_LIBRARIES})
@@ -226,7 +255,7 @@ IMPALA_ADD_THIRDPARTY_LIB(pprof ${PPROF_INCLUDE_DIR} ${PPROF_STATIC_LIB} "")
 # find GTest headers and libs
 set (GTEST_FIND_QUIETLY TRUE)
 find_package(GTest REQUIRED)
-IMPALA_ADD_THIRDPARTY_LIB(gtest ${GTEST_INCLUDE_DIR} ${GTEST_STATIC_LIB} "")
+IMPALA_ADD_THIRDPARTY_LIB(gtest ${GTEST_INCLUDE_DIR} ${GTEST_STATIC_LIB} ${GTEST_SHARED_LIB})
 
 # Use LLVM release binaries.
 set(LLVM_BINARIES_ROOT ${LLVM_ROOT})
@@ -234,6 +263,7 @@ find_package(LlvmBinaries REQUIRED)
 
 # Find LLVM libraries to link against.
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG"
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG_NOOPT"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "TIDY"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN"
@@ -258,19 +288,39 @@ find_package(Ldap REQUIRED)
 IMPALA_ADD_THIRDPARTY_LIB(ldap ${LDAP_INCLUDE_DIR} ${LDAP_STATIC_LIBRARY} "")
 IMPALA_ADD_THIRDPARTY_LIB(lber "" ${LBER_STATIC_LIBRARY} "")
 
-# The environment variable $THRIFT_HOME is set in impala-config.sh
-# Make sure it's consistent with $THRIFT_ROOT.
-if (NOT ($ENV{THRIFT_HOME} STREQUAL ${THRIFT_ROOT}))
-  message(FATAL_ERROR "THRIFT_ROOT (${THRIFT_ROOT}) differs from environment "
-      "variable THRIFT_HOME ($ENV{THRIFT_HOME}).")
+# The environment variable $THRIFT_CPP_HOME is set in impala-config.sh
+# Make sure it's consistent with $THRIFT_CPP_ROOT.
+if (NOT ($ENV{THRIFT_CPP_HOME} STREQUAL ${THRIFT_CPP_ROOT}))
+  message(FATAL_ERROR "THRIFT_CPP_ROOT (${THRIFT_CPP_ROOT}) differs from environment "
+      "variable THRIFT_CPP_HOME ($ENV{THRIFT_CPP_HOME}).")
 endif()
 # find thrift headers and libs
-set(THRIFT_FIND_QUIETLY TRUE)
-find_package(Thrift REQUIRED)
-IMPALA_ADD_THIRDPARTY_LIB(thrift ${THRIFT_INCLUDE_DIR} ${THRIFT_STATIC_LIB} "")
-message(STATUS "Thrift version: ${THRIFT_VERSION}")
-message(STATUS "Thrift contrib dir: ${THRIFT_CONTRIB_DIR}")
-message(STATUS "Thrift compiler: ${THRIFT_COMPILER}")
+set(THRIFT_CPP_FIND_QUIETLY TRUE)
+find_package(ThriftCpp REQUIRED)
+IMPALA_ADD_THIRDPARTY_LIB(thrift ${THRIFT_CPP_INCLUDE_DIR} ${THRIFT_CPP_STATIC_LIB} "")
+message(STATUS "Thrift CPP version: ${THRIFT_CPP_VERSION}")
+message(STATUS "Thrift CPP contrib dir: ${THRIFT_CPP_CONTRIB_DIR}")
+message(STATUS "Thrift CPP compiler: ${THRIFT_CPP_COMPILER}")
+
+# The environment variable $THRIFT_JAVA_HOME is set in impala-config.sh
+# Make sure it's consistent with $THRIFT_JAVA_ROOT.
+if (NOT ($ENV{THRIFT_JAVA_HOME} STREQUAL ${THRIFT_JAVA_ROOT}))
+  message(FATAL_ERROR "THRIFT_JAVA_ROOT (${THRIFT_JAVA_ROOT}) differs from environment "
+      "variable THRIFT_JAVA_HOME ($ENV{THRIFT_JAVA_HOME}).")
+endif()
+find_package(ThriftJava REQUIRED)
+message(STATUS "Thrift JAVA version: ${THRIFT_JAVA_VERSION}")
+message(STATUS "Thrift JAVA compiler: ${THRIFT_JAVA_COMPILER}")
+
+# The environment variable $THRIFT_PY_HOME is set in impala-config.sh
+# Make sure it's consistent with $THRIFT_PY_ROOT.
+if (NOT ($ENV{THRIFT_PY_HOME} STREQUAL ${THRIFT_PY_ROOT}))
+  message(FATAL_ERROR "THRIFT_PY_ROOT (${THRIFT_PY_ROOT}) differs from environment "
+      "variable THRIFT_PY_HOME ($ENV{THRIFT_PY_HOME}).")
+endif()
+find_package(ThriftPython REQUIRED)
+message(STATUS "Thrift PY version: ${THRIFT_PY_VERSION}")
+message(STATUS "Thrift PY compiler: ${THRIFT_PY_COMPILER}")
 
 # find flatbuffers headers, lib and compiler
 find_package(FlatBuffers REQUIRED)
@@ -307,6 +357,7 @@ message(STATUS "RapidJson include dir: " ${RAPIDJSON_INCLUDE_DIR})
 # find Avro headers and libs
 find_package(Avro REQUIRED)
 IMPALA_ADD_THIRDPARTY_LIB(avro ${AVRO_INCLUDE_DIR} ${AVRO_STATIC_LIB} "")
+message(STATUS "Use C++ AVRO library: " $ENV{USE_AVRO_CPP})
 
 # find ORC headers and libs
 find_package(Orc REQUIRED)
@@ -345,6 +396,8 @@ IMPALA_ADD_THIRDPARTY_LIB(crcutil ${CRCUTIL_INCLUDE_DIR} ${CRCUTIL_STATIC_LIB}
   ${CRCUTIL_SHARED_LIB})
 
 # find jni headers and libs
+set(JAVA_AWT_LIBRARY NotNeeded)
+set(JAVA_AWT_INCLUDE_PATH NotNeeded)
 find_package(JNI REQUIRED)
 IMPALA_ADD_THIRDPARTY_LIB(java_jvm "${JNI_INCLUDE_DIRS}" "" ${JAVA_JVM_LIBRARY})
 
@@ -360,7 +413,7 @@ IMPALA_ADD_THIRDPARTY_LIB(krb5 ${KERBEROS_INCLUDE_DIR} "" ${KERBEROS_LIBRARY})
 
 # We require certain binaries from the kerberos project for our automated kerberos
 # testing.
-find_package(KerberosPrograms REQUIRED)
+find_package(KerberosPrograms)
 
 # find curl headers and libs
 find_package(Curl REQUIRED)
@@ -418,7 +471,7 @@ endif()
 if(NOT $ENV{KUDU_CLIENT_DIR} EQUAL "")
   set(kuduClient_DIR "$ENV{KUDU_CLIENT_DIR}/usr/local/share/kuduClient/cmake")
 else()
-  if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG")
+  if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG" OR "${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG_NOOPT")
     set(kuduClient_DIR "$ENV{IMPALA_KUDU_HOME}/debug/share/kuduClient/cmake")
   else()
     set(kuduClient_DIR "$ENV{IMPALA_KUDU_HOME}/release/share/kuduClient/cmake")
@@ -443,6 +496,10 @@ else()
   set_property(GLOBAL PROPERTY RULE_LAUNCH_CUSTOM ${JUNITXML_WRAPPER})
 endif()
 
+## installation path
+set(CMAKE_INSTALL_PREFIX "/opt")
+set(IMPALA_INSTALLDIR "impala" CACHE INTERNAL "")
+
 # compile these subdirs using their own CMakeLists.txt
 add_subdirectory(common/function-registry)
 add_subdirectory(common/thrift)
@@ -451,20 +508,14 @@ add_subdirectory(common/protobuf)
 add_subdirectory(be)
 add_subdirectory(docker)
 add_subdirectory(java)
+add_subdirectory(shell)
+add_subdirectory(package)
 
 # Build target for all generated files which most backend code depends on
 add_custom_target(gen-deps ALL DEPENDS thrift-deps proto-deps fb-deps
-  kudu-util-proto-deps kudu-rpc-proto-deps kudu-security-proto-deps)
+  kudu-util-proto-deps kudu-rpc-proto-deps kudu-security-proto-deps gen_ir_descriptions)
 
 add_custom_target(tarballs ALL DEPENDS shell_tarball)
-
-add_custom_target(shell_tarball DEPENDS gen-deps
-  COMMAND "${CMAKE_SOURCE_DIR}/shell/make_shell_tarball.sh"
-)
-
-add_custom_target(shell_pypi_package DEPENDS shell_tarball
-  COMMAND "DIST_DIR=${CMAKE_SOURCE_DIR}/shell/dist CLEAN_DIST=true ${CMAKE_SOURCE_DIR}/shell/packaging/make_python_package.sh"
-)
 
 add_custom_target(cscope ALL DEPENDS gen-deps
   COMMAND "${CMAKE_SOURCE_DIR}/bin/gen-cscope.sh"
@@ -474,8 +525,21 @@ add_custom_target(impala_python ALL
   COMMAND "${CMAKE_SOURCE_DIR}/bin/init-impala-python.sh"
 )
 
+add_custom_target(impala_python3 ALL
+  COMMAND "${CMAKE_SOURCE_DIR}/bin/init-impala-python.sh" "-python3"
+)
+
+set(IMPALA_PYTHON_INSTALLS "")
+if (NOT $ENV{IMPALA_SYSTEM_PYTHON2} EQUAL "")
+  list(APPEND IMPALA_PYTHON_INSTALLS shell_python2_install)
+endif()
+if (NOT $ENV{IMPALA_SYSTEM_PYTHON3} EQUAL "")
+  list(APPEND IMPALA_PYTHON_INSTALLS shell_python3_install)
+endif()
+add_custom_target(impala_shell_pypi ALL DEPENDS ${IMPALA_PYTHON_INSTALLS})
+
 add_custom_target(notests_independent_targets DEPENDS
-  java cscope tarballs impala_python
+  java cscope tarballs impala_python impala_python3 impala_shell_pypi
 )
 add_custom_target(notests_regular_targets DEPENDS
   impalad statestored catalogd admissiond fesupport loggingsupport ImpalaUdf udasample udfsample impala-profile-tool

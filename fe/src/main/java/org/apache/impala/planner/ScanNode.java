@@ -18,7 +18,10 @@
 package org.apache.impala.planner;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Stack;
 
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
@@ -30,35 +33,48 @@ import org.apache.impala.analysis.MultiAggregateInfo;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.TupleDescriptor;
-import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.NotImplementedException;
+import org.apache.impala.common.Pair;
 import org.apache.impala.common.PrintUtils;
 import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TNetworkAddress;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TScanRangeSpec;
 import org.apache.impala.thrift.TTableStats;
+import org.apache.impala.util.ExprUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
+import com.google.common.math.IntMath;
+import com.google.common.math.LongMath;
 
 /**
  * Representation of the common elements of all scan nodes.
  */
 abstract public class ScanNode extends PlanNode {
+  private final static Logger LOG = LoggerFactory.getLogger(ScanNode.class);
   // Factor capturing the worst-case deviation from a uniform distribution of scan ranges
   // among nodes. The factor of 1.2 means that a particular node may have 20% more
   // scan ranges than would have been estimated assuming a uniform distribution.
   // Used for HDFS and Kudu Scan node estimations.
   protected static final double SCAN_RANGE_SKEW_FACTOR = 1.2;
+  protected static final int MIN_NUM_SCAN_THREADS = 1;
 
   protected final TupleDescriptor desc_;
 
   // Total number of rows this node is expected to process
   protected long inputCardinality_ = -1;
+
+  // Total number of rows this node is expected to process after reduction by runtime
+  // filter.
+  // TODO: merge this with inputCardinality_.
+  protected long filteredInputCardinality_ = -1;
 
   // Scan-range specs. Populated in init().
   protected TScanRangeSpec scanRangeSpecs_;
@@ -78,12 +94,30 @@ abstract public class ScanNode extends PlanNode {
   // propagated outside the query block.
   protected ExprSubstitutionMap optimizedAggSmap_;
 
+  // Refer to the comment of 'TableRef.tableNumRowsHint_'
+  protected long tableNumRowsHint_ = -1;
+
+  // Selectivity estimates of scan ranges to open if this scan node consumes a partition
+  // filter. This selectivity is based on assumption that scan ranges are uniformly
+  // distributed across all partitions. Set in reduceCardinalityByRuntimeFilter().
+  protected double scanRangeSelectivity_ = 1.0;
+
   public ScanNode(PlanNodeId id, TupleDescriptor desc, String displayName) {
     super(id, desc.getId().asList(), displayName);
     desc_ = desc;
   }
 
+  @Override
+  public void computeStats(Analyzer analyzer) {
+    super.computeStats(analyzer);
+    analyzer.registerTupleProducingNode(desc_.getId(), this);
+    hasHardEstimates_ = !hasScanConjuncts() && !isAccessingCollectionType();
+  }
+
   public TupleDescriptor getTupleDesc() { return desc_; }
+
+  @Override
+  protected boolean shouldPickUpZippingUnnestConjuncts() { return true; }
 
   /**
    * Checks if this scan is supported based on the types of scanned columns and the
@@ -286,20 +320,41 @@ abstract public class ScanNode extends PlanNode {
     return result;
   }
 
+  /**
+   * Return true if this scan node has limit, no scan conjunct,
+   * and no storage layer conjunct. Otherwise, return false.
+   * This is mainly used to determine whether a scan's input cardinality can be bounded by
+   * the LIMIT clause or not.
+   */
+  public boolean hasSimpleLimit() {
+    return hasLimit() && !hasScanConjuncts() && !hasStorageLayerConjuncts();
+  }
+
+  private long capInputCardinalityWithLimit(long inputCardinality) {
+    if (hasSimpleLimit()) {
+      if (inputCardinality < 0) {
+        return getLimit();
+      } else {
+        return Math.min(getLimit(), inputCardinality);
+      }
+    }
+    return inputCardinality;
+  }
+
   @Override
   public long getInputCardinality() {
-    if (!hasScanConjuncts() && !hasStorageLayerConjuncts() && hasLimit()) {
-      return getLimit();
-    }
-    return inputCardinality_;
+    return capInputCardinalityWithLimit(inputCardinality_);
+  }
+
+  // May return -1.
+  // TODO: merge this with getInputCardinality().
+  public long getFilteredInputCardinality() {
+    return capInputCardinalityWithLimit(
+        filteredInputCardinality_ > -1 ? filteredInputCardinality_ : inputCardinality_);
   }
 
   @Override
   protected String getDisplayLabelDetail() {
-    FeTable table = desc_.getTable();
-    List<String> path = new ArrayList<>();
-    path.add(table.getDb().getName());
-    path.add(table.getName());
     Preconditions.checkNotNull(desc_.getPath());
     if (desc_.hasExplicitAlias()) {
       return desc_.getPath().toString() + " " + desc_.getAlias();
@@ -324,7 +379,7 @@ abstract public class ScanNode extends PlanNode {
   protected int computeMaxNumberOfScannerThreads(TQueryOptions queryOptions,
       int perHostScanRanges) {
     // The non-MT scan node requires at least one scanner thread.
-    if (queryOptions.getMt_dop() >= 1) {
+    if (Planner.useMTFragment(queryOptions)) {
       return 1;
     }
     int maxScannerThreads = Math.min(perHostScanRanges,
@@ -337,6 +392,79 @@ abstract public class ScanNode extends PlanNode {
     }
     return maxScannerThreads;
   }
+
+  /**
+   * Maximum number of scanner threads (when using CPC costing) after considering
+   * number of scan ranges and related query options.
+   */
+  protected int computeMaxScannerThreadsForCPC(TQueryOptions queryOptions) {
+    // maxThread calculation below intentionally does not include core count from
+    // executor group config. This is to allow scan fragment parallelism to scale
+    // regardless of the core count limit.
+    int maxThreadsPerNode = Math.max(queryOptions.getProcessing_cost_min_threads(),
+        queryOptions.getMax_fragment_instances_per_node());
+    int maxThreadsGlobal = IntMath.saturatedMultiply(getNumNodes(), maxThreadsPerNode);
+    int maxScannerThreads = Math.max(MIN_NUM_SCAN_THREADS,
+        (int) Math.min(estScanRangeAfterRuntimeFilter(), maxThreadsGlobal));
+    return maxScannerThreads;
+  }
+
+  /**
+   * Compute processing cost of this scan node.
+   * <p>
+   * This method does not mutate any state of the scan node object, including
+   * the processingCost_ field. Caller must set processingCost_ themself with
+   * the return value of this method.
+   */
+  protected ProcessingCost computeScanProcessingCost(TQueryOptions queryOptions) {
+    int maxScannerThreads = computeMaxScannerThreadsForCPC(queryOptions);
+    long inputCardinality = getFilteredInputCardinality();
+
+    if (inputCardinality >= 0) {
+      ProcessingCost cardinalityBasedCost =
+          ProcessingCost.basicCost(getDisplayLabel(), inputCardinality,
+              ExprUtil.computeExprsTotalCost(conjuncts_), rowMaterializationCost());
+      if (inputCardinality == 0) {
+        Preconditions.checkState(cardinalityBasedCost.getTotalCost() == 0,
+            "Scan is empty but cost is non-zero.");
+      }
+      return cardinalityBasedCost;
+    } else {
+      // Input cardinality is unknown. Return synthetic ProcessingCost based on
+      // maxScannerThreads.
+      long syntheticCardinality =
+          Math.max(1, Math.min(inputCardinality, maxScannerThreads));
+      long syntheticPerRowCost = LongMath.saturatedMultiply(
+          Math.max(1,
+              BackendConfig.INSTANCE.getMinProcessingPerThread() / syntheticCardinality),
+          maxScannerThreads);
+
+      return ProcessingCost.basicCost(
+          getDisplayLabel(), syntheticCardinality, 0, syntheticPerRowCost);
+    }
+  }
+
+  /**
+   * Estimate per-row cost as 1 per 1KB row size plus
+   * (scan_range_cost_factor * min_processing_per_thread) for every scan ranges.
+   * <p>
+   * This reflects deserialization/copy cost per row and scan range open cost.
+   */
+  private float rowMaterializationCost() {
+    float perRowCost = getAvgRowSize() / 1024;
+    if (getFilteredInputCardinality() <= 0) return perRowCost;
+
+    float perScanRangeCost = BackendConfig.INSTANCE.getMinProcessingPerThread()
+        * BackendConfig.INSTANCE.getScanRangeCostFactor();
+    float scanRangeCostPerRow = perScanRangeCost / getFilteredInputCardinality()
+        * estScanRangeAfterRuntimeFilter();
+    return perRowCost + scanRangeCostPerRow;
+  }
+
+  protected int estScanRangeAfterRuntimeFilter() {
+    return (int) Math.ceil(getEffectiveNumScanRanges() * scanRangeSelectivity_);
+  }
+
   /**
    * Returns true if this node has conjuncts to be evaluated by Impala against the scan
    * tuple.
@@ -350,4 +478,171 @@ abstract public class ScanNode extends PlanNode {
   public boolean hasStorageLayerConjuncts() { return false; }
 
   public ExprSubstitutionMap getOptimizedAggSmap() { return optimizedAggSmap_; }
+
+  protected long getEffectiveNumScanRanges() {
+    Preconditions.checkNotNull(scanRangeSpecs_);
+    return scanRangeSpecs_.getConcrete_rangesSize();
+  }
+
+  /**
+   * Return runtime filters targetting this scan node that are likely to reduce
+   * cardinality estimation. Returned filters are organized as a map of originating
+   * join node id to list of runtime filters from it.
+   */
+  private Map<PlanNodeId, List<RuntimeFilterGenerator.RuntimeFilter>>
+      groupFiltersForCardinalityReduction() {
+    // Row-level filtering is only available in Kudu scanner (through runtime filter
+    // pushdown) and HDFS columnar scanner (see EvalRuntimeFilter call in
+    // HdfsColumnarScanner::ProcessScratchBatch).
+    boolean evalAtRowLevel = (this instanceof KuduScanNode)
+        || ((this instanceof HdfsScanNode)
+            && ((HdfsScanNode) this).isAllColumnarScanner());
+
+    Map<PlanNodeId, List<RuntimeFilterGenerator.RuntimeFilter>> filtersByJoinId =
+        new HashMap<>();
+    for (RuntimeFilterGenerator.RuntimeFilter filter : getRuntimeFilters()) {
+      PlanNodeId filterSourceId = filter.getSrc().getId();
+      boolean isPartitionFilter = filter.isPartitionFilterAt(id_);
+      if (filter.isHighlySelective() && (isPartitionFilter || evalAtRowLevel)) {
+        // Partition level filtering always applies regardless of file format.
+        // Row-level runtime filtering, however, only applies at HDFS columnar file
+        // format and Kudu.
+        filtersByJoinId.computeIfAbsent(filterSourceId, id -> new ArrayList<>())
+            .add(filter);
+      }
+    }
+    return filtersByJoinId;
+  }
+
+  /**
+   * Given a contiguous probe pipeline 'nodeStack' that begins from this scan node,
+   * calculate a reduced output cardinality estimate of this scan node. The probe
+   * pipeline 'nodeStack' must have original cardinality estimate that is not increasing
+   * from scan node towards the bottom join node in stack. The join node at the bottom of
+   * stack is assumed to have the least output cardinality and all nodes below it in node
+   * tree must not have cardinality less than it.
+   * Return a pair of estimated output cardinality and partition selectivity from
+   * evaluating runtime filters.
+   */
+  private Pair<Long, Double> getReducedCardinalityByFilter(
+      Stack<PlanNode> nodeStack, double reductionScale) {
+    Map<PlanNodeId, List<RuntimeFilterGenerator.RuntimeFilter>> filtersByJoinId =
+        groupFiltersForCardinalityReduction();
+    long reducedCardinality = cardinality_;
+    Map<String, Double> partitionSelectivities = new HashMap<>();
+
+    // Compute scan cardinality reduction by applying runtime filters from the bottom
+    // of probe pipelines upward.
+    for (int i = nodeStack.size() - 1; i >= 0; i--) {
+      PlanNode node = nodeStack.get(i);
+      if (node instanceof ExchangeNode) continue;
+
+      Preconditions.checkState(node instanceof JoinNode);
+      JoinNode join = (JoinNode) node;
+      PlanNodeId joinId = join.getId();
+      if (!filtersByJoinId.containsKey(joinId)) continue;
+
+      long cardOnThisJoin = reducedCardinality;
+      for (RuntimeFilterGenerator.RuntimeFilter filter : filtersByJoinId.get(joinId)) {
+        long estCardAfterFilter = filter.reducedCardinalityForScanNode(
+            this, reducedCardinality, partitionSelectivities);
+        if (estCardAfterFilter > -1) {
+          cardOnThisJoin = Math.min(cardOnThisJoin, estCardAfterFilter);
+        }
+      }
+      reducedCardinality = cardOnThisJoin;
+    }
+
+    double partSel =
+        partitionSelectivities.values().stream().reduce(1.0, (a, b) -> a * b);
+    double scaledPartSel = 1.0 - ((1.0 - partSel) * reductionScale);
+
+    // The lowest join node in the stack should have the least output cardinality.
+    // Cap the minumum scan cardinality at highest join node's cardinality.
+    long lowestJoinCard = nodeStack.get(0).getCardinality();
+    long scaledReduction = (long) ((cardinality_ - reducedCardinality) * reductionScale);
+    long scaledCardinality = Math.max(lowestJoinCard, cardinality_ - scaledReduction);
+    return Pair.create(scaledCardinality, scaledPartSel);
+  }
+
+  /**
+   * Applies cardinality reduction over a contiguous probe pipeline 'nodeStack' that
+   * begins from this scan node. Depending on whether join nodes in 'nodeStack'
+   * produces a runtime filter and the type of that runtime filter, this method then
+   * applies the runtime filter selectivity to this scan node, reducing its cardinality
+   * and input cardinality estimate. The runtime filter selectivity is calculated with
+   * the simplest join cardinality formula from JoinNode.computeGenericJoinCardinality().
+   * 'reductionScale' is a [0.0..1.0] range to control the scale of reduction.
+   * Higher value means more reduction (lower cardinality estimate).
+   */
+  @Override
+  protected void reduceCardinalityByRuntimeFilter(
+      Stack<PlanNode> nodeStack, double reductionScale) {
+    if (nodeStack.isEmpty() || inputCardinality_ <= 0) {
+      nodeStack.clear();
+      return;
+    }
+    // Sanity check that original cardinality is non-increasing from top to bottom of
+    // stack.
+    long prevCardinality = cardinality_;
+    for (int i = nodeStack.size() - 1; i >= 0; i--) {
+      long currentCardinality = nodeStack.get(i).getCardinality();
+      Preconditions.checkState(currentCardinality <= prevCardinality,
+          "Original cardinality of " + nodeStack.get(i).getDisplayLabel()
+              + " is larger than node below it.");
+      prevCardinality = currentCardinality;
+    }
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("reduceCardinalityByRuntimeFilter from " + getDisplayLabel() + " to "
+          + nodeStack.get(0).getDisplayLabel());
+    }
+
+    Pair<Long, Double> reducedCardinality =
+        getReducedCardinalityByFilter(nodeStack, reductionScale);
+    long scanCardinalityAfterFilter = reducedCardinality.getFirst();
+
+    // Estimate scanRangeSelectivity_ based on partition selectivity.
+    // This assumes that scan ranges are uniformly distributed across partitions.
+    // If num ranges > 0, cap it to estimate at least 1 scan range read.
+    long numRanges = getEffectiveNumScanRanges();
+    scanRangeSelectivity_ = reducedCardinality.getSecond();
+    if (numRanges > 0 && scanRangeSelectivity_ < (1.0 / numRanges)) {
+      scanRangeSelectivity_ = 1.0 / numRanges;
+    }
+
+    // Apply 'scanRangeSelectivity_' towards scan's 'inputCardinality_'.
+    // Do not directly assign with the much lower 'scanCardinalityAfterFilter' here
+    // since non-partition filter still requires scanner to open and read a scan range.
+    // Kudu scan is an exception because Kudu does the row-level filtering for Impala.
+    long inputCardinalityEst = (this instanceof KuduScanNode) ?
+        scanCardinalityAfterFilter :
+        Math.max(scanCardinalityAfterFilter,
+            (long) Math.ceil(inputCardinality_ * scanRangeSelectivity_));
+    if (inputCardinality_ > inputCardinalityEst) {
+      filteredInputCardinality_ = inputCardinalityEst;
+    }
+
+    if (cardinality_ > scanCardinalityAfterFilter) {
+      // Replace this scan's cardinality with 'scanCardinalityAfterFilter'.
+      setFilteredCardinality(scanCardinalityAfterFilter);
+
+      while (nodeStack.size() > 1
+          && nodeStack.peek().cardinality_ > scanCardinalityAfterFilter) {
+        // Update each joinNode's cardinality_ in the stack.
+        // Stop when there is only 1 join node left in the stack (which is the join node
+        // with the least cardinality that must not be reduced anymore) or when the next
+        // join node cardinality is lower than 'scanCardinalityAfterFilter'.
+        PlanNode node = nodeStack.pop();
+        node.setFilteredCardinality(scanCardinalityAfterFilter);
+      }
+    }
+    nodeStack.clear();
+
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("reduceCardinalityByRuntimeFilter completed at " + getDisplayLabel()
+          + ". inputCardinality=" + getInputCardinality() + " filteredInputCardinality="
+          + getFilteredInputCardinality() + " cardinality=" + getCardinality()
+          + " filteredCardinality=" + getFilteredCardinality());
+    }
+  }
 }

@@ -78,10 +78,13 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         collectionField, collectionTable), tbl);
     TblsAnalyzeOk(String.format("select c.%s from $TBL a, a.int_array_col b, a.%s c",
         collectionField, collectionTable), tbl);
+    TblsAnalyzeOk(String.format(
+        "select 1 from $TBL, allcomplextypes.%s, functional.allcomplextypes.%s",
+        collectionTable, collectionTable), tbl);
 
     // Test join types. Parent/collection joins do not require an ON or USING clause.
     for (JoinOperator joinOp: JoinOperator.values()) {
-      if (joinOp.isNullAwareLeftAntiJoin()) continue;
+      if (joinOp.isNullAwareLeftAntiJoin() || joinOp.isIcebergDeleteJoin()) continue;
       TblsAnalyzeOk(String.format("select 1 from $TBL %s allcomplextypes.%s",
           joinOp, collectionTable), tbl);
       TblsAnalyzeOk(String.format("select 1 from $TBL a %s a.%s",
@@ -99,9 +102,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         collectionField, collectionTable), tbl);
     // Non parent/collection outer or semi  joins require an ON or USING clause.
     for (JoinOperator joinOp: JoinOperator.values()) {
-      if (joinOp.isNullAwareLeftAntiJoin()
-          || joinOp.isCrossJoin()
-          || joinOp.isInnerJoin()) {
+      if (joinOp.isNullAwareLeftAntiJoin() || joinOp.isCrossJoin() || joinOp.isInnerJoin()
+          || joinOp.isIcebergDeleteJoin()) {
         continue;
       }
       AnalysisError(String.format(
@@ -118,15 +120,9 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         collectionField, collectionTable, collectionTable), tbl,
         "Duplicate table alias: 'b'");
     // Duplicate implicit alias.
-    String[] childTblPath = collectionTable.split("\\.");
-    String childTblAlias = childTblPath[childTblPath.length - 1];
     TblsAnalysisError(String.format("select %s from $TBL a, a.%s, a.%s",
         collectionField, collectionTable, collectionTable), tbl,
-        String.format("Duplicate table alias: '%s'", childTblAlias));
-    TblsAnalysisError(String.format(
-        "select 1 from $TBL, allcomplextypes.%s, functional.allcomplextypes.%s",
-        collectionTable, collectionTable), tbl,
-        String.format("Duplicate table alias: '%s'", childTblAlias));
+        String.format("Duplicate table alias: '%s'", "a." + collectionTable));
     // Duplicate implicit/explicit alias.
     TblsAnalysisError(String.format(
         "select %s from $TBL, functional.allcomplextypes.%s allcomplextypes",
@@ -324,7 +320,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
     // Test that parent/collection joins without an ON clause analyze ok.
     for (JoinOperator joinOp: JoinOperator.values()) {
-      if (joinOp.isNullAwareLeftAntiJoin()) continue;
+      if (joinOp.isNullAwareLeftAntiJoin() || joinOp.isIcebergDeleteJoin()) continue;
       AnalyzesOk(String.format(
           "select 1 from functional.allcomplextypes a %s a.int_array_col b", joinOp));
       AnalyzesOk(String.format(
@@ -334,6 +330,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
       AnalyzesOk(String.format(
           "select 1 from functional.allcomplextypes a %s a.struct_map_col", joinOp));
     }
+
+    AnalysisError("select pos from " +
+        "(select int_array_col from functional.allcomplextypes) v",
+        "Could not resolve column/field reference: 'pos'");
+    AnalyzesOk("select pos from " +
+        "(select int_array_col from functional.allcomplextypes) v, v.int_array_col");
   }
 
   @Test
@@ -407,10 +409,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "TABLESAMPLE is only supported on HDFS tables: functional.alltypes_view");
     AnalysisError("select * from functional.allcomplextypes.int_array_col " +
         "tablesample system (10)",
-        "TABLESAMPLE is only supported on HDFS tables: int_array_col");
+        "TABLESAMPLE is only supported on HDFS tables: " +
+        "functional.allcomplextypes.int_array_col");
     AnalysisError("select * from functional.allcomplextypes a, a.int_array_col " +
         "tablesample system (10)",
-        "TABLESAMPLE is only supported on HDFS tables: int_array_col");
+        "TABLESAMPLE is only supported on HDFS tables: a.int_array_col");
   }
 
   /**
@@ -428,10 +431,6 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
    */
   private void testSlotRefPath(String sql, List<Integer> expectedAbsPath) {
     AnalysisContext ctx = createAnalysisCtx();
-    // TODO: Turning Codegen OFF could be removed once the Codegen support is implemented
-    // for structs given in the select list.
-    ctx.getQueryOptions().setDisable_codegen(true);
-
     SelectStmt stmt = (SelectStmt) AnalyzesOk(sql, ctx);
     Expr e = stmt.getResultExprs().get(stmt.getResultExprs().size() - 1);
     Preconditions.checkState(e instanceof SlotRef);
@@ -628,10 +627,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     testTableRefPath("select 1 from d.t7.c3.item.a2.item.a3", path(2, 0, 1, 0, 2), null);
     testSlotRefPath("select item from d.t7.c3.a2.a3", path(2, 0, 1, 0, 2, 0));
     testSlotRefPath("select item from d.t7.c3.item.a2.item.a3", path(2, 0, 1, 0, 2, 0));
-    AnalysisContext ctx = createAnalysisCtx();
-    ctx.getQueryOptions().setDisable_codegen(true);
-    AnalysisError("select item from d.t7.c3", ctx,
-        "Struct containing a collection type is not allowed in the select list.");
+    testSlotRefPath("select item from d.t7.c3", path(2, 0));
     // Test path assembly with multiple tuple descriptors.
     testTableRefPath("select 1 from d.t7, t7.c3, c3.a2, a2.a3",
         path(2, 0, 1, 0, 2), path(2, 0, 1, 0, 2));
@@ -775,22 +771,20 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
     // Check the support of struct in the select list for different file formats.
     AnalysisContext ctx = createAnalysisCtx();
-    ctx.getQueryOptions().setDisable_codegen(true);
-    AnalysisError("select alltypes from functional_parquet.complextypes_structs", ctx,
-        "Querying STRUCT is only supported for ORC file format.");
+    AnalysisError("select int_struct_col from functional.allcomplextypes", ctx,
+        "Querying STRUCT is only supported for ORC and Parquet file formats.");
     AnalyzesOk("select alltypes from functional_orc_def.complextypes_structs", ctx);
 
-    // Check if a struct in the select list raises an error if it contains collections.
+    // Check that a struct in the select list doesn't raise an error if it contains
+    // collections.
     addTestTable(
         "create table nested_structs (s1 struct<s2:struct<i:int>>) stored as orc");
     addTestTable("create table nested_structs_with_list " +
         "(s1 struct<s2:struct<a:array<int>>>) stored as orc");
     AnalyzesOk("select s1 from nested_structs", ctx);
     AnalyzesOk("select s1.s2 from nested_structs", ctx);
-    AnalysisError("select s1 from nested_structs_with_list", ctx, "Struct containing " +
-        "a collection type is not allowed in the select list.");
-    AnalysisError("select s1.s2 from nested_structs_with_list", ctx, "Struct " +
-        "containing a collection type is not allowed in the select list.");
+    AnalyzesOk("select s1 from nested_structs_with_list", ctx);
+    AnalyzesOk("select s1.s2 from nested_structs_with_list", ctx);
   }
 
   @Test
@@ -804,7 +798,6 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
     // Slot path is not ambiguous and resolves to a struct.
     AnalysisContext ctx = createAnalysisCtx();
-    ctx.getQueryOptions().setDisable_codegen(true);
     AnalyzesOk("select a from a.a", ctx);
     AnalyzesOk("select t.a from a.a t", ctx);
     AnalyzesOk("select t.a.a from a.a t", ctx);
@@ -1023,49 +1016,82 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // Empty star expansion, but non empty result exprs.
     AnalyzesOk("select 1, * from only_complex_types");
 
-    // Struct in select list works only if codegen is OFF.
+    // Struct in select list.
     AnalysisContext ctx = createAnalysisCtx();
-    ctx.getQueryOptions().setDisable_codegen(false);
-    AnalysisError("select alltypes from functional_orc_def.complextypes_structs", ctx,
-        "Struct type in select list is not allowed when Codegen is ON. You might want " +
-        "to set DISABLE_CODEGEN=true");
-    ctx.getQueryOptions().setDisable_codegen(true);
     AnalyzesOk("select alltypes from functional_orc_def.complextypes_structs", ctx);
-    // Illegal complex-typed expr in a union.
-    AnalysisError("select int_array_col from functional.allcomplextypes ",
-        "Expr 'int_array_col' in select list returns a collection type 'ARRAY<INT>'.\n" +
-        "Collection types are not allowed in the select list.");
-    // Illegal complex-typed expr in a union.
-    AnalysisError("select int_array_col from functional.allcomplextypes " +
-        "union all select int_array_col from functional.allcomplextypes",
-        "Expr 'int_array_col' in select list returns a collection type 'ARRAY<INT>'.\n" +
-        "Collection types are not allowed in the select list.");
+    AnalyzesOk("select int_array_col from functional.allcomplextypes");
+    AnalyzesOk("select int_array_col from functional.allcomplextypes " +
+        "union all select int_array_col from functional.allcomplextypes");
+    AnalysisError("select int_array_col, item from functional.allcomplextypes", ctx,
+        "Could not resolve column/field reference: 'item'");
+    AnalysisError("select int_array_col, int_array_col.item " +
+        "from functional.allcomplextypes", ctx,
+        "Illegal column/field reference 'int_array_col.item' with intermediate " +
+        "collection 'int_array_col' of type 'ARRAY<INT>'");
     AnalysisError("select tiny_struct from functional_orc_def.complextypes_structs " +
         "union all select tiny_struct from functional_orc_def.complextypes_structs", ctx,
-        "Set operations don't support STRUCT type. STRUCT<b:BOOLEAN> in tiny_struct");
-    // Illegal complex-typed expr inside inline view.
-    AnalysisError("select 1 from " +
-        "(select int_array_col from functional.allcomplextypes) v",
-        "Expr 'int_array_col' in select list returns a collection type 'ARRAY<INT>'.\n" +
-        "Collection types are not allowed in the select list.");
+        "Set operations don't support STRUCT types or types containing STRUCT types." +
+        " STRUCT<b:BOOLEAN> in tiny_struct");
+    AnalysisError("select all_mix from functional_parquet.collection_struct_mix " +
+        "union all select all_mix from functional_parquet.collection_struct_mix", ctx,
+        "Set operations don't support STRUCT types or types containing STRUCT types. " +
+        "MAP<INT,STRUCT<big:STRUCT<arr:ARRAY<STRUCT<inner_arr:ARRAY<ARRAY<INT>>," +
+        "m:TIMESTAMP>>,n:INT>,small:STRUCT<str:STRING,i:INT>>> in all_mix.");
+    AnalyzesOk("select 1 from " +
+        "(select int_array_col from functional.allcomplextypes) v");
+    AnalyzesOk("select int_array_col from " +
+        "(select int_array_col from functional.allcomplextypes) v");
     // Structs are allowed in an inline view.
     AnalyzesOk("select v.ts from (select tiny_struct as ts from " +
         "functional_orc_def.complextypes_structs) v;", ctx);
     // Illegal complex-typed expr in an insert.
     AnalysisError("insert into functional.allcomplextypes " +
         "select int_array_col from functional.allcomplextypes",
-        "Expr 'int_array_col' in select list returns a collection type 'ARRAY<INT>'.\n" +
-        "Collection types are not allowed in the select list.");
+        "Unable to INSERT into target table (functional.allcomplextypes) because " +
+        "the column 'int_array_col' has a complex type 'ARRAY<INT>' and Impala " +
+        "doesn't support inserting into tables containing complex type columns");
     // Illegal complex-typed expr in a CTAS.
     AnalysisError("create table new_tbl as " +
         "select int_array_col from functional.allcomplextypes",
-        "Expr 'int_array_col' in select list returns a collection type 'ARRAY<INT>'.\n" +
-        "Collection types are not allowed in the select list.");
+        "Unable to INSERT into target table (default.new_tbl) because the column " +
+        "'int_array_col' has a complex type 'ARRAY<INT>' and Impala doesn't support " +
+        "inserting into tables containing complex type columns");
     AnalysisError("create table new_tbl as " +
         "select tiny_struct from functional_orc_def.complextypes_structs", ctx,
         "Unable to INSERT into target table (default.new_tbl) because the column " +
             "'tiny_struct' has a complex type 'STRUCT<b:BOOLEAN>' and Impala doesn't " +
             "support inserting into tables containing complex type columns");
+    // Binary in complex types is also supported.
+    AnalyzesOk("select binary_item_col from functional_parquet.binary_in_complex_types");
+    AnalyzesOk(
+        "select binary_member_col from functional_parquet.binary_in_complex_types");
+    AnalyzesOk("select binary_key_col from functional_parquet.binary_in_complex_types");
+    AnalyzesOk("select binary_value_col from functional_parquet.binary_in_complex_types");
+
+    //Make complex types available in star queries
+    ctx.getQueryOptions().setExpand_complex_types(true);
+
+    AnalyzesOk("select * from functional_parquet.complextypes_structs",ctx);
+    AnalyzesOk("select * from functional_parquet.complextypes_nested_structs",ctx);
+    AnalyzesOk("select * from functional_parquet.complextypes_maps_view",ctx);
+
+    AnalyzesOk("select outer_struct.str, outer_struct.* from " +
+            "functional_parquet.complextypes_nested_structs",ctx);
+    AnalyzesOk("select * from (select * from " +
+            "functional_parquet.complextypes_nested_structs) v",ctx);
+    AnalyzesOk("select * from (select int_map, int_map_array from " +
+            "functional_parquet.complextypestbl) v",ctx);
+
+    AnalyzesOk("select * from functional_parquet.complextypes_arrays",ctx);
+    AnalyzesOk("select * from " +
+            "functional_parquet.complextypes_arrays_only_view",ctx);
+    AnalyzesOk("select v.id, v.* from " +
+            "(select * from functional_parquet.complextypes_arrays) v",ctx);
+
+    // Allow also structs in collections and vice versa.
+    AnalyzesOk("select * from functional_parquet.allcomplextypes", ctx);
+    AnalyzesOk("select * from functional_orc_def.complextypestbl", ctx);
+    AnalyzesOk("select * from functional_parquet.binary_in_complex_types", ctx);
   }
 
   @Test
@@ -1551,7 +1577,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
     // Test that joins without an ON clause analyze ok if the rhs table is correlated.
     for (JoinOperator joinOp: JoinOperator.values()) {
-      if (joinOp.isNullAwareLeftAntiJoin()) continue;
+      if (joinOp.isNullAwareLeftAntiJoin() || joinOp.isIcebergDeleteJoin()) continue;
       AnalyzesOk(String.format("select 1 from functional.allcomplextypes a %s " +
           "(select item from a.int_array_col) v", joinOp));
       AnalyzesOk(String.format("select 1 from functional.allcomplextypes a %s " +
@@ -1666,6 +1692,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalysisError("select * from functional.alltypes a full outer join " +
         "functional.alltypes b",
         "FULL OUTER JOIN requires an ON or USING clause");
+
+    // BINARY columns can be used in joins.
+    AnalyzesOk("select * from functional.binary_tbl a join " +
+        "functional.binary_tbl b on a.binary_col = b.binary_col");
+    AnalyzesOk("select * from functional.binary_tbl a join " +
+        "functional.binary_tbl b using (binary_col)");
   }
 
   @Test
@@ -1957,7 +1989,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         // Table hints not supported for HBase tables
         AnalyzesOk(String.format("select * from functional_hbase.alltypes %s " +
               "%sschedule_random_replica%s", alias, prefix, suffix),
-            "Table hints only supported for Hdfs tables");
+            "Table hints only supported for Hdfs/Kudu tables");
         // Table hints not supported for catalog views
         AnalyzesOk(String.format("select * from functional.alltypes_view %s " +
               "%sschedule_random_replica%s", alias, prefix, suffix),
@@ -1984,7 +2016,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
   */
   private boolean hasStraightJoin(String stmt, String expectedWarning){
     AnalysisContext ctx = createAnalysisCtx();
-    AnalyzesOk(stmt,ctx, expectedWarning);
+    if (expectedWarning == null) {
+      AnalyzesOkWithoutWarnings(stmt, ctx);
+    } else {
+      AnalyzesOk(stmt, ctx, expectedWarning);
+    }
     return ctx.getAnalyzer().isStraightJoin();
   }
 
@@ -2297,6 +2333,9 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "SUM requires a numeric parameter: sum(string_col)");
     AnalysisError("select avg(string_col) from functional.alltypes",
         "AVG requires a numeric or timestamp parameter: avg(string_col)");
+    AnalysisError("select avg(binary_col) from functional.binary_tbl",
+        "AVG requires a numeric or timestamp parameter: avg(binary_col)");
+
 
     // aggregate requires table in the FROM clause
     AnalysisError("select count(*)", "aggregation without a FROM clause is not allowed");
@@ -2321,6 +2360,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         + "from functional.date_tbl");
     AnalyzesOk("select ndv(date_col), distinctpc(date_col), distinctpcsa(date_col), "
         + "count(distinct date_col) from functional.date_tbl");
+
+    // Binary
+    AnalyzesOk("select min(binary_col), max(binary_col), count(binary_col), "
+        + "max(length(binary_col)) from functional.binary_tbl");
+    AnalysisError("select ndv(binary_col) from functional.binary_tbl",
+        "No matching function with signature: ndv(BINARY).");
 
     // Test select stmt avg smap.
     AnalyzesOk("select cast(avg(c1) as decimal(10,4)) as c from " +
@@ -2894,6 +2939,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "group by 1, 2");
     AnalyzesOk("select date_part, date_col, count(*) from functional.date_tbl " +
         "group by 1, 2");
+    AnalyzesOk("select binary_col, count(*) from functional.binary_tbl " +
+        "group by binary_col");
 
     // doesn't group by all non-agg select list items
     AnalysisError("select zip, count(*) from functional.testtbl",
@@ -2993,6 +3040,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "order by true asc, false desc, NULL asc");
     AnalyzesOk("select d1, d2 from functional.decimal_tbl order by d1");
     AnalyzesOk("select date_col, date_part from functional.date_tbl order by date_col");
+    AnalyzesOk("select string_col from functional.binary_tbl order by binary_col");
 
     // resolves ordinals
     AnalyzesOk("select zip, id from functional.testtbl order by 1");
@@ -3457,6 +3505,9 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "partition (year, month) " +
         "values(1, true, 1, 1, 1, 1, cast(1.0 as float), cast(1.0 as double), " +
         "'a', 'a', cast(0 as timestamp), 2009, 10)");
+
+    assertEquals("SELECT 1", AnalyzesOk("values (1)").toSql(ToSqlOptions.REWRITTEN));
+
     // Values stmt with multiple rows.
     AnalyzesOk("values((1, 2, 3), (4, 5, 6))");
     AnalyzesOk("select * from (values('a', 'b', 'c')) as t");
@@ -3480,6 +3531,9 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "'b', 'b', cast(0 as timestamp), 2009, 2)," +
         "(3, true, 3, 3, 3, 3, cast(3.0 as float), cast(3.0 as double), " +
         "'c', 'c', cast(0 as timestamp), 2009, 3))");
+
+    assertEquals("SELECT 1 UNION ALL SELECT 2",
+        AnalyzesOk("values (1), (2)").toSql(ToSqlOptions.REWRITTEN));
 
     // Test multiple aliases. Values() is like union, the column labels are 'x' and 'y'.
     AnalyzesOk("values((1 as x, 'a' as y), (2 as k, 'b' as j))");
@@ -3513,6 +3567,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "Target table 'functional.alltypes' is incompatible with source expressions.\n" +
         "Expression ''a'' (type: STRING) is not compatible with column 'tinyint_col'" +
         " (type: TINYINT)");
+    // Regression test for IMPALA-12042: Transitive compatibility is not
+    // allowed (boolean -> tinyint -> decimal(4,1))
+    AnalysisError("values (true), (123), (111.0)",
+        "Incompatible return types 'BOOLEAN' and 'DECIMAL(4,1)'"
+            + " of exprs 'TRUE' and '111.0'");
   }
 
   @Test
@@ -3960,6 +4019,22 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
   }
 
   @Test
+  public void TestIcebergLoadData() throws AnalysisException {
+    AnalyzesOk("load data inpath "
+        + "'/test-warehouse/iceberg_test/iceberg_non_partitioned/data' into table "
+        + "functional_parquet.iceberg_non_partitioned");
+    AnalyzesOk("load data inpath "
+        + "'/test-warehouse/iceberg_test/iceberg_non_partitioned/data' overwrite into "
+        + "table functional_parquet.iceberg_non_partitioned");
+    AnalysisError("load data inpath "
+        + "'/test-warehouse/iceberg_test/iceberg_partitioned/data/"
+        + "event_time_hour=2020-01-01-08/action=view/' into table "
+        + "functional_parquet.iceberg_partitioned partition "
+        + "(event_time_hour='2020-01-01-08', action='view');", "PARTITION clause is not "
+        + "supported for Iceberg tables.");
+  }
+
+  @Test
   public void TestInsert() throws AnalysisException {
     for (String qualifier: ImmutableList.of("INTO", "OVERWRITE")) {
       testInsertStatic(qualifier);
@@ -4251,7 +4326,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "from functional.alltypes");
 
     String hbaseQuery =  "INSERT " + qualifier + " TABLE " +
-        "functional_hbase.insertalltypesagg select id, bigint_col, bool_col, " +
+        "functional_hbase.insertalltypesagg select id, bigint_col, " +
+        "cast(string_col as binary), bool_col, " +
         "date_string_col, day, double_col, float_col, int_col, month, smallint_col, " +
         "string_col, timestamp_col, tinyint_col, year from functional.alltypesagg";
 
@@ -4606,11 +4682,10 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     testNumberOfMembers(ValuesStmt.class, 0);
 
     // Also check TableRefs.
-    testNumberOfMembers(TableRef.class, 28);
+    testNumberOfMembers(TableRef.class, 31);
     testNumberOfMembers(BaseTableRef.class, 0);
     testNumberOfMembers(InlineViewRef.class, 10);
   }
-
   @SuppressWarnings("rawtypes")
   private void testNumberOfMembers(Class cl, int expectedNumMembers) {
     int actualNumMembers = 0;
@@ -4630,6 +4705,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
   public void TestSetQueryOption() {
     AnalyzesOk("set foo=true");
     AnalyzesOk("set");
+    AnalyzesOk("unset all");
   }
 
   @Test
@@ -4918,7 +4994,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         iceT);
     TblsAnalyzeOk("select * from $TBL for system_time as of now() + interval 3 days",
         iceT);
-    TblsAnalyzeOk("select * from $TBL for system_version as of 123456", iceT);
+    // Use a legal snapshot id '93996984692289973' from the testdata.
+    TblsAnalyzeOk("select * from $TBL for system_version as of 93996984692289973", iceT);
 
     TblsAnalysisError("select * from $TBL for system_time as of 42", iceT,
         "FOR SYSTEM_TIME AS OF <expression> must be a timestamp type");
@@ -4934,6 +5011,35 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "FOR SYSTEM_TIME AS OF clause is only supported for Iceberg tables.");
     TblsAnalysisError("select * from $TBL for system_version as of 123", nonIceT,
         "FOR SYSTEM_VERSION AS OF clause is only supported for Iceberg tables.");
+  }
+
+  @Test
+  public void testIcebergDescribeHistory() throws ImpalaException {
+    TableName iceT = new TableName("functional_parquet", "iceberg_non_partitioned");
+    TableName nonIceT = new TableName("functional", "allcomplextypes");
+
+    // Analyze without predicate.
+    TblsAnalyzeOk("DESCRIBE HISTORY $TBL", iceT);
+
+    // Analyze with predicates.
+    TblsAnalyzeOk("DESCRIBE HISTORY $TBL FROM \"2022-02-14 13:31:09.819\"", iceT);
+    TblsAnalyzeOk("DESCRIBE HISTORY $TBL FROM " +
+        "cast('2021-08-09 15:52:45' as timestamp) - interval 2 days + interval 3 days",
+        iceT);
+    TblsAnalyzeOk("DESCRIBE HISTORY $TBL FROM now() + interval 3 days", iceT);
+    TblsAnalyzeOk("DESCRIBE HISTORY $TBL BETWEEN '2021-02-22' AND '2021-02-22'", iceT);
+
+    // Analyze should fail with unsupported expression types.
+    TblsAnalysisError("DESCRIBE HISTORY $TBL FROM 42 ", iceT,
+        "FROM <expression> must be a timestamp type");
+    TblsAnalysisError("DESCRIBE HISTORY $TBL FROM id", iceT,
+        "Unsupported expression: 'id'");
+    TblsAnalysisError("DESCRIBE HISTORY $TBL FROM '2021-02-32 15:52:45'", iceT,
+        "Invalid TIMESTAMP expression");
+
+    // DESCRIBE HISTORY is only supported for Iceberg tables.
+    TblsAnalysisError("DESCRIBE HISTORY $TBL", nonIceT,
+        "DESCRIBE HISTORY must specify an Iceberg table:");
   }
 
   @Test
@@ -5000,5 +5106,113 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
             "/* +ILLEGAL_HINT_TEST1,ILLEGAL_HINT_TEST2,ILLEGAL_HINT_TEST3 */ " +
             "l_shipdate <= (select '1998-09-02')",
         "Predicate hint not recognized: ILLEGAL_HINT_TEST3");
+  }
+
+  @Test
+  public void testTableCardinalityHintNegative() {
+    // Cannot set cardinality hint with non long type parameter
+    AnalysisError("select * from functional.alltypes /* +TABLE_NUM_ROWS(aa) */",
+        "For input string: \"aa\"");
+    AnalysisError("select * from functional.alltypes /* +TABLE_NUM_ROWS(-1) */",
+        "Syntax error in line 1");
+    AnalysisError("select * from functional.alltypes /* +TABLE_NUM_ROWS(1.0) */",
+        "Syntax error in line 1");
+    // Cannot set cardinality hint with multiple parameters
+    AnalysisError("select * from functional.alltypes /* +TABLE_NUM_ROWS(10, 20) */",
+        "Syntax error in line 1");
+  }
+
+  @Test
+  public void testTableCardinalityHintPositive() {
+    // Cannot set cardinality hint without parameter
+    AnalyzesOk("select * from functional.alltypes /* +TABLE_NUM_ROWS */",
+        "Table hint not recognized for table functional.alltypes: TABLE_NUM_ROWS");
+    // 'TABLE_NUM_ROWS' is only valid for hdfs and kudu table now
+    AnalyzesOk("select * from functional.alltypes /* +TABLE_NUM_ROWS(100) */");
+    AnalyzesOk("select * from functional_kudu.alltypes /* +TABLE_NUM_ROWS(100) */");
+    // Kudu table only support 'TABLE_NUM_ROWS' hint
+    AnalyzesOk("select * from functional_kudu.alltypes /* +SCHEDULE_CACHE_LOCAL */",
+        "Kudu table only support 'TABLE_NUM_ROWS' hint.");
+    // Only hdfs and kudu tables can use this hint
+    AnalyzesOk("select * from functional_hbase.alltypes /* +TABLE_NUM_ROWS(100) */",
+        "Table hint not recognized for table " +
+            "functional_hbase.alltypes: TABLE_NUM_ROWS(100)");
+  }
+
+  @Test
+  public void testSelectivityHintNegative() {
+    // Selectivity hint must use bracket, even for single predicate
+    AnalysisError("select * from t1 where a > 1 and b > 2 /* +SELECTIVITY(0.1) */",
+        "Syntax error in line 1");
+    AnalysisError("select * from t1 where a > 1 /* +SELECTIVITY(0.1) */",
+        "Syntax error in line 1");
+
+    // Cannot set selectivity hint exists predicate
+    AnalysisError("select * from t1 where exists (select x from t2) " +
+            "/* +SELECTIVITY(0.1) */",
+        "Syntax error in line 1");
+
+    // Selectivity hint only accept one parameter with decimal type
+    // Negative number and zero are not allowed
+    AnalysisError("select * from t1 where (a > 1) /* +SELECTIVITY('0.1') */",
+        "Syntax error in line 1");
+    AnalysisError("select * from t1 where (a > 1) /* +SELECTIVITY(0) */",
+        "Syntax error in line 1");
+    AnalysisError("select * from t1 where (a > 1) /* +SELECTIVITY(-1.0) */",
+        "Syntax error in line 1");
+    AnalysisError("select * from t1 where (a > 1) /* +SELECTIVITY(0.1, 0.2) */",
+        "Syntax error in line 1");
+    AnalysisError("select * from t1 where (a > 1) /* +SELECTIVITY(1/3) */",
+        "Syntax error in line 1");
+  }
+
+  @Test
+  public void testSelectivityHintPositive() {
+    // Selectivity hint legal value is (0,1]
+    AnalyzesOk("select * from tpch.lineitem where (l_shipdate <= '1998-09-02') " +
+            "/* +SELECTIVITY(1.1) */",
+        "Invalid selectivity hint value: 1.1, allowed value should be a double value in "
+            + "(0, 1].");
+    AnalyzesOk("select * from tpch.lineitem where (l_shipdate <= '1998-09-02') " +
+            "/* +SELECTIVITY(0.0) */",
+        "Invalid selectivity hint value: 0.0, allowed value should be a double value in "
+            + "(0, 1].");
+
+    // Also valid for a very long decimal value
+    AnalyzesOk("select * from functional.alltypes where (id > 1000)" +
+        "/* +SELECTIVITY(0.3333333333333333333333333333333333) */");
+    // Set selectivity hint for compound predicate
+    AnalyzesOk("select * from functional.alltypes where (id > 1000 and int_col = 1)" +
+        "/* +SELECTIVITY(0.1) */");
+    AnalyzesOk("select * from functional.alltypes where (id > 1000 or int_col = 1)" +
+        "/* +SELECTIVITY(0.1) */");
+
+    // Selectivity hint is invalid for 'AND' compound predicate.
+    AnalyzesOk("select * from tpch.lineitem where (l_shipdate <= '1998-09-02' and " +
+            "l_shipdate >= '1997-09-02')/* +SELECTIVITY(0.5) */",
+        "Selectivity hints are ignored for 'AND' compound predicates, either in the SQL "
+            + "query or internally generated.");
+  }
+
+  @Test
+  public void TestConvertTable() {
+    AnalyzesOk("alter table functional_parquet.tinytable convert to iceberg");
+    AnalyzesOk("alter table functional_parquet.tinytable convert to iceberg"
+            + " tblproperties('iceberg.catalog'='hadoop.tables')");
+    AnalyzesOk("alter table functional_parquet.tinytable convert to iceberg"
+            + " tblproperties('iceberg.catalog'='hive.catalog')");
+    AnalysisError("alter table functional_parquet.alltypes convert to iceberg",
+        "Incompatible column type in source table. Unsupported Hive type: BYTE");
+    AnalysisError("alter table functional_parquet.tinytable convert to iceberg"
+            + " tblproperties('iceberg.catalog'='hadoop.catalog')",
+        "The Hadoop Catalog is not supported because the location may change");
+    AnalysisError("alter table functional_kudu.tinytable convert to iceberg",
+        "CONVERT TO ICEBERG is not supported for KuduTable");
+    AnalysisError("alter table functional.tinytable convert to iceberg",
+        "CONVERT TO ICEBERG is not supported for " +
+        "org.apache.hadoop.mapred.TextInputFormat");
+    AnalysisError("alter table functional_parquet.tinytable convert to iceberg"
+            + " tblproperties('metadata.generator.threads'='a1')",
+        "CONVERT TO ICEBERG only accepts 'iceberg.catalog' as TBLPROPERTY.");
   }
 }

@@ -1,0 +1,531 @@
+====
+---- QUERY
+# Create external JDBC table
+DROP TABLE IF EXISTS alltypes_jdbc_datasource;
+CREATE EXTERNAL TABLE alltypes_jdbc_datasource (
+ id INT,
+ bool_col BOOLEAN,
+ tinyint_col TINYINT,
+ smallint_col SMALLINT,
+ int_col INT,
+ bigint_col BIGINT,
+ float_col FLOAT,
+ double_col DOUBLE,
+ date_col DATE,
+ string_col STRING,
+ timestamp_col TIMESTAMP)
+STORED BY JDBC
+TBLPROPERTIES (
+"database.type"="MYSQL",
+"jdbc.url"="jdbc:mysql://localhost:3306/functional",
+"jdbc.properties"="autoReconnect=false, useUnicode=false",
+"jdbc.driver"="com.mysql.cj.jdbc.Driver",
+"driver.url"="$FILESYSTEM_PREFIX/test-warehouse/data-sources/jdbc-drivers/mysql-jdbc.jar",
+"dbcp.username"="hiveuser",
+"dbcp.password"="password",
+"table"="alltypes");
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+# Create external JDBC table
+DROP TABLE IF EXISTS alltypes_jdbc_datasource_2;
+CREATE EXTERNAL TABLE alltypes_jdbc_datasource_2 (
+ id INT,
+ bool_col BOOLEAN,
+ tinyint_col TINYINT,
+ smallint_col SMALLINT,
+ int_col INT,
+ bigint_col BIGINT,
+ float_col FLOAT,
+ double_col DOUBLE,
+ date_col DATE,
+ string_col STRING,
+ timestamp_col TIMESTAMP)
+STORED BY JDBC
+TBLPROPERTIES (
+"database.type"="MYSQL",
+"jdbc.url"="jdbc:mysql://localhost:3306/functional",
+"jdbc.driver"="com.mysql.cj.jdbc.Driver",
+"driver.url"="$FILESYSTEM_PREFIX/test-warehouse/data-sources/jdbc-drivers/mysql-jdbc.jar",
+"dbcp.username"="hiveuser",
+"dbcp.password"="password",
+"table"="AllTypesCaseSensitiveNames",
+"column.mapping"="id=id, bool_col=Bool_col, tinyint_col=Tinyint_col, smallint_col=Smallint_col, int_col=Int_col, bigint_col=Bigint_col, float_col=Float_col, double_col=Double_col, date_col=Date_col, string_col=String_col, timestamp=Timestamp");
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+# Create external JDBC table with decimal type of columns
+DROP TABLE IF EXISTS jdbc_decimal_tbl;
+CREATE EXTERNAL TABLE jdbc_decimal_tbl (
+ d1 DECIMAL(9,0),
+ d2 DECIMAL(10,0),
+ d3 DECIMAL(20,10),
+ d4 DECIMAL(38,38),
+ d5 DECIMAL(10,5))
+STORED BY JDBC
+TBLPROPERTIES (
+"database.type"="MYSQL",
+"jdbc.url"="jdbc:mysql://localhost:3306/functional",
+"jdbc.driver"="com.mysql.cj.jdbc.Driver",
+"driver.url"="$FILESYSTEM_PREFIX/test-warehouse/data-sources/jdbc-drivers/mysql-jdbc.jar",
+"dbcp.username"="hiveuser",
+"dbcp.password"="password",
+"table"="decimal_tbl");
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+# Test the jdbc DataSource
+# count(*) with a predicate evaluated by Impala
+select count(*) from alltypes_jdbc_datasource
+where float_col = 0 and string_col is not NULL
+---- RESULTS
+730
+---- TYPES
+BIGINT
+====
+---- QUERY
+# count(*) with no predicates has no materialized slots
+select count(*) from alltypes_jdbc_datasource
+---- RESULTS
+7300
+---- TYPES
+BIGINT
+====
+---- QUERY
+# Gets all types including a row with a NULL value. The predicate pushed to
+# the DataSource.
+select *
+from alltypes_jdbc_datasource
+where id > 10 and int_col< 5 limit 5
+---- RESULTS
+11,false,1,1,1,10,1.100000023841858,10.1,2009-01-02,'1',2009-01-02 00:11:00
+12,false,2,2,2,20,2.200000047683716,20.2,2009-01-02,'2',2009-01-02 00:12:00
+13,false,3,3,3,30,3.299999952316284,30.3,2009-01-02,'3',2009-01-02 00:13:00
+14,false,4,4,4,40,4.400000095367432,40.4,2009-01-02,'4',2009-01-02 00:14:01
+20,false,0,0,0,0,0,0,2009-01-03,'0',2009-01-03 00:20:01
+---- TYPES
+INT, BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT, DOUBLE, DATE, STRING, TIMESTAMP
+====
+---- QUERY
+# Gets specified columns.
+select id, bool_col, smallint_col, float_col, double_col, date_col
+from alltypes_jdbc_datasource
+where id > 10 and int_col< 5 limit 5
+---- RESULTS
+11,false,1,1.100000023841858,10.1,2009-01-02
+12,false,2,2.200000047683716,20.2,2009-01-02
+13,false,3,3.299999952316284,30.3,2009-01-02
+14,false,4,4.400000095367432,40.4,2009-01-02
+20,false,0,0,0,2009-01-03
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE
+====
+---- QUERY
+# Gets specified columns from external jdbc table with case sensitive column names
+# and table name.
+select id, bool_col, smallint_col, float_col, double_col, date_col
+from alltypes_jdbc_datasource_2
+where id > 10 and int_col< 5 limit 5
+---- RESULTS
+11,false,1,1.100000023841858,10.1,2009-01-02
+12,false,2,2.200000047683716,20.2,2009-01-02
+13,false,3,3.299999952316284,30.3,2009-01-02
+14,false,4,4.400000095367432,40.4,2009-01-02
+20,false,0,0,0,2009-01-03
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE
+====
+---- QUERY
+# Inner join with a non jdbc table
+select a.id, b.int_col
+from alltypes_jdbc_datasource a inner join functional.alltypes b on (a.id = b.id)
+where a.id = 1
+---- RESULTS
+1,1
+---- TYPES
+INT, INT
+====
+---- QUERY
+# Inner join with another jdbc table
+select a.id, b.int_col
+from alltypes_jdbc_datasource a inner join alltypes_jdbc_datasource_2 b on (a.id = b.id)
+where a.id < 3 group by a.id, b.int_col
+---- RESULTS
+0,0
+1,1
+2,2
+---- TYPES
+INT, INT
+====
+---- QUERY
+# Cross join
+select a.id, b.id
+from alltypes_jdbc_datasource a cross join alltypes_jdbc_datasource b
+where (a.id < 3 and b.id < 3)
+order by a.id, b.id limit 10
+---- RESULTS
+0,0
+0,1
+0,2
+1,0
+1,1
+1,2
+2,0
+2,1
+2,2
+---- TYPES
+INT, INT
+====
+---- QUERY
+# Gets specified columns based on date predicate with operator '='.
+select id, bool_col, smallint_col, float_col, double_col, date_col
+from alltypes_jdbc_datasource
+where date_col = DATE '2009-01-09' order by id limit 5;
+---- RESULTS
+80,false,0,0,0,2009-01-09
+81,false,1,1.100000023841858,10.1,2009-01-09
+82,false,2,2.200000047683716,20.2,2009-01-09
+83,false,3,3.299999952316284,30.3,2009-01-09
+84,false,4,4.400000095367432,40.4,2009-01-09
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE
+====
+---- QUERY
+# Gets specified columns based on date predicate with operator '='
+# with empty results.
+select id, bool_col, smallint_col, float_col, double_col, date_col
+from alltypes_jdbc_datasource
+where date_col = DATE '1990-01-01' order by id limit 5;
+---- RESULTS
+====
+---- QUERY
+# Gets specified columns based on date predicate with operator '>'.
+select id, bool_col, smallint_col, float_col, double_col, date_col
+from alltypes_jdbc_datasource
+where date_col > DATE '2009-01-02' order by id limit 5;
+---- RESULTS
+20,false,0,0,0,2009-01-03
+21,false,1,1.100000023841858,10.1,2009-01-03
+22,false,2,2.200000047683716,20.2,2009-01-03
+23,false,3,3.299999952316284,30.3,2009-01-03
+24,false,4,4.400000095367432,40.4,2009-01-03
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE
+====
+---- QUERY
+# Gets specified columns based on date predicate with operator '>'
+# with empty results.
+select id, bool_col, smallint_col, float_col, double_col, date_col
+from alltypes_jdbc_datasource
+where date_col > DATE '2990-01-01' order by id limit 5;
+---- RESULTS
+====
+---- QUERY
+# Gets specified columns based on date predicate with operator '<'.
+select id, bool_col, smallint_col, float_col, double_col, date_col
+from alltypes_jdbc_datasource
+where date_col < DATE '2009-01-02' order by id limit 5;
+---- RESULTS
+0,false,0,0,0,2009-01-01
+1,false,1,1.100000023841858,10.1,2009-01-01
+2,false,2,2.200000047683716,20.2,2009-01-01
+3,false,3,3.299999952316284,30.3,2009-01-01
+4,false,4,4.400000095367432,40.4,2009-01-01
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE
+====
+---- QUERY
+# Gets specified columns based on date predicate with operator '<'
+# with empty results.
+select id, bool_col, smallint_col, float_col, double_col, date_col
+from alltypes_jdbc_datasource
+where date_col < DATE '1990-01-01' order by id limit 5;
+---- RESULTS
+====
+---- QUERY
+# Gets specified columns based on date predicate with operator '>='.
+select id, bool_col, smallint_col, float_col, double_col, date_col
+from alltypes_jdbc_datasource
+where date_col >= DATE '2009-01-02' order by id limit 5;
+---- RESULTS
+10,false,0,0,0,2009-01-02
+11,false,1,1.100000023841858,10.1,2009-01-02
+12,false,2,2.200000047683716,20.2,2009-01-02
+13,false,3,3.299999952316284,30.3,2009-01-02
+14,false,4,4.400000095367432,40.4,2009-01-02
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE
+====
+---- QUERY
+# Gets specified columns based on date predicate with operator '<='.
+select id, bool_col, smallint_col, float_col, double_col, date_col
+from alltypes_jdbc_datasource
+where date_col <= DATE '2009-01-02' order by id limit 5;
+---- RESULTS
+0,false,0,0,0,2009-01-01
+1,false,1,1.100000023841858,10.1,2009-01-01
+2,false,2,2.200000047683716,20.2,2009-01-01
+3,false,3,3.299999952316284,30.3,2009-01-01
+4,false,4,4.400000095367432,40.4,2009-01-01
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE
+====
+---- QUERY
+# Gets specified columns based on date predicate with operator '!='.
+select id, bool_col, smallint_col, float_col, double_col, date_col
+from alltypes_jdbc_datasource
+where date_col != DATE '2009-01-01' order by id limit 5;
+---- RESULTS
+10,false,0,0,0,2009-01-02
+11,false,1,1.100000023841858,10.1,2009-01-02
+12,false,2,2.200000047683716,20.2,2009-01-02
+13,false,3,3.299999952316284,30.3,2009-01-02
+14,false,4,4.400000095367432,40.4,2009-01-02
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE
+====
+---- QUERY
+# Gets specified columns based on date predicate with operator 'between'.
+select id, bool_col, smallint_col, float_col, double_col, date_col
+from alltypes_jdbc_datasource
+where date_col between DATE '2009-03-01' and DATE '2009-04-01' order by id limit 5;
+---- RESULTS
+590,false,0,0,0,2009-03-01
+591,false,1,1.100000023841858,10.1,2009-03-01
+592,false,2,2.200000047683716,20.2,2009-03-01
+593,false,3,3.299999952316284,30.3,2009-03-01
+594,false,4,4.400000095367432,40.4,2009-03-01
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE
+====
+---- QUERY
+# Gets specified columns based on timestamp predicate with operator '='.
+select id, bool_col, smallint_col, float_col, double_col, date_col, timestamp_col
+from alltypes_jdbc_datasource
+where timestamp_col = '2009-01-02 00:12:00.00' order by id limit 5;
+---- RESULTS
+12,false,2,2.200000047683716,20.2,2009-01-02,2009-01-02 00:12:00
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE, TIMESTAMP
+====
+---- QUERY
+# Gets specified columns based on timestamp predicate with operator '='
+# with empty result.
+select id, bool_col, smallint_col, float_col, double_col, date_col, timestamp_col
+from alltypes_jdbc_datasource
+where timestamp_col = '1990-01-02 00:12:00.00' order by id limit 5;
+---- RESULTS
+====
+---- QUERY
+# Gets specified columns based on timestamp predicate with operator '>'.
+select id, bool_col, smallint_col, float_col, double_col, date_col, timestamp_col
+from alltypes_jdbc_datasource
+where timestamp_col > '2009-01-02 00:12:00.00' order by id limit 5;
+---- RESULTS
+13,false,3,3.299999952316284,30.3,2009-01-02,2009-01-02 00:13:00
+14,false,4,4.400000095367432,40.4,2009-01-02,2009-01-02 00:14:01
+15,false,5,5.5,50.5,2009-01-02,2009-01-02 00:15:01
+16,false,6,6.599999904632568,60.59999999999999,2009-01-02,2009-01-02 00:16:01
+17,false,7,7.699999809265137,70.7,2009-01-02,2009-01-02 00:17:01
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE, TIMESTAMP
+====
+---- QUERY
+# Gets specified columns based on timestamp predicate with operator '>'
+# with empty result.
+select id, bool_col, smallint_col, float_col, double_col, date_col, timestamp_col
+from alltypes_jdbc_datasource
+where timestamp_col > '2990-01-01 00:12:00.460000000' order by id limit 5;
+---- RESULTS
+====
+---- QUERY
+# Gets specified columns based on timestamp predicate with operator '<'.
+select id, bool_col, smallint_col, float_col, double_col, date_col, timestamp_col
+from alltypes_jdbc_datasource
+where timestamp_col < '2009-01-02 00:12:00.460000000' order by id limit 5;
+---- RESULTS
+0,false,0,0,0,2009-01-01,2009-01-01 00:00:00
+1,false,1,1.100000023841858,10.1,2009-01-01,2009-01-01 00:01:00
+2,false,2,2.200000047683716,20.2,2009-01-01,2009-01-01 00:02:00
+3,false,3,3.299999952316284,30.3,2009-01-01,2009-01-01 00:03:00
+4,false,4,4.400000095367432,40.4,2009-01-01,2009-01-01 00:04:01
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE, TIMESTAMP
+====
+---- QUERY
+# Gets specified columns based on timestamp predicate with operator '<'
+# with empty result.
+select id, bool_col, smallint_col, float_col, double_col, date_col, timestamp_col
+from alltypes_jdbc_datasource
+where timestamp_col <  '1990-01-01 00:12:00.460000000' order by id limit 5;
+---- RESULTS
+====
+---- QUERY
+# Gets specified columns based on timestamp predicate with operator '>='.
+select id, bool_col, smallint_col, float_col, double_col, date_col, timestamp_col
+from alltypes_jdbc_datasource
+where timestamp_col >= '2009-01-02 00:12:00.460000000' order by id limit 5;
+---- RESULTS
+13,false,3,3.299999952316284,30.3,2009-01-02,2009-01-02 00:13:00
+14,false,4,4.400000095367432,40.4,2009-01-02,2009-01-02 00:14:01
+15,false,5,5.5,50.5,2009-01-02,2009-01-02 00:15:01
+16,false,6,6.599999904632568,60.59999999999999,2009-01-02,2009-01-02 00:16:01
+17,false,7,7.699999809265137,70.7,2009-01-02,2009-01-02 00:17:01
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE, TIMESTAMP
+====
+---- QUERY
+# Gets specified columns based on timestamp predicate with operator '<='.
+select id, bool_col, smallint_col, float_col, double_col, date_col, timestamp_col
+from alltypes_jdbc_datasource
+where timestamp_col <= '2009-01-02 00:12:00.460000000' order by id limit 5;
+---- RESULTS
+0,false,0,0,0,2009-01-01,2009-01-01 00:00:00
+1,false,1,1.100000023841858,10.1,2009-01-01,2009-01-01 00:01:00
+2,false,2,2.200000047683716,20.2,2009-01-01,2009-01-01 00:02:00
+3,false,3,3.299999952316284,30.3,2009-01-01,2009-01-01 00:03:00
+4,false,4,4.400000095367432,40.4,2009-01-01,2009-01-01 00:04:01
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE, TIMESTAMP
+====
+---- QUERY
+# Gets specified columns based on timestamp predicate with operator '!='.
+select id, bool_col, smallint_col, float_col, double_col, date_col, timestamp_col
+from alltypes_jdbc_datasource
+where timestamp_col != '2009-01-02 00:12:00.460000000' order by id limit 5;
+---- RESULTS
+0,false,0,0,0,2009-01-01,2009-01-01 00:00:00
+1,false,1,1.100000023841858,10.1,2009-01-01,2009-01-01 00:01:00
+2,false,2,2.200000047683716,20.2,2009-01-01,2009-01-01 00:02:00
+3,false,3,3.299999952316284,30.3,2009-01-01,2009-01-01 00:03:00
+4,false,4,4.400000095367432,40.4,2009-01-01,2009-01-01 00:04:01
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE, TIMESTAMP
+====
+---- QUERY
+# Gets specified columns based on timestamp predicate with operator 'between'.
+select count(*) from alltypes_jdbc_datasource where timestamp_col between
+'2009-01-03 00:12:00' and '2009-01-05 00:12:00'
+---- RESULTS
+20
+---- TYPES
+BIGINT
+====
+---- QUERY
+# Gets specified columns based on timestamp predicate without time in timestamp.
+select id, bool_col, smallint_col, float_col, double_col, date_col, timestamp_col
+from alltypes_jdbc_datasource
+where timestamp_col > '2009-01-03' order by id limit 5;
+---- RESULTS
+20,false,0,0,0,2009-01-03,2009-01-03 00:20:01
+21,false,1,1.100000023841858,10.1,2009-01-03,2009-01-03 00:21:01
+22,false,2,2.200000047683716,20.2,2009-01-03,2009-01-03 00:22:01
+23,false,3,3.299999952316284,30.3,2009-01-03,2009-01-03 00:23:01
+24,false,4,4.400000095367432,40.4,2009-01-03,2009-01-03 00:24:01
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE, TIMESTAMP
+====
+---- QUERY
+# Gets specified columns based on timestamp predicate without milisecond in timestamp.
+select id, bool_col, smallint_col, float_col, double_col, date_col, timestamp_col
+from alltypes_jdbc_datasource
+where timestamp_col > '2009-01-03 00:22:00' order by id limit 5;
+---- RESULTS
+22,false,2,2.200000047683716,20.2,2009-01-03,2009-01-03 00:22:01
+23,false,3,3.299999952316284,30.3,2009-01-03,2009-01-03 00:23:01
+24,false,4,4.400000095367432,40.4,2009-01-03,2009-01-03 00:24:01
+25,false,5,5.5,50.5,2009-01-03,2009-01-03 00:25:01
+26,false,6,6.599999904632568,60.59999999999999,2009-01-03,2009-01-03 00:26:02
+---- TYPES
+INT, BOOLEAN, SMALLINT, FLOAT, DOUBLE, DATE, TIMESTAMP
+====
+---- QUERY
+select * from jdbc_decimal_tbl;
+---- RESULTS
+1234,2222,1.2345678900,0.12345678900000000000000000000000000000,12345.78900
+2345,111,12.3456789000,0.12345678900000000000000000000000000000,3.14100
+12345,333,123.4567890000,0.12345678900000000000000000000000000000,11.22000
+12345,333,1234.5678900000,0.12345678900000000000000000000000000000,0.10000
+132842,333,12345.6789000000,0.12345678900000000000000000000000000000,0.77889
+---- TYPES
+DECIMAL,DECIMAL,DECIMAL,DECIMAL,DECIMAL
+====
+---- QUERY
+select * from jdbc_decimal_tbl where d3 < 10.00;
+---- RESULTS
+1234,2222,1.2345678900,0.12345678900000000000000000000000000000,12345.78900
+---- TYPES
+DECIMAL,DECIMAL,DECIMAL,DECIMAL,DECIMAL
+====
+---- QUERY
+select * from jdbc_decimal_tbl where d3 <= 123.45678900;
+---- RESULTS
+1234,2222,1.2345678900,0.12345678900000000000000000000000000000,12345.78900
+2345,111,12.3456789000,0.12345678900000000000000000000000000000,3.14100
+12345,333,123.4567890000,0.12345678900000000000000000000000000000,11.22000
+---- TYPES
+DECIMAL,DECIMAL,DECIMAL,DECIMAL,DECIMAL
+====
+---- QUERY
+select * from jdbc_decimal_tbl where d3 = 123.45678900;
+---- RESULTS
+12345,333,123.4567890000,0.12345678900000000000000000000000000000,11.22000
+---- TYPES
+DECIMAL,DECIMAL,DECIMAL,DECIMAL,DECIMAL
+====
+---- QUERY
+select * from jdbc_decimal_tbl where d3 != 123.45678900;
+---- RESULTS
+1234,2222,1.2345678900,0.12345678900000000000000000000000000000,12345.78900
+2345,111,12.3456789000,0.12345678900000000000000000000000000000,3.14100
+12345,333,1234.5678900000,0.12345678900000000000000000000000000000,0.10000
+132842,333,12345.6789000000,0.12345678900000000000000000000000000000,0.77889
+---- TYPES
+DECIMAL,DECIMAL,DECIMAL,DECIMAL,DECIMAL
+====
+---- QUERY
+select * from jdbc_decimal_tbl where d3 >= 123.45678900;
+---- RESULTS
+12345,333,123.4567890000,0.12345678900000000000000000000000000000,11.22000
+12345,333,1234.5678900000,0.12345678900000000000000000000000000000,0.10000
+132842,333,12345.6789000000,0.12345678900000000000000000000000000000,0.77889
+---- TYPES
+DECIMAL,DECIMAL,DECIMAL,DECIMAL,DECIMAL
+====
+---- QUERY
+select * from jdbc_decimal_tbl where d3 > 123.45678900;
+---- RESULTS
+12345,333,1234.5678900000,0.12345678900000000000000000000000000000,0.10000
+132842,333,12345.6789000000,0.12345678900000000000000000000000000000,0.77889
+---- TYPES
+DECIMAL,DECIMAL,DECIMAL,DECIMAL,DECIMAL
+====
+---- QUERY
+select * from jdbc_decimal_tbl where d3 >= 123.45678900 and d5 < 10.0;
+---- RESULTS
+12345,333,1234.5678900000,0.12345678900000000000000000000000000000,0.10000
+132842,333,12345.6789000000,0.12345678900000000000000000000000000000,0.77889
+---- TYPES
+DECIMAL,DECIMAL,DECIMAL,DECIMAL,DECIMAL
+====
+---- QUERY
+# Drop table
+DROP TABLE alltypes_jdbc_datasource;
+---- RESULTS
+'Table has been dropped.'
+====
+---- QUERY
+# Drop table
+DROP TABLE alltypes_jdbc_datasource_2;
+---- RESULTS
+'Table has been dropped.'
+====
+---- QUERY
+# Drop table
+DROP TABLE jdbc_decimal_tbl;
+---- RESULTS
+'Table has been dropped.'
+====

@@ -15,9 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-
-cmake_minimum_required(VERSION 2.6)
-
 # Helper function to generate build rules.  For each input thrift file, this function will
 # generate a rule that maps the input file to the output c++ file.
 # Thrift will generate multiple output files for each input (including java files) and
@@ -50,15 +47,13 @@ function(THRIFT_GEN VAR)
     #   - Does not include java output files
     set(OUTPUT_BE_FILE "${BE_OUTPUT_DIR}/gen-cpp/${THRIFT_FILE_WE}_types.cpp")
     set(OUTPUT_BE_FILE ${OUTPUT_BE_FILE} "${BE_OUTPUT_DIR}/gen-cpp/${THRIFT_FILE_WE}_types.h")
-    set(OUTPUT_BE_FILE ${OUTPUT_BE_FILE} "${BE_OUTPUT_DIR}/gen-cpp/${THRIFT_FILE_WE}_constants.cpp")
-    set(OUTPUT_BE_FILE ${OUTPUT_BE_FILE} "${BE_OUTPUT_DIR}/gen-cpp/${THRIFT_FILE_WE}_constants.h")
     list(APPEND ${VAR} ${OUTPUT_BE_FILE})
 
     # BeeswaxService thrift generation
     # It depends on hive_meta_store, which in turn depends on fb303.
     # The java dependency is handled by maven.
     # We need to generate C++ src file for the parent dependencies using the "-r" option.
-    set(CPP_ARGS ${THRIFT_INCLUDE_DIR_OPTION}
+    set(CPP_ARGS ${THRIFT_CPP_INCLUDE_DIR_OPTION}
         --gen cpp:moveable_types,no_default_operators,templates -o ${BE_OUTPUT_DIR})
     IF (THRIFT_FILE STREQUAL "beeswax.thrift")
       set(CPP_ARGS -r ${CPP_ARGS})
@@ -69,8 +64,25 @@ function(THRIFT_GEN VAR)
       # from Hive or Parquet.
       add_custom_command(
         OUTPUT ${OUTPUT_BE_FILE}
-        COMMAND ${THRIFT_COMPILER} ${CPP_ARGS} ${THRIFT_FILE}
-        COMMAND ${THRIFT_COMPILER} ${PYTHON_ARGS} ${THRIFT_FILE}
+        COMMAND ${THRIFT_QUIET_WRAPPER} ${THRIFT_CPP_COMPILER} ${CPP_ARGS} ${THRIFT_FILE}
+        COMMAND ${THRIFT_QUIET_WRAPPER} ${THRIFT_PY_COMPILER} ${PYTHON_ARGS} ${THRIFT_FILE}
+        DEPENDS ${ABS_THRIFT_FILE}
+        COMMENT "Running thrift compiler on ${THRIFT_FILE}"
+        VERBATIM
+      )
+    ELSEIF (THRIFT_FILE STREQUAL "ImpalaService.thrift")
+      add_custom_command(
+        OUTPUT ${OUTPUT_BE_FILE}
+        COMMAND ${THRIFT_QUIET_WRAPPER} ${THRIFT_CPP_COMPILER} ${CPP_ARGS} ${THRIFT_FILE}
+        # Because of some CMake bug we can't just use
+        #     sed -i.bak "'s|\\(dispatchCallTemplated.*\\));|\\1) override;|'"
+        # here because for some reason CMake doesn't remove the quotes and generates
+        # wrong Makefiles. Strange, because at global scope add_custom_command works fine.
+        COMMAND ${CMAKE_SOURCE_DIR}/bin/cmake_aux/add_override.sh
+            ${BE_OUTPUT_DIR}/gen-cpp/ImpalaHiveServer2Service.h
+            ${BE_OUTPUT_DIR}/gen-cpp/ImpalaService.h
+        COMMAND ${THRIFT_QUIET_WRAPPER} ${THRIFT_JAVA_COMPILER} ${JAVA_FE_ARGS} ${THRIFT_FILE}
+        COMMAND ${THRIFT_QUIET_WRAPPER} ${THRIFT_PY_COMPILER} ${PYTHON_ARGS} ${THRIFT_FILE}
         DEPENDS ${ABS_THRIFT_FILE}
         COMMENT "Running thrift compiler on ${THRIFT_FILE}"
         VERBATIM
@@ -78,9 +90,9 @@ function(THRIFT_GEN VAR)
     ELSE (THRIFT_FILE STREQUAL ${TCLI_SERVICE_THRIFT} OR THRIFT_FILE STREQUAL "parquet.thrift")
       add_custom_command(
         OUTPUT ${OUTPUT_BE_FILE}
-        COMMAND ${THRIFT_COMPILER} ${CPP_ARGS} ${THRIFT_FILE}
-        COMMAND ${THRIFT_COMPILER} ${JAVA_FE_ARGS} ${THRIFT_FILE}
-        COMMAND ${THRIFT_COMPILER} ${PYTHON_ARGS} ${THRIFT_FILE}
+        COMMAND ${THRIFT_QUIET_WRAPPER} ${THRIFT_CPP_COMPILER} ${CPP_ARGS} ${THRIFT_FILE}
+        COMMAND ${THRIFT_QUIET_WRAPPER} ${THRIFT_JAVA_COMPILER} ${JAVA_FE_ARGS} ${THRIFT_FILE}
+        COMMAND ${THRIFT_QUIET_WRAPPER} ${THRIFT_PY_COMPILER} ${PYTHON_ARGS} ${THRIFT_FILE}
         DEPENDS ${ABS_THRIFT_FILE}
         COMMENT "Running thrift compiler on ${THRIFT_FILE}"
         VERBATIM
@@ -113,7 +125,7 @@ function(THRIFT_GEN_DS VAR)
     list(APPEND ${VAR} ${OUTPUT_FILE})
     add_custom_command(
       OUTPUT ${OUTPUT_FILE}
-      COMMAND ${THRIFT_COMPILER} ${JAVA_EXT_DS_ARGS} ${THRIFT_FILE} &&
+      COMMAND ${THRIFT_QUIET_WRAPPER} ${THRIFT_JAVA_COMPILER} ${JAVA_EXT_DS_ARGS} ${THRIFT_FILE} &&
               mkdir -p ${OUTPUT_DIR} && echo ${OUTPUT_FILE_MESSAGE} > ${OUTPUT_FILE}
       DEPENDS ${ABS_THRIFT_FILE}
       COMMENT "Running thrift compiler for ext-data-source on ${THRIFT_FILE}"
@@ -125,9 +137,16 @@ endfunction(THRIFT_GEN_DS)
 
 set(HIVE_THRIFT_SOURCE_DIR "hive-$ENV{IMPALA_HIVE_MAJOR_VERSION}-api")
 set(TCLI_SERVICE_THRIFT "${HIVE_THRIFT_SOURCE_DIR}/TCLIService.thrift")
-message("Using Thrift compiler: ${THRIFT_COMPILER}")
-set(THRIFT_INCLUDE_DIR_OPTION -I ${THRIFT_CONTRIB_DIR} -I $ENV{HIVE_METASTORE_THRIFT_DIR}
-  -I ${HIVE_THRIFT_SOURCE_DIR})
+message("Using Thrift CPP compiler: ${THRIFT_CPP_COMPILER}")
+message("Using Thrift JAVA compiler: ${THRIFT_JAVA_COMPILER}")
+message("Using Thrift PY compiler: ${THRIFT_PY_COMPILER}")
+set(THRIFT_QUIET_WRAPPER "${CMAKE_SOURCE_DIR}/bin/thrift-quiet-wrapper.sh")
+set(THRIFT_CPP_INCLUDE_DIR_OPTION -I ${THRIFT_CPP_CONTRIB_DIR}
+  -I $ENV{HIVE_METASTORE_THRIFT_DIR} -I ${HIVE_THRIFT_SOURCE_DIR})
+set(THRIFT_JAVA_INCLUDE_DIR_OPTION -I ${THRIFT_JAVA_CONTRIB_DIR}
+  -I $ENV{HIVE_METASTORE_THRIFT_DIR} -I ${HIVE_THRIFT_SOURCE_DIR})
+set(THRIFT_PY_INCLUDE_DIR_OPTION -I ${THRIFT_PY_CONTRIB_DIR}
+  -I $ENV{HIVE_METASTORE_THRIFT_DIR} -I ${HIVE_THRIFT_SOURCE_DIR})
 set(BE_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/be/generated-sources)
 set(FE_OUTPUT_DIR ${CMAKE_SOURCE_DIR}/fe/generated-sources)
 # TODO: avoid duplicating generated java classes
@@ -141,9 +160,9 @@ file(MAKE_DIRECTORY ${PYTHON_OUTPUT_DIR})
 file(MAKE_DIRECTORY ${HIVE_THRIFT_SOURCE_DIR})
 
 # Args passed to thrift for Java gen
-set(JAVA_FE_ARGS ${THRIFT_INCLUDE_DIR_OPTION} --gen java -o ${FE_OUTPUT_DIR})
-set(JAVA_EXT_DS_ARGS ${THRIFT_INCLUDE_DIR_OPTION} --gen java -o ${EXT_DS_OUTPUT_DIR})
-set(PYTHON_ARGS ${THRIFT_INCLUDE_DIR_OPTION} -r --gen py:no_utf8strings -o
+set(JAVA_FE_ARGS ${THRIFT_JAVA_INCLUDE_DIR_OPTION} --gen java -o ${FE_OUTPUT_DIR})
+set(JAVA_EXT_DS_ARGS ${THRIFT_JAVA_INCLUDE_DIR_OPTION} --gen java -o ${EXT_DS_OUTPUT_DIR})
+set(PYTHON_ARGS ${THRIFT_PY_INCLUDE_DIR_OPTION} -r --gen py:no_utf8strings -o
                 ${PYTHON_OUTPUT_DIR})
 
 set (EXT_DATA_SRC_FILES
@@ -185,6 +204,7 @@ set (SRC_FILES
   RuntimeProfile.thrift
   SqlConstraints.thrift
   StatestoreService.thrift
+  SystemTables.thrift
   Zip.thrift
   ${TCLI_SERVICE_THRIFT}
   ${EXT_DATA_SRC_FILES}

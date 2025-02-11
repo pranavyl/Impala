@@ -18,6 +18,7 @@
 #ifndef STATESTORE_STATESTORE_SERVICE_CLIENT_WRAPPER_H
 #define STATESTORE_STATESTORE_SERVICE_CLIENT_WRAPPER_H
 
+#include "gen-cpp/StatestoreHaService.h"
 #include "gen-cpp/StatestoreService.h"
 
 namespace impala {
@@ -26,14 +27,12 @@ class StatestoreServiceClientWrapper : public StatestoreServiceClient {
  public:
   StatestoreServiceClientWrapper(
       std::shared_ptr<::apache::thrift::protocol::TProtocol> prot)
-    : StatestoreServiceClient(prot) {
-  }
+    : StatestoreServiceClient(move(prot)) {}
 
   StatestoreServiceClientWrapper(
       std::shared_ptr<::apache::thrift::protocol::TProtocol> iprot,
       std::shared_ptr<::apache::thrift::protocol::TProtocol> oprot)
-    : StatestoreServiceClient(iprot, oprot) {
-  }
+    : StatestoreServiceClient(move(iprot), move(oprot)) {}
 
 /// We intentionally disable this clang warning as we intend to hide the
 /// the same-named functions defined in the base class.
@@ -46,6 +45,56 @@ class StatestoreServiceClientWrapper : public StatestoreServiceClient {
     send_RegisterSubscriber(params);
     *send_done = true;
     recv_RegisterSubscriber(_return);
+  }
+
+  void GetProtocolVersion(TGetProtocolVersionResponse& _return,
+      const TGetProtocolVersionRequest& params, bool* send_done) {
+    DCHECK(!*send_done);
+    send_GetProtocolVersion(params);
+    *send_done = true;
+    recv_GetProtocolVersion(_return);
+  }
+
+  void SetStatestoreDebugAction(TSetStatestoreDebugActionResponse& _return,
+      const TSetStatestoreDebugActionRequest& params, bool* send_done) {
+    DCHECK(!*send_done);
+    send_SetStatestoreDebugAction(params);
+    *send_done = true;
+    recv_SetStatestoreDebugAction(_return);
+  }
+#pragma clang diagnostic pop
+};
+
+class StatestoreHaServiceClientWrapper : public StatestoreHaServiceClient {
+ public:
+  StatestoreHaServiceClientWrapper(
+      std::shared_ptr<::apache::thrift::protocol::TProtocol> prot)
+    : StatestoreHaServiceClient(std::move(prot)) {}
+
+  StatestoreHaServiceClientWrapper(
+      std::shared_ptr<::apache::thrift::protocol::TProtocol> iprot,
+      std::shared_ptr<::apache::thrift::protocol::TProtocol> oprot)
+    : StatestoreHaServiceClient(std::move(iprot), std::move(oprot)) {}
+
+/// We intentionally disable this clang warning as we intend to hide the
+/// the same-named functions defined in the base class.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Woverloaded-virtual"
+
+  void StatestoreHaHandshake(TStatestoreHaHandshakeResponse& _return,
+      const TStatestoreHaHandshakeRequest& params, bool* send_done) {
+    DCHECK(!*send_done);
+    send_StatestoreHaHandshake(params);
+    *send_done = true;
+    recv_StatestoreHaHandshake(_return);
+  }
+
+  void StatestoreHaHeartbeat(TStatestoreHaHeartbeatResponse& _return,
+      const TStatestoreHaHeartbeatRequest& params, bool* send_done) {
+    DCHECK(!*send_done);
+    send_StatestoreHaHeartbeat(params);
+    *send_done = true;
+    recv_StatestoreHaHeartbeat(_return);
   }
 
 #pragma clang diagnostic pop

@@ -80,7 +80,7 @@ PLAN-ROOT SINK
 |  |
 |  15:SCAN HDFS [tpcds_parquet.store_sales]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(30 AS INT), ss_quantity >= CAST(26 AS INT), (ss_list_price >= CAST(154 AS DECIMAL(5,0)) AND ss_list_price <= CAST(164 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(7326 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(8326 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(7 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(27 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(30 AS INT), ss_quantity >= CAST(26 AS INT), (ss_list_price >= CAST(154 AS DECIMAL(5,0)) AND ss_list_price <= CAST(164 AS DECIMAL(10,0)) OR ss_coupon_amt >= CAST(7326 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(8326 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(7 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(27 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -112,7 +112,7 @@ PLAN-ROOT SINK
 |  |
 |  12:SCAN HDFS [tpcds_parquet.store_sales]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(25 AS INT), ss_quantity >= CAST(21 AS INT), (ss_list_price >= CAST(122 AS DECIMAL(3,0)) AND ss_list_price <= CAST(132 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(836 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(1836 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(17 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(37 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(25 AS INT), ss_quantity >= CAST(21 AS INT), (ss_list_price >= CAST(122 AS DECIMAL(3,0)) AND ss_list_price <= CAST(132 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(836 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(1836 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(17 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(37 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -144,7 +144,7 @@ PLAN-ROOT SINK
 |  |
 |  09:SCAN HDFS [tpcds_parquet.store_sales]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(20 AS INT), ss_quantity >= CAST(16 AS INT), (ss_list_price >= CAST(135 AS DECIMAL(5,0)) AND ss_list_price <= CAST(145 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(6071 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(7071 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(38 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(58 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(20 AS INT), ss_quantity >= CAST(16 AS INT), (ss_list_price >= CAST(135 AS DECIMAL(5,0)) AND ss_list_price <= CAST(145 AS DECIMAL(10,0)) OR ss_coupon_amt >= CAST(6071 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(7071 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(38 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(58 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -176,7 +176,7 @@ PLAN-ROOT SINK
 |  |
 |  06:SCAN HDFS [tpcds_parquet.store_sales]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(15 AS INT), ss_quantity >= CAST(11 AS INT), (ss_list_price >= CAST(142 AS DECIMAL(5,0)) AND ss_list_price <= CAST(152 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(12214 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(13214 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(79 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(99 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(15 AS INT), ss_quantity >= CAST(11 AS INT), (ss_list_price >= CAST(142 AS DECIMAL(5,0)) AND ss_list_price <= CAST(152 AS DECIMAL(10,0)) OR ss_coupon_amt >= CAST(12214 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(13214 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(79 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(99 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -208,7 +208,7 @@ PLAN-ROOT SINK
 |  |
 |  03:SCAN HDFS [tpcds_parquet.store_sales]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(10 AS INT), ss_quantity >= CAST(6 AS INT), (ss_list_price >= CAST(90 AS DECIMAL(3,0)) AND ss_list_price <= CAST(100 AS DECIMAL(3,0)) OR ss_coupon_amt >= CAST(2323 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(3323 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(31 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(51 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(10 AS INT), ss_quantity >= CAST(6 AS INT), (ss_list_price >= CAST(90 AS DECIMAL(3,0)) AND ss_list_price <= CAST(100 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(2323 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(3323 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(31 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(51 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -235,7 +235,7 @@ PLAN-ROOT SINK
 |
 00:SCAN HDFS [tpcds_parquet.store_sales]
    HDFS partitions=1824/1824 files=1824 size=200.96MB
-   predicates: ss_quantity <= CAST(5 AS INT), ss_quantity >= CAST(0 AS INT), (ss_list_price >= CAST(8 AS DECIMAL(3,0)) AND ss_list_price <= CAST(18 AS DECIMAL(3,0)) OR ss_coupon_amt >= CAST(459 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(1459 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(57 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(77 AS DECIMAL(3,0)))
+   predicates: ss_quantity <= CAST(5 AS INT), ss_quantity >= CAST(0 AS INT), (ss_list_price >= CAST(8 AS DECIMAL(3,0)) AND ss_list_price <= CAST(18 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(459 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(1459 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(57 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(77 AS DECIMAL(5,0)))
    stored statistics:
      table: rows=2.88M size=200.96MB
      partitions: 1824/1824 rows=2.88M
@@ -248,7 +248,7 @@ PLAN-ROOT SINK
    in pipelines: 00(GETNEXT)
 ---- DISTRIBUTEDPLAN
 Max Per-Host Resource Reservation: Memory=39.62MB Threads=24
-Per-Host Resource Estimates: Memory=509MB
+Per-Host Resource Estimates: Memory=513MB
 F02:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
 |  Per-Host Resources: mem-estimate=4.09MB mem-reservation=4.00MB thread-reservation=1
 PLAN-ROOT SINK
@@ -267,7 +267,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 50(GETNEXT)
 |  |
 |  F17:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=32.00KB mem-reservation=0B thread-reservation=1
+|  Per-Host Resources: mem-estimate=128.00KB mem-reservation=0B thread-reservation=1
 |  50:AGGREGATE [FINALIZE]
 |  |  output: count:merge(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -280,7 +280,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 17(GETNEXT)
 |  |
 |  F16:PLAN FRAGMENT [HASH(ss_list_price)] hosts=3 instances=3
-|  Per-Host Resources: mem-estimate=10.20MB mem-reservation=1.94MB thread-reservation=1
+|  Per-Host Resources: mem-estimate=10.45MB mem-reservation=1.94MB thread-reservation=1
 |  17:AGGREGATE
 |  |  output: count(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -295,22 +295,22 @@ PLAN-ROOT SINK
 |  |  in pipelines: 48(GETNEXT), 15(OPEN)
 |  |
 |  47:EXCHANGE [HASH(ss_list_price)]
-|  |  mem-estimate=203.72KB mem-reservation=0B thread-reservation=0
-|  |  tuple-ids=31 row-size=20B cardinality=20.23K
+|  |  mem-estimate=463.76KB mem-reservation=0B thread-reservation=0
+|  |  tuple-ids=31 row-size=20B cardinality=60.17K
 |  |  in pipelines: 15(GETNEXT)
 |  |
 |  F15:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
-|  Per-Host Resources: mem-estimate=74.00MB mem-reservation=4.00MB thread-reservation=2
+|  Per-Host Resources: mem-estimate=74.28MB mem-reservation=4.00MB thread-reservation=2
 |  16:AGGREGATE [STREAMING]
 |  |  output: avg(ss_list_price), count(ss_list_price)
 |  |  group by: ss_list_price
 |  |  mem-estimate=10.00MB mem-reservation=2.00MB spill-buffer=64.00KB thread-reservation=0
-|  |  tuple-ids=31 row-size=20B cardinality=20.23K
+|  |  tuple-ids=31 row-size=20B cardinality=60.17K
 |  |  in pipelines: 15(GETNEXT)
 |  |
 |  15:SCAN HDFS [tpcds_parquet.store_sales, RANDOM]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(30 AS INT), ss_quantity >= CAST(26 AS INT), (ss_list_price >= CAST(154 AS DECIMAL(5,0)) AND ss_list_price <= CAST(164 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(7326 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(8326 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(7 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(27 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(30 AS INT), ss_quantity >= CAST(26 AS INT), (ss_list_price >= CAST(154 AS DECIMAL(5,0)) AND ss_list_price <= CAST(164 AS DECIMAL(10,0)) OR ss_coupon_amt >= CAST(7326 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(8326 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(7 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(27 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -333,7 +333,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 45(GETNEXT)
 |  |
 |  F14:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=32.00KB mem-reservation=0B thread-reservation=1
+|  Per-Host Resources: mem-estimate=128.00KB mem-reservation=0B thread-reservation=1
 |  45:AGGREGATE [FINALIZE]
 |  |  output: count:merge(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -346,7 +346,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 14(GETNEXT)
 |  |
 |  F13:PLAN FRAGMENT [HASH(ss_list_price)] hosts=3 instances=3
-|  Per-Host Resources: mem-estimate=10.20MB mem-reservation=1.94MB thread-reservation=1
+|  Per-Host Resources: mem-estimate=10.45MB mem-reservation=1.94MB thread-reservation=1
 |  14:AGGREGATE
 |  |  output: count(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -361,22 +361,22 @@ PLAN-ROOT SINK
 |  |  in pipelines: 43(GETNEXT), 12(OPEN)
 |  |
 |  42:EXCHANGE [HASH(ss_list_price)]
-|  |  mem-estimate=203.72KB mem-reservation=0B thread-reservation=0
-|  |  tuple-ids=25 row-size=20B cardinality=20.23K
+|  |  mem-estimate=463.76KB mem-reservation=0B thread-reservation=0
+|  |  tuple-ids=25 row-size=20B cardinality=60.17K
 |  |  in pipelines: 12(GETNEXT)
 |  |
 |  F12:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
-|  Per-Host Resources: mem-estimate=74.00MB mem-reservation=4.00MB thread-reservation=2
+|  Per-Host Resources: mem-estimate=74.28MB mem-reservation=4.00MB thread-reservation=2
 |  13:AGGREGATE [STREAMING]
 |  |  output: avg(ss_list_price), count(ss_list_price)
 |  |  group by: ss_list_price
 |  |  mem-estimate=10.00MB mem-reservation=2.00MB spill-buffer=64.00KB thread-reservation=0
-|  |  tuple-ids=25 row-size=20B cardinality=20.23K
+|  |  tuple-ids=25 row-size=20B cardinality=60.17K
 |  |  in pipelines: 12(GETNEXT)
 |  |
 |  12:SCAN HDFS [tpcds_parquet.store_sales, RANDOM]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(25 AS INT), ss_quantity >= CAST(21 AS INT), (ss_list_price >= CAST(122 AS DECIMAL(3,0)) AND ss_list_price <= CAST(132 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(836 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(1836 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(17 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(37 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(25 AS INT), ss_quantity >= CAST(21 AS INT), (ss_list_price >= CAST(122 AS DECIMAL(3,0)) AND ss_list_price <= CAST(132 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(836 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(1836 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(17 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(37 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -399,7 +399,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 40(GETNEXT)
 |  |
 |  F11:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=32.00KB mem-reservation=0B thread-reservation=1
+|  Per-Host Resources: mem-estimate=128.00KB mem-reservation=0B thread-reservation=1
 |  40:AGGREGATE [FINALIZE]
 |  |  output: count:merge(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -412,7 +412,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 11(GETNEXT)
 |  |
 |  F10:PLAN FRAGMENT [HASH(ss_list_price)] hosts=3 instances=3
-|  Per-Host Resources: mem-estimate=10.20MB mem-reservation=1.94MB thread-reservation=1
+|  Per-Host Resources: mem-estimate=10.45MB mem-reservation=1.94MB thread-reservation=1
 |  11:AGGREGATE
 |  |  output: count(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -427,22 +427,22 @@ PLAN-ROOT SINK
 |  |  in pipelines: 38(GETNEXT), 09(OPEN)
 |  |
 |  37:EXCHANGE [HASH(ss_list_price)]
-|  |  mem-estimate=203.72KB mem-reservation=0B thread-reservation=0
-|  |  tuple-ids=19 row-size=20B cardinality=20.23K
+|  |  mem-estimate=463.76KB mem-reservation=0B thread-reservation=0
+|  |  tuple-ids=19 row-size=20B cardinality=60.17K
 |  |  in pipelines: 09(GETNEXT)
 |  |
 |  F09:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
-|  Per-Host Resources: mem-estimate=74.00MB mem-reservation=4.00MB thread-reservation=2
+|  Per-Host Resources: mem-estimate=74.28MB mem-reservation=4.00MB thread-reservation=2
 |  10:AGGREGATE [STREAMING]
 |  |  output: avg(ss_list_price), count(ss_list_price)
 |  |  group by: ss_list_price
 |  |  mem-estimate=10.00MB mem-reservation=2.00MB spill-buffer=64.00KB thread-reservation=0
-|  |  tuple-ids=19 row-size=20B cardinality=20.23K
+|  |  tuple-ids=19 row-size=20B cardinality=60.17K
 |  |  in pipelines: 09(GETNEXT)
 |  |
 |  09:SCAN HDFS [tpcds_parquet.store_sales, RANDOM]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(20 AS INT), ss_quantity >= CAST(16 AS INT), (ss_list_price >= CAST(135 AS DECIMAL(5,0)) AND ss_list_price <= CAST(145 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(6071 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(7071 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(38 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(58 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(20 AS INT), ss_quantity >= CAST(16 AS INT), (ss_list_price >= CAST(135 AS DECIMAL(5,0)) AND ss_list_price <= CAST(145 AS DECIMAL(10,0)) OR ss_coupon_amt >= CAST(6071 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(7071 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(38 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(58 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -465,7 +465,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 35(GETNEXT)
 |  |
 |  F08:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=32.00KB mem-reservation=0B thread-reservation=1
+|  Per-Host Resources: mem-estimate=128.00KB mem-reservation=0B thread-reservation=1
 |  35:AGGREGATE [FINALIZE]
 |  |  output: count:merge(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -478,7 +478,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 08(GETNEXT)
 |  |
 |  F07:PLAN FRAGMENT [HASH(ss_list_price)] hosts=3 instances=3
-|  Per-Host Resources: mem-estimate=10.20MB mem-reservation=1.94MB thread-reservation=1
+|  Per-Host Resources: mem-estimate=10.45MB mem-reservation=1.94MB thread-reservation=1
 |  08:AGGREGATE
 |  |  output: count(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -493,22 +493,22 @@ PLAN-ROOT SINK
 |  |  in pipelines: 33(GETNEXT), 06(OPEN)
 |  |
 |  32:EXCHANGE [HASH(ss_list_price)]
-|  |  mem-estimate=203.72KB mem-reservation=0B thread-reservation=0
-|  |  tuple-ids=13 row-size=20B cardinality=20.23K
+|  |  mem-estimate=463.76KB mem-reservation=0B thread-reservation=0
+|  |  tuple-ids=13 row-size=20B cardinality=60.17K
 |  |  in pipelines: 06(GETNEXT)
 |  |
 |  F06:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
-|  Per-Host Resources: mem-estimate=74.00MB mem-reservation=4.00MB thread-reservation=2
+|  Per-Host Resources: mem-estimate=74.28MB mem-reservation=4.00MB thread-reservation=2
 |  07:AGGREGATE [STREAMING]
 |  |  output: avg(ss_list_price), count(ss_list_price)
 |  |  group by: ss_list_price
 |  |  mem-estimate=10.00MB mem-reservation=2.00MB spill-buffer=64.00KB thread-reservation=0
-|  |  tuple-ids=13 row-size=20B cardinality=20.23K
+|  |  tuple-ids=13 row-size=20B cardinality=60.17K
 |  |  in pipelines: 06(GETNEXT)
 |  |
 |  06:SCAN HDFS [tpcds_parquet.store_sales, RANDOM]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(15 AS INT), ss_quantity >= CAST(11 AS INT), (ss_list_price >= CAST(142 AS DECIMAL(5,0)) AND ss_list_price <= CAST(152 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(12214 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(13214 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(79 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(99 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(15 AS INT), ss_quantity >= CAST(11 AS INT), (ss_list_price >= CAST(142 AS DECIMAL(5,0)) AND ss_list_price <= CAST(152 AS DECIMAL(10,0)) OR ss_coupon_amt >= CAST(12214 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(13214 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(79 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(99 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -531,7 +531,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 30(GETNEXT)
 |  |
 |  F05:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Host Resources: mem-estimate=32.00KB mem-reservation=0B thread-reservation=1
+|  Per-Host Resources: mem-estimate=128.00KB mem-reservation=0B thread-reservation=1
 |  30:AGGREGATE [FINALIZE]
 |  |  output: count:merge(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -544,7 +544,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 05(GETNEXT)
 |  |
 |  F04:PLAN FRAGMENT [HASH(ss_list_price)] hosts=3 instances=3
-|  Per-Host Resources: mem-estimate=10.20MB mem-reservation=1.94MB thread-reservation=1
+|  Per-Host Resources: mem-estimate=10.45MB mem-reservation=1.94MB thread-reservation=1
 |  05:AGGREGATE
 |  |  output: count(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -559,22 +559,22 @@ PLAN-ROOT SINK
 |  |  in pipelines: 28(GETNEXT), 03(OPEN)
 |  |
 |  27:EXCHANGE [HASH(ss_list_price)]
-|  |  mem-estimate=203.72KB mem-reservation=0B thread-reservation=0
-|  |  tuple-ids=7 row-size=20B cardinality=20.23K
+|  |  mem-estimate=463.76KB mem-reservation=0B thread-reservation=0
+|  |  tuple-ids=7 row-size=20B cardinality=60.17K
 |  |  in pipelines: 03(GETNEXT)
 |  |
 |  F03:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
-|  Per-Host Resources: mem-estimate=74.00MB mem-reservation=4.00MB thread-reservation=2
+|  Per-Host Resources: mem-estimate=74.28MB mem-reservation=4.00MB thread-reservation=2
 |  04:AGGREGATE [STREAMING]
 |  |  output: avg(ss_list_price), count(ss_list_price)
 |  |  group by: ss_list_price
 |  |  mem-estimate=10.00MB mem-reservation=2.00MB spill-buffer=64.00KB thread-reservation=0
-|  |  tuple-ids=7 row-size=20B cardinality=20.23K
+|  |  tuple-ids=7 row-size=20B cardinality=60.17K
 |  |  in pipelines: 03(GETNEXT)
 |  |
 |  03:SCAN HDFS [tpcds_parquet.store_sales, RANDOM]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(10 AS INT), ss_quantity >= CAST(6 AS INT), (ss_list_price >= CAST(90 AS DECIMAL(3,0)) AND ss_list_price <= CAST(100 AS DECIMAL(3,0)) OR ss_coupon_amt >= CAST(2323 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(3323 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(31 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(51 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(10 AS INT), ss_quantity >= CAST(6 AS INT), (ss_list_price >= CAST(90 AS DECIMAL(3,0)) AND ss_list_price <= CAST(100 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(2323 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(3323 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(31 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(51 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -598,7 +598,7 @@ PLAN-ROOT SINK
 |  in pipelines: 02(GETNEXT)
 |
 F01:PLAN FRAGMENT [HASH(ss_list_price)] hosts=3 instances=3
-Per-Host Resources: mem-estimate=10.20MB mem-reservation=1.94MB thread-reservation=1
+Per-Host Resources: mem-estimate=10.45MB mem-reservation=1.94MB thread-reservation=1
 02:AGGREGATE
 |  output: count(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -613,22 +613,22 @@ Per-Host Resources: mem-estimate=10.20MB mem-reservation=1.94MB thread-reservati
 |  in pipelines: 24(GETNEXT), 00(OPEN)
 |
 23:EXCHANGE [HASH(ss_list_price)]
-|  mem-estimate=203.72KB mem-reservation=0B thread-reservation=0
-|  tuple-ids=1 row-size=20B cardinality=20.23K
+|  mem-estimate=463.76KB mem-reservation=0B thread-reservation=0
+|  tuple-ids=1 row-size=20B cardinality=60.17K
 |  in pipelines: 00(GETNEXT)
 |
 F00:PLAN FRAGMENT [RANDOM] hosts=3 instances=3
-Per-Host Resources: mem-estimate=74.00MB mem-reservation=4.00MB thread-reservation=2
+Per-Host Resources: mem-estimate=74.28MB mem-reservation=4.00MB thread-reservation=2
 01:AGGREGATE [STREAMING]
 |  output: avg(ss_list_price), count(ss_list_price)
 |  group by: ss_list_price
 |  mem-estimate=10.00MB mem-reservation=2.00MB spill-buffer=64.00KB thread-reservation=0
-|  tuple-ids=1 row-size=20B cardinality=20.23K
+|  tuple-ids=1 row-size=20B cardinality=60.17K
 |  in pipelines: 00(GETNEXT)
 |
 00:SCAN HDFS [tpcds_parquet.store_sales, RANDOM]
    HDFS partitions=1824/1824 files=1824 size=200.96MB
-   predicates: ss_quantity <= CAST(5 AS INT), ss_quantity >= CAST(0 AS INT), (ss_list_price >= CAST(8 AS DECIMAL(3,0)) AND ss_list_price <= CAST(18 AS DECIMAL(3,0)) OR ss_coupon_amt >= CAST(459 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(1459 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(57 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(77 AS DECIMAL(3,0)))
+   predicates: ss_quantity <= CAST(5 AS INT), ss_quantity >= CAST(0 AS INT), (ss_list_price >= CAST(8 AS DECIMAL(3,0)) AND ss_list_price <= CAST(18 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(459 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(1459 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(57 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(77 AS DECIMAL(5,0)))
    stored statistics:
      table: rows=2.88M size=200.96MB
      partitions: 1824/1824 rows=2.88M
@@ -641,7 +641,7 @@ Per-Host Resources: mem-estimate=74.00MB mem-reservation=4.00MB thread-reservati
    in pipelines: 00(GETNEXT)
 ---- PARALLELPLANS
 Max Per-Host Resource Reservation: Memory=75.25MB Threads=35
-Per-Host Resource Estimates: Memory=439MB
+Per-Host Resource Estimates: Memory=454MB
 F02:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
 |  Per-Instance Resources: mem-estimate=4.02MB mem-reservation=4.00MB thread-reservation=1
 PLAN-ROOT SINK
@@ -667,7 +667,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 50(GETNEXT)
 |  |
 |  F17:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Instance Resources: mem-estimate=32.00KB mem-reservation=0B thread-reservation=1
+|  Per-Instance Resources: mem-estimate=128.00KB mem-reservation=0B thread-reservation=1
 |  50:AGGREGATE [FINALIZE]
 |  |  output: count:merge(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -680,7 +680,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 17(GETNEXT)
 |  |
 |  F16:PLAN FRAGMENT [HASH(ss_list_price)] hosts=3 instances=6
-|  Per-Instance Resources: mem-estimate=10.27MB mem-reservation=1.94MB thread-reservation=1
+|  Per-Instance Resources: mem-estimate=10.84MB mem-reservation=1.94MB thread-reservation=1
 |  17:AGGREGATE
 |  |  output: count(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -695,22 +695,22 @@ PLAN-ROOT SINK
 |  |  in pipelines: 48(GETNEXT), 15(OPEN)
 |  |
 |  47:EXCHANGE [HASH(ss_list_price)]
-|  |  mem-estimate=275.72KB mem-reservation=0B thread-reservation=0
-|  |  tuple-ids=31 row-size=20B cardinality=20.23K
+|  |  mem-estimate=860.68KB mem-reservation=0B thread-reservation=0
+|  |  tuple-ids=31 row-size=20B cardinality=110.08K
 |  |  in pipelines: 15(GETNEXT)
 |  |
 |  F15:PLAN FRAGMENT [RANDOM] hosts=3 instances=6
-|  Per-Instance Resources: mem-estimate=26.00MB mem-reservation=4.00MB thread-reservation=1
+|  Per-Instance Resources: mem-estimate=26.56MB mem-reservation=4.00MB thread-reservation=1
 |  16:AGGREGATE [STREAMING]
 |  |  output: avg(ss_list_price), count(ss_list_price)
 |  |  group by: ss_list_price
 |  |  mem-estimate=10.00MB mem-reservation=2.00MB spill-buffer=64.00KB thread-reservation=0
-|  |  tuple-ids=31 row-size=20B cardinality=20.23K
+|  |  tuple-ids=31 row-size=20B cardinality=110.08K
 |  |  in pipelines: 15(GETNEXT)
 |  |
 |  15:SCAN HDFS [tpcds_parquet.store_sales, RANDOM]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(30 AS INT), ss_quantity >= CAST(26 AS INT), (ss_list_price >= CAST(154 AS DECIMAL(5,0)) AND ss_list_price <= CAST(164 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(7326 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(8326 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(7 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(27 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(30 AS INT), ss_quantity >= CAST(26 AS INT), (ss_list_price >= CAST(154 AS DECIMAL(5,0)) AND ss_list_price <= CAST(164 AS DECIMAL(10,0)) OR ss_coupon_amt >= CAST(7326 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(8326 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(7 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(27 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -740,7 +740,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 45(GETNEXT)
 |  |
 |  F14:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Instance Resources: mem-estimate=32.00KB mem-reservation=0B thread-reservation=1
+|  Per-Instance Resources: mem-estimate=128.00KB mem-reservation=0B thread-reservation=1
 |  45:AGGREGATE [FINALIZE]
 |  |  output: count:merge(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -753,7 +753,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 14(GETNEXT)
 |  |
 |  F13:PLAN FRAGMENT [HASH(ss_list_price)] hosts=3 instances=6
-|  Per-Instance Resources: mem-estimate=10.27MB mem-reservation=1.94MB thread-reservation=1
+|  Per-Instance Resources: mem-estimate=10.84MB mem-reservation=1.94MB thread-reservation=1
 |  14:AGGREGATE
 |  |  output: count(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -768,22 +768,22 @@ PLAN-ROOT SINK
 |  |  in pipelines: 43(GETNEXT), 12(OPEN)
 |  |
 |  42:EXCHANGE [HASH(ss_list_price)]
-|  |  mem-estimate=275.72KB mem-reservation=0B thread-reservation=0
-|  |  tuple-ids=25 row-size=20B cardinality=20.23K
+|  |  mem-estimate=860.68KB mem-reservation=0B thread-reservation=0
+|  |  tuple-ids=25 row-size=20B cardinality=110.08K
 |  |  in pipelines: 12(GETNEXT)
 |  |
 |  F12:PLAN FRAGMENT [RANDOM] hosts=3 instances=6
-|  Per-Instance Resources: mem-estimate=26.00MB mem-reservation=4.00MB thread-reservation=1
+|  Per-Instance Resources: mem-estimate=26.56MB mem-reservation=4.00MB thread-reservation=1
 |  13:AGGREGATE [STREAMING]
 |  |  output: avg(ss_list_price), count(ss_list_price)
 |  |  group by: ss_list_price
 |  |  mem-estimate=10.00MB mem-reservation=2.00MB spill-buffer=64.00KB thread-reservation=0
-|  |  tuple-ids=25 row-size=20B cardinality=20.23K
+|  |  tuple-ids=25 row-size=20B cardinality=110.08K
 |  |  in pipelines: 12(GETNEXT)
 |  |
 |  12:SCAN HDFS [tpcds_parquet.store_sales, RANDOM]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(25 AS INT), ss_quantity >= CAST(21 AS INT), (ss_list_price >= CAST(122 AS DECIMAL(3,0)) AND ss_list_price <= CAST(132 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(836 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(1836 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(17 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(37 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(25 AS INT), ss_quantity >= CAST(21 AS INT), (ss_list_price >= CAST(122 AS DECIMAL(3,0)) AND ss_list_price <= CAST(132 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(836 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(1836 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(17 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(37 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -813,7 +813,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 40(GETNEXT)
 |  |
 |  F11:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Instance Resources: mem-estimate=32.00KB mem-reservation=0B thread-reservation=1
+|  Per-Instance Resources: mem-estimate=128.00KB mem-reservation=0B thread-reservation=1
 |  40:AGGREGATE [FINALIZE]
 |  |  output: count:merge(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -826,7 +826,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 11(GETNEXT)
 |  |
 |  F10:PLAN FRAGMENT [HASH(ss_list_price)] hosts=3 instances=6
-|  Per-Instance Resources: mem-estimate=10.27MB mem-reservation=1.94MB thread-reservation=1
+|  Per-Instance Resources: mem-estimate=10.84MB mem-reservation=1.94MB thread-reservation=1
 |  11:AGGREGATE
 |  |  output: count(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -841,22 +841,22 @@ PLAN-ROOT SINK
 |  |  in pipelines: 38(GETNEXT), 09(OPEN)
 |  |
 |  37:EXCHANGE [HASH(ss_list_price)]
-|  |  mem-estimate=275.72KB mem-reservation=0B thread-reservation=0
-|  |  tuple-ids=19 row-size=20B cardinality=20.23K
+|  |  mem-estimate=860.68KB mem-reservation=0B thread-reservation=0
+|  |  tuple-ids=19 row-size=20B cardinality=110.08K
 |  |  in pipelines: 09(GETNEXT)
 |  |
 |  F09:PLAN FRAGMENT [RANDOM] hosts=3 instances=6
-|  Per-Instance Resources: mem-estimate=26.00MB mem-reservation=4.00MB thread-reservation=1
+|  Per-Instance Resources: mem-estimate=26.56MB mem-reservation=4.00MB thread-reservation=1
 |  10:AGGREGATE [STREAMING]
 |  |  output: avg(ss_list_price), count(ss_list_price)
 |  |  group by: ss_list_price
 |  |  mem-estimate=10.00MB mem-reservation=2.00MB spill-buffer=64.00KB thread-reservation=0
-|  |  tuple-ids=19 row-size=20B cardinality=20.23K
+|  |  tuple-ids=19 row-size=20B cardinality=110.08K
 |  |  in pipelines: 09(GETNEXT)
 |  |
 |  09:SCAN HDFS [tpcds_parquet.store_sales, RANDOM]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(20 AS INT), ss_quantity >= CAST(16 AS INT), (ss_list_price >= CAST(135 AS DECIMAL(5,0)) AND ss_list_price <= CAST(145 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(6071 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(7071 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(38 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(58 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(20 AS INT), ss_quantity >= CAST(16 AS INT), (ss_list_price >= CAST(135 AS DECIMAL(5,0)) AND ss_list_price <= CAST(145 AS DECIMAL(10,0)) OR ss_coupon_amt >= CAST(6071 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(7071 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(38 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(58 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -886,7 +886,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 35(GETNEXT)
 |  |
 |  F08:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Instance Resources: mem-estimate=32.00KB mem-reservation=0B thread-reservation=1
+|  Per-Instance Resources: mem-estimate=128.00KB mem-reservation=0B thread-reservation=1
 |  35:AGGREGATE [FINALIZE]
 |  |  output: count:merge(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -899,7 +899,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 08(GETNEXT)
 |  |
 |  F07:PLAN FRAGMENT [HASH(ss_list_price)] hosts=3 instances=6
-|  Per-Instance Resources: mem-estimate=10.27MB mem-reservation=1.94MB thread-reservation=1
+|  Per-Instance Resources: mem-estimate=10.84MB mem-reservation=1.94MB thread-reservation=1
 |  08:AGGREGATE
 |  |  output: count(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -914,22 +914,22 @@ PLAN-ROOT SINK
 |  |  in pipelines: 33(GETNEXT), 06(OPEN)
 |  |
 |  32:EXCHANGE [HASH(ss_list_price)]
-|  |  mem-estimate=275.72KB mem-reservation=0B thread-reservation=0
-|  |  tuple-ids=13 row-size=20B cardinality=20.23K
+|  |  mem-estimate=860.68KB mem-reservation=0B thread-reservation=0
+|  |  tuple-ids=13 row-size=20B cardinality=110.08K
 |  |  in pipelines: 06(GETNEXT)
 |  |
 |  F06:PLAN FRAGMENT [RANDOM] hosts=3 instances=6
-|  Per-Instance Resources: mem-estimate=26.00MB mem-reservation=4.00MB thread-reservation=1
+|  Per-Instance Resources: mem-estimate=26.56MB mem-reservation=4.00MB thread-reservation=1
 |  07:AGGREGATE [STREAMING]
 |  |  output: avg(ss_list_price), count(ss_list_price)
 |  |  group by: ss_list_price
 |  |  mem-estimate=10.00MB mem-reservation=2.00MB spill-buffer=64.00KB thread-reservation=0
-|  |  tuple-ids=13 row-size=20B cardinality=20.23K
+|  |  tuple-ids=13 row-size=20B cardinality=110.08K
 |  |  in pipelines: 06(GETNEXT)
 |  |
 |  06:SCAN HDFS [tpcds_parquet.store_sales, RANDOM]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(15 AS INT), ss_quantity >= CAST(11 AS INT), (ss_list_price >= CAST(142 AS DECIMAL(5,0)) AND ss_list_price <= CAST(152 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(12214 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(13214 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(79 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(99 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(15 AS INT), ss_quantity >= CAST(11 AS INT), (ss_list_price >= CAST(142 AS DECIMAL(5,0)) AND ss_list_price <= CAST(152 AS DECIMAL(10,0)) OR ss_coupon_amt >= CAST(12214 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(13214 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(79 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(99 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -959,7 +959,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 30(GETNEXT)
 |  |
 |  F05:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
-|  Per-Instance Resources: mem-estimate=32.00KB mem-reservation=0B thread-reservation=1
+|  Per-Instance Resources: mem-estimate=128.00KB mem-reservation=0B thread-reservation=1
 |  30:AGGREGATE [FINALIZE]
 |  |  output: count:merge(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -972,7 +972,7 @@ PLAN-ROOT SINK
 |  |  in pipelines: 05(GETNEXT)
 |  |
 |  F04:PLAN FRAGMENT [HASH(ss_list_price)] hosts=3 instances=6
-|  Per-Instance Resources: mem-estimate=10.27MB mem-reservation=1.94MB thread-reservation=1
+|  Per-Instance Resources: mem-estimate=10.84MB mem-reservation=1.94MB thread-reservation=1
 |  05:AGGREGATE
 |  |  output: count(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -987,22 +987,22 @@ PLAN-ROOT SINK
 |  |  in pipelines: 28(GETNEXT), 03(OPEN)
 |  |
 |  27:EXCHANGE [HASH(ss_list_price)]
-|  |  mem-estimate=275.72KB mem-reservation=0B thread-reservation=0
-|  |  tuple-ids=7 row-size=20B cardinality=20.23K
+|  |  mem-estimate=860.68KB mem-reservation=0B thread-reservation=0
+|  |  tuple-ids=7 row-size=20B cardinality=110.08K
 |  |  in pipelines: 03(GETNEXT)
 |  |
 |  F03:PLAN FRAGMENT [RANDOM] hosts=3 instances=6
-|  Per-Instance Resources: mem-estimate=26.00MB mem-reservation=4.00MB thread-reservation=1
+|  Per-Instance Resources: mem-estimate=26.56MB mem-reservation=4.00MB thread-reservation=1
 |  04:AGGREGATE [STREAMING]
 |  |  output: avg(ss_list_price), count(ss_list_price)
 |  |  group by: ss_list_price
 |  |  mem-estimate=10.00MB mem-reservation=2.00MB spill-buffer=64.00KB thread-reservation=0
-|  |  tuple-ids=7 row-size=20B cardinality=20.23K
+|  |  tuple-ids=7 row-size=20B cardinality=110.08K
 |  |  in pipelines: 03(GETNEXT)
 |  |
 |  03:SCAN HDFS [tpcds_parquet.store_sales, RANDOM]
 |     HDFS partitions=1824/1824 files=1824 size=200.96MB
-|     predicates: ss_quantity <= CAST(10 AS INT), ss_quantity >= CAST(6 AS INT), (ss_list_price >= CAST(90 AS DECIMAL(3,0)) AND ss_list_price <= CAST(100 AS DECIMAL(3,0)) OR ss_coupon_amt >= CAST(2323 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(3323 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(31 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(51 AS DECIMAL(3,0)))
+|     predicates: ss_quantity <= CAST(10 AS INT), ss_quantity >= CAST(6 AS INT), (ss_list_price >= CAST(90 AS DECIMAL(3,0)) AND ss_list_price <= CAST(100 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(2323 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(3323 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(31 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(51 AS DECIMAL(5,0)))
 |     stored statistics:
 |       table: rows=2.88M size=200.96MB
 |       partitions: 1824/1824 rows=2.88M
@@ -1026,7 +1026,7 @@ PLAN-ROOT SINK
 |  in pipelines: 02(GETNEXT)
 |
 F01:PLAN FRAGMENT [HASH(ss_list_price)] hosts=3 instances=6
-Per-Instance Resources: mem-estimate=10.27MB mem-reservation=1.94MB thread-reservation=1
+Per-Instance Resources: mem-estimate=10.84MB mem-reservation=1.94MB thread-reservation=1
 02:AGGREGATE
 |  output: count(ss_list_price), avg:merge(ss_list_price), count:merge(ss_list_price)
 |  mem-estimate=16.00KB mem-reservation=0B spill-buffer=2.00MB thread-reservation=0
@@ -1041,22 +1041,22 @@ Per-Instance Resources: mem-estimate=10.27MB mem-reservation=1.94MB thread-reser
 |  in pipelines: 24(GETNEXT), 00(OPEN)
 |
 23:EXCHANGE [HASH(ss_list_price)]
-|  mem-estimate=275.72KB mem-reservation=0B thread-reservation=0
-|  tuple-ids=1 row-size=20B cardinality=20.23K
+|  mem-estimate=860.68KB mem-reservation=0B thread-reservation=0
+|  tuple-ids=1 row-size=20B cardinality=110.08K
 |  in pipelines: 00(GETNEXT)
 |
 F00:PLAN FRAGMENT [RANDOM] hosts=3 instances=6
-Per-Instance Resources: mem-estimate=26.00MB mem-reservation=4.00MB thread-reservation=1
+Per-Instance Resources: mem-estimate=26.56MB mem-reservation=4.00MB thread-reservation=1
 01:AGGREGATE [STREAMING]
 |  output: avg(ss_list_price), count(ss_list_price)
 |  group by: ss_list_price
 |  mem-estimate=10.00MB mem-reservation=2.00MB spill-buffer=64.00KB thread-reservation=0
-|  tuple-ids=1 row-size=20B cardinality=20.23K
+|  tuple-ids=1 row-size=20B cardinality=110.08K
 |  in pipelines: 00(GETNEXT)
 |
 00:SCAN HDFS [tpcds_parquet.store_sales, RANDOM]
    HDFS partitions=1824/1824 files=1824 size=200.96MB
-   predicates: ss_quantity <= CAST(5 AS INT), ss_quantity >= CAST(0 AS INT), (ss_list_price >= CAST(8 AS DECIMAL(3,0)) AND ss_list_price <= CAST(18 AS DECIMAL(3,0)) OR ss_coupon_amt >= CAST(459 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(1459 AS DECIMAL(5,0)) OR ss_wholesale_cost >= CAST(57 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(77 AS DECIMAL(3,0)))
+   predicates: ss_quantity <= CAST(5 AS INT), ss_quantity >= CAST(0 AS INT), (ss_list_price >= CAST(8 AS DECIMAL(3,0)) AND ss_list_price <= CAST(18 AS DECIMAL(5,0)) OR ss_coupon_amt >= CAST(459 AS DECIMAL(5,0)) AND ss_coupon_amt <= CAST(1459 AS DECIMAL(10,0)) OR ss_wholesale_cost >= CAST(57 AS DECIMAL(3,0)) AND ss_wholesale_cost <= CAST(77 AS DECIMAL(5,0)))
    stored statistics:
      table: rows=2.88M size=200.96MB
      partitions: 1824/1824 rows=2.88M

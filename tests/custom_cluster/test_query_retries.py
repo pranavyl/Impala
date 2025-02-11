@@ -21,21 +21,22 @@
 # TODO: Re-factor tests into multiple classes.
 # TODO: Add a test that cancels queries while a retry is running
 
+from __future__ import absolute_import, division, print_function
+from builtins import map, range
 import pytest
 import re
-import shutil
-import tempfile
 import time
 
 from random import randint
 
 from RuntimeProfile.ttypes import TRuntimeProfileFormat
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
-from tests.common.impala_test_suite import ImpalaTestSuite
+from tests.common.impala_test_suite import ImpalaTestSuite, LOG
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 from tests.common.errors import Timeout
-from tests.common.skip import SkipIfEC, SkipIfBuildType, SkipIfGCS, SkipIfCOS
-from tests.common.skip import SkipIfNotHdfsMinicluster
+from tests.common.skip import (SkipIfEC, SkipIfBuildType, SkipIfFS,
+    SkipIfNotHdfsMinicluster)
+from tests.common.test_dimensions import add_mandatory_exec_option
 
 # The BE krpc port of the impalad to simulate rpc or disk errors in tests.
 FAILED_KRPC_PORT = 27001
@@ -49,13 +50,14 @@ def _get_rpc_fail_action(port):
 def _get_disk_fail_action(port):
   return "IMPALA_TMP_FILE_WRITE:127.0.0.1:{port}:FAIL".format(port=port)
 
+
 # All tests in this class have SkipIfEC because all tests run a query and expect
 # the query to be retried when killing a random impalad. On EC this does not always work
 # because many queries that might run on three impalads for HDFS / S3 builds, might only
 # run on two instances on EC builds. The difference is that EC creates smaller tables
 # compared to data stored on HDFS / S3. If the query is only run on two instances, then
 # randomly killing one impalad won't necessarily trigger a retry of the query.
-@SkipIfEC.fix_later
+@SkipIfEC.parquet_file_size
 class TestQueryRetries(CustomClusterTestSuite):
 
   # A query that shuffles a lot of data. Useful when testing query retries since it
@@ -75,6 +77,11 @@ class TestQueryRetries(CustomClusterTestSuite):
   _union_query = """select count(*) from functional.alltypestiny
         union all
         select count(*) from functional.alltypes where bool_col = sleep(50)"""
+
+  # A simple count query with predicate. The predicate is needed so that the planner does
+  # not create the optimized count(star) query plan.
+  _count_query = "select count(*) from tpch_parquet.lineitem where l_orderkey < 50"
+  _count_query_result = "55"
 
   @classmethod
   def get_workload(cls):
@@ -122,6 +129,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     # state since it asserts that no queries are in flight.
     self.client.close_query(handle)
     self.__validate_web_ui_state()
+    self.__validate_memz()
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -170,6 +178,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     # state since it asserts that no queries are in flight.
     self.client.close_query(handle)
     self.__validate_web_ui_state()
+    self.__validate_memz()
 
     # Assert that the web ui shows all queries are complete.
     completed_queries = self.cluster.get_first_impalad().service.get_completed_queries()
@@ -196,14 +205,14 @@ class TestQueryRetries(CustomClusterTestSuite):
     # Launch a set of concurrent queries.
     num_concurrent_queries = 3
     handles = []
-    for _ in xrange(num_concurrent_queries):
+    for _ in range(num_concurrent_queries):
       handle = self.execute_query_async(self._shuffle_heavy_query,
           query_options={'retry_failed_queries': 'true'})
       handles.append(handle)
 
     # Wait for each query to start running.
     running_state = self.client.QUERY_STATES['RUNNING']
-    map(lambda handle: self.wait_for_state(handle, running_state, 60), handles)
+    list(map(lambda handle: self.wait_for_state(handle, running_state, 60), handles))
 
     # Kill a random impalad.
     killed_impalad = self.__kill_random_impalad()
@@ -232,6 +241,7 @@ class TestQueryRetries(CustomClusterTestSuite):
 
     # Validate the state of the Web UI.
     self.__validate_web_ui_state()
+    self.__validate_memz()
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -246,7 +256,7 @@ class TestQueryRetries(CustomClusterTestSuite):
 
     # Kill an impalad, and run a query. The query should be retried.
     killed_impalad = self.__kill_random_impalad()
-    query = "select count(*) from tpch_parquet.lineitem"
+    query = self._count_query
     handle = self.execute_query_async(query,
         query_options={'retry_failed_queries': 'true'})
     self.wait_for_state(handle, self.client.QUERY_STATES['FINISHED'], 60)
@@ -258,7 +268,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     results = self.client.fetch(query, handle)
     assert results.success
     assert len(results.data) == 1
-    assert "6001215" in results.data[0]
+    assert self._count_query_result in results.data[0]
 
     # The runtime profile of the retried query.
     retried_runtime_profile = self.client.get_runtime_profile(handle)
@@ -282,9 +292,9 @@ class TestQueryRetries(CustomClusterTestSuite):
     # state since it asserts that no queries are in flight.
     self.client.close_query(handle)
     self.__validate_web_ui_state()
+    self.__validate_memz()
 
-  @SkipIfGCS.jira(reason="IMPALA-10562")
-  @SkipIfCOS.jira(reason="IMPALA-10562")
+  @SkipIfFS.shutdown_idle_fails
   @SkipIfBuildType.not_dev_build
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -306,7 +316,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     # and the query should be retried. Add delay before admission so that the 2nd node
     # is removed from the blacklist before scheduler makes schedule for the retried
     # query.
-    query = "select count(*) from tpch_parquet.lineitem"
+    query = self._count_query
     handle = self.execute_query_async(query,
         query_options={'retry_failed_queries': 'true',
                        'debug_action': 'AC_BEFORE_ADMISSION:SLEEP@18000'})
@@ -319,7 +329,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     results = self.client.fetch(query, handle)
     assert results.success
     assert len(results.data) == 1
-    assert "6001215" in results.data[0]
+    assert self._count_query_result in results.data[0]
 
     # The runtime profile of the retried query.
     retried_runtime_profile = self.client.get_runtime_profile(handle)
@@ -350,8 +360,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     self.client.close_query(handle)
     self.__validate_web_ui_state()
 
-  @SkipIfGCS.jira(reason="IMPALA-10562")
-  @SkipIfCOS.jira(reason="IMPALA-10562")
+  @SkipIfFS.shutdown_idle_fails
   @SkipIfBuildType.not_dev_build
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -370,7 +379,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     rpc_not_accessible_impalad = self.cluster.impalads[1]
     assert rpc_not_accessible_impalad.service.krpc_port == FAILED_KRPC_PORT
 
-    query = "select count(*) from tpch_parquet.lineitem"
+    query = self._count_query
     handle = self.execute_query_async(query,
         query_options={'retry_failed_queries': 'true',
                        'debug_action': 'AC_BEFORE_ADMISSION:SLEEP@18000'})
@@ -395,7 +404,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     try:
       self.client.fetch(self._shuffle_heavy_query, handle)
       assert False
-    except ImpalaBeeswaxException, e:
+    except ImpalaBeeswaxException as e:
       assert "Admission for query exceeded timeout 60000ms in pool default-pool." \
           in str(e)
       assert "Queued reason: Waiting for executors to start. Only DDL queries and " \
@@ -459,7 +468,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     try:
       self.client.fetch(self._shuffle_heavy_query, handle)
       assert False
-    except ImpalaBeeswaxException, e:
+    except ImpalaBeeswaxException as e:
       assert "Max retry limit was hit. Query was retried 1 time(s)." in str(e)
 
     # Assert that the killed impalad shows up in the list of blacklisted executors from
@@ -474,6 +483,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     # Validate the state of the web ui. The query must be closed before validating the
     # state since it asserts that no queries are in flight.
     self.__validate_web_ui_state()
+    self.__validate_memz()
 
   @pytest.mark.execute_serially
   def test_retry_fetched_rows(self):
@@ -586,6 +596,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     self.client.close_query(handle)
 
   @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(disable_log_buffering=True)
   def test_query_retry_reaches_spool_limit(self):
     """Test retryable queries with results spooling enabled and
     spool_all_results_for_retries=true that reach spooling mem limit will return rows and
@@ -610,7 +621,7 @@ class TestQueryRetries(CustomClusterTestSuite):
 
     # PLAN_ROOT_SINK's reservation limit should be set at
     # 2 * DEFAULT_SPILLABLE_BUFFER_SIZE = 16 KB.
-    plan_root_sink_reservation_limit = "PLAN_ROOT_SINK[\s\S]*?ReservationLimit: 16.00 KB"
+    plan_root_sink_reservation_limit = r"PLAN_ROOT_SINK[\s\S]*?ReservationLimit: 16.00 KB"
     profile = self.client.get_runtime_profile(handle)
     assert re.search(plan_root_sink_reservation_limit, profile)
 
@@ -692,7 +703,7 @@ class TestQueryRetries(CustomClusterTestSuite):
 
     # Kill an impalad, and run a query. The query should be retried.
     self.cluster.impalads[1].kill()
-    query = "select count(*) from tpch_parquet.lineitem"
+    query = self._count_query
     handle = self.execute_query_async(query,
         query_options={'retry_failed_queries': 'true'})
     self.wait_for_state(handle, self.client.QUERY_STATES['FINISHED'], 60)
@@ -715,8 +726,9 @@ class TestQueryRetries(CustomClusterTestSuite):
     try:
       self.client.fetch(query, handle)
       assert False
-    except Exception, e:
+    except Exception as e:
         assert "Cancelled" in str(e)
+    self.__validate_memz()
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -730,7 +742,7 @@ class TestQueryRetries(CustomClusterTestSuite):
 
     # Kill an impalad, and run a query. The query should be retried.
     self.cluster.impalads[1].kill()
-    query = "select count(*) from tpch_parquet.lineitem"
+    query = self._count_query
     handle = self.execute_query_async(query,
         query_options={'retry_failed_queries': 'true'})
     self.__wait_until_retry_state(handle, 'RETRYING')
@@ -746,6 +758,38 @@ class TestQueryRetries(CustomClusterTestSuite):
     self.client.close_query(handle)
     time.sleep(2)
     assert self.cluster.impalads[0].get_pid() is not None, "Coordinator crashed"
+    self.__validate_memz()
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      statestored_args="--statestore_heartbeat_frequency_ms=60000")
+  def test_retrying_query_before_inflight(self):
+    """Trigger a query retry, and delay setting the original query inflight as that may
+    happen after the query is retried. Validate that the query succeeds. Set a really
+    high statestore heartbeat frequency so that killed impalads are not removed from
+    the cluster membership."""
+
+    # Kill an impalad, and run a query. The query should be retried.
+    self.cluster.impalads[1].kill()
+    query = self._count_query
+    handle = self.execute_query_async(query,
+        query_options={'retry_failed_queries': 'true',
+                       'debug_action': 'SET_QUERY_INFLIGHT:SLEEP@1000'})
+    self.__wait_until_retry_state(handle, 'RETRIED')
+
+    # SetQueryInflight will complete before execute_query_async returns because it will
+    # be completed before Impala acknowledges that the query has started.
+    page = self.cluster.get_first_impalad().service.get_debug_webpage_json('sessions')
+    for session in page['sessions']:
+      # Every session should have one completed query: either test setup, or the original
+      # query that's being retried.
+      assert session['inflight_queries'] < session['total_queries']
+
+    self.client.close_query(handle)
+    # If original query state closure is skipped, the coordinator will crash on a DCHECK.
+    time.sleep(2)
+    assert self.cluster.impalads[0].get_pid() is not None, "Coordinator crashed"
+    self.__validate_memz()
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -759,7 +803,7 @@ class TestQueryRetries(CustomClusterTestSuite):
 
     # Kill an impalad, and run a query. The query should be retried.
     self.cluster.impalads[1].kill()
-    query = "select count(*) from tpch_parquet.lineitem"
+    query = self._count_query
     handle = self.execute_query_async(query,
         query_options={'retry_failed_queries': 'true'})
 
@@ -772,6 +816,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     self.assert_eventually(60, 0.1,
         lambda: impala_service.get_num_in_flight_queries() == 0,
         lambda: "in-flight queries: %d" % impala_service.get_num_in_flight_queries())
+    self.__validate_memz()
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -782,7 +827,7 @@ class TestQueryRetries(CustomClusterTestSuite):
 
     # Kill an impalad, and run a query. The query should be retried.
     self.cluster.impalads[1].kill()
-    query = "select count(*) from tpch_parquet.lineitem"
+    query = self._count_query
     self.hs2_client.set_configuration({'retry_failed_queries': 'true'})
     self.hs2_client.set_configuration_option('impala.resultset.cache.size', '1024')
     self.hs2_client.execute_async(query)
@@ -798,6 +843,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     self.assert_eventually(60, 0.1,
         lambda: impala_service.get_num_in_flight_queries() == 0,
         lambda: "in-flight queries: %d" % impala_service.get_num_in_flight_queries())
+    self.__validate_memz()
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -808,7 +854,7 @@ class TestQueryRetries(CustomClusterTestSuite):
 
     # Kill an impalad, and run a query. The query should be retried.
     self.cluster.impalads[1].kill()
-    query = "select count(*) from tpch_parquet.lineitem"
+    query = self._count_query
     self.execute_query_async(query, query_options={'retry_failed_queries': 'true'})
     # The number of in-flight queries is 0 at the beginning, then 1 when the original
     # query is submitted. It's 2 when the retried query is registered. Although the retry
@@ -822,6 +868,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     self.assert_eventually(60, 0.1,
         lambda: impala_service.get_num_in_flight_queries() == 0,
         lambda: "in-flight queries: %d" % impala_service.get_num_in_flight_queries())
+    self.__validate_memz()
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -837,9 +884,9 @@ class TestQueryRetries(CustomClusterTestSuite):
 
     # Kill an impalad, and run a query. The query should be retried.
     self.cluster.impalads[1].kill()
-    query = "select count(*) from tpch_parquet.lineitem"
+    query = self._count_query
     handle = self.execute_query_async(query,
-        query_options={'retry_failed_queries': 'true', 'query_timeout_s': '1'})
+        query_options={'retry_failed_queries': 'true', 'exec_time_limit_s': '1'})
     self.wait_for_state(handle, self.client.QUERY_STATES['EXCEPTION'], 60)
 
     # Validate the live exec summary.
@@ -860,8 +907,8 @@ class TestQueryRetries(CustomClusterTestSuite):
     try:
       self.client.fetch(query, handle)
       assert False
-    except Exception, e:
-        assert "expired due to client inactivity" in str(e)
+    except Exception as e:
+        assert "expired due to execution time limit of 1s000ms" in str(e)
 
     # Assert that the impalad metrics show one expired query.
     assert impalad_service.get_metric_value('impala-server.num-queries-expired') == 1
@@ -876,7 +923,7 @@ class TestQueryRetries(CustomClusterTestSuite):
 
     # Kill an impalad, and run a query. The query should be retried.
     self.cluster.impalads[1].kill()
-    query = "select count(*) from tpch_parquet.lineitem"
+    query = self._count_query
     client = self.cluster.get_first_impalad().service.create_beeswax_client()
     client.set_configuration({'retry_failed_queries': 'true'})
     handle = client.execute_async(query)
@@ -893,7 +940,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     # error.
     try:
       client.fetch(query, handle)
-    except Exception, e:
+    except Exception as e:
       assert "Client session expired" in str(e)
 
     # Assert that the impalad metrics show one expired session.
@@ -906,7 +953,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     """Test query retries with the HS2 protocol. Enable the results set cache as well and
     test that query retries work with the results cache."""
     self.cluster.impalads[1].kill()
-    query = "select count(*) from tpch_parquet.lineitem"
+    query = self._count_query
     self.hs2_client.set_configuration({'retry_failed_queries': 'true'})
     self.hs2_client.set_configuration_option('impala.resultset.cache.size', '1024')
     handle = self.hs2_client.execute_async(query)
@@ -915,7 +962,7 @@ class TestQueryRetries(CustomClusterTestSuite):
     results = self.hs2_client.fetch(query, handle)
     assert results.success
     assert len(results.data) == 1
-    assert int(results.data[0]) == 6001215
+    assert results.data[0] == self._count_query_result
 
     # Validate the live exec summary.
     retried_query_id = \
@@ -961,8 +1008,10 @@ class TestQueryRetries(CustomClusterTestSuite):
     start_time = time.time()
     retry_status = __get_retry_status()
     while retry_status != retry_state and time.time() - start_time < timeout:
+      LOG.info("Wait 100ms for retry state {0}. Current retry state: {1}"
+               .format(retry_state, retry_status))
+      time.sleep(0.1)
       retry_status = __get_retry_status()
-      time.sleep(0.5)
     if retry_status != retry_state:
       raise Timeout("query {0} was not retried within timeout".format
           (handle.get_handle().id))
@@ -977,7 +1026,7 @@ class TestQueryRetries(CustomClusterTestSuite):
 
   def __get_query_id_from_profile(self, profile):
     """Extracts and returns the query id of the given profile."""
-    query_id_search = re.search("Query \(id=(.*)\)", profile)
+    query_id_search = re.search(r"Query \(id=(.*)\)", profile)
     assert query_id_search, "Invalid query profile, has no query id:\n{0}".format(
         profile)
     return query_id_search.group(1)
@@ -1028,7 +1077,7 @@ class TestQueryRetries(CustomClusterTestSuite):
 
   def __get_query_options(self, profile):
     """Returns the query options from the given profile."""
-    query_options_pattern = "Query Options \(set by configuration and planner\): (.*)"
+    query_options_pattern = r"Query Options \(set by configuration and planner\): (.*)"
     query_options = re.search(query_options_pattern, profile)
     assert query_options, profile
     return query_options.group(1)
@@ -1113,6 +1162,17 @@ class TestQueryRetries(CustomClusterTestSuite):
           return query_id_search.group(1)
     return None
 
+  def __exist_queries_in_web_ui_memz(self):
+    memz_breakdown = self.cluster.get_first_impalad() \
+      .service.get_debug_webpage_json('memz')['detailed']
+    query = re.compile(r"Query\([0-9a-f]{16}:[0-9a-f]{16}")
+    return query.search(memz_breakdown)
+
+  def __validate_memz(self):
+    # Validate that all queries are released
+    self.assert_eventually(60, 0.1,
+        lambda: self.__exist_queries_in_web_ui_memz() is None)
+
 
 # Tests that verify the query-retries are properly triggered by disk IO failure.
 # Coordinator adds an executor node to its blacklist if that node reports query
@@ -1130,33 +1190,40 @@ class TestQueryRetriesFaultyDisk(CustomClusterTestSuite):
       pytest.skip('runs only in exhaustive')
     super(TestQueryRetriesFaultyDisk, cls).setup_class()
 
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestQueryRetriesFaultyDisk, cls).add_test_dimensions()
+    # Buffer pool limit that is low enough to force Impala to spill to disk when
+    # executing spill_query.
+    add_mandatory_exec_option(cls, 'buffer_pool_limit', '45m')
+    add_mandatory_exec_option(cls, 'retry_failed_queries', True)
+    # Set debug_action to inject disk write error for spill-to-disk on impalad for
+    # which krpc port is 27001.
+    add_mandatory_exec_option(
+      cls, 'debug_action', _get_disk_fail_action(FAILED_KRPC_PORT))
+
   # Query with order by requires spill to disk if intermediate results don't fit in mem
   spill_query = """
       select o_orderdate, o_custkey, o_comment
       from tpch.orders
       order by o_orderdate
       """
-  # Buffer pool limit that is low enough to force Impala to spill to disk when executing
-  # spill_query.
-  buffer_pool_limit = "45m"
 
   def setup_method(self, method):
     # Don't call the superclass method to prevent starting Impala before each test. In
     # this class, each test is responsible for doing that because we want to generate
     # the parameter string to start-impala-cluster in each test method.
-    self.created_dirs = []
+    pass
 
   def teardown_method(self, method):
-    for dir_path in self.created_dirs:
-      shutil.rmtree(dir_path, ignore_errors=True)
+    self.clear_tmp_dirs()
 
   def __generate_scratch_dir(self, num):
     result = []
-    for i in xrange(num):
-      dir_path = tempfile.mkdtemp()
-      self.created_dirs.append(dir_path)
+    for i in range(num):
+      dir_path = self.make_tmp_dir('scratch_dir_{}'.format(i))
       result.append(dir_path)
-      print "Generated dir" + dir_path
+      print("Generated dir " + dir_path)
     return result
 
   def __validate_web_ui_state(self):
@@ -1190,12 +1257,6 @@ class TestQueryRetriesFaultyDisk(CustomClusterTestSuite):
     self.assert_impalad_log_contains("INFO", "Using scratch directory ",
         expected_count=1)
 
-    # Set debug_action to inject disk write error for spill-to-disk on impalad for which
-    # krpc port is 27001.
-    vector.get_value('exec_option')['buffer_pool_limit'] = self.buffer_pool_limit
-    vector.get_value('exec_option')['debug_action'] = \
-        _get_disk_fail_action(FAILED_KRPC_PORT)
-    vector.get_value('exec_option')['retry_failed_queries'] = "true"
     coord_impalad = self.cluster.get_first_impalad()
     client = coord_impalad.service.create_beeswax_client()
 

@@ -17,6 +17,21 @@
 
 package org.apache.impala.catalog;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Function;
+import com.google.common.base.Joiner;
+import com.google.common.base.MoreObjects;
+import com.google.common.base.MoreObjects.ToStringHelper;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Predicate;
+import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import com.google.flatbuffers.FlatBufferBuilder;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -29,10 +44,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
-
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.fs.BlockLocation;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
@@ -41,6 +56,7 @@ import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.PartitionKeyValue;
+import org.apache.impala.catalog.HdfsTable.FileMetadataStats;
 import org.apache.impala.catalog.events.InFlightEvents;
 import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEventPropertyKey;
 import org.apache.impala.common.FileSystemUtil;
@@ -51,6 +67,7 @@ import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.fb.FbCompression;
 import org.apache.impala.fb.FbFileBlock;
 import org.apache.impala.fb.FbFileDesc;
+import org.apache.impala.fb.FbFileMetadata;
 import org.apache.impala.thrift.CatalogObjectsConstants;
 import org.apache.impala.thrift.TAccessLevel;
 import org.apache.impala.thrift.TCatalogObject;
@@ -67,20 +84,6 @@ import org.apache.impala.util.HdfsCachingUtil;
 import org.apache.impala.util.ListMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Function;
-import com.google.common.base.Joiner;
-import com.google.common.base.MoreObjects;
-import com.google.common.base.Preconditions;
-import com.google.common.base.Predicate;
-import com.google.common.base.Strings;
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
-import com.google.flatbuffers.FlatBufferBuilder;
 
 /**
  * Query-relevant information for one table partition. Partitions are comparable
@@ -113,10 +116,26 @@ public class HdfsPartition extends CatalogObjectImpl
     // Internal representation of a file descriptor using a FlatBuffer.
     private final FbFileDesc fbFileDescriptor_;
 
-    private FileDescriptor(FbFileDesc fileDescData) { fbFileDescriptor_ = fileDescData; }
+    // Internal representation of additional file metadata, e.g. Iceberg metadata.
+    private final FbFileMetadata fbFileMetadata_;
+
+    private FileDescriptor(FbFileDesc fileDescData) {
+      fbFileDescriptor_ = fileDescData;
+      fbFileMetadata_ = null;
+    }
+
+    public FileDescriptor(FbFileDesc fileDescData, FbFileMetadata fileMetadata) {
+      fbFileDescriptor_ = fileDescData;
+      fbFileMetadata_ = fileMetadata;
+    }
 
     public static FileDescriptor fromThrift(THdfsFileDesc desc) {
       ByteBuffer bb = ByteBuffer.wrap(desc.getFile_desc_data());
+      if (desc.isSetFile_metadata()) {
+        ByteBuffer bbMd = ByteBuffer.wrap(desc.getFile_metadata());
+        return new FileDescriptor(FbFileDesc.getRootAsFbFileDesc(bb),
+                                  FbFileMetadata.getRootAsFbFileMetadata(bbMd));
+      }
       return new FileDescriptor(FbFileDesc.getRootAsFbFileDesc(bb));
     }
 
@@ -145,7 +164,11 @@ public class HdfsPartition extends CatalogObjectImpl
           it.mutateReplicaHostIdxs(j, FileBlock.makeReplicaIdx(isCached, newHostIdx));
         }
       }
-      return new FileDescriptor(cloned);
+      return new FileDescriptor(cloned, fbFileMetadata_);
+    }
+
+    public FileDescriptor cloneWithFileMetadata(FbFileMetadata fileMetadata) {
+      return new FileDescriptor(fbFileDescriptor_, fileMetadata);
     }
 
     /**
@@ -169,8 +192,9 @@ public class HdfsPartition extends CatalogObjectImpl
      *                          for which no disk ID could be determined
      */
     public static FileDescriptor create(FileStatus fileStatus, String relPath,
-        BlockLocation[] blockLocations, ListMap<TNetworkAddress> hostIndex, boolean isEc,
-        Reference<Long> numUnknownDiskIds) throws IOException {
+        BlockLocation[] blockLocations, ListMap<TNetworkAddress> hostIndex,
+        boolean isEncrypted, boolean isEc, Reference<Long> numUnknownDiskIds,
+        String absPath) throws IOException {
       FlatBufferBuilder fbb = new FlatBufferBuilder(1);
       int[] fbFileBlockOffsets = new int[blockLocations.length];
       int blockIdx = 0;
@@ -185,19 +209,19 @@ public class HdfsPartition extends CatalogObjectImpl
         }
       }
       return new FileDescriptor(createFbFileDesc(fbb, fileStatus, relPath,
-          fbFileBlockOffsets, isEc));
+          fbFileBlockOffsets, isEncrypted, isEc, absPath));
     }
 
     /**
      * Creates the file descriptor of a file represented by 'fileStatus' that
      * resides in a filesystem that doesn't support the BlockLocation API (e.g. S3).
      */
-    public static FileDescriptor createWithNoBlocks(FileStatus fileStatus,
-        String relPath) {
+    public static FileDescriptor createWithNoBlocks(
+        FileStatus fileStatus, String relPath, String absPath) {
       FlatBufferBuilder fbb = new FlatBufferBuilder(1);
-      return new FileDescriptor(createFbFileDesc(fbb, fileStatus, relPath, null, false));
+      return new FileDescriptor(
+          createFbFileDesc(fbb, fileStatus, relPath, null, false, false, absPath));
     }
-
     /**
      * Serializes the metadata of a file descriptor represented by 'fileStatus' into a
      * FlatBuffer using 'fbb' and returns the associated FbFileDesc object.
@@ -205,32 +229,62 @@ public class HdfsPartition extends CatalogObjectImpl
      * in the underlying buffer. Can be null if there are no blocks.
      */
     private static FbFileDesc createFbFileDesc(FlatBufferBuilder fbb,
-        FileStatus fileStatus, String relPath, int[] fbFileBlockOffets, boolean isEc) {
-      int relPathOffset = fbb.createString(relPath);
+        FileStatus fileStatus, String relPath, int[] fbFileBlockOffsets,
+        boolean isEncrypted, boolean isEc, String absPath) {
+      int relPathOffset = fbb.createString(relPath == null ? StringUtils.EMPTY : relPath);
       // A negative block vector offset is used when no block offsets are specified.
       int blockVectorOffset = -1;
-      if (fbFileBlockOffets != null) {
-        blockVectorOffset = FbFileDesc.createFileBlocksVector(fbb, fbFileBlockOffets);
+      if (fbFileBlockOffsets != null) {
+        blockVectorOffset = FbFileDesc.createFileBlocksVector(fbb, fbFileBlockOffsets);
       }
+      int absPathOffset = -1;
+      if (StringUtils.isNotEmpty(absPath)) absPathOffset = fbb.createString(absPath);
       FbFileDesc.startFbFileDesc(fbb);
-      // TODO(todd) rename to RelativePathin the FBS
+      // TODO(todd) rename to RelativePath in the FBS
       FbFileDesc.addRelativePath(fbb, relPathOffset);
       FbFileDesc.addLength(fbb, fileStatus.getLen());
       FbFileDesc.addLastModificationTime(fbb, fileStatus.getModificationTime());
+      FbFileDesc.addIsEncrypted(fbb, isEncrypted);
       FbFileDesc.addIsEc(fbb, isEc);
       HdfsCompression comp = HdfsCompression.fromFileName(fileStatus.getPath().getName());
       FbFileDesc.addCompression(fbb, comp.toFb());
       if (blockVectorOffset >= 0) FbFileDesc.addFileBlocks(fbb, blockVectorOffset);
+      if (absPathOffset >= 0) FbFileDesc.addAbsolutePath(fbb, absPathOffset);
       fbb.finish(FbFileDesc.endFbFileDesc(fbb));
       // To eliminate memory fragmentation, copy the contents of the FlatBuffer to the
       // smallest possible ByteBuffer.
       ByteBuffer bb = fbb.dataBuffer().slice();
       ByteBuffer compressedBb = ByteBuffer.allocate(bb.capacity());
       compressedBb.put(bb);
-      return FbFileDesc.getRootAsFbFileDesc((ByteBuffer)compressedBb.flip());
+      return FbFileDesc.getRootAsFbFileDesc((ByteBuffer) compressedBb.flip());
     }
 
     public String getRelativePath() { return fbFileDescriptor_.relativePath(); }
+
+    public String getAbsolutePath() {
+      return StringUtils.isEmpty(fbFileDescriptor_.absolutePath()) ?
+          StringUtils.EMPTY :
+          fbFileDescriptor_.absolutePath();
+    }
+
+    public String getAbsolutePath(String rootPath) {
+      if (StringUtils.isEmpty(fbFileDescriptor_.relativePath())
+          && StringUtils.isNotEmpty(fbFileDescriptor_.absolutePath())) {
+        return fbFileDescriptor_.absolutePath();
+      } else {
+        return rootPath + Path.SEPARATOR + fbFileDescriptor_.relativePath();
+      }
+    }
+
+    public String getPath() {
+      if (StringUtils.isEmpty(fbFileDescriptor_.relativePath())
+          && StringUtils.isNotEmpty(fbFileDescriptor_.absolutePath())) {
+        return fbFileDescriptor_.absolutePath();
+      } else {
+        return fbFileDescriptor_.relativePath();
+      }
+    }
+
     public long getFileLength() { return fbFileDescriptor_.length(); }
 
     /** Compute the total length of files in fileDescs */
@@ -248,16 +302,28 @@ public class HdfsPartition extends CatalogObjectImpl
 
     public long getModificationTime() { return fbFileDescriptor_.lastModificationTime(); }
     public int getNumFileBlocks() { return fbFileDescriptor_.fileBlocksLength(); }
+    public boolean getIsEncrypted() {return fbFileDescriptor_.isEncrypted(); }
     public boolean getIsEc() {return fbFileDescriptor_.isEc(); }
 
     public FbFileBlock getFbFileBlock(int idx) {
       return fbFileDescriptor_.fileBlocks(idx);
     }
 
+    public FbFileDesc getFbFileDescriptor() {
+      return fbFileDescriptor_;
+    }
+
+    public FbFileMetadata getFbFileMetadata() {
+      return fbFileMetadata_;
+    }
+
     public THdfsFileDesc toThrift() {
       THdfsFileDesc fd = new THdfsFileDesc();
       ByteBuffer bb = fbFileDescriptor_.getByteBuffer();
       fd.setFile_desc_data(bb);
+      if (fbFileMetadata_ != null) {
+        fd.setFile_metadata(fbFileMetadata_.getByteBuffer());
+      }
       return fd;
     }
 
@@ -268,17 +334,21 @@ public class HdfsPartition extends CatalogObjectImpl
       for (int i = 0; i < numFileBlocks; ++i) {
         blocks.add(FileBlock.debugString(getFbFileBlock(i)));
       }
-      return MoreObjects.toStringHelper(this)
+      ToStringHelper stringHelper = MoreObjects.toStringHelper(this)
           .add("RelativePath", getRelativePath())
           .add("Length", getFileLength())
           .add("Compression", getFileCompression())
           .add("ModificationTime", getModificationTime())
-          .add("Blocks", Joiner.on(", ").join(blocks)).toString();
+          .add("Blocks", Joiner.on(", ").join(blocks));
+      if (StringUtils.isNotEmpty(getAbsolutePath())) {
+        stringHelper.add("AbsolutePath", getAbsolutePath());
+      }
+      return stringHelper.toString();
     }
 
     @Override
     public int compareTo(FileDescriptor otherFd) {
-      return getRelativePath().compareTo(otherFd.getRelativePath());
+      return getPath().compareTo(otherFd.getPath());
     }
 
     /**
@@ -692,9 +762,21 @@ public class HdfsPartition extends CatalogObjectImpl
   // -1 means there is no previous compaction event or compaction is not supported
   private final long lastCompactionId_;
 
+  // The last refresh event id of the partition
+  // -1 means there is no previous refresh event happened
+  private final long lastRefreshEventId_;
+
+  // File statistics corresponding to the encoded file descriptors.
+  private final FileMetadataStats fileMetadataStats_;
+
   /**
-   * Constructor.  Needed for third party extensions that want to use their own builder
-   * to construct the object.
+   * Constructor. Needed for third party extensions that want to use their own builder
+   * to construct the object. A third party extension has to update the field of
+   * 'fileMetadataStats_' if it would like to use this field to get the size of the
+   * partition.
+   *
+   * Note that 'partitionIdCounter_' is not accessible to the subclasses in that its
+   * private.
    */
   protected HdfsPartition(HdfsTable table, long prevId, String partName,
       List<LiteralExpr> partitionKeyValues, HdfsStorageDescriptor fileFormatDescriptor,
@@ -711,7 +793,64 @@ public class HdfsPartition extends CatalogObjectImpl
         encodedInsertFileDescriptors, encodedDeleteFileDescriptors, location,
         isMarkedCached, accessLevel, hmsParameters, cachedMsPartitionDescriptor,
         partitionStats, hasIncrementalStats, numRows, writeId,
-        inFlightEvents, /*createEventId=*/-1L, /*lastCompactionId*/-1L);
+        inFlightEvents, /*createEventId=*/-1L, /*lastCompactionId*/-1L,
+        /*lastRefreshEventId*/-1L, new HdfsTable.FileMetadataStats());
+  }
+
+  /**
+   * Constructor. Needed for third party extensions that want to use their own builder
+   * to construct the object. A third party extension has to update the field of
+   * 'fileMetadataStats_' if it would like to use this field to get the size of the
+   * partition.
+   *
+   * Note that 'partitionIdCounter_' is not accessible to the subclasses in that its
+   * private.
+   */
+  protected HdfsPartition(HdfsTable table, long id, long prevId, String partName,
+      List<LiteralExpr> partitionKeyValues, HdfsStorageDescriptor fileFormatDescriptor,
+      @Nonnull ImmutableList<byte[]> encodedFileDescriptors,
+      ImmutableList<byte[]> encodedInsertFileDescriptors,
+      ImmutableList<byte[]> encodedDeleteFileDescriptors,
+      HdfsPartitionLocationCompressor.Location location,
+      boolean isMarkedCached, TAccessLevel accessLevel, Map<String, String> hmsParameters,
+      CachedHmsPartitionDescriptor cachedMsPartitionDescriptor,
+      byte[] partitionStats, boolean hasIncrementalStats, long numRows, long writeId,
+      InFlightEvents inFlightEvents, long createEventId, long lastCompactionId) {
+    this(table, partitionIdCounter_.getAndIncrement(), prevId, partName,
+        partitionKeyValues, fileFormatDescriptor, encodedFileDescriptors,
+        encodedInsertFileDescriptors, encodedDeleteFileDescriptors, location,
+        isMarkedCached, accessLevel, hmsParameters, cachedMsPartitionDescriptor,
+        partitionStats, hasIncrementalStats, numRows, writeId,
+        inFlightEvents, /*createEventId=*/-1L, /*lastCompactionId*/-1L,
+        /*lastRefreshEventId*/-1L, new HdfsTable.FileMetadataStats());
+  }
+
+  /**
+   * Constructor. Needed for third party extensions that want to use their own builder
+   * to construct the object. It allows third party extensions to provide their own
+   * FileMetadataStats when instantiating an HdfsPartition.
+   *
+   * Note that 'partitionIdCounter_' is not accessible to the subclasses in that its
+   * private.
+   */
+  protected HdfsPartition(HdfsTable table, long id, long prevId, String partName,
+    List<LiteralExpr> partitionKeyValues, HdfsStorageDescriptor fileFormatDescriptor,
+    @Nonnull ImmutableList<byte[]> encodedFileDescriptors,
+    ImmutableList<byte[]> encodedInsertFileDescriptors,
+    ImmutableList<byte[]> encodedDeleteFileDescriptors,
+    HdfsPartitionLocationCompressor.Location location,
+    boolean isMarkedCached, TAccessLevel accessLevel, Map<String, String> hmsParameters,
+    CachedHmsPartitionDescriptor cachedMsPartitionDescriptor,
+    byte[] partitionStats, boolean hasIncrementalStats, long numRows, long writeId,
+    InFlightEvents inFlightEvents, long createEventId, long lastCompactionId,
+    HdfsTable.FileMetadataStats fileMetadataStats) {
+    this(table, partitionIdCounter_.getAndIncrement(), prevId, partName,
+        partitionKeyValues, fileFormatDescriptor, encodedFileDescriptors,
+        encodedInsertFileDescriptors, encodedDeleteFileDescriptors, location,
+        isMarkedCached, accessLevel, hmsParameters, cachedMsPartitionDescriptor,
+        partitionStats, hasIncrementalStats, numRows, writeId,
+        inFlightEvents, /*createEventId=*/-1L, /*lastCompactionId*/-1L,
+        /*lastRefreshEventId*/-1L, fileMetadataStats);
   }
 
   protected HdfsPartition(HdfsTable table, long id, long prevId, String partName,
@@ -723,7 +862,9 @@ public class HdfsPartition extends CatalogObjectImpl
       boolean isMarkedCached, TAccessLevel accessLevel, Map<String, String> hmsParameters,
       CachedHmsPartitionDescriptor cachedMsPartitionDescriptor,
       byte[] partitionStats, boolean hasIncrementalStats, long numRows, long writeId,
-      InFlightEvents inFlightEvents, long createEventId, long lastCompactionId) {
+      InFlightEvents inFlightEvents, long createEventId, long lastCompactionId,
+      long lastRefreshEventId, FileMetadataStats fileMetadataStats) {
+    Preconditions.checkArgument(fileMetadataStats != null);
     table_ = table;
     id_ = id;
     prevId_ = prevId;
@@ -744,14 +885,18 @@ public class HdfsPartition extends CatalogObjectImpl
     inFlightEvents_ = inFlightEvents;
     createEventId_ = createEventId;
     lastCompactionId_ = lastCompactionId;
+    lastRefreshEventId_ = lastRefreshEventId;
     if (partName == null && id_ != CatalogObjectsConstants.PROTOTYPE_PARTITION_ID) {
       partName_ = FeCatalogUtils.getPartitionName(this);
     } else {
       partName_ = partName;
     }
+    fileMetadataStats_ = fileMetadataStats;
   }
 
   public long getCreateEventId() { return createEventId_; }
+
+  public long getLastRefreshEventId() { return lastRefreshEventId_; }
 
   @Override // FeFsPartition
   public HdfsStorageDescriptor getInputFormatDescriptor() {
@@ -827,9 +972,10 @@ public class HdfsPartition extends CatalogObjectImpl
 
   @Override
   public FileSystemUtil.FsType getFsType() {
-    Preconditions.checkNotNull(getLocationPath().toUri().getScheme(),
-        "Cannot get scheme from path " + getLocationPath());
-    return FileSystemUtil.FsType.getFsType(getLocationPath().toUri().getScheme());
+    Path location = getLocationPath();
+    Preconditions.checkNotNull(location.toUri().getScheme(),
+        "Cannot get scheme from path " + location);
+    return FileSystemUtil.FsType.getFsType(location.toUri().getScheme());
   }
 
   @Override // FeFsPartition
@@ -952,9 +1098,8 @@ public class HdfsPartition extends CatalogObjectImpl
     List<FileDescriptor> fdList = getFileDescriptors();
     Set<String> fileNames = new HashSet<>(fdList.size());
     // Fully qualified file names.
-    String location = getLocation();
     for (FileDescriptor fd : fdList) {
-      fileNames.add(location + Path.SEPARATOR + fd.getRelativePath());
+      fileNames.add(fd.getAbsolutePath(getLocation()));
     }
     return fileNames;
   }
@@ -964,6 +1109,10 @@ public class HdfsPartition extends CatalogObjectImpl
     return encodedFileDescriptors_.size() +
            encodedInsertFileDescriptors_.size() +
            encodedDeleteFileDescriptors_.size();
+  }
+
+  public FileMetadataStats getFileMetadataStats() {
+    return fileMetadataStats_;
   }
 
   @Override
@@ -978,8 +1127,11 @@ public class HdfsPartition extends CatalogObjectImpl
 
   public void setPartitionMetadata(TPartialPartitionInfo tPart) {
     // The special "prototype partition" or the only partition of an unpartitioned table
-    // have a null cachedMsPartitionDescriptor.
-    if (cachedMsPartitionDescriptor_ == null) return;
+    // don't have partition metadata.
+    if (id_ == CatalogObjectsConstants.PROTOTYPE_PARTITION_ID
+        || !table_.isPartitioned()) {
+      return;
+    }
     // Don't need to make a copy here since the caller should not modify the parameters.
     tPart.hms_parameters = getParameters();
     tPart.write_id = writeId_;
@@ -1068,6 +1220,9 @@ public class HdfsPartition extends CatalogObjectImpl
 
   @Override
   public long getSize() {
+    if (fileMetadataStats_.numFiles > 0) {
+      return fileMetadataStats_.totalFileBytes;
+    }
     long result = 0;
     for (HdfsPartition.FileDescriptor fileDescriptor: getFileDescriptors()) {
       result += fileDescriptor.getFileLength();
@@ -1198,7 +1353,11 @@ public class HdfsPartition extends CatalogObjectImpl
     // is not active.
     private long createEventId_ = -1L;
     private long lastCompactionId_ = -1L;
+    private long lastRefreshEventId_ = -1L;
     private InFlightEvents inFlightEvents_ = new InFlightEvents();
+
+    // File statistics for the partition, initialized to all zeros.
+    private FileMetadataStats fileMetadataStats_ = new FileMetadataStats();
 
     @Nullable
     private HdfsPartition oldInstance_ = null;
@@ -1220,6 +1379,10 @@ public class HdfsPartition extends CatalogObjectImpl
       this(partition.table_);
       oldInstance_ = partition;
       prevId_ = oldInstance_.id_;
+      copyFromPartition(partition);
+    }
+
+    public Builder copyFromPartition(HdfsPartition partition) {
       partitionKeyValues_ = partition.partitionKeyValues_;
       fileFormatDescriptor_ = partition.fileFormatDescriptor_;
       setFileDescriptors(partition);
@@ -1237,7 +1400,11 @@ public class HdfsPartition extends CatalogObjectImpl
       }
       // Take over the in-flight events
       inFlightEvents_ = partition.inFlightEvents_;
+      // Don't lose the event ids
+      createEventId_ = partition.createEventId_;
       lastCompactionId_ = partition.lastCompactionId_;
+      lastRefreshEventId_ = partition.lastRefreshEventId_;
+      return this;
     }
 
     public HdfsPartition build() {
@@ -1260,7 +1427,7 @@ public class HdfsPartition extends CatalogObjectImpl
           encodedDeleteFileDescriptors_, location_, isMarkedCached_, accessLevel_,
           hmsParameters_, cachedMsPartitionDescriptor_, partitionStats_,
           hasIncrementalStats_, numRows_, writeId_, inFlightEvents_, createEventId_,
-          lastCompactionId_);
+          lastCompactionId_, lastRefreshEventId_, fileMetadataStats_);
     }
 
     public Builder setId(long id) {
@@ -1270,6 +1437,11 @@ public class HdfsPartition extends CatalogObjectImpl
 
     public Builder setCreateEventId(long eventId) {
       createEventId_ = eventId;
+      return this;
+    }
+
+    public Builder setLastRefreshEventId(long eventId) {
+      lastRefreshEventId_ = eventId;
       return this;
     }
 
@@ -1306,6 +1478,9 @@ public class HdfsPartition extends CatalogObjectImpl
         isMarkedCached_ = HdfsCachingUtil.getCacheDirectiveId(
             msPartition.getParameters()) != null;
         numRows_ = FeCatalogUtils.getRowCount(msPartition.getParameters());
+        if (table_.getDebugMetadataScale() > -1.0 && numRows_ > 0) {
+          numRows_ *= table_.getDebugMetadataScale();
+        }
         hmsParameters_ = msPartition.getParameters();
         extractAndCompressPartStats();
         // Intern parameters after removing the incremental stats
@@ -1478,6 +1653,7 @@ public class HdfsPartition extends CatalogObjectImpl
     }
 
     public Builder setFileDescriptors(HdfsPartition partition) {
+      fileMetadataStats_.set(partition.getFileMetadataStats());
       encodedFileDescriptors_ = partition.encodedFileDescriptors_;
       encodedInsertFileDescriptors_ = partition.encodedInsertFileDescriptors_;
       encodedDeleteFileDescriptors_ = partition.encodedDeleteFileDescriptors_;
@@ -1503,6 +1679,13 @@ public class HdfsPartition extends CatalogObjectImpl
     public Builder setFileDescriptors(ImmutableList<byte[]> encodedDescriptors) {
       encodedFileDescriptors_ = encodedDescriptors;
       return this;
+    }
+
+    public void setFileMetadataStats(FileMetadataStats fileMetadataStats) {
+      // The fileMetadataStats will not be shared by more than one HdfsPartition even if
+      // the FileMetadataLoader is reused, because a new FileMetadataStats will be
+      // created each time the file metadata of a partition gets loaded.
+      fileMetadataStats_ = fileMetadataStats;
     }
 
     public HdfsFileFormat getFileFormat() {
@@ -1616,13 +1799,25 @@ public class HdfsPartition extends CatalogObjectImpl
       }
 
       if (thriftPartition.isSetFile_desc()) {
-        setFileDescriptors(fdsFromThrift(thriftPartition.getFile_desc()));
+        List<FileDescriptor> fds = fdsFromThrift(thriftPartition.getFile_desc());
+        setFileDescriptors(fds);
+        for (FileDescriptor fd: fds) {
+          fileMetadataStats_.accumulate(fd);
+        }
       }
       if (thriftPartition.isSetInsert_file_desc()) {
-        setInsertFileDescriptors(fdsFromThrift(thriftPartition.getInsert_file_desc()));
+        List<FileDescriptor> fds = fdsFromThrift(thriftPartition.getInsert_file_desc());
+        setInsertFileDescriptors(fds);
+        for (FileDescriptor fd: fds) {
+          fileMetadataStats_.accumulate(fd);
+        }
       }
       if (thriftPartition.isSetDelete_file_desc()) {
-        setDeleteFileDescriptors(fdsFromThrift(thriftPartition.getDelete_file_desc()));
+        List<FileDescriptor> fds = fdsFromThrift(thriftPartition.getDelete_file_desc());
+        setDeleteFileDescriptors(fds);
+        for (FileDescriptor fd: fds) {
+          fileMetadataStats_.accumulate(fd);
+        }
       }
 
       accessLevel_ = thriftPartition.isSetAccess_level() ?
@@ -1679,9 +1874,9 @@ public class HdfsPartition extends CatalogObjectImpl
           && hmsParameters_.equals(oldInstance.hmsParameters_)
           && partitionStats_ == oldInstance.partitionStats_
           && hasIncrementalStats_ == oldInstance.hasIncrementalStats_
-          && numRows_ == oldInstance.numRows_
-          && writeId_ == oldInstance.writeId_
-          && lastCompactionId_ == oldInstance.lastCompactionId_);
+          && numRows_ == oldInstance.numRows_ && writeId_ == oldInstance.writeId_
+          && lastCompactionId_ == oldInstance.lastCompactionId_
+          && lastRefreshEventId_ == oldInstance_.lastRefreshEventId_);
     }
   }
 

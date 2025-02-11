@@ -22,21 +22,45 @@ import static org.junit.Assert.assertTrue;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
-import java.io.IOException;
 
 /**
  * Helper class to run a shell command.
  */
 class RunShellCommand {
   /**
+   * Tuple wrapping stdout, stderr from Run.
+   */
+  public static class Output {
+    public Output(String out, String err) {
+      stdout = out;
+      stderr = err;
+    }
+
+    public String stdout;
+    public String stderr;
+  }
+
+  /**
    * Run a shell command 'cmd'. If 'shouldSucceed' is true, the command is expected to
-   * succeed, otherwise it is expected to fail. Returns the output (stdout) of the
+   * succeed, otherwise it is expected to fail. Returns the output (stdout, stderr) of the
    * command.
    */
-  public static String Run(String[] cmd, boolean shouldSucceed, String expectedOut,
+  public static Output Run(String[] cmd, boolean shouldSucceed, String expectedOut,
       String expectedErr) throws Exception {
+    // run the command with the env variables inherited from the current process
+    return Run(cmd, null, shouldSucceed, expectedOut, expectedErr);
+  }
+
+  /**
+   * Run a shell command 'cmd' with custom 'env' variables.
+   * If 'shouldSucceed' is true, the command is expected to
+   * succeed, otherwise it is expected to fail. Returns the output (stdout, stderr) of the
+   * command.
+   */
+  public static Output Run(String[] cmd, String[] env, boolean shouldSucceed,
+                           String expectedOut, String expectedErr) throws Exception {
     Runtime rt = Runtime.getRuntime();
-    Process process = rt.exec(cmd);
+    Process process = rt.exec(cmd, env);
     // Collect stderr.
     BufferedReader input = new BufferedReader(
         new InputStreamReader(process.getErrorStream()));
@@ -60,6 +84,6 @@ class RunShellCommand {
     // If the query succeeds, assert that the output is correct.
     String stdout = stdoutBuf.toString();
     if (shouldSucceed) assertTrue(stdout, stdout.contains(expectedOut));
-    return stdout;
+    return new Output(stdout, stderr);
   }
 }

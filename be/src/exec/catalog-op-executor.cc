@@ -47,16 +47,20 @@ using namespace apache::hive::service::cli::thrift;
 using namespace apache::thrift;
 
 DECLARE_bool(use_local_catalog);
-DECLARE_int32(catalog_service_port);
-DECLARE_string(catalog_service_host);
 DECLARE_string(debug_actions);
 
 DECLARE_int32(catalog_client_connection_num_retries);
 DECLARE_int32(catalog_client_rpc_timeout_ms);
 DECLARE_int32(catalog_client_rpc_retry_interval_ms);
 
+DEFINE_int32_hidden(inject_latency_before_catalog_fetch_ms, 0,
+    "Latency (ms) to be injected before fetching catalog data from the catalogd");
 DEFINE_int32_hidden(inject_latency_after_catalog_fetch_ms, 0,
     "Latency (ms) to be injected after fetching catalog data from the catalogd");
+DEFINE_double_hidden(inject_failure_ratio_in_catalog_fetch, -1,
+    "Ratio to randomly fail the GetPartialCatalogObject RPC with TABLE_NOT_LOADED "
+    "status. 0.1 means fail it in a possibility of 10%. Negative values disable this. "
+    "values >= 1 will always make the RPC fail");
 
 /// Used purely for debug actions. The DEBUG_ACTION is only executed on the first RPC
 /// attempt.
@@ -94,8 +98,6 @@ Status CatalogOpExecutor::Exec(const TCatalogOpRequest& request) {
   DCHECK(profile_ != NULL);
   RuntimeProfile::Counter* exec_timer = ADD_TIMER(profile_, "CatalogOpExecTimer");
   SCOPED_TIMER(exec_timer);
-  const TNetworkAddress& address =
-      MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
   RETURN_IF_ERROR(status);
   switch (request.op_type) {
     case TCatalogOpType::DDL: {
@@ -105,15 +107,16 @@ Status CatalogOpExecutor::Exec(const TCatalogOpRequest& request) {
       exec_response_.reset(new TDdlExecResponse());
       int attempt = 0; // Used for debug action only.
       CatalogServiceConnection::RpcStatus rpc_status =
-          CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(), address,
+          CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(),
+              *ExecEnv::GetInstance()->GetCatalogdAddress().get(),
               &CatalogServiceClientWrapper::ExecDdl, request.ddl_params,
               FLAGS_catalog_client_connection_num_retries,
               FLAGS_catalog_client_rpc_retry_interval_ms,
               [&attempt]() { return CatalogRpcDebugFn(&attempt); }, exec_response_.get());
       RETURN_IF_ERROR(rpc_status.status);
-      if (FLAGS_use_local_catalog) VerifyMinimalResponse(exec_response_.get()->result);
+      if (FLAGS_use_local_catalog) VerifyMinimalResponse(exec_response_->result);
       catalog_update_result_.reset(
-          new TCatalogUpdateResult(exec_response_.get()->result));
+          new TCatalogUpdateResult(exec_response_->result));
       Status status(exec_response_->result.status);
       if (status.ok()) {
         if (request.ddl_params.ddl_type == TDdlType::DROP_FUNCTION) {
@@ -122,19 +125,26 @@ Status CatalogOpExecutor::Exec(const TCatalogOpRequest& request) {
           HandleDropDataSource(request.ddl_params.drop_data_source_params);
         }
       }
+      if (exec_response_->__isset.profile) {
+        catalog_profile_ = make_unique<TRuntimeProfileNode>(exec_response_->profile);
+      }
       return status;
     }
     case TCatalogOpType::RESET_METADATA: {
       TResetMetadataResponse response;
       int attempt = 0; // Used for debug action only.
       CatalogServiceConnection::RpcStatus rpc_status =
-          CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(), address,
+          CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(),
+              *ExecEnv::GetInstance()->GetCatalogdAddress().get(),
               &CatalogServiceClientWrapper::ResetMetadata, request.reset_metadata_params,
               FLAGS_catalog_client_connection_num_retries,
               FLAGS_catalog_client_rpc_retry_interval_ms,
               [&attempt]() { return CatalogRpcDebugFn(&attempt); }, &response);
       RETURN_IF_ERROR(rpc_status.status);
       if (FLAGS_use_local_catalog) VerifyMinimalResponse(response.result);
+      if (response.__isset.profile) {
+        catalog_profile_ = make_unique<TRuntimeProfileNode>(response.profile);
+      }
       catalog_update_result_.reset(new TCatalogUpdateResult(response.result));
       return Status(response.result.status);
     }
@@ -145,7 +155,7 @@ Status CatalogOpExecutor::Exec(const TCatalogOpRequest& request) {
   }
 }
 
-Status CatalogOpExecutor::ExecComputeStats(
+Status CatalogOpExecutor::ExecComputeStats(const TCatalogServiceRequestHeader& header,
     const TCatalogOpRequest& compute_stats_request,
     const TTableSchema& tbl_stats_schema, const TRowSet& tbl_stats_data,
     const TTableSchema& col_stats_schema, const TRowSet& col_stats_data) {
@@ -156,10 +166,10 @@ Status CatalogOpExecutor::ExecComputeStats(
   catalog_op_req.__set_sync_ddl(compute_stats_request.sync_ddl);
   TDdlExecRequest& update_stats_req = catalog_op_req.ddl_params;
   update_stats_req.__set_ddl_type(TDdlType::ALTER_TABLE);
-  update_stats_req.__set_sync_ddl(compute_stats_request.sync_ddl);
-  update_stats_req.__set_debug_action(compute_stats_request.ddl_params.debug_action);
-  update_stats_req.__set_header(TCatalogServiceRequestHeader());
-  update_stats_req.header.__set_want_minimal_response(FLAGS_use_local_catalog);
+  update_stats_req.query_options.__set_sync_ddl(compute_stats_request.sync_ddl);
+  update_stats_req.query_options.__set_debug_action(
+      compute_stats_request.ddl_params.query_options.debug_action);
+  update_stats_req.__set_header(header);
 
   const TComputeStatsParams& compute_stats_params =
       compute_stats_request.ddl_params.compute_stats_params;
@@ -341,15 +351,14 @@ void CatalogOpExecutor::SetColumnStats(const TTableSchema& col_stats_schema,
 
 Status CatalogOpExecutor::GetCatalogObject(const TCatalogObject& object_desc,
     TCatalogObject* result) {
-  const TNetworkAddress& address =
-      MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
   TGetCatalogObjectRequest request;
   request.__set_object_desc(object_desc);
 
   TGetCatalogObjectResponse response;
   int attempt = 0; // Used for debug action only.
   CatalogServiceConnection::RpcStatus rpc_status =
-      CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(), address,
+      CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(),
+          *ExecEnv::GetInstance()->GetCatalogdAddress().get(),
           &CatalogServiceClientWrapper::GetCatalogObject, request,
           FLAGS_catalog_client_connection_num_retries,
           FLAGS_catalog_client_rpc_retry_interval_ms,
@@ -363,11 +372,17 @@ Status CatalogOpExecutor::GetPartialCatalogObject(
     const TGetPartialCatalogObjectRequest& req,
     TGetPartialCatalogObjectResponse* resp) {
   DCHECK(FLAGS_use_local_catalog || TestInfo::is_test());
-  const TNetworkAddress& address =
-      MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
+  if (FLAGS_inject_latency_before_catalog_fetch_ms > 0) {
+    SleepForMs(FLAGS_inject_latency_before_catalog_fetch_ms);
+  }
+  // Non-table requests are lightweight requests that won't be blocked by table loading
+  // or table locks. Note that when loading table list of a db, the type is DB.
+  auto client_cache_ptr = (req.object_desc.type == TCatalogObjectType::TABLE) ?
+      env_->catalogd_client_cache() : env_->catalogd_lightweight_req_client_cache();
   int attempt = 0; // Used for debug action only.
   CatalogServiceConnection::RpcStatus rpc_status =
-      CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(), address,
+      CatalogServiceConnection::DoRpcWithRetry(client_cache_ptr,
+          *ExecEnv::GetInstance()->GetCatalogdAddress().get(),
           &CatalogServiceClientWrapper::GetPartialCatalogObject, req,
           FLAGS_catalog_client_connection_num_retries,
           FLAGS_catalog_client_rpc_retry_interval_ms,
@@ -376,17 +391,21 @@ Status CatalogOpExecutor::GetPartialCatalogObject(
   if (FLAGS_inject_latency_after_catalog_fetch_ms > 0) {
     SleepForMs(FLAGS_inject_latency_after_catalog_fetch_ms);
   }
+  if (FLAGS_inject_failure_ratio_in_catalog_fetch > 0
+      && rand() < FLAGS_inject_failure_ratio_in_catalog_fetch * (RAND_MAX + 1L)) {
+    resp->lookup_status = CatalogLookupStatus::TABLE_NOT_LOADED;
+  }
   return Status::OK();
 }
 
 
 Status CatalogOpExecutor::PrioritizeLoad(const TPrioritizeLoadRequest& req,
     TPrioritizeLoadResponse* result) {
-  const TNetworkAddress& address =
-      MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
   int attempt = 0; // Used for debug action only.
   CatalogServiceConnection::RpcStatus rpc_status =
-      CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(), address,
+      CatalogServiceConnection::DoRpcWithRetry(
+          env_->catalogd_lightweight_req_client_cache(),
+          *ExecEnv::GetInstance()->GetCatalogdAddress().get(),
           &CatalogServiceClientWrapper::PrioritizeLoad, req,
           FLAGS_catalog_client_connection_num_retries,
           FLAGS_catalog_client_rpc_retry_interval_ms,
@@ -397,11 +416,10 @@ Status CatalogOpExecutor::PrioritizeLoad(const TPrioritizeLoadRequest& req,
 
 Status CatalogOpExecutor::GetPartitionStats(
     const TGetPartitionStatsRequest& req, TGetPartitionStatsResponse* result) {
-  const TNetworkAddress& address =
-      MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
   int attempt = 0; // Used for debug action only.
   CatalogServiceConnection::RpcStatus rpc_status =
-      CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(), address,
+      CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(),
+          *ExecEnv::GetInstance()->GetCatalogdAddress().get(),
           &CatalogServiceClientWrapper::GetPartitionStats, req,
           FLAGS_catalog_client_connection_num_retries,
           FLAGS_catalog_client_rpc_retry_interval_ms,
@@ -412,15 +430,64 @@ Status CatalogOpExecutor::GetPartitionStats(
 
 Status CatalogOpExecutor::UpdateTableUsage(const TUpdateTableUsageRequest& req,
   TUpdateTableUsageResponse* resp) {
-  const TNetworkAddress& address =
-      MakeNetworkAddress(FLAGS_catalog_service_host, FLAGS_catalog_service_port);
   int attempt = 0; // Used for debug action only.
   CatalogServiceConnection::RpcStatus rpc_status =
-      CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(), address,
+      CatalogServiceConnection::DoRpcWithRetry(
+          // The operation doesn't require table lock in catalogd. It doesn't require
+          // the table being loaded neither. So we can use clients for lightweight
+          // requests.
+          env_->catalogd_lightweight_req_client_cache(),
+          *ExecEnv::GetInstance()->GetCatalogdAddress().get(),
           &CatalogServiceClientWrapper::UpdateTableUsage, req,
           FLAGS_catalog_client_connection_num_retries,
           FLAGS_catalog_client_rpc_retry_interval_ms,
           [&attempt]() { return CatalogRpcDebugFn(&attempt); }, resp);
   RETURN_IF_ERROR(rpc_status.status);
+  return Status::OK();
+}
+
+Status CatalogOpExecutor::GetNullPartitionName(
+    const TGetNullPartitionNameRequest& req, TGetNullPartitionNameResponse* result) {
+  int attempt = 0; // Used for debug action only.
+  CatalogServiceConnection::RpcStatus rpc_status =
+      CatalogServiceConnection::DoRpcWithRetry(
+          env_->catalogd_lightweight_req_client_cache(),
+          *ExecEnv::GetInstance()->GetCatalogdAddress().get(),
+          &CatalogServiceClientWrapper::GetNullPartitionName, req,
+          FLAGS_catalog_client_connection_num_retries,
+          FLAGS_catalog_client_rpc_retry_interval_ms,
+          [&attempt]() { return CatalogRpcDebugFn(&attempt); }, result);
+  RETURN_IF_ERROR(rpc_status.status);
+  return Status::OK();
+}
+
+Status CatalogOpExecutor::GetLatestCompactions(
+    const TGetLatestCompactionsRequest& req, TGetLatestCompactionsResponse* result) {
+  int attempt = 0; // Used for debug action only.
+  CatalogServiceConnection::RpcStatus rpc_status =
+      CatalogServiceConnection::DoRpcWithRetry(
+          env_->catalogd_lightweight_req_client_cache(),
+          *ExecEnv::GetInstance()->GetCatalogdAddress().get(),
+          &CatalogServiceClientWrapper::GetLatestCompactions, req,
+          FLAGS_catalog_client_connection_num_retries,
+          FLAGS_catalog_client_rpc_retry_interval_ms,
+          [&attempt]() { return CatalogRpcDebugFn(&attempt); }, result);
+  RETURN_IF_ERROR(rpc_status.status);
+  return Status::OK();
+}
+
+Status CatalogOpExecutor::SetEventProcessorStatus(
+    const TSetEventProcessorStatusRequest& req,
+    TSetEventProcessorStatusResponse* result) {
+  int attempt = 0; // Used for debug action only.
+  CatalogServiceConnection::RpcStatus rpc_status =
+      CatalogServiceConnection::DoRpcWithRetry(env_->catalogd_client_cache(),
+          *ExecEnv::GetInstance()->GetCatalogdAddress(),
+          &CatalogServiceClientWrapper::SetEventProcessorStatus, req,
+          FLAGS_catalog_client_connection_num_retries,
+          FLAGS_catalog_client_rpc_retry_interval_ms,
+          [&attempt]() { return CatalogRpcDebugFn(&attempt); }, result);
+  RETURN_IF_ERROR(rpc_status.status);
+  if (result->status.status_code != TErrorCode::OK) return Status(result->status);
   return Status::OK();
 }

@@ -30,6 +30,7 @@ import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableType;
+import org.apache.impala.util.EventSequence;
 
 import com.codahale.metrics.Timer;
 import com.google.common.base.Preconditions;
@@ -98,9 +99,10 @@ public class HBaseTable extends Table implements FeHBaseTable {
    */
   @Override
   public void load(boolean reuseMetadata, IMetaStoreClient client,
-      org.apache.hadoop.hive.metastore.api.Table msTbl, String reason)
-      throws TableLoadingException {
+      org.apache.hadoop.hive.metastore.api.Table msTbl, String reason,
+      EventSequence catalogTimeline) throws TableLoadingException {
     Preconditions.checkNotNull(getMetaStoreTable());
+    Table.LOADING_TABLES.incrementAndGet();
     try (Timer.Context timer = getMetrics().getTimer(Table.LOAD_DURATION_METRIC).time()) {
       msTable_ = msTbl;
       final Timer.Context storageLoadTimer =
@@ -110,7 +112,10 @@ public class HBaseTable extends Table implements FeHBaseTable {
         hbaseTableName_ = Util.getHBaseTableName(getMetaStoreTable());
         // Warm up the connection and verify the table exists.
         Util.getHBaseTable(hbaseTableName_).close();
+        catalogTimeline.markEvent("Checked HBase table exists");
         columnFamilies_ = null;
+        // Warm up the connection and verify the table exists.
+        getColumnFamilies();
         cols = Util.loadColumns(msTable_);
       } finally {
         storageMetadataLoadTime_ = storageLoadTimer.stop();
@@ -122,11 +127,13 @@ public class HBaseTable extends Table implements FeHBaseTable {
       // since we don't support composite hbase rowkeys yet, all hbase tables have a
       // single clustering col
       numClusteringCols_ = 1;
-      loadAllColumnStats(client);
+      loadAllColumnStats(client, catalogTimeline);
       refreshLastUsedTime();
     } catch (Exception e) {
       throw new TableLoadingException("Failed to load metadata for HBase table: " + name_,
           e);
+    } finally {
+      Table.LOADING_TABLES.decrementAndGet();
     }
   }
 
@@ -135,9 +142,9 @@ public class HBaseTable extends Table implements FeHBaseTable {
     super.loadFromThrift(table);
     try {
       hbaseTableName_ = Util.getHBaseTableName(getMetaStoreTable());
-      // Warm up the connection and verify the table exists.
-      Util.getHBaseTable(hbaseTableName_).close();
       columnFamilies_ = null;
+      // Warm up the connection and verify the table exists.
+      getColumnFamilies();
     } catch (Exception e) {
       throw new TableLoadingException(
           "Failed to load metadata for HBase table from thrift table: " + name_, e);

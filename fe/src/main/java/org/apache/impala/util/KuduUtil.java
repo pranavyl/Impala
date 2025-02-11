@@ -18,6 +18,7 @@
 package org.apache.impala.util;
 
 import static java.lang.String.format;
+import static org.apache.impala.service.KuduCatalogOpExecutor.GOT_KUDU_CLIENT;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -87,17 +88,25 @@ public class KuduUtil {
    * fetching tablet metadata.
    */
   public static KuduClient getKuduClient(String kuduMasters) {
-    KuduClient client = kuduClients_.get(kuduMasters);
-    if (client == null) {
+    KuduClient client = kuduClients_.computeIfAbsent(kuduMasters, k -> {
       KuduClientBuilder b = new KuduClient.KuduClientBuilder(kuduMasters);
       b.defaultAdminOperationTimeoutMs(BackendConfig.INSTANCE.getKuduClientTimeoutMs());
       b.defaultOperationTimeoutMs(BackendConfig.INSTANCE.getKuduClientTimeoutMs());
       b.workerCount(KUDU_CLIENT_WORKER_THREAD_COUNT);
       b.saslProtocolName(BackendConfig.INSTANCE.getKuduSaslProtocolName());
-      client = b.build();
-      kuduClients_.put(kuduMasters, client);
-    }
+      return b.build();
+    });
     return client;
+  }
+
+  /**
+   * Wrapper to get kudu client and mark the given 'catalogTimeline' when it finishes.
+   */
+  public static KuduClient getKuduClient(String masterHosts,
+      EventSequence catalogTimeline) {
+    KuduClient kudu = KuduUtil.getKuduClient(masterHosts);
+    catalogTimeline.markEvent(GOT_KUDU_CLIENT);
+    return kudu;
   }
 
   /**
@@ -341,10 +350,13 @@ public class KuduUtil {
   }
 
   public static TColumn setColumnOptions(TColumn column, boolean isKey,
-      Boolean isNullable, Encoding encoding, CompressionAlgorithm compression,
-      Expr defaultValue, Integer blockSize, String kuduName) {
+      boolean isPrimaryKeyUnique, Boolean isNullable, boolean isAutoIncrementing,
+      Encoding encoding, CompressionAlgorithm compression, Expr defaultValue,
+      Integer blockSize, String kuduName) {
     column.setIs_key(isKey);
+    column.setIs_primary_key_unique(isPrimaryKeyUnique);
     if (isNullable != null) column.setIs_nullable(isNullable);
+    column.setIs_auto_incrementing(isAutoIncrementing);
     try {
       if (encoding != null) column.setEncoding(toThrift(encoding));
       if (compression != null) column.setCompression(toThrift(compression));
@@ -430,10 +442,10 @@ public class KuduUtil {
       case DECIMAL: return org.apache.kudu.Type.DECIMAL;
       case DATE: return org.apache.kudu.Type.DATE;
       case VARCHAR: return org.apache.kudu.Type.VARCHAR;
+      case BINARY: return org.apache.kudu.Type.BINARY;
       /* Fall through below */
       case INVALID_TYPE:
       case NULL_TYPE:
-      case BINARY:
       case DATETIME:
       case CHAR:
       default:
@@ -459,6 +471,7 @@ public class KuduUtil {
         return ScalarType.createDecimalType(
             typeAttributes.getPrecision(), typeAttributes.getScale());
       case VARCHAR: return ScalarType.createVarcharType(typeAttributes.getLength());
+      case BINARY: return Type.BINARY;
       default:
         throw new ImpalaRuntimeException(String.format(
             "Kudu type '%s' is not supported in Impala", t.getName()));
@@ -478,5 +491,23 @@ public class KuduUtil {
         insertStmt.getPartitionColPos());
     kuduPartitionExpr.analyze(analyzer);
     return kuduPartitionExpr;
+  }
+
+  // Used for test assertions
+  public static int getkuduClientsSize() {
+    return kuduClients_.size();
+  }
+
+  // Used for generating log messages
+  public static String getPrimaryKeyString(boolean isPrimaryKeyUnique) {
+    StringBuilder sb = new StringBuilder();
+    if (!isPrimaryKeyUnique) sb.append("NON UNIQUE ");
+    sb.append("PRIMARY KEY");
+    return sb.toString();
+  }
+
+  // Get auto-incrementing column name of Kudu table
+  public static String getAutoIncrementingColumnName() {
+    return Schema.getAutoIncrementingColumnName();
   }
 }

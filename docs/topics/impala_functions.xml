@@ -87,6 +87,10 @@ under the License.
       <li>
         <xref href="impala_misc_functions.xml#misc_functions"/>
       </li>
+
+      <li>
+        <xref href="impala_geospatial_functions.xml#geospatial_functions"/>
+      </li>
     </ul>
 
     <p>
@@ -1034,6 +1038,13 @@ under the License.
             <entry>
               <xref href="impala_math_functions.xml#math_functions/precision"
                 >PRECISION</xref>
+            </entry>
+          </row>
+          <row>
+            <entry>
+              <xref href=
+                "impala_string_functions.xml#string_functions/prettyprint_bytes">
+                PRETTYPRINT_BYTES</xref>
             </entry>
           </row>
           <row>

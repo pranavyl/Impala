@@ -92,7 +92,8 @@ TEST(CountersTest, Basic) {
   RuntimeProfile* from_thrift = RuntimeProfile::CreateFromThrift(&pool, thrift_profile);
   counter_merged = from_thrift->GetCounter("A");
   EXPECT_EQ(counter_merged->value(), 1);
-  EXPECT_TRUE(from_thrift->GetCounter("Not there") ==  NULL);
+  EXPECT_TRUE(from_thrift->GetCounter("Not there") == NULL);
+  EXPECT_TRUE(from_thrift->GetCounter("Not there") == nullptr);
   TExecSummary exec_summary_result;
   from_thrift->GetExecSummary(&exec_summary_result);
   EXPECT_EQ(exec_summary_result.status, status);
@@ -107,6 +108,7 @@ TEST(CountersTest, Basic) {
       RuntimeProfile::CreateFromThrift(&pool, deserialized_thrift_profile);
   counter_merged = deserialized_profile->GetCounter("A");
   EXPECT_EQ(counter_merged->value(), 1);
+  EXPECT_TRUE(deserialized_profile->GetCounter("Not there") == NULL);
   EXPECT_TRUE(deserialized_profile->GetCounter("Not there") == nullptr);
   deserialized_profile->GetExecSummary(&exec_summary_result);
   EXPECT_EQ(exec_summary_result.status, status);
@@ -119,6 +121,7 @@ TEST(CountersTest, Basic) {
       RuntimeProfile::DecompressToProfile(compressed, &pool, &deserialized_profile2));
   counter_merged = deserialized_profile2->GetCounter("A");
   EXPECT_EQ(counter_merged->value(), 1);
+  EXPECT_TRUE(deserialized_profile2->GetCounter("Not there") == NULL);
   EXPECT_TRUE(deserialized_profile2->GetCounter("Not there") == nullptr);
   deserialized_profile2->GetExecSummary(&exec_summary_result);
   EXPECT_EQ(exec_summary_result.status, status);
@@ -1105,7 +1108,7 @@ void ValidateSampler(const StreamingSampler<int, 10>& sampler, int expected_num,
 }
 
 TEST(CountersTest, StreamingSampler) {
-  StreamingSampler<int, 10> sampler;
+  StreamingSampler<int, 10> sampler(500);
 
   int idx = 0;
   for (int i = 0; i < 3; ++i) {
@@ -1603,7 +1606,7 @@ TEST(CountersTest, PartialUpdate) {
 /// printing with a varying number of test samples.
 struct TimeSeriesTestParam {
   TimeSeriesTestParam(int num_samples, vector<const char*> expected)
-    : num_samples(num_samples), expected(expected) {}
+    : num_samples(num_samples), expected(move(expected)) {}
   int num_samples;
   vector<const char*> expected;
 
@@ -1623,6 +1626,7 @@ TEST_P(TimeSeriesCounterResampleTest, TestPrettyPrint) {
   RuntimeProfile* profile = RuntimeProfile::Create(&pool, "Profile");
 
   const TimeSeriesTestParam& param = GetParam();
+  FLAGS_periodic_counter_update_period_ms = 500;
   const int test_period = FLAGS_periodic_counter_update_period_ms;
 
   // Add a counter with a sample function that counts up, starting from 0.
@@ -1657,7 +1661,7 @@ TEST_P(TimeSeriesCounterResampleTest, TestPrettyPrint) {
   for (const char* e : param.expected) EXPECT_STR_CONTAINS(pretty_str, e);
 }
 
-INSTANTIATE_TEST_CASE_P(VariousNumbers, TimeSeriesCounterResampleTest,
+INSTANTIATE_TEST_SUITE_P(VariousNumbers, TimeSeriesCounterResampleTest,
     ::testing::Values(
     TimeSeriesTestParam(64, {"TestCounter (500.000ms): 0, 1, 2, 3", "61, 62, 63"}),
 
@@ -1838,11 +1842,14 @@ TEST(ToJson, TimeSeriesCounterToJsonTest) {
   FLAGS_status_report_interval_ms = 50000;
   RuntimeProfile::TimeSeriesCounter* counter =
       profile->AddChunkedTimeSeriesCounter("TimeSeriesCounter", TUnit::UNIT, sample_fn);
-  RuntimeProfile::TimeSeriesCounter* counter2 =
-      profile->AddSamplingTimeSeriesCounter("SamplingCounter", TUnit::UNIT, sample_fn);
+  auto counter2 = static_cast<RuntimeProfile::SamplingTimeSeriesCounter*>(
+      profile->AddSamplingTimeSeriesCounter("SamplingCounter", TUnit::UNIT, sample_fn));
 
   // Stop counter updates from interfering with the rest of the test.
   StopAndClearCounter(profile, counter);
+  // ChunkedTimeSeriesCounters are stopped and cleared above.
+  // But SamplingTimeSeriesCounter needs explicitly Reset() to back to the initial state.
+  counter2->Reset();
 
   // Reset value after previous values have been retrieved.
   value = 0;
@@ -1852,15 +1859,17 @@ TEST(ToJson, TimeSeriesCounterToJsonTest) {
   for (int i = 0; i < 80; ++i) counter2->AddSample(test_period);
 
   profile->ToJson(&doc);
+  EXPECT_EQ(doc["contents"]["time_series_counters"][1]["counter_name"],
+      "TimeSeriesCounter");
   EXPECT_STR_CONTAINS(
       doc["contents"]["time_series_counters"][1]["data"].GetString(), "0,1,2,3,4");
-
   EXPECT_STR_CONTAINS(
       doc["contents"]["time_series_counters"][1]["data"].GetString(), "60,61,62,63");
 
+  EXPECT_EQ(doc["contents"]["time_series_counters"][0]["counter_name"],
+      "SamplingCounter");
   EXPECT_STR_CONTAINS(
       doc["contents"]["time_series_counters"][0]["data"].GetString(), "0,2,4,6");
-
   EXPECT_STR_CONTAINS(
       doc["contents"]["time_series_counters"][0]["data"].GetString(), "72,74,76,78");
 }

@@ -18,11 +18,23 @@
 package org.apache.impala.util;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
+import org.apache.commons.collections.CollectionUtils;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.hive.HiveSchemaUtil;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
+import org.apache.impala.analysis.IcebergPartitionField;
+import org.apache.impala.analysis.IcebergPartitionSpec;
+import org.apache.impala.analysis.IcebergPartitionTransform;
 import org.apache.impala.catalog.ArrayType;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.IcebergColumn;
@@ -31,11 +43,11 @@ import org.apache.impala.catalog.MapType;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
-import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.thrift.TColumn;
 import org.apache.impala.thrift.TColumnType;
+import org.apache.impala.thrift.TIcebergPartitionTransformType;
 
 /**
  * Utility class for converting between Iceberg and Impala schemas and types.
@@ -56,7 +68,7 @@ public class IcebergSchemaConverter {
    * Transform iceberg type to impala type
    */
   public static Type toImpalaType(org.apache.iceberg.types.Type t)
-      throws TableLoadingException {
+      throws ImpalaRuntimeException {
     switch (t.typeId()) {
       case BOOLEAN:
         return Type.BOOLEAN;
@@ -101,7 +113,7 @@ public class IcebergSchemaConverter {
         return new StructType(structFields);
       }
       default:
-        throw new TableLoadingException(String.format(
+        throw new ImpalaRuntimeException(String.format(
             "Iceberg type '%s' is not supported in Impala", t.typeId()));
     }
   }
@@ -110,12 +122,12 @@ public class IcebergSchemaConverter {
    * Converts Iceberg schema to a Hive schema.
    */
   public static List<FieldSchema> convertToHiveSchema(Schema schema)
-      throws TableLoadingException {
+      throws ImpalaRuntimeException {
     List<FieldSchema> ret = new ArrayList<>();
     for (Types.NestedField column : schema.columns()) {
       Type colType = toImpalaType(column.type());
       // Update sd cols by iceberg NestedField
-      ret.add(new FieldSchema(column.name(), colType.toSql().toLowerCase(),
+      ret.add(new FieldSchema(column.name().toLowerCase(), colType.toSql().toLowerCase(),
           column.doc()));
     }
     return ret;
@@ -125,7 +137,7 @@ public class IcebergSchemaConverter {
    * Converts Iceberg schema to an Impala schema.
    */
   public static List<Column> convertToImpalaSchema(Schema schema)
-      throws TableLoadingException {
+      throws ImpalaRuntimeException {
     List<Column> ret = new ArrayList<>();
     int pos = 0;
     for (Types.NestedField column : schema.columns()) {
@@ -143,18 +155,49 @@ public class IcebergSchemaConverter {
     return ret;
   }
 
+  public static Schema convertToIcebergSchema(Table table) {
+    List<FieldSchema> columns = Lists.newArrayList(table.getSd().getCols());
+    columns.addAll(table.getPartitionKeys());
+    return HiveSchemaUtil.convert(columns, false);
+  }
+
+  public static PartitionSpec createIcebergPartitionSpec(Table table,
+      Schema schema) {
+    PartitionSpec.Builder specBuilder = PartitionSpec.builderFor(schema);
+    for (FieldSchema partitionKey : table.getPartitionKeys()) {
+      specBuilder.identity(partitionKey.getName());
+    }
+    return specBuilder.build();
+  }
+
   /**
    * Generates Iceberg schema from given columns. It also assigns a unique 'field id' for
-   * each schema element, although Iceberg will reassign the ids.
+   * each schema element, although Iceberg will reassign the ids. 'primaryKeyColumnNames'
+   * are used for populating 'identifier-field-ids' in the Schema.
    */
-  public static Schema genIcebergSchema(List<TColumn> columns)
-      throws ImpalaRuntimeException {
+  public static Schema genIcebergSchema(List<TColumn> columns,
+      List<String> primaryKeyColumnNames) throws ImpalaRuntimeException {
     iThreadLocal.set(1);
     List<Types.NestedField> fields = new ArrayList<Types.NestedField>();
+    Map<String, Integer> colNameToFieldId = new HashMap<>();
     for (TColumn column : columns) {
-      fields.add(createIcebergField(column));
+      Types.NestedField icebergField = createIcebergField(column);
+      fields.add(icebergField);
+      colNameToFieldId.put(icebergField.name(), icebergField.fieldId());
     }
-    return new Schema(fields);
+
+    if (primaryKeyColumnNames == null || primaryKeyColumnNames.isEmpty()) {
+      return new Schema(fields);
+    }
+
+    Set<Integer> identifierFieldIds = new HashSet<>();
+    for (String pkColName : primaryKeyColumnNames) {
+      if (!colNameToFieldId.containsKey(pkColName)) {
+        throw new ImpalaRuntimeException("Invalid primary key column name: " + pkColName);
+      }
+      identifierFieldIds.add(colNameToFieldId.get(pkColName));
+    }
+    return new Schema(fields, identifierFieldIds);
   }
 
   /**

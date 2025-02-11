@@ -41,11 +41,14 @@ impala_shell_defaults = {
             'output_delimiter': '\\t',
             'output_file': None,
             'print_header': False,
+            'vertical': False,
             'live_progress': True,  # The option only applies to interactive shell session
             'live_summary': False,
             'query': None,
             'query_file': None,
             'show_profiles': False,
+            'rpc_stdout': False,
+            'rpc_file': None,
             'ssl': False,
             'use_kerberos': False,
             'use_ldap': False,
@@ -54,6 +57,9 @@ impala_shell_defaults = {
             'version': False,
             'write_delimited': False,
             'client_connect_timeout_ms': 60000,
+            'http_socket_timeout_s': None,
             'global_config_default_path': '/etc/impalarc',
             'strict_hs2_protocol': False,
+            'hs2_fp_format': None,
+            'no_http_tracing': False
     }

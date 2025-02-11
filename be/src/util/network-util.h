@@ -54,9 +54,19 @@ bool FindFirstNonLocalhost(const std::vector<std::string>& addresses, std::strin
 /// Returns OK if a hostname can be found, false otherwise.
 Status GetHostname(std::string* hostname) WARN_UNUSED_RESULT;
 
+/// Generate UDS address.
+string GetUDSAddress(const std::string& hostname, int port, const UniqueIdPB& backend_id,
+    const UdsAddressUniqueIdPB& uds_addr_unique_id);
+
 /// Utility methods because Thrift/protobuf do not supply useful constructors
 TNetworkAddress MakeNetworkAddress(const std::string& hostname, int port);
 NetworkAddressPB MakeNetworkAddressPB(const std::string& hostname, int port);
+NetworkAddressPB MakeNetworkAddressPB(const std::string& hostname, int port,
+    const UniqueIdPB& backend_id, const UdsAddressUniqueIdPB& uds_addr_unique_id);
+/// This function generate unique ID if needed.
+/// It's only used if backend ID is not available, like unit-test or Admissiond.
+NetworkAddressPB MakeNetworkAddressPB(const std::string& hostname, int port,
+    const UdsAddressUniqueIdPB& uds_addr_unique_id);
 
 /// Utility method to parse the given string into a network address.
 /// Accepted format: "host:port" or "host". For the latter format the port is set to zero.
@@ -83,14 +93,46 @@ TNetworkAddress FromNetworkAddressPB(const NetworkAddressPB& address);
 /// Utility method to convert a TNetworkAddress to a NetworkAddressPB.
 NetworkAddressPB FromTNetworkAddress(const TNetworkAddress& address);
 
-/// Utility method to convert TNetworkAddress to Kudu sock addr.
+/// Utility method to convert NetworkAddressPB to Kudu Sockaddr.
+/// If use_uds is true, set Kudu Sockaddr as UDS address.
 /// Note that 'address' has to contain a resolved IP address.
-Status TNetworkAddressToSockaddr(const TNetworkAddress& address,
-    kudu::Sockaddr* sockaddr);
+Status NetworkAddressPBToSockaddr(
+    const NetworkAddressPB& address, bool use_uds, kudu::Sockaddr* sockaddr);
+
+/// Custom comparator to sort network addresses first by host (alphabetically) and then by
+/// by port (numerically) and finally by uds address (alphabetically).
+struct TNetworkAddressComparator {
+  bool operator()(const TNetworkAddress& a, const TNetworkAddress& b) const;
+};
 
 /// Returns a ephemeral port that is currently unused. Returns -1 on an error or if
 /// a free ephemeral port can't be found after 100 tries.
 int FindUnusedEphemeralPort();
+
+/// Compare function for two NetworkAddressPB.
+/// The order is decided first by hostname, then by port, then by uds address.
+inline int CompareNetworkAddressPB(
+    const NetworkAddressPB& lhs, const NetworkAddressPB& rhs) {
+  int comp = lhs.hostname().compare(rhs.hostname());
+  if (comp == 0) comp = lhs.port() - rhs.port();
+  if (comp == 0) {
+    if (lhs.has_uds_address()) {
+      if (rhs.has_uds_address()) {
+        comp = lhs.uds_address().compare(rhs.uds_address());
+      } else {
+        comp = 1; // lhs preceed rhs
+      }
+    } else if (rhs.has_uds_address()) {
+      comp = -1; // rhs preceed lhs
+    }
+  }
+  return comp;
+}
+
+/// Return true if two NetworkAddressPB are match.
+inline bool KrpcAddressEqual(const NetworkAddressPB& lhs, const NetworkAddressPB& rhs) {
+  return CompareNetworkAddressPB(lhs, rhs) == 0;
+}
 
 extern const std::string LOCALHOST_IP_STR;
 

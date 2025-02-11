@@ -15,12 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 
 from beeswaxd.BeeswaxService import QueryState
 from tests.common.custom_cluster_test_suite import (
     DEFAULT_CLUSTER_SIZE,
     CustomClusterTestSuite)
+from tests.common.test_result_verifier import error_msg_expected
 
 # The exact query doesn't matter much for these tests, just want a query that touches
 # data on all nodes.
@@ -75,7 +78,7 @@ class TestProcessFailures(CustomClusterTestSuite):
     handles = []
 
     # Run num_concurrent_queries asynchronously
-    for _ in xrange(num_concurrent_queries):
+    for _ in range(num_concurrent_queries):
       handles.append(client.execute_async(query))
 
     # Wait for the queries to start running
@@ -86,7 +89,7 @@ class TestProcessFailures(CustomClusterTestSuite):
     impalad.kill()
 
     # Assert that all executors have 0 in-flight fragments
-    for i in xrange(1, len(self.cluster.impalads)):
+    for i in range(1, len(self.cluster.impalads)):
       self.cluster.impalads[i].service.wait_for_metric_value(
         "impala-server.num-fragments-in-flight", 0, timeout=30)
 
@@ -151,6 +154,7 @@ class TestProcessFailures(CustomClusterTestSuite):
     query_id = handle.get_handle().id
     error_state = "Failed due to unreachable impalad"
     assert impalad.service.wait_for_query_status(client, query_id, error_state)
+    assert error_msg_expected(client.get_log(handle), error_state, query_id)
 
     # Assert that the query status on the query profile web page contains the expected
     # failed hostport.

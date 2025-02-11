@@ -49,6 +49,8 @@ struct TSlotDescriptor {
   7: required i32 nullIndicatorByte
   8: required i32 nullIndicatorBit
   9: required i32 slotIdx
+  10: required CatalogObjects.TVirtualColumnType virtual_col_type =
+      CatalogObjects.TVirtualColumnType.NONE
 }
 
 struct TColumnDescriptor {
@@ -76,6 +78,7 @@ struct TTableDescriptor {
   9: optional CatalogObjects.TDataSourceTable dataSourceTable
   10: optional CatalogObjects.TKuduTable kuduTable
   11: optional CatalogObjects.TIcebergTable icebergTable
+  12: optional CatalogObjects.TSystemTable systemTable
 
   // Unqualified name of table
   7: required string tableName
@@ -110,4 +113,4 @@ struct TDescriptorTable {
 struct TDescriptorTableSerialized {
   // TDescriptorTable serialized
   1: required binary thrift_desc_tbl
-}
+} (cpp.customostream)

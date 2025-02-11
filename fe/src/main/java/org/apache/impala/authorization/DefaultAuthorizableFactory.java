@@ -37,11 +37,10 @@ public class DefaultAuthorizableFactory implements AuthorizableFactory {
   }
 
   @Override
-  public Authorizable newTable(String dbName, String tableName, String ownerUser,
-      boolean viewCreatedWithoutAuthz) {
+  public Authorizable newTable(String dbName, String tableName, String ownerUser) {
     Preconditions.checkNotNull(dbName);
     Preconditions.checkNotNull(tableName);
-    return new AuthorizableTable(dbName, tableName, ownerUser, viewCreatedWithoutAuthz);
+    return new AuthorizableTable(dbName, tableName, ownerUser);
   }
 
   @Override
@@ -78,5 +77,12 @@ public class DefaultAuthorizableFactory implements AuthorizableFactory {
     Preconditions.checkNotNull(dbName);
     Preconditions.checkNotNull(fnName);
     return new AuthorizableFn(dbName, fnName);
+  }
+
+  @Override
+  public Authorizable newStorageHandlerUri(String storageType, String storageUri) {
+    Preconditions.checkNotNull(storageType);
+    Preconditions.checkNotNull(storageUri);
+    return new AuthorizableStorageHandlerUri(storageType, storageUri);
   }
 }

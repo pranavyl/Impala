@@ -19,13 +19,11 @@ package org.apache.impala.catalog.metastore;
 
 import static org.apache.impala.catalog.metastore.HmsApiNameEnum.GET_PARTITION_BY_NAMES;
 
-import com.facebook.fb303.fb_status;
 import com.google.common.base.Preconditions;
 import java.util.List;
 import java.util.Map;
 
-import org.apache.commons.lang.exception.ExceptionUtils;
-import org.apache.hadoop.hive.metastore.PartitionExpressionProxy;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.hadoop.hive.metastore.api.AddPartitionsRequest;
 import org.apache.hadoop.hive.metastore.api.AddPartitionsResult;
 import org.apache.hadoop.hive.metastore.api.AlreadyExistsException;
@@ -34,30 +32,24 @@ import org.apache.hadoop.hive.metastore.api.AlterPartitionsResponse;
 import org.apache.hadoop.hive.metastore.api.AlterTableRequest;
 import org.apache.hadoop.hive.metastore.api.AlterTableResponse;
 import org.apache.hadoop.hive.metastore.api.CreateTableRequest;
-import org.apache.hadoop.hive.metastore.api.CurrentNotificationEventId;
 import org.apache.hadoop.hive.metastore.api.Database;
+import org.apache.hadoop.hive.metastore.api.DropDatabaseRequest;
 import org.apache.hadoop.hive.metastore.api.DropPartitionsRequest;
 import org.apache.hadoop.hive.metastore.api.DropPartitionsResult;
 import org.apache.hadoop.hive.metastore.api.EnvironmentContext;
 import org.apache.hadoop.hive.metastore.api.GetPartitionsByNamesRequest;
 import org.apache.hadoop.hive.metastore.api.GetPartitionsByNamesResult;
-import org.apache.hadoop.hive.metastore.api.GetPartitionsRequest;
 import org.apache.hadoop.hive.metastore.api.GetTableRequest;
 import org.apache.hadoop.hive.metastore.api.GetTableResult;
-import org.apache.hadoop.hive.metastore.api.GetTablesRequest;
-import org.apache.hadoop.hive.metastore.api.GetTablesResult;
 import org.apache.hadoop.hive.metastore.api.InvalidObjectException;
 import org.apache.hadoop.hive.metastore.api.InvalidOperationException;
 import org.apache.hadoop.hive.metastore.api.MetaException;
-import org.apache.hadoop.hive.metastore.api.NoSuchLockException;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.metastore.api.NotificationEvent;
 import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.PartitionSpec;
 import org.apache.hadoop.hive.metastore.api.PartitionsByExprRequest;
 import org.apache.hadoop.hive.metastore.api.PartitionsByExprResult;
-import org.apache.hadoop.hive.metastore.api.PartitionsRequest;
-import org.apache.hadoop.hive.metastore.api.PartitionsResponse;
 import org.apache.hadoop.hive.metastore.api.RenamePartitionRequest;
 import org.apache.hadoop.hive.metastore.api.RenamePartitionResponse;
 import org.apache.hadoop.hive.metastore.api.SQLCheckConstraint;
@@ -66,31 +58,28 @@ import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
 import org.apache.hadoop.hive.metastore.api.SQLNotNullConstraint;
 import org.apache.hadoop.hive.metastore.api.SQLPrimaryKey;
 import org.apache.hadoop.hive.metastore.api.SQLUniqueConstraint;
-import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.TruncateTableRequest;
 import org.apache.hadoop.hive.metastore.api.TruncateTableResponse;
 import org.apache.hadoop.hive.metastore.utils.MetaStoreUtils;
+import org.apache.hadoop.util.StringUtils;
 import org.apache.impala.catalog.CatalogHmsAPIHelper;
 import org.apache.impala.catalog.events.DeleteEventLog;
-import org.apache.impala.catalog.events.EventFactory;
 import org.apache.impala.catalog.events.MetastoreEvents;
-import org.apache.impala.catalog.events.MetastoreEvents.CreateTableEvent;
-import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEvent;
-import org.apache.impala.catalog.events.MetastoreEvents.MetastoreEventFactory;
 import org.apache.impala.catalog.events.MetastoreEventsProcessor;
-import org.apache.impala.common.ImpalaException;
-import org.apache.impala.common.Metrics;
 import org.apache.impala.common.Pair;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.CatalogOpExecutor;
+import org.apache.impala.service.MetadataOp;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TTableName;
+import org.apache.impala.util.EventSequence;
+import org.apache.impala.util.NoOpEventSequence;
 import org.apache.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.CatalogException;
-import org.apache.impala.compat.MetastoreShim;
 
 /**
  * This class implements the HMS APIs that are served by CatalogD
@@ -225,13 +214,9 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
           throw e;
         }
       }
-      List<NotificationEvent> events =
-          MetastoreEventsProcessor.getNextMetastoreEventsInBatches(catalog_, fromEventId,
-              notificationEvent ->
-                  MetastoreEvents.CreateDatabaseEvent.CREATE_DATABASE_EVENT_TYPE
-                      .equals(notificationEvent.getEventType())
-                      && dbName.equalsIgnoreCase(notificationEvent.getDbName()));
-
+      List<NotificationEvent> events = MetastoreEventsProcessor
+          .getNextMetastoreEventsInBatchesForDb(catalog_, fromEventId, dbName,
+              MetastoreEvents.CreateDatabaseEvent.EVENT_TYPE);
       Preconditions.checkArgument(events.size() == 1,
           "Db %s was recreated in metastore " +
               "while the current db creation was in progress", dbName);
@@ -254,11 +239,11 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
 
   @Override
   public void drop_database(String databaseName, boolean deleteData,
-      boolean ignoreUnknownDb) throws NoSuchObjectException,
+      boolean cascade) throws NoSuchObjectException,
           InvalidOperationException, MetaException, TException {
     if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
             !BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls()) {
-      super.drop_database(databaseName, deleteData, ignoreUnknownDb);
+      super.drop_database(databaseName, deleteData, cascade);
       return;
     }
     // TODO: The complete logic can be moved to
@@ -270,7 +255,7 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
     try  {
       try {
         currentEventId = super.get_current_notificationEventId().getEventId();
-        super.drop_database(databaseName, deleteData, ignoreUnknownDb);
+        super.drop_database(databaseName, deleteData, cascade);
       } catch (NoSuchObjectException e) {
         // db does not exist in metastore, remove it from
         // catalog if exists
@@ -280,7 +265,46 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
         }
         throw e;
       }
-      dropDbIfExists(databaseName, ignoreUnknownDb, currentEventId, apiName);
+      dropDbIfExists(databaseName, false, currentEventId, apiName);
+    } finally {
+      catalogOpExecutor_.getMetastoreDdlLock().unlock();
+    }
+  }
+
+  @Override
+  public void drop_database_req(final DropDatabaseRequest dropDatabaseRequest)
+      throws NoSuchObjectException, InvalidOperationException, MetaException {
+    if (!BackendConfig.INSTANCE.enableCatalogdHMSCache() ||
+        !BackendConfig.INSTANCE.enableSyncToLatestEventOnDdls()) {
+      super.drop_database_req(dropDatabaseRequest);
+      return;
+    }
+    String apiName = HmsApiNameEnum.DROP_DATABASE_REQ.apiName();
+    String dbName =
+        MetaStoreUtils.parseDbName(dropDatabaseRequest.getName(), serverConf_)[1];
+    long currentEventId = -1;
+    catalogOpExecutor_.getMetastoreDdlLock().lock();
+    try  {
+      try {
+        currentEventId = super.get_current_notificationEventId().getEventId();
+        super.drop_database_req(dropDatabaseRequest);
+      } catch (NoSuchObjectException e) {
+        // db does not exist in metastore, remove it from
+        // catalog if exists
+        if (catalog_.removeDb(dbName) != null) {
+          LOG.info("Db {} not known to metastore, removed it from catalog for " +
+              "metastore api {}", dbName, apiName);
+        }
+        throw e;
+        // TODO: We should add TException to method signature in hive and we can remove
+        // following two catch blocks.
+      } catch (InvalidOperationException|MetaException e) {
+        throw e;
+      } catch (TException e) {
+        throw new MetaException(StringUtils.stringifyException(e));
+      }
+      dropDbIfExists(dropDatabaseRequest.getName(),
+          dropDatabaseRequest.isIgnoreUnknownDb(), currentEventId, apiName);
     } finally {
       catalogOpExecutor_.getMetastoreDdlLock().unlock();
     }
@@ -327,7 +351,8 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
       }
     };
     String apiName = HmsApiNameEnum.CREATE_TABLE.apiName();
-    createTableCore(table.getDbName(), table.getTableName(), apiName, task);
+    createTableCore(apiName, table.getDbName(), table.getTableName(),
+        MetadataOp.getImpalaTableType(table.getTableType()), task);
   }
 
   @Override
@@ -347,7 +372,8 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
     };
     String apiName = HmsApiNameEnum.CREATE_TABLE_REQ.apiName();
     org.apache.hadoop.hive.metastore.api.Table table = req.getTable();
-    createTableCore(table.getDbName(), table.getTableName(), apiName, task);
+    createTableCore(apiName, table.getDbName(), table.getTableName(),
+        MetadataOp.getImpalaTableType(table.getTableType()), task);
   }
 
 
@@ -376,7 +402,8 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
       }
     };
     String apiName = HmsApiNameEnum.CREATE_TABLE_WITH_CONSTRAINTS.apiName();
-    createTableCore(table.getDbName(), table.getTableName(), apiName, task);
+    createTableCore(apiName, table.getDbName(), table.getTableName(),
+        MetadataOp.getImpalaTableType(table.getTableType()), task);
   }
 
   @Override
@@ -397,7 +424,8 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
       }
     };
     String apiName = HmsApiNameEnum.CREATE_TABLE_WITH_ENVIRONMENT_CONTEXT.apiName();
-    createTableCore(table.getDbName(), table.getTableName(), apiName, task);
+    createTableCore(apiName, table.getDbName(), table.getTableName(),
+        MetadataOp.getImpalaTableType(table.getTableType()), task);
   }
 
   @Override
@@ -843,8 +871,11 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
     try {
       String sourceDb = MetaStoreUtils.parseDbName(sourceDbWithCatalog, serverConf_)[1];
       String destDb = MetaStoreUtils.parseDbName(destDbWithCatalog, serverConf_)[1];
-      srcTbl = catalogOpExecutor_.getExistingTable(sourceDb, sourceTbl, apiName);
-      destinationTbl = catalogOpExecutor_.getExistingTable(destDb, destTbl, apiName);
+      EventSequence catalogTimeline = NoOpEventSequence.INSTANCE;
+      srcTbl = catalogOpExecutor_.getExistingTable(sourceDb, sourceTbl, apiName,
+          catalogTimeline);
+      destinationTbl = catalogOpExecutor_.getExistingTable(destDb, destTbl, apiName,
+          catalogTimeline);
 
       if (!catalog_.tryWriteLock(
           new org.apache.impala.catalog.Table[] {srcTbl, destinationTbl})) {
@@ -887,8 +918,11 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
     try {
       String sourceDb = MetaStoreUtils.parseDbName(sourceDbWithCatalog, serverConf_)[1];
       String destDb = MetaStoreUtils.parseDbName(destDbWithCatalog, serverConf_)[1];
-      srcTbl = catalogOpExecutor_.getExistingTable(sourceDb, sourceTbl, apiName);
-      destinationTbl = catalogOpExecutor_.getExistingTable(destDb, destTbl, apiName);
+      EventSequence catalogTimeline = NoOpEventSequence.INSTANCE;
+      srcTbl = catalogOpExecutor_.getExistingTable(sourceDb, sourceTbl, apiName,
+          catalogTimeline);
+      destinationTbl = catalogOpExecutor_.getExistingTable(destDb, destTbl, apiName,
+          catalogTimeline);
 
       if (!catalog_.tryWriteLock(
           new org.apache.impala.catalog.Table[] {srcTbl, destinationTbl})) {
@@ -1182,7 +1216,8 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
     org.apache.impala.catalog.Table tbl = null;
     try {
       String dbName = MetaStoreUtils.parseDbName(dbNameWithCatalog, serverConf_)[1];
-      tbl = catalogOpExecutor_.getExistingTable(dbName, tblName, apiName);
+      tbl = catalogOpExecutor_.getExistingTable(dbName, tblName, apiName,
+          NoOpEventSequence.INSTANCE);
     } catch (Exception e) {
       rethrowException(e, apiName);
     }
@@ -1238,7 +1273,7 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
       String errMsg = String.format(SYNC_TABLE_LATEST_EVENT_ID_ERR_MSG,
           tbl.getFullName(), apiName);
       LOG.error("{}. Exception stacktrace: {} ", errMsg,
-          ExceptionUtils.getFullStackTrace(e));
+          ExceptionUtils.getStackTrace(e));
       rethrowException(e, apiName);
     }
   }
@@ -1263,7 +1298,7 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
       String errMsg = String.format(SYNC_DB_LATEST_EVENT_ID_ERR_MSG,
               db.getName(), apiName);
       LOG.error("{}. Exception stacktrace: {} ", errMsg,
-          ExceptionUtils.getFullStackTrace(e));
+          ExceptionUtils.getStackTrace(e));
       rethrowException(e, apiName);
     }
   }
@@ -1291,12 +1326,11 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
       T resp = task.execute();
       // Rename scenario, remove old table and add new one
       try {
+        // the alter table event is generated on the renamed table
         List<NotificationEvent> events =
-            MetastoreEventsProcessor.getNextMetastoreEventsInBatches(catalog_,
-                currentEventId, event -> "ALTER_TABLE".equals(event.getEventType())
-                // the alter table event is generated on the renamed table
-                && newTable.getDbName().equalsIgnoreCase(event.getDbName())
-                && newTable.getTableName().equalsIgnoreCase(event.getTableName()));
+            MetastoreEventsProcessor.getNextMetastoreEventsInBatchesForTable(catalog_,
+                currentEventId, newTable.getDbName(), newTable.getTableName(),
+                MetastoreEvents.AlterTableEvent.EVENT_TYPE);
         Preconditions.checkState(events.size() == 1, String.format("For table %s.%s, "
             + "from event id: %s, expected ALTER_TABLE events size to be 1 but is %s",
             newTable.getDbName(), newTable.getTableName(), currentEventId,
@@ -1322,7 +1356,7 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
         // ALTER TABLE/VIEW RENAME is implemented as an ADD + DROP.
         Pair<org.apache.impala.catalog.Table, org.apache.impala.catalog.Table> result =
             catalog_.renameTable(oldTTable, newTTable);
-        if (result.first == null && result.second == null) {
+        if (result == null || result.first == null || result.second == null) {
           throw new CatalogException("failed to rename table " + oldTTable + " to " +
               newTTable + " for " + apiName);
         }
@@ -1355,8 +1389,8 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
     return null;
   }
 
-  private void createTableCore(String dbNameWithCatalog, String tblName, String apiName,
-      CreateTableTask task) throws TException {
+  private void createTableCore(String apiName, String dbNameWithCatalog, String tblName,
+      TImpalaTableType tblType, CreateTableTask task) throws TException {
     String dbName = MetaStoreUtils.parseDbName(dbNameWithCatalog, serverConf_)[1];
     catalogOpExecutor_.getMetastoreDdlLock().lock();
     org.apache.impala.catalog.Table tbl = null;
@@ -1379,21 +1413,17 @@ public class CatalogMetastoreServiceHandler extends MetastoreServiceHandler {
             "exception {} from metastore", dbName, tblName, e.getClass().getName());
       }
       List<NotificationEvent> events =
-          MetastoreEventsProcessor
-              .getNextMetastoreEventsInBatches(catalog_, fromEventId,
-                  event -> MetastoreEvents.CreateTableEvent.CREATE_TABLE_EVENT_TYPE
-                      .equals(event.getEventType())
-                      && dbName.equalsIgnoreCase(event.getDbName())
-                      && tblName.equalsIgnoreCase(event.getTableName()));
-
+          MetastoreEventsProcessor.getNextMetastoreEventsInBatchesForTable(catalog_,
+              fromEventId, dbName, tblName, MetastoreEvents.CreateTableEvent.EVENT_TYPE);
       Preconditions.checkState(events.size() == 1,
           "Table %s.%s was recreated in metastore since event id %s" +
               "while the current table creation was in progress", dbName, tblName,
           fromEventId);
       long createEventId = events.get(0).getEventId();
-      catalog_.addIncompleteTable(dbName, tblName, createEventId);
-      LOG.info("Added incomplete table {}.{} with create event id: {}", dbName, tblName,
+      catalog_.addIncompleteTable(dbName, tblName, tblType, /*tblComment*/null,
           createEventId);
+      LOG.info("Added incomplete table {}.{} (type={}) with create event id: {}",
+          dbName, tblName, tblType, createEventId);
       // sync to latest event ID
       tbl = getTableAndAcquireWriteLock(dbName, tblName, apiName);
       catalog_.getLock().writeLock().unlock();

@@ -27,11 +27,14 @@ import org.apache.hadoop.hive.metastore.api.PrincipalType;
 import org.apache.hadoop.hive.metastore.api.PrivilegeGrantInfo;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.FeDb;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.IcebergColumn;
 import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
+import org.apache.impala.catalog.iceberg.IcebergMetadataTable;
+import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TColumnValue;
 import org.apache.impala.thrift.TDescribeOutputStyle;
@@ -78,7 +81,7 @@ public class DescribeResultFactory {
     String comment = null;
     if(msDb != null) {
       location = msDb.getLocationUri();
-      managedLocation = msDb.getManagedLocationUri();
+      managedLocation = MetastoreShim.getManagedLocationUri(msDb);
       comment = msDb.getDescription();
     }
 
@@ -196,8 +199,8 @@ public class DescribeResultFactory {
    * Hive's MetadataFormatUtils class is used to build the results.  filteredColumns is a
    * list of columns the user is authorized to view.
    */
-  public static TDescribeResult buildDescribeFormattedResult(FeTable table,
-      List<Column> filteredColumns) {
+  public static TDescribeResult buildDescribeFormattedResult(
+      FeTable table, List<Column> filteredColumns) throws ImpalaRuntimeException {
     TDescribeResult result = new TDescribeResult();
     result.results = Lists.newArrayList();
 
@@ -232,6 +235,10 @@ public class DescribeResultFactory {
     // First add all the columns (includes partition columns).
     sb.append(MetastoreShim.getAllColumnsInformation(msTable.getSd().getCols(),
         msTable.getPartitionKeys(), true, false, true));
+    if (table instanceof FeIcebergTable) {
+      sb.append(MetastoreShim.getPartitionTransformInformation(
+          FeIcebergTable.Utils.getPartitionTransformKeys((FeIcebergTable) table)));
+    }
     // Add the extended table metadata information.
     sb.append(MetastoreShim.getTableInformation(msTable));
     sb.append(MetastoreShim.getConstraintsInformation(pki, fki));
@@ -294,6 +301,12 @@ public class DescribeResultFactory {
       // Kudu-specific describe info.
       TColumnValue pkCol = new TColumnValue();
       pkCol.setString_val(Boolean.toString(kuduColumn.isKey()));
+      TColumnValue pkUniqueCol = new TColumnValue();
+      if (kuduColumn.isKey()) {
+        pkUniqueCol.setString_val(Boolean.toString(kuduColumn.isPrimaryKeyUnique()));
+      } else {
+        pkUniqueCol.setString_val("");
+      }
       TColumnValue nullableCol = new TColumnValue();
       nullableCol.setString_val(Boolean.toString(kuduColumn.isNullable()));
       TColumnValue defaultValCol = new TColumnValue();
@@ -309,8 +322,8 @@ public class DescribeResultFactory {
       TColumnValue blockSizeCol = new TColumnValue();
       blockSizeCol.setString_val(Integer.toString(kuduColumn.getBlockSize()));
       descResult.results.add(new TResultRow(
-          Lists.newArrayList(colNameCol, dataTypeCol, commentCol, pkCol, nullableCol,
-              defaultValCol, encodingCol, compressionCol, blockSizeCol)));
+          Lists.newArrayList(colNameCol, dataTypeCol, commentCol, pkCol, pkUniqueCol,
+              nullableCol, defaultValCol, encodingCol, compressionCol, blockSizeCol)));
     }
     return descResult;
   }
@@ -338,5 +351,20 @@ public class DescribeResultFactory {
           Lists.newArrayList(colNameCol, dataTypeCol, commentCol, nullableCol)));
     }
     return descResult;
+  }
+
+  /**
+   * Builds a TDescribeResult for an Iceberg metadata table from an IcebergTable and a
+   * metadata table name.
+   *
+   * This describe request is issued against a VirtualTable which only exists in the
+   * Analyzer's StmtTableCache. Therefore, to get the columns of an IcebergMetadataTable
+   * it is simpler to re-create this object than to extract those from a new
+   * org.apache.iceberg.Table object or to send it over.
+   */
+  public static TDescribeResult buildIcebergMetadataDescribeMinimalResult(
+      FeIcebergTable table, String vTableName) throws ImpalaRuntimeException {
+    IcebergMetadataTable metadataTable = new IcebergMetadataTable(table, vTableName);
+    return buildIcebergDescribeMinimalResult(metadataTable.getColumns());
   }
 }

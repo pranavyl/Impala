@@ -45,6 +45,7 @@ import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.util.ExprUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -358,6 +359,17 @@ public class AnalyticEvalNode extends PlanNode {
   }
 
   @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    // The total cost per row is the sum of the evaluation costs for analytic functions,
+    // partition by equal and order by equal predicate. 'partitionByEq_' and 'orderByEq_'
+    // are excluded since the input data stream is already partitioned and sorted within
+    // each partition (see notes on class AnalyticEvalNode in analytic-eval-node.h).
+    float totalCostToEvalOneRow = ExprUtil.computeExprsTotalCost(analyticFnCalls_);
+    processingCost_ = ProcessingCost.basicCost(
+        getDisplayLabel(), getCardinality(), totalCostToEvalOneRow);
+  }
+
+  @Override
   public void computeNodeResourceProfile(TQueryOptions queryOptions) {
     Preconditions.checkNotNull(
         fragment_, "PlanNode must be placed into a fragment before calling this method.");
@@ -587,7 +599,7 @@ public class AnalyticEvalNode extends PlanNode {
       return falseStatus;
     }
     List<Expr> lhsSourceExprs = ((SlotRef) lhs).getDesc().getSourceExprs();
-    if (lhsSourceExprs.size() > 1 ||
+    if (lhsSourceExprs.size() != 1 ||
           !(lhsSourceExprs.get(0) instanceof AnalyticExpr)) {
       return falseStatus;
     }

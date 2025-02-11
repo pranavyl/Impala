@@ -76,6 +76,12 @@ class ImpaladMetricKeys {
   /// Total number of cached bytes read by the io mgr
   static const char* IO_MGR_CACHED_BYTES_READ;
 
+  /// Total number of encrypted bytes read by the io mgr
+  static const char* IO_MGR_ENCRYPTED_BYTES_READ;
+
+  /// Total number of erasure-coded bytes read by the io mgr
+  static const char* IO_MGR_ERASURE_CODED_BYTES_READ;
+
   /// Total number of bytes read from the remote data cache.
   static const char* IO_MGR_REMOTE_DATA_CACHE_HIT_BYTES;
 
@@ -107,6 +113,20 @@ class ImpaladMetricKeys {
 
   /// Total number of entries evicted immediately from the remote data cache.
   static const char* IO_MGR_REMOTE_DATA_CACHE_INSTANT_EVICTIONS;
+
+  /// Total number of bytes async writes outstanding in the remote data cache.
+  static const char* IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_OUTSTANDING_BYTES;
+
+  /// Total number of async writes submitted in the remote data cache.
+  static const char* IO_MGR_REMOTE_DATA_CACHE_NUM_ASYNC_WRITES_SUBMITTED;
+
+  /// Total number of bytes not inserted in the remote data cache due to async writes
+  /// buffer size limit.
+  static const char* IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_BYTES;
+
+  /// Total number of entries not inserted in the remote data cache due to async writes
+  /// buffer size limit.
+  static const char* IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_ENTRIES;
 
   /// Total number of bytes written to disk by the io mgr (for spilling)
   static const char* IO_MGR_BYTES_WRITTEN;
@@ -144,6 +164,9 @@ class ImpaladMetricKeys {
 
   /// ServiceID of Catalog with impalad.
   static const char* CATALOG_SERVICE_ID;
+
+  // Address of active catalogd.
+  static const char* ACTIVE_CATALOGD_ADDRESS;
 
   /// Number of tables in the catalog
   static const char* CATALOG_NUM_TABLES;
@@ -195,6 +218,12 @@ class ImpaladMetricKeys {
   /// Total time spent in Impalad Catalog cache loading new values.
   static const char* CATALOG_CACHE_TOTAL_LOAD_TIME;
 
+  /// Median size of Impalad Catalog cache entries.
+  static const char* CATALOG_CACHE_ENTRY_MEDIAN_SIZE;
+
+  /// 99th percentile size of Impalad Catalog cache entries.
+  static const char* CATALOG_CACHE_ENTRY_99TH_SIZE;
+
   /// Number of files open for insert
   static const char* NUM_FILES_OPEN_FOR_INSERT;
 
@@ -232,6 +261,32 @@ class ImpaladMetricKeys {
   /// --debug_actions is set.
   static const char* DEBUG_ACTION_NUM_FAIL;
 
+  // Estimated total size of query logs that are currently retained in memory.
+  // Associated metric is modified in ImpalaServer::ArchiveQuery and must hold
+  // ImpalaServer::query_log_lock_ on modification.
+  static const char* QUERY_LOG_EST_TOTAL_BYTES;
+
+  /// The number of completed queries queued up and waiting to be written to the query
+  /// log table.
+  static const char* COMPLETED_QUERIES_QUEUED;
+
+  /// The number of completed queries successfully written to the query log table.
+  static const char* COMPLETED_QUERIES_WRITTEN;
+
+  /// The number of completed queries that failed to be written to the query log
+  /// table.
+  static const char* COMPLETED_QUERIES_FAIL;
+
+  /// Number of writes to the query log table that happened at the regularly scheduled
+  /// time.
+  static const char* COMPLETED_QUERIES_SCHEDULED_WRITES;
+
+  /// Number of writes to the query log table that happened because the max queued
+  /// completed queries records was reached.
+  static const char* COMPLETED_QUERIES_MAX_RECORDS_WRITES;
+
+  /// Time spent writing completed queries to the query log table.
+  static const char* COMPLETED_QUERIES_WRITE_DURATIONS;
 };
 
 /// Global impalad-wide metrics.  This is useful for objects that want to update metrics
@@ -258,6 +313,8 @@ class ImpaladMetrics {
   static IntCounter* IO_MGR_BYTES_READ;
   static IntCounter* IO_MGR_LOCAL_BYTES_READ;
   static IntCounter* IO_MGR_CACHED_BYTES_READ;
+  static IntCounter* IO_MGR_ENCRYPTED_BYTES_READ;
+  static IntCounter* IO_MGR_ERASURE_CODED_BYTES_READ;
   static IntCounter* IO_MGR_REMOTE_DATA_CACHE_HIT_BYTES;
   static IntCounter* IO_MGR_REMOTE_DATA_CACHE_HIT_COUNT;
   static IntCounter* IO_MGR_REMOTE_DATA_CACHE_MISS_BYTES;
@@ -266,6 +323,10 @@ class ImpaladMetrics {
   static IntCounter* IO_MGR_REMOTE_DATA_CACHE_DROPPED_BYTES;
   static IntCounter* IO_MGR_REMOTE_DATA_CACHE_DROPPED_ENTRIES;
   static IntCounter* IO_MGR_REMOTE_DATA_CACHE_INSTANT_EVICTIONS;
+  static IntCounter* IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_OUTSTANDING_BYTES;
+  static IntCounter* IO_MGR_REMOTE_DATA_CACHE_NUM_ASYNC_WRITES_SUBMITTED;
+  static IntCounter* IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_BYTES;
+  static IntCounter* IO_MGR_REMOTE_DATA_CACHE_ASYNC_WRITES_DROPPED_ENTRIES;
   static IntCounter* IO_MGR_SHORT_CIRCUIT_BYTES_READ;
   static IntCounter* IO_MGR_BYTES_WRITTEN;
   static IntCounter* IO_MGR_CACHED_FILE_HANDLES_REOPENED;
@@ -280,6 +341,10 @@ class ImpaladMetrics {
   static IntCounter* CATALOG_CACHE_REQUEST_COUNT;
   static IntCounter* CATALOG_CACHE_TOTAL_LOAD_TIME;
   static IntCounter* DEBUG_ACTION_NUM_FAIL;
+  static IntCounter* COMPLETED_QUERIES_WRITTEN;
+  static IntCounter* COMPLETED_QUERIES_FAIL;
+  static IntCounter* COMPLETED_QUERIES_SCHEDULED_WRITES;
+  static IntCounter* COMPLETED_QUERIES_MAX_RECORDS_WRITES;
 
   // Gauges
   static IntGauge* CATALOG_NUM_DBS;
@@ -291,6 +356,8 @@ class ImpaladMetrics {
   static DoubleGauge* CATALOG_CACHE_HIT_RATE;
   static DoubleGauge* CATALOG_CACHE_LOAD_EXCEPTION_RATE;
   static DoubleGauge* CATALOG_CACHE_MISS_RATE;
+  static DoubleGauge* CATALOG_CACHE_ENTRY_MEDIAN_SIZE;
+  static DoubleGauge* CATALOG_CACHE_ENTRY_99TH_SIZE;
   static IntGauge* IMPALA_SERVER_NUM_OPEN_BEESWAX_SESSIONS;
   static IntGauge* IMPALA_SERVER_NUM_OPEN_HS2_SESSIONS;
   static MetricGroup* IO_MGR_METRICS;
@@ -307,15 +374,19 @@ class ImpaladMetrics {
   static IntGauge* NUM_QUERIES_REGISTERED;
   static IntGauge* RESULTSET_CACHE_TOTAL_NUM_ROWS;
   static IntGauge* RESULTSET_CACHE_TOTAL_BYTES;
+  static IntGauge* QUERY_LOG_EST_TOTAL_BYTES;
+  static IntGauge* COMPLETED_QUERIES_QUEUED;
 
   // Properties
   static BooleanProperty* CATALOG_READY;
   static BooleanProperty* IMPALA_SERVER_READY;
   static StringProperty* IMPALA_SERVER_VERSION;
   static StringProperty* CATALOG_SERVICE_ID;
+  static StringProperty* ACTIVE_CATALOGD_ADDRESS;
   // Histograms
   static HistogramMetric* QUERY_DURATIONS;
   static HistogramMetric* DDL_DURATIONS;
+  static HistogramMetric* COMPLETED_QUERIES_WRITE_DURATIONS;
 
   // Other
   static StatsMetric<uint64_t, StatsType::MEAN>* IO_MGR_CACHED_FILE_HANDLES_HIT_RATIO;

@@ -149,8 +149,8 @@ class QueryDriver {
   /// query string (TQueryCtx::TClientRequest::stmt).
   Status RunFrontendPlanner(const TQueryCtx& query_ctx) WARN_UNUSED_RESULT;
 
-  /// Similar to RunFrontendPlanner but takes TExecRequest from and external planner
-  Status SetExternalPlan(const TQueryCtx& query_ctx, const TExecRequest& exec_request);
+  /// Similar to RunFrontendPlanner but takes TExecRequest from an external planner
+  Status SetExternalPlan(const TQueryCtx& query_ctx, TExecRequest exec_request);
 
   /// Returns the ClientRequestState corresponding to the given query id.
   ClientRequestState* GetClientRequestState(const TUniqueId& query_id);
@@ -180,15 +180,20 @@ class QueryDriver {
   /// This indicates that the query should no longer be considered registered from the
   /// client's point of view. Returns an INVALID_QUERY_HANDLE error if finalization
   /// already started. After this method has been called, finalized() will return true.
-  /// 'check_inflight' and 'cause' are passed to
-  /// ClientRequestState::Finalize(bool, Status).
+  /// If 'check_inflight' is true and the query is not yet inflight, Finalize will error.
+  /// 'cause' is passed to ClientRequestState::Finalize(Status).
   Status Finalize(QueryHandle* query_handle, bool check_inflight, const Status* cause);
 
   /// Delete this query from the given QueryDriverMap.
   Status Unregister(ImpalaServer::QueryDriverMap* query_driver_map) WARN_UNUSED_RESULT;
 
-  /// True if Finalize() was called.
+  /// True if Finalize() was called while the query was inflight.
   bool finalized() const { return finalized_.Load(); }
+
+  /// Functions to set/get whether or not the query managed by this class should be
+  /// recorded in the query log table.
+  void IncludeInQueryLog(const bool include) noexcept;
+  bool IncludedInQueryLog() const noexcept;
 
   /// Creates a new QueryDriver instance using the given ImpalaServer. Creates the
   /// ClientRequestState for the given 'query_ctx' and 'session_state'. Sets the given
@@ -207,7 +212,7 @@ class QueryDriver {
   /// QueryDriver. The pointer is necessary to ensure that 'this' QueryDriver is not
   /// deleted while the thread is running.
   void RetryQueryFromThread(
-      const Status& error, std::shared_ptr<QueryDriver> query_driver);
+      const Status& error, const std::shared_ptr<QueryDriver>& query_driver);
 
   /// Creates the initial ClientRequestState for the given TQueryCtx. Should only be
   /// called once by the ImpalaServer. Additional ClientRequestStates are created by
@@ -224,6 +229,12 @@ class QueryDriver {
   void CreateRetriedClientRequestState(ClientRequestState* request_state,
       std::unique_ptr<ClientRequestState>* retry_request_state,
       std::shared_ptr<ImpalaServer::SessionState>* session);
+
+  /// Does the work of RunFrontendPlanner so we can also use it to dump the planner
+  /// result from SetExternalPlan to dump_exec_request_path without redundant work.
+  /// Set use_request to false to skip saving the TExecRequest produced in exec_request_.
+  Status DoFrontendPlanning(const TQueryCtx& query_ctx,
+      bool use_request = true) WARN_UNUSED_RESULT;
 
   /// Helper method for handling failures when retrying a query. 'status' is the reason
   /// why the retry failed and is expected to be in the error state. Additional details
@@ -248,12 +259,12 @@ class QueryDriver {
   std::unique_ptr<ClientRequestState> retried_client_request_state_;
 
   /// The TExecRequest for the query. Created in 'CreateClientRequestState' and loaded in
-  /// 'RunFrontendPlanner'.
-  std::unique_ptr<TExecRequest> exec_request_;
+  /// 'RunFrontendPlanner'. Not thread safe.
+  std::unique_ptr<const TExecRequest> exec_request_;
 
-  /// The TExecRequest for the retried query. Created in
+  /// The TExecRequest for the retried query. Created and initialized in
   /// 'CreateRetriedClientRequestState'.
-  std::unique_ptr<TExecRequest> retry_exec_request_;
+  std::unique_ptr<const TExecRequest> retry_exec_request_;
 
   /// Thread to process query retry requests. Done in a separate thread to avoid blocking
   /// control service RPC threads.
@@ -264,8 +275,12 @@ class QueryDriver {
   /// query_driver_map.
   TUniqueId registered_retry_query_id_;
 
-  /// True if a thread has called Finalize(). Threads calling Finalize() do a
-  /// compare-and-swap on this so that only one thread can proceed.
+  /// True if a thread has called Finalize() and the query is inflight. Threads calling
+  /// Finalize() do a compare-and-swap on this so that only one thread can proceed.
   AtomicBool finalized_{false};
+
+  /// True if this query should be recorded in the query log table.
+  /// Default: `true`
+  bool include_in_query_log_ = true;
 };
 }

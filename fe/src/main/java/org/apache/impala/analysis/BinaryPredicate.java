@@ -20,6 +20,7 @@ package org.apache.impala.analysis;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.FeTable;
@@ -46,6 +47,9 @@ public class BinaryPredicate extends Predicate {
   // true if this BinaryPredicate is inferred from slot equivalences, false otherwise.
   private boolean isInferred_ = false;
 
+  private ExprId betweenExprId_ = null;
+  private double betweenSelectivity_ = -1;
+
   public enum Operator {
     EQ("=", "eq", TComparisonOp.EQ),
     NE("!=", "ne", TComparisonOp.NE),
@@ -55,9 +59,8 @@ public class BinaryPredicate extends Predicate {
     GT(">", "gt", TComparisonOp.GT),
     DISTINCT_FROM("IS DISTINCT FROM", "distinctfrom", TComparisonOp.DISTINCT_FROM),
     NOT_DISTINCT("IS NOT DISTINCT FROM", "notdistinct", TComparisonOp.NOT_DISTINCT),
-    // Same as EQ, except it returns True if the rhs is NULL. There is no backend
-    // function for this. The functionality is embedded in the hash-join
-    // implementation.
+    // Same as EQ, except it returns True if both sides are NULL. There is no backend
+    // function for this. The functionality is embedded in the hash-join implementation.
     NULL_MATCHING_EQ("=", "null_matching_eq", TComparisonOp.EQ);
 
     private final String description_;
@@ -156,6 +159,8 @@ public class BinaryPredicate extends Predicate {
     super(other);
     op_ = other.op_;
     isInferred_ = other.isInferred_;
+    betweenExprId_ = other.betweenExprId_;
+    betweenSelectivity_ = other.betweenSelectivity_;
   }
 
   public boolean isNullMatchingEq() { return op_ == Operator.NULL_MATCHING_EQ; }
@@ -194,6 +199,10 @@ public class BinaryPredicate extends Predicate {
     toStrHelper.add("op", op_).addValue(super.debugString());
     if (isAuxExpr()) toStrHelper.add("isAux", true);
     if (isInferred_) toStrHelper.add("isInferred", true);
+    if (derivedFromBetween()) {
+      toStrHelper.add("betweenExprId", betweenExprId_);
+      toStrHelper.add("betweenSelectivity", betweenSelectivity_);
+    }
     return toStrHelper.toString();
   }
 
@@ -235,7 +244,7 @@ public class BinaryPredicate extends Predicate {
     if (!contains(Subquery.class)) {
       // Don't perform any casting for predicates with subqueries here. Any casting
       // required will be performed when the subquery is unnested.
-      castForFunctionCall(true, analyzer.isDecimalV2());
+      castForFunctionCall(true, analyzer.getRegularCompatibilityLevel());
     }
 
     // Determine selectivity
@@ -245,6 +254,10 @@ public class BinaryPredicate extends Predicate {
   protected void computeSelectivity() {
     // TODO: Compute selectivity for nested predicates.
     // TODO: Improve estimation using histograms.
+    if (hasValidSelectivityHint()) {
+      return;
+    }
+
     Reference<SlotRef> slotRefRef = new Reference<SlotRef>();
     if (!isSingleColumnPredicate(slotRefRef, null)) {
       return;
@@ -270,7 +283,8 @@ public class BinaryPredicate extends Predicate {
       if (op_ == Operator.DISTINCT_FROM && rChildIsNull) {
         selectivity_ = 1.0;
       } else {
-        selectivity_ = 1.0 - 1.0 / distinctValues;
+        // avoid 0.0 selectivity if ndv == 1 (IMPALA-11301).
+        selectivity_ = distinctValues == 1 ? 0.5 : (1.0 - 1.0 / distinctValues);
       }
     } else {
       return;
@@ -405,10 +419,24 @@ public class BinaryPredicate extends Predicate {
   }
 
   @Override
-  public boolean localEquals(Expr that) {
+  protected boolean localEquals(Expr that) {
     return super.localEquals(that) && op_.equals(((BinaryPredicate)that).op_);
   }
 
   @Override
+  protected int localHash() {
+    return Objects.hash(super.localHash(), op_);
+  }
+
+  @Override
   public Expr clone() { return new BinaryPredicate(this); }
+
+  public void setBetweenSelectivity(ExprId betweenExprId, double betweenSelectivity) {
+    betweenExprId_ = betweenExprId;
+    betweenSelectivity_ = betweenSelectivity;
+  }
+
+  public boolean derivedFromBetween() { return betweenExprId_ != null; }
+  public ExprId getBetweenExprId() { return betweenExprId_; }
+  public double getBetweenSelectivity() { return betweenSelectivity_; }
 }

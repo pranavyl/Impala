@@ -22,6 +22,7 @@
 #include "gutil/strings/substitute.h"
 #include "kudu/util/flag_tags.h"
 #include "rpc/jni-thrift-util.h"
+#include "rpc/thrift-util.h"
 #include "util/backend-gflag-util.h"
 #include "util/logging-support.h"
 #include "util/os-util.h"
@@ -31,10 +32,10 @@
 DECLARE_bool(load_catalog_in_background);
 DECLARE_bool(load_auth_to_local_rules);
 DECLARE_bool(enable_stats_extrapolation);
-DECLARE_bool(enable_orc_scanner);
 DECLARE_bool(use_local_catalog);
 DECLARE_int32(local_catalog_cache_expiration_s);
 DECLARE_int32(local_catalog_cache_mb);
+DECLARE_int32(local_catalog_cache_concurrency_level);
 DECLARE_int32(non_impala_java_vlog);
 DECLARE_int32(num_metadata_loading_threads);
 DECLARE_int32(max_hdfs_partitions_parallel_load);
@@ -51,6 +52,7 @@ DECLARE_string(authorized_proxy_group_config);
 DECLARE_bool(enable_shell_based_groups_mapping_support);
 DECLARE_string(catalog_topic_mode);
 DECLARE_string(kudu_master_hosts);
+DECLARE_bool(enable_kudu_impala_hms_check);
 DECLARE_string(reserved_words_version);
 DECLARE_double(max_filter_error_rate);
 DECLARE_int64(min_buffer_size);
@@ -101,6 +103,35 @@ DECLARE_bool(invalidate_hms_cache_on_ddls);
 DECLARE_bool(hms_event_incremental_refresh_transactional_table);
 DECLARE_bool(auto_check_compaction);
 DECLARE_bool(enable_sync_to_latest_event_on_ddls);
+DECLARE_bool(pull_table_types_and_comments);
+DECLARE_bool(enable_reload_events);
+DECLARE_string(geospatial_library);
+DECLARE_string(file_metadata_reload_properties);
+DECLARE_string(java_weigher);
+DECLARE_int32(iceberg_reload_new_files_threshold);
+DECLARE_bool(enable_skipping_older_events);
+DECLARE_bool(enable_json_scanner);
+DECLARE_bool(iceberg_allow_datafiles_in_table_location_only);
+DECLARE_bool(iceberg_always_allow_merge_on_read_operations);
+DECLARE_bool(enable_reading_puffin_stats);
+DECLARE_int32(catalog_operation_log_size);
+DECLARE_string(hostname);
+DECLARE_bool(allow_catalog_cache_op_from_masked_users);
+DECLARE_int32(topic_update_log_gc_frequency);
+DECLARE_string(debug_actions);
+DECLARE_bool(invalidate_metadata_on_event_processing_failure);
+DECLARE_bool(invalidate_global_metadata_on_event_processing_failure);
+DECLARE_string(inject_process_event_failure_event_types);
+DECLARE_double(inject_process_event_failure_ratio);
+DECLARE_bool(enable_workload_mgmt);
+DECLARE_string(query_log_table_name);
+DECLARE_string(default_skipped_hms_event_types);
+DECLARE_string(common_hms_event_types);
+DECLARE_int32(dbcp_max_conn_pool_size);
+DECLARE_int32(dbcp_max_wait_millis_for_conn);
+DECLARE_int32(dbcp_data_source_idle_timeout_s);
+DECLARE_bool(enable_catalogd_ha);
+DECLARE_string(injected_group_members_debug_only);
 
 // HS2 SAML2.0 configuration
 // Defined here because TAG_FLAG caused issues in global-flags.cc
@@ -187,7 +218,96 @@ DEFINE_string(startup_filesystem_check_directories, "/",
     "specified to a subdirectory to avoid accesses to the root of the filesystem. "
     "To disable the startup check, specify the empty string.");
 
+DEFINE_bool(use_hms_column_order_for_hbase_tables, false,
+    "Use the column order in HMS for HBase tables instead of ordering the columns by "
+    "family/qualifier. Keeping the default as false for backward compatibility.");
+
+DEFINE_string(ignored_dir_prefix_list, ".,_tmp.,_spark_metadata",
+    "Comma separated list to specify the prefix for tmp/staging dirs that catalogd should"
+    " skip in loading file metadata.");
+
+DEFINE_double_hidden(query_cpu_count_divisor, 1.0,
+    "(Deprecated) this is now deprecated in favor of query option with the same name. "
+    "(Advance) Divide the CPU requirement of a query to fit the total available CPU in "
+    "the executor group. For example, setting value 2 will fit the query with CPU "
+    "requirement 2X to an executor group with total available CPU X. Note that setting "
+    "with a fractional value less than 1 effectively multiplies the query CPU "
+    "requirement. A valid value is > 0.0. The default value is 1.");
+
+// TODO: Tune the individual expression cost from IMPALA-2805.
+DEFINE_bool_hidden(processing_cost_use_equal_expr_weight, true,
+    "(Advance) If true, all expression evaluations are weighted equally to 1 during the "
+    "plan node's processing cost calculation. If false, expression cost from IMPALA-2805 "
+    "will be used. Default to false.");
+
+// TODO: Benchmark and tune this config with an optimal value.
+DEFINE_int64_hidden(min_processing_per_thread, 10000000,
+    "(Advance) Minimum processing load (in processing cost unit) that a fragment "
+    "instance need to work on before planner consider increasing instance count. Used to "
+    "adjust fragment instance count based on estimated workload rather than the MT_DOP "
+    "setting. Setting this to high number will reduce parallelism of a fragment (more "
+    "workload per fragment), while setting to low number will increase parallelism (less "
+    "workload per fragment). Actual parallelism might still be constrained by the total "
+    "number of cores in selected executor group, MT_DOP, or PROCESSING_COST_MIN_THREAD "
+    "query option. Must be a positive integer. Default to 10M.");
+
+// TODO: Benchmark and tune this config with an optimal value.
+DEFINE_double_hidden(scan_range_cost_factor, 0.005,
+    "(Advance) Cost factor associated with processing one scan range. Combined with "
+    "min_processing_per_thread flag, this flag define the cost to process one scan range "
+    "as (scan_range_cost_factor * min_processing_per_thread). Default to 0.005, which "
+    "roughly means that one scan node instance will handle at most 200 scan ranges.");
+
+DEFINE_bool_hidden(skip_resource_checking_on_last_executor_group_set, true,
+    "(Advance) If true, memory and cpu resource checking will be skipped when a query "
+    "is being planned against the last (largest) executor group set. Setting true will "
+    "ensure that query will always get admitted into last executor group set if it does "
+    "not fit in any other group set.");
+
+DEFINE_double_hidden(max_filter_error_rate_from_full_scan, 0.9,
+    "(Advance) Skip generating bloom runtime filter that is generated from "
+    "a full build scan and has resulting error rate estimation that is higher than "
+    "this value after filter size limit applied. This config may get ignored if "
+    "target error rate is set with higher value through RUNTIME_FILTER_ERROR_RATE "
+    "query option or max_filter_error_rate backend flag. Setting value less than 0 "
+    "will disable this runtime filter reduction feature.");
+
+DEFINE_double_hidden(query_cpu_root_factor, 1.5,
+    "(Advance) The Nth root value to control sublinear scale down of unbounded "
+    "cpu requirement for executor group set selection.");
+
+DEFINE_int64_hidden(data_stream_sender_buffer_size_used_by_planner, -1,
+    "Similar to data_stream_sender_buffer_size but used during planning."
+    "With default -1 the planner uses the old logic that is different"
+    "than how the backend actually works (see IMPALA-12594)");
+
+using strings::Substitute;
+
 namespace impala {
+
+// Flag validation
+// ------------------------------------------------------------
+static bool ValidatePositiveDouble(const char* flagname, double value) {
+  if (0.0 < value) {
+    return true;
+  }
+  LOG(ERROR) << Substitute(
+      "$0 must be greater than 0.0, value $1 is invalid", flagname, value);
+  return false;
+}
+
+static bool ValidateMinProcessingPerThread(const char* flagname, int64_t value) {
+  if (0 < value) {
+    return true;
+  }
+  LOG(ERROR) << Substitute(
+      "$0 must be a positive integer, value $1 is invalid", flagname, value);
+  return false;
+}
+
+DEFINE_validator(query_cpu_count_divisor, &ValidatePositiveDouble);
+DEFINE_validator(min_processing_per_thread, &ValidateMinProcessingPerThread);
+DEFINE_validator(query_cpu_root_factor, &ValidatePositiveDouble);
 
 Status GetConfigFromCommand(const string& flag_cmd, string& result) {
   result.clear();
@@ -200,13 +320,15 @@ Status GetConfigFromCommand(const string& flag_cmd, string& result) {
 
 Status PopulateThriftBackendGflags(TBackendGflags& cfg) {
   cfg.__set_load_catalog_in_background(FLAGS_load_catalog_in_background);
-  cfg.__set_enable_orc_scanner(FLAGS_enable_orc_scanner);
   cfg.__set_use_local_catalog(FLAGS_use_local_catalog);
   cfg.__set_local_catalog_cache_mb(FLAGS_local_catalog_cache_mb);
   cfg.__set_local_catalog_cache_expiration_s(
     FLAGS_local_catalog_cache_expiration_s);
+  cfg.__set_local_catalog_cache_concurrency_level(
+    FLAGS_local_catalog_cache_concurrency_level);
   cfg.__set_server_name(FLAGS_server_name);
   cfg.__set_kudu_master_hosts(FLAGS_kudu_master_hosts);
+  cfg.__set_enable_kudu_impala_hms_check(FLAGS_enable_kudu_impala_hms_check);
   cfg.__set_read_size(FLAGS_read_size);
   cfg.__set_num_metadata_loading_threads(FLAGS_num_metadata_loading_threads);
   cfg.__set_max_hdfs_partitions_parallel_load(FLAGS_max_hdfs_partitions_parallel_load);
@@ -324,6 +446,68 @@ Status PopulateThriftBackendGflags(TBackendGflags& cfg) {
   cfg.__set_auto_check_compaction(FLAGS_auto_check_compaction);
   cfg.__set_enable_sync_to_latest_event_on_ddls(
       FLAGS_enable_sync_to_latest_event_on_ddls);
+  cfg.__set_pull_table_types_and_comments(FLAGS_pull_table_types_and_comments);
+  cfg.__set_use_hms_column_order_for_hbase_tables(
+      FLAGS_use_hms_column_order_for_hbase_tables);
+  cfg.__set_ignored_dir_prefix_list(FLAGS_ignored_dir_prefix_list);
+  cfg.__set_enable_reload_events(FLAGS_enable_reload_events);
+  if (FLAGS_geospatial_library == to_string(TGeospatialLibrary::NONE)) {
+    cfg.__set_geospatial_library(TGeospatialLibrary::NONE);
+  } else {
+    DCHECK_EQ(FLAGS_geospatial_library, to_string(TGeospatialLibrary::HIVE_ESRI));
+    cfg.__set_geospatial_library(TGeospatialLibrary::HIVE_ESRI);
+  }
+  cfg.__set_query_cpu_count_divisor(FLAGS_query_cpu_count_divisor);
+  cfg.__set_processing_cost_use_equal_expr_weight(
+      FLAGS_processing_cost_use_equal_expr_weight);
+  cfg.__set_min_processing_per_thread(FLAGS_min_processing_per_thread);
+  cfg.__set_skip_resource_checking_on_last_executor_group_set(
+      FLAGS_skip_resource_checking_on_last_executor_group_set);
+  cfg.__set_file_metadata_reload_properties(FLAGS_file_metadata_reload_properties);
+  cfg.__set_thrift_rpc_max_message_size(ThriftInternalRpcMaxMessageSize());
+  cfg.__set_scan_range_cost_factor(FLAGS_scan_range_cost_factor);
+  cfg.__set_use_jamm_weigher(FLAGS_java_weigher == "jamm");
+  cfg.__set_iceberg_reload_new_files_threshold(FLAGS_iceberg_reload_new_files_threshold);
+  cfg.__set_enable_skipping_older_events(FLAGS_enable_skipping_older_events);
+  cfg.__set_enable_json_scanner(FLAGS_enable_json_scanner);
+  cfg.__set_iceberg_allow_datafiles_in_table_location_only(
+      FLAGS_iceberg_allow_datafiles_in_table_location_only);
+  cfg.__set_iceberg_always_allow_merge_on_read_operations(
+      FLAGS_iceberg_always_allow_merge_on_read_operations);
+  cfg.__set_enable_reading_puffin_stats(
+      FLAGS_enable_reading_puffin_stats);
+  cfg.__set_max_filter_error_rate_from_full_scan(
+      FLAGS_max_filter_error_rate_from_full_scan);
+  cfg.__set_catalog_operation_log_size(FLAGS_catalog_operation_log_size);
+  cfg.__set_hostname(FLAGS_hostname);
+  cfg.__set_allow_catalog_cache_op_from_masked_users(
+      FLAGS_allow_catalog_cache_op_from_masked_users);
+  cfg.__set_topic_update_log_gc_frequency(FLAGS_topic_update_log_gc_frequency);
+  cfg.__set_debug_actions(FLAGS_debug_actions);
+  cfg.__set_invalidate_metadata_on_event_processing_failure(
+      FLAGS_invalidate_metadata_on_event_processing_failure);
+  cfg.__set_invalidate_global_metadata_on_event_processing_failure(
+      FLAGS_invalidate_global_metadata_on_event_processing_failure);
+  cfg.__set_inject_process_event_failure_event_types(
+      FLAGS_inject_process_event_failure_event_types);
+  cfg.__set_inject_process_event_failure_ratio(FLAGS_inject_process_event_failure_ratio);
+  cfg.__set_enable_workload_mgmt(FLAGS_enable_workload_mgmt);
+  cfg.__set_query_log_table_name(FLAGS_query_log_table_name);
+  cfg.__set_query_cpu_root_factor(FLAGS_query_cpu_root_factor);
+  cfg.__set_default_skipped_hms_event_types(FLAGS_default_skipped_hms_event_types);
+  cfg.__set_common_hms_event_types(FLAGS_common_hms_event_types);
+  cfg.__set_dbcp_max_conn_pool_size(FLAGS_dbcp_max_conn_pool_size);
+  cfg.__set_dbcp_max_wait_millis_for_conn(FLAGS_dbcp_max_wait_millis_for_conn);
+  cfg.__set_dbcp_data_source_idle_timeout(FLAGS_dbcp_data_source_idle_timeout_s);
+  cfg.__set_data_stream_sender_buffer_size_used_by_planner(
+      FLAGS_data_stream_sender_buffer_size_used_by_planner);
+  cfg.__set_injected_group_members_debug_only(FLAGS_injected_group_members_debug_only);
+#ifdef NDEBUG
+  cfg.__set_is_release_build(true);
+#else
+  cfg.__set_is_release_build(false);
+#endif
+  cfg.__set_enable_catalogd_ha(FLAGS_enable_catalogd_ha);
   return Status::OK();
 }
 

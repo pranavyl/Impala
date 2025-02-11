@@ -17,6 +17,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import os
 import sys
 
@@ -25,21 +26,21 @@ hive_major_version = int(os.environ['IMPALA_HIVE_VERSION'][0])
 
 
 def _get_system_ram_mb():
-  lines = file("/proc/meminfo").readlines()
+  lines = open("/proc/meminfo").readlines()
   memtotal_line = [l for l in lines if l.startswith('MemTotal')][0]
   mem_kb = int(memtotal_line.split()[1])
-  return mem_kb / 1024
+  return mem_kb // 1024
 
 
 def _get_yarn_nm_ram_mb():
   sys_ram = _get_system_ram_mb()
-  available_ram_gb = int(os.getenv("IMPALA_CLUSTER_MAX_MEM_GB", str(sys_ram / 1024)))
+  available_ram_gb = int(os.getenv("IMPALA_CLUSTER_MAX_MEM_GB", str(sys_ram // 1024)))
   # Fit into the following envelope:
   # - need 4GB at a bare minimum
-  # - leave at least 24G for other services
+  # - leave at least 20G for other services
   # - don't need more than 48G
-  ret = min(max(available_ram_gb * 1024 - 24 * 1024, 4096), 48 * 1024)
-  print >>sys.stderr, "Configuring Yarn NM to use {0}MB RAM".format(ret)
+  ret = min(max(available_ram_gb * 1024 - 20 * 1024, 4096), 48 * 1024)
+  print("Configuring Yarn NM to use {0}MB RAM".format(ret), file=sys.stderr)
   return ret
 
 
@@ -54,6 +55,10 @@ CONFIG = {
   'yarn.nodemanager.local-dirs': '${NODE_DIR}/var/lib/hadoop-yarn/cache/${USER}/nm-local-dir',
   'yarn.nodemanager.log-dirs': '${NODE_DIR}/var/log/hadoop-yarn/containers',
 
+  # Set it to a large enough value so that the logs of all the containers ever created in
+  # a Jenkins run will be retained.
+  'yarn.nodemanager.log.retain-seconds': 86400,
+
   # Enable the MR shuffle service, which is also used by Tez.
   'yarn.nodemanager.aux-services': 'mapreduce_shuffle',
   'yarn.nodemanager.aux-services.mapreduce_shuffle.class': 'org.apache.hadoop.mapred.ShuffleHandler',
@@ -64,7 +69,18 @@ CONFIG = {
   # Limit memory used by the NM to 8GB.
   # TODO(todd): auto-configure this based on the memory available on the machine
   # to speed up data-loading.
-  'yarn.nodemanager.resource.memory-mb': _get_yarn_nm_ram_mb()
+  'yarn.nodemanager.resource.memory-mb': _get_yarn_nm_ram_mb(),
+
+  # Allow YARN to run with at least 3GB disk free. Otherwise it hangs completely.
+  # Avoids disabling YARN disk monitoring completely because otherwise multiple jobs might
+  # use up all the disk in a scenario where otherwise they could complete sequentially.
+  'yarn.nodemanager.disk-health-checker.max-disk-utilization-per-disk-percentage': 99,
+
+  # Increase YARN container resources to 2GB to avoid dataload failures
+  'yarn.app.mapreduce.am.resource.mb': 2048,
+
+  # Increase YARN minimum container size to 2GB to avoid dataload failures
+  'yarn.scheduler.minimum-allocation-mb': 2048
 }
 
 app_classpath = [

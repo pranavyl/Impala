@@ -15,12 +15,23 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 from tests.common.impala_cluster import ImpalaCluster
-from tests.common.skip import SkipIfBuildType
+from tests.common.skip import SkipIfBuildType, SkipIfFS
+from tests.common.test_result_verifier import error_msg_expected
 from tests.verifiers.metric_verifier import MetricVerifier
+
+# The BE krpc port of the impalad to simulate rpc errors in tests.
+FAILED_KRPC_PORT = 27001
+
+
+def _get_rpc_fail_action(port):
+  return "IMPALA_SERVICE_POOL:127.0.0.1:{port}:ExecQueryFInstances:FAIL" \
+      .format(port=port)
 
 @SkipIfBuildType.not_dev_build
 class TestRPCTimeout(CustomClusterTestSuite):
@@ -132,7 +143,7 @@ class TestRPCTimeout(CustomClusterTestSuite):
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args("--backend_client_rpc_timeout_ms=1000"
       " --datastream_sender_timeout_ms=30000 --debug_actions=%s" %
-      "|".join(map(lambda rpc: "%s_DELAY:JITTER@3000@0.1" % rpc, all_rpcs)))
+      "|".join(["%s_DELAY:JITTER@3000@0.1" % rpc for rpc in all_rpcs]))
   def test_random_rpc_timeout(self, vector):
     self.execute_query_verify_metrics(self.TEST_QUERY, None, 10)
 
@@ -173,15 +184,18 @@ class TestRPCTimeout(CustomClusterTestSuite):
       " --debug_actions=REPORT_EXEC_STATUS_DELAY:SLEEP@1000")
   def test_reportexecstatus_retries(self, unique_database):
     tbl = "%s.kudu_test" % unique_database
-    self.execute_query("create table %s (a int primary key) stored as kudu" % tbl)
+    self.execute_query("create table %s ("
+        "a bigint primary key, b bigint not null) stored as kudu" % tbl)
     # Since the sleep time (1000ms) is much longer than the rpc timeout (100ms), all
     # reports will appear to fail. The query is designed to result in many intermediate
     # status reports but fewer than the max allowed failures, so the query should succeed.
-    result = self.execute_query(
-        "insert into %s select 0 from tpch.lineitem limit 100000" % tbl)
+    result = self.execute_query("insert into %s select c_custkey, "
+        "case when c_custkey > 1 then null else c_custkey end "
+        "from tpch.customer order by c_custkey limit 100000" % tbl)
     assert result.success, str(result)
     # Ensure that the error log was tracked correctly - all but the first row inserted
-    # should result in a 'key already present' insert error.
+    # should result in a 'Row with null value violates nullability constraint on table'
+    # insert error.
     assert "(1 of 99999 similar)" in result.log, str(result)
 
   @pytest.mark.execute_serially
@@ -194,6 +208,29 @@ class TestRPCTimeout(CustomClusterTestSuite):
     self.execute_query_verify_metrics(self.SLOW_TEST_QUERY,
         expected_exception="cancelled due to unresponsive backend")
 
+  @SkipIfFS.shutdown_idle_fails
+  @SkipIfBuildType.not_dev_build
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args="--backend_client_rpc_timeout_ms=1000 --debug_actions=" +
+      _get_rpc_fail_action(FAILED_KRPC_PORT),
+      statestored_args="--statestore_heartbeat_frequency_ms=1000 \
+          --statestore_max_missed_heartbeats=2")
+  def test_miss_complete_cb(self, unique_database):
+    """Test verify cancellation should not be blocked if the callback of ExecComplate
+    are missing."""
+
+    rpc_not_accessible_impalad = self.cluster.impalads[1]
+    assert rpc_not_accessible_impalad.service.krpc_port == FAILED_KRPC_PORT
+
+    # The 2nd node cannot be accessible through KRPC so that it's added to blacklist
+    # and the query should be aborted without hanging.
+    query = "select count(*) from tpch_parquet.lineitem where l_orderkey < 50"
+    debug_action = 'IMPALA_MISS_EXEC_COMPLETE_CB:FAIL@1.0'
+    ex = self.execute_query_expect_failure(self.client, query,
+        query_options={'retry_failed_queries': 'false', 'debug_action': debug_action})
+    assert error_msg_expected(str(ex), "Remote error: Runtime error: Debug Action: "
+        "IMPALA_SERVICE_POOL:FAIL")
 
 class TestCatalogRPCTimeout(CustomClusterTestSuite):
   """"Tests RPC timeout and retry handling for catalogd operations."""

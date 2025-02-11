@@ -18,17 +18,16 @@
 # Injects failures  at specific locations in each of the plan nodes. Currently supports
 # two types of failures - cancellation of the query and a failure test hook.
 #
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
-import os
 import re
-from collections import defaultdict
 from time import sleep
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite, LOG
-from tests.common.skip import (SkipIf, SkipIfS3, SkipIfABFS, SkipIfADLS, SkipIfIsilon,
-                               SkipIfGCS, SkipIfCOS, SkipIfLocal)
+from tests.common.skip import SkipIf, SkipIfFS
 from tests.common.test_dimensions import create_exec_option_dimension
 from tests.common.test_vector import ImpalaTestDimension
 from tests.verifiers.metric_verifier import MetricVerifier
@@ -61,14 +60,9 @@ QUERIES = [
            WHERE t2.int_col < 1000"""
 ]
 
-@SkipIf.skip_hbase # -skip_hbase argument specified
-@SkipIfS3.hbase # S3: missing coverage: failures
-@SkipIfGCS.hbase
-@SkipIfCOS.hbase
-@SkipIfABFS.hbase
-@SkipIfADLS.hbase
-@SkipIfIsilon.hbase # ISILON: missing coverage: failures.
-@SkipIfLocal.hbase
+
+@SkipIf.skip_hbase  # -skip_hbase argument specified
+@SkipIfFS.hbase  # missing coverage: failures
 class TestFailpoints(ImpalaTestSuite):
   @classmethod
   def get_workload(cls):

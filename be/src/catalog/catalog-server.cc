@@ -30,8 +30,10 @@
 #include "util/collection-metrics.h"
 #include "util/debug-util.h"
 #include "util/event-metrics.h"
+#include "util/json-util.h"
 #include "util/logging-support.h"
 #include "util/metrics.h"
+#include "util/pretty-printer.h"
 #include "util/thrift-debug-util.h"
 #include "util/webserver.h"
 
@@ -124,11 +126,103 @@ DEFINE_bool(enable_sync_to_latest_event_on_ddls, false, "This configuration is "
     "(if enabled). If this config is enabled, then the flag invalidate_hms_cache_on_ddls "
     "should be disabled");
 
+DEFINE_bool(enable_reload_events, false, "This configuration is used to fire a "
+    "refresh/invalidate table event to the HMS such that other event processors "
+    "(such as other Impala catalogds) that poll HMS notification logs can process "
+    "this event. The default value is false, so impala will not fire this "
+    "event. If enabled, impala will fire this event and other catalogD will process it."
+    "This config only affects the firing of the reload event. Processing of reload "
+    "event will always happen");
+
+DEFINE_string(file_metadata_reload_properties, "EXTERNAL, metadata_location,"
+    "transactional, transactional_properties, TRANSLATED_TO_EXTERNAL, repl.last.id",
+    "This configuration is used to whitelist the table properties that are supposed to"
+    "refresh file metadata when these properties are changed. To skip this optimization,"
+    "set the value to empty string");
+
+DEFINE_bool(enable_skipping_older_events, false, "This configuration is used to skip any"
+    "older events in the event processor based on the lastRefreshEventId on the"
+    "database/table/partition in the cache. All the DML queries that change the metadata"
+    "in the catalogD's cache will update the lastRefreshEventId i.e.., fetch the latest"
+    "available event on HMS and set it on the object. In case the event processor is"
+    "lagging, the older events in event processor queue can be skipped by comparing the"
+    "current event id to that of lastRefreshEventId. The default is set to false to"
+    "disable the optimisation. Set this true to enable skipping the older events and"
+    "quickly catch with the events of HMS");
+
+DEFINE_int32(catalog_operation_log_size, 100, "Number of catalog operation log records "
+    "to retain in catalogd. If -1, the operation log has unbounded size.");
+
+// The standby catalogd may have stale metadata for some reason, like event processor
+// could have hung or could be just behind in processing events. Also the standby
+// catalogd doesn't get invalidate requests from coordinators so we should probably
+// reset its metadata when it becomes active to avoid stale metadata.
+DEFINE_bool_hidden(catalogd_ha_reset_metadata_on_failover, true, "If true, reset all "
+    "metadata when the catalogd becomes active.");
+
+DEFINE_int32(topic_update_log_gc_frequency, 1000, "Frequency at which the entries "
+    "of the catalog topic update log are garbage collected. An entry may survive "
+    "for (2 * TOPIC_UPDATE_LOG_GC_FREQUENCY) - 1 topic updates.");
+
+DEFINE_bool(invalidate_metadata_on_event_processing_failure, true,
+    "This configuration is used to invalidate metadata for table(s) upon event process "
+    "failure other than HMS connection issues. The default value is true. When enabled, "
+    "invalidate metadata is performed automatically upon event process failure. "
+    "Otherwise, failure can put metastore event processor in non-active state.");
+
+DEFINE_bool(invalidate_global_metadata_on_event_processing_failure, false,
+    "This configuration is used to global invalidate metadata when "
+    "invalidate_metadata_on_event_processing_failure cannot invalidate metadata for "
+    "table(s). The default value is false. When enabled, global invalidate metadata is "
+    "performed automatically. Otherwise, failure can put metastore event processor in "
+    "non-active state.");
+
+DEFINE_string_hidden(inject_process_event_failure_event_types, "",
+    "This configuration is used to inject event processing failure for an event type "
+    "randomly. It is used for debugging purpose. Empty string indicates no failure "
+    "injection and it is default behavior. Valid values are comma separated event types "
+    "as specified in MetastoreEventType enum. This config is only for testing purpose "
+    "and it should not be set in production environments.");
+
+DEFINE_double_hidden(inject_process_event_failure_ratio, 1.0,
+    "This configuration is used in conjunction with the config "
+    "'inject_process_event_failure_event_types', to define what is the ratio of an"
+    "event failure. If the generated random number is lesser than this value, then we"
+    "fail the event processor(EP).");
+
+DEFINE_string(default_skipped_hms_event_types,
+    "OPEN_TXN,UPDATE_TBL_COL_STAT_EVENT,UPDATE_PART_COL_STAT_EVENT",
+    "HMS event types that are not used by Impala. They are skipped by default in "
+    "fetching HMS event batches. Only in few places they will be fetched, e.g. fetching "
+    "the latest event time in HMS.");
+DEFINE_string(common_hms_event_types, "ADD_PARTITION,ALTER_PARTITION,DROP_PARTITION,"
+    "ADD_PARTITION,ALTER_PARTITION,DROP_PARTITION,CREATE_TABLE,ALTER_TABLE,DROP_TABLE,"
+    "CREATE_DATABASE,ALTER_DATABASE,DROP_DATABASE,INSERT,OPEN_TXN,COMMIT_TXN,ABORT_TXN,"
+    "ALLOC_WRITE_ID_EVENT,ACID_WRITE_EVENT,BATCH_ACID_WRITE_EVENT,"
+    "UPDATE_TBL_COL_STAT_EVENT,DELETE_TBL_COL_STAT_EVENT,UPDATE_PART_COL_STAT_EVENT,"
+    "UPDATE_PART_COL_STAT_EVENT_BATCH,DELETE_PART_COL_STAT_EVENT,COMMIT_COMPACTION_EVENT,"
+    "RELOAD",
+    "Common HMS event types that will be used in eventTypeSkipList when fetching events "
+    "from HMS. The strings come from constants in "
+    "org.apache.hadoop.hive.metastore.messaging.MessageBuilder. When bumping Hive "
+    "versions, the list might need to be updated accordingly. To avoid bringing too much "
+    "computation overhead to HMS's underlying RDBMS in evaluating predicates of "
+    "EVENT_TYPE != 'xxx', rare event types are not tracked in this list. They are "
+    "CREATE_FUNCTION,DROP_FUNCTION,ADD_PRIMARYKEY,ADD_FOREIGNKEY,ADD_UNIQUECONSTRAINT,"
+    "ADD_NOTNULLCONSTRAINT, ADD_DEFAULTCONSTRAINT, ADD_CHECKCONSTRAINT, DROP_CONSTRAINT,"
+    "CREATE_ISCHEMA, ALTER_ISCHEMA, DROP_ISCHEMA, ADD_SCHEMA_VERSION,"
+    "ALTER_SCHEMA_VERSION, DROP_SCHEMA_VERSION, CREATE_CATALOG, ALTER_CATALOG,"
+    "DROP_CATALOG, CREATE_DATACONNECTOR, ALTER_DATACONNECTOR, DROP_DATACONNECTOR.");
+
 DECLARE_string(state_store_host);
-DECLARE_int32(state_store_subscriber_port);
 DECLARE_int32(state_store_port);
+DECLARE_string(state_store_2_host);
+DECLARE_int32(state_store_2_port);
+DECLARE_int32(state_store_subscriber_port);
 DECLARE_string(hostname);
 DECLARE_bool(compact_catalog_topic);
+DECLARE_bool(enable_catalogd_ha);
+DECLARE_bool(force_catalogd_active);
 
 #ifndef NDEBUG
 DECLARE_int32(stress_catalog_startup_delay_ms);
@@ -140,9 +234,28 @@ string CatalogServer::IMPALA_CATALOG_TOPIC = "catalog-update";
 
 const string CATALOG_SERVER_TOPIC_PROCESSING_TIMES =
     "catalog-server.topic-processing-time-s";
-
 const string CATALOG_SERVER_PARTIAL_FETCH_RPC_QUEUE_LEN =
     "catalog.partial-fetch-rpc.queue-len";
+const string CATALOG_ACTIVE_STATUS = "catalog-server.active-status";
+const string CATALOG_HA_NUM_ACTIVE_STATUS_CHANGE =
+    "catalog-server.ha-number-active-status-change";
+const string CATALOG_NUM_FILE_METADATA_LOADING_THREADS =
+    "catalog-server.metadata.file.num-loading-threads";
+const string CATALOG_NUM_FILE_METADATA_LOADING_TASKS =
+    "catalog-server.metadata.file.num-loading-tasks";
+const string CATALOG_NUM_TABLES_LOADING_FILE_METADATA =
+    "catalog-server.metadata.table.num-loading-file-metadata";
+const string CATALOG_NUM_TABLES_LOADING_METADATA =
+    "catalog-server.metadata.table.num-loading-metadata";
+const string CATALOG_NUM_TABLES_ASYNC_LOADING_METADATA =
+    "catalog-server.metadata.table.async-loading.num-in-progress";
+const string CATALOG_NUM_TABLES_WAITING_FOR_ASYNC_LOADING =
+    "catalog-server.metadata.table.async-loading.queue-len";
+const string CATALOG_NUM_DBS = "catalog.num-databases";
+const string CATALOG_NUM_TABLES = "catalog.num-tables";
+const string CATALOG_NUM_FUNCTIONS = "catalog.num-functions";
+const string CATALOG_NUM_HMS_CLIENTS_IDLE = "catalog.hms-client-pool.num-idle";
+const string CATALOG_NUM_HMS_CLIENTS_IN_USE = "catalog.hms-client-pool.num-in-use";
 
 const string CATALOG_WEB_PAGE = "/catalog";
 const string CATALOG_TEMPLATE = "catalog.tmpl";
@@ -155,6 +268,8 @@ const string TABLE_METRICS_TEMPLATE = "table_metrics.tmpl";
 const string EVENT_WEB_PAGE = "/events";
 const string EVENT_METRICS_TEMPLATE = "events.tmpl";
 const string CATALOG_SERVICE_HEALTH_WEB_PAGE = "/healthz";
+const string HADOOP_VARZ_TEMPLATE = "hadoop-varz.tmpl";
+const string HADOOP_VARZ_WEB_PAGE = "/hadoop-varz";
 
 const int REFRESH_METRICS_INTERVAL_MS = 1000;
 
@@ -163,12 +278,17 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
  public:
   CatalogServiceThriftIf(CatalogServer* catalog_server)
       : catalog_server_(catalog_server) {
+    server_address_ = TNetworkAddressToString(
+        MakeNetworkAddress(FLAGS_hostname, FLAGS_catalog_service_port));
   }
 
   // Executes a TDdlExecRequest and returns details on the result of the operation.
   void ExecDdl(TDdlExecResponse& resp, const TDdlExecRequest& req) override {
     VLOG_RPC << "ExecDdl(): request=" << ThriftDebugString(req);
-    Status status = catalog_server_->catalog()->ExecDdl(req, &resp);
+    Status status = AcceptRequest(req.protocol_version);
+    if (status.ok()) {
+      status = catalog_server_->catalog()->ExecDdl(req, &resp);
+    }
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
     TStatus thrift_status;
     status.ToThrift(&thrift_status);
@@ -181,7 +301,10 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
       override {
     VLOG_RPC << "ResetMetadata(): request=" << ThriftDebugString(req);
     DebugActionNoFail(FLAGS_debug_actions, "RESET_METADATA_DELAY");
-    Status status = catalog_server_->catalog()->ResetMetadata(req, &resp);
+    Status status = AcceptRequest(req.protocol_version);
+    if (status.ok()) {
+      status = catalog_server_->catalog()->ResetMetadata(req, &resp);
+    }
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
     TStatus thrift_status;
     status.ToThrift(&thrift_status);
@@ -194,7 +317,10 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
   void UpdateCatalog(TUpdateCatalogResponse& resp, const TUpdateCatalogRequest& req)
       override {
     VLOG_RPC << "UpdateCatalog(): request=" << ThriftDebugString(req);
-    Status status = catalog_server_->catalog()->UpdateCatalog(req, &resp);
+    Status status = AcceptRequest(req.protocol_version);
+    if (status.ok()) {
+      status = catalog_server_->catalog()->UpdateCatalog(req, &resp);
+    }
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
     TStatus thrift_status;
     status.ToThrift(&thrift_status);
@@ -207,7 +333,10 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
   void GetFunctions(TGetFunctionsResponse& resp, const TGetFunctionsRequest& req)
       override {
     VLOG_RPC << "GetFunctions(): request=" << ThriftDebugString(req);
-    Status status = catalog_server_->catalog()->GetFunctions(req, &resp);
+    Status status = AcceptRequest(req.protocol_version);
+    if (status.ok()) {
+      status = catalog_server_->catalog()->GetFunctions(req, &resp);
+    }
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
     TStatus thrift_status;
     status.ToThrift(&thrift_status);
@@ -219,9 +348,15 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
   void GetCatalogObject(TGetCatalogObjectResponse& resp,
       const TGetCatalogObjectRequest& req) override {
     VLOG_RPC << "GetCatalogObject(): request=" << ThriftDebugString(req);
-    Status status = catalog_server_->catalog()->GetCatalogObject(req.object_desc,
-        &resp.catalog_object);
+    Status status = AcceptRequest(req.protocol_version);
+    if (status.ok()) {
+      status = catalog_server_->catalog()->GetCatalogObject(
+          req.object_desc, &resp.catalog_object);
+    }
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
+    TStatus thrift_status;
+    status.ToThrift(&thrift_status);
+    resp.__set_status(thrift_status);
     VLOG_RPC << "GetCatalogObject(): response=" << ThriftDebugStringNoThrow(resp);
   }
 
@@ -235,7 +370,10 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
     // so a heavy query workload against a table undergoing a slow refresh doesn't
     // end up taking down the catalog by creating thousands of threads.
     VLOG_RPC << "GetPartialCatalogObject(): request=" << ThriftDebugString(req);
-    Status status = catalog_server_->catalog()->GetPartialCatalogObject(req, &resp);
+    Status status = AcceptRequest(req.protocol_version);
+    if (status.ok()) {
+      status = catalog_server_->catalog()->GetPartialCatalogObject(req, &resp);
+    }
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
     TStatus thrift_status;
     status.ToThrift(&thrift_status);
@@ -246,7 +384,10 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
   void GetPartitionStats(TGetPartitionStatsResponse& resp,
       const TGetPartitionStatsRequest& req) override {
     VLOG_RPC << "GetPartitionStats(): request=" << ThriftDebugString(req);
-    Status status = catalog_server_->catalog()->GetPartitionStats(req, &resp);
+    Status status = AcceptRequest(req.protocol_version);
+    if (status.ok()) {
+      status = catalog_server_->catalog()->GetPartitionStats(req, &resp);
+    }
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
     TStatus thrift_status;
     status.ToThrift(&thrift_status);
@@ -260,7 +401,10 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
   void PrioritizeLoad(TPrioritizeLoadResponse& resp, const TPrioritizeLoadRequest& req)
       override {
     VLOG_RPC << "PrioritizeLoad(): request=" << ThriftDebugString(req);
-    Status status = catalog_server_->catalog()->PrioritizeLoad(req);
+    Status status = AcceptRequest(req.protocol_version);
+    if (status.ok()) {
+      status = catalog_server_->catalog()->PrioritizeLoad(req);
+    }
     if (!status.ok()) LOG(ERROR) << status.GetDetail();
     TStatus thrift_status;
     status.ToThrift(&thrift_status);
@@ -271,23 +415,108 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
   void UpdateTableUsage(TUpdateTableUsageResponse& resp,
       const TUpdateTableUsageRequest& req) override {
     VLOG_RPC << "UpdateTableUsage(): request=" << ThriftDebugString(req);
-    Status status = catalog_server_->catalog()->UpdateTableUsage(req);
+    Status status = AcceptRequest(req.protocol_version);
+    if (status.ok()) {
+      status = catalog_server_->catalog()->UpdateTableUsage(req);
+    }
     if (!status.ok()) LOG(WARNING) << status.GetDetail();
+    TStatus thrift_status;
+    status.ToThrift(&thrift_status);
+    resp.__set_status(thrift_status);
+    VLOG_RPC << "UpdateTableUsage(): response.status=" << resp.status;
+  }
+
+  void GetNullPartitionName(TGetNullPartitionNameResponse& resp,
+      const TGetNullPartitionNameRequest& req) override {
+    VLOG_RPC << "GetNullPartitionName(): request=" << ThriftDebugString(req);
+    Status status = AcceptRequest(req.protocol_version);
+    if (status.ok()) {
+      status = catalog_server_->catalog()->GetNullPartitionName(&resp);
+    }
+    if (!status.ok()) LOG(ERROR) << status.GetDetail();
+    TStatus thrift_status;
+    status.ToThrift(&thrift_status);
+    resp.__set_status(thrift_status);
+    VLOG_RPC << "GetNullPartitionName(): response=" << ThriftDebugStringNoThrow(resp);
+  }
+
+  void GetLatestCompactions(TGetLatestCompactionsResponse& resp,
+      const TGetLatestCompactionsRequest& req) override {
+    VLOG_RPC << "GetLatestCompactions(): request=" << ThriftDebugString(req);
+    Status status = AcceptRequest(req.protocol_version);
+    if (status.ok()) {
+      status = catalog_server_->catalog()->GetLatestCompactions(req, &resp);
+    }
+    if (!status.ok()) LOG(ERROR) << status.GetDetail();
+    TStatus thrift_status;
+    status.ToThrift(&thrift_status);
+    resp.__set_status(thrift_status);
+    VLOG_RPC << "GetLatestCompactions(): response=" << ThriftDebugStringNoThrow(resp);
+  }
+
+  void SetEventProcessorStatus(TSetEventProcessorStatusResponse& resp,
+      const TSetEventProcessorStatusRequest& req) override {
+    VLOG_RPC << "SetEventProcessorStatus(): request=" << ThriftDebugString(req);
+    Status status = AcceptRequest(req.protocol_version);
+    if (status.ok()) {
+      status = catalog_server_->catalog()->SetEventProcessorStatus(req, &resp);
+    }
+    if (!status.ok()) LOG(ERROR) << status.GetDetail();
+    VLOG_RPC << "SetEventProcessorStatus(): response=" << ThriftDebugStringNoThrow(resp);
   }
 
  private:
   CatalogServer* catalog_server_;
+  string server_address_;
+
+  // Check if catalog protocols are compatible between client and catalog server.
+  // Return Status::OK() if the protocols are compatible and catalog server is active.
+  Status AcceptRequest(CatalogServiceVersion::type client_version) {
+    Status status = Status::OK();
+    if (client_version < catalog_server_->GetProtocolVersion()) {
+      status = Status(TErrorCode::CATALOG_INCOMPATIBLE_PROTOCOL, client_version + 1,
+          catalog_server_->GetProtocolVersion() + 1);
+    } else if (FLAGS_enable_catalogd_ha && !catalog_server_->IsActive()) {
+      status = Status(Substitute("Request for Catalog service is rejected since "
+          "catalogd $0 is in standby mode", server_address_));
+    }
+    return status;
+  }
 };
 
 CatalogServer::CatalogServer(MetricGroup* metrics)
-  : thrift_iface_(new CatalogServiceThriftIf(this)),
+  : protocol_version_(CatalogServiceVersion::V2),
+    thrift_iface_(new CatalogServiceThriftIf(this)),
     thrift_serializer_(FLAGS_compact_catalog_topic), metrics_(metrics),
+    is_active_(!FLAGS_enable_catalogd_ha), is_ha_determined_(!FLAGS_enable_catalogd_ha),
     topic_updates_ready_(false), last_sent_catalog_version_(0L),
     catalog_objects_max_version_(0L) {
   topic_processing_time_metric_ = StatsMetric<double>::CreateAndRegister(metrics,
       CATALOG_SERVER_TOPIC_PROCESSING_TIMES);
   partial_fetch_rpc_queue_len_metric_ =
       metrics->AddGauge(CATALOG_SERVER_PARTIAL_FETCH_RPC_QUEUE_LEN, 0);
+  num_file_metadata_loading_threads_metric_ =
+      metrics->AddGauge(CATALOG_NUM_FILE_METADATA_LOADING_THREADS, 0);
+  num_file_metadata_loading_tasks_metric_ =
+      metrics->AddGauge(CATALOG_NUM_FILE_METADATA_LOADING_TASKS, 0);
+  num_tables_loading_file_metadata_metric_ =
+      metrics->AddGauge(CATALOG_NUM_TABLES_LOADING_FILE_METADATA, 0);
+  num_tables_loading_metadata_metric_ =
+      metrics->AddGauge(CATALOG_NUM_TABLES_LOADING_METADATA, 0);
+  num_tables_async_loading_metadata_metric_ =
+      metrics->AddGauge(CATALOG_NUM_TABLES_ASYNC_LOADING_METADATA, 0);
+  num_tables_waiting_for_async_loading_metric_ =
+      metrics->AddGauge(CATALOG_NUM_TABLES_WAITING_FOR_ASYNC_LOADING, 0);
+  num_dbs_metric_ = metrics->AddGauge(CATALOG_NUM_DBS, 0);
+  num_tables_metric_ = metrics->AddGauge(CATALOG_NUM_TABLES, 0);
+  num_functions_metric_ = metrics->AddGauge(CATALOG_NUM_FUNCTIONS, 0);
+  num_hms_clients_idle_metric_ = metrics->AddGauge(CATALOG_NUM_HMS_CLIENTS_IDLE, 0);
+  num_hms_clients_in_use_metric_ = metrics->AddGauge(CATALOG_NUM_HMS_CLIENTS_IN_USE, 0);
+
+  active_status_metric_ =
+      metrics->AddProperty(CATALOG_ACTIVE_STATUS, !FLAGS_enable_catalogd_ha);
+  num_ha_active_status_change_metric_ =
+      metrics->AddCounter(CATALOG_HA_NUM_ACTIVE_STATUS_CHANGE, 0);
 }
 
 Status CatalogServer::Start() {
@@ -295,6 +524,8 @@ Status CatalogServer::Start() {
       MakeNetworkAddress(FLAGS_hostname, FLAGS_state_store_subscriber_port);
   TNetworkAddress statestore_address =
       MakeNetworkAddress(FLAGS_state_store_host, FLAGS_state_store_port);
+  TNetworkAddress statestore2_address =
+      MakeNetworkAddress(FLAGS_state_store_2_host, FLAGS_state_store_2_port);
   TNetworkAddress server_address = MakeNetworkAddress(FLAGS_hostname,
       FLAGS_catalog_service_port);
 
@@ -311,9 +542,11 @@ Status CatalogServer::Start() {
   RETURN_IF_ERROR(Thread::Create("catalog-server", "catalog-metrics-refresh-thread",
       &CatalogServer::RefreshMetrics, this, &catalog_metrics_refresh_thread_));
 
-  statestore_subscriber_.reset(new StatestoreSubscriber(
+  active_catalogd_version_checker_.reset(new ActiveCatalogdVersionChecker());
+  statestore_subscriber_.reset(new StatestoreSubscriberCatalog(
      Substitute("catalog-server@$0", TNetworkAddressToString(server_address)),
-     subscriber_address, statestore_address, metrics_));
+     subscriber_address, statestore_address, statestore2_address, metrics_,
+     protocol_version_, server_address));
 
   StatestoreSubscriber::UpdateCallback cb =
       bind<void>(mem_fn(&CatalogServer::UpdateCatalogTopicCallback), this, _1, _2);
@@ -329,22 +562,38 @@ Status CatalogServer::Start() {
     status.AddDetail("CatalogService failed to start");
     return status;
   }
+  // Add callback to handle notification of updating catalogd from Statestore.
+  if (FLAGS_enable_catalogd_ha) {
+    StatestoreSubscriber::UpdateCatalogdCallback update_catalogd_cb =
+        bind<void>(mem_fn(&CatalogServer::UpdateActiveCatalogd), this, _1, _2, _3);
+    statestore_subscriber_->AddUpdateCatalogdTopic(update_catalogd_cb);
+  }
+
   RETURN_IF_ERROR(statestore_subscriber_->Start());
+  if (FLAGS_force_catalogd_active && !IsActive()) {
+    // If both catalogd are started with 'force_catalogd_active' as true in short time,
+    // the second election overwrite the first election. The one which registering with
+    // statstore first will be inactive.
+    LOG(WARNING) << "Could not start CatalogD as active instance";
+  }
 
   // Notify the thread to start for the first time.
   {
     lock_guard<mutex> l(catalog_lock_);
-    catalog_update_cv_.NotifyOne();
+    if (is_active_) catalog_update_cv_.NotifyOne();
   }
   return Status::OK();
 }
 
-void CatalogServer::RegisterWebpages(Webserver* webserver) {
+void CatalogServer::RegisterWebpages(Webserver* webserver, bool metrics_only) {
   Webserver::RawUrlCallback healthz_callback =
       [this](const auto& req, auto* data, auto* response) {
         return this->HealthzHandler(req, data, response);
       };
   webserver->RegisterUrlCallback(CATALOG_SERVICE_HEALTH_WEB_PAGE, healthz_callback);
+
+  if (metrics_only) return;
+
   webserver->RegisterUrlCallback(CATALOG_WEB_PAGE, CATALOG_TEMPLATE,
       [this](const auto& args, auto* doc) { this->CatalogUrlCallback(args, doc); }, true);
   webserver->RegisterUrlCallback(CATALOG_OBJECT_WEB_PAGE, CATALOG_OBJECT_TEMPLATE,
@@ -355,10 +604,12 @@ void CatalogServer::RegisterWebpages(Webserver* webserver) {
       false);
   webserver->RegisterUrlCallback(EVENT_WEB_PAGE, EVENT_METRICS_TEMPLATE,
       [this](const auto& args, auto* doc) { this->EventMetricsUrlCallback(args, doc); },
-      false);
+      true);
   webserver->RegisterUrlCallback(CATALOG_OPERATIONS_WEB_PAGE, CATALOG_OPERATIONS_TEMPLATE,
       [this](const auto& args, auto* doc) { this->OperationUsageUrlCallback(args, doc); },
       true);
+  webserver->RegisterUrlCallback(HADOOP_VARZ_WEB_PAGE, HADOOP_VARZ_TEMPLATE,
+      [this](const auto& args, auto* doc) { this->HadoopVarzHandler(args, doc); }, true);
   RegisterLogLevelCallbacks(webserver, true);
 }
 
@@ -370,10 +621,10 @@ void CatalogServer::UpdateCatalogTopicCallback(
   if (topic == incoming_topic_deltas.end()) return;
 
   unique_lock<mutex> l(catalog_lock_, std::try_to_lock);
-  // Return if unable to acquire the catalog_lock_ or if the topic update data is
-  // not yet ready for processing. This indicates the catalog_update_gathering_thread_
-  // is still building a topic update.
-  if (!l || !topic_updates_ready_) return;
+  // Return if unable to acquire the catalog_lock_, or this instance is not active,
+  // or if the topic update data is not yet ready for processing. This indicates the
+  // catalog_update_gathering_thread_ is still building a topic update.
+  if (!l || !is_active_ || !topic_updates_ready_) return;
 
   const TTopicDelta& delta = topic->second;
 
@@ -409,6 +660,81 @@ void CatalogServer::UpdateCatalogTopicCallback(
   // Signal the catalog update gathering thread to start.
   topic_updates_ready_ = false;
   catalog_update_cv_.NotifyOne();
+}
+
+void CatalogServer::UpdateActiveCatalogd(bool is_registration_reply,
+    int64_t active_catalogd_version, const TCatalogRegistration& catalogd_registration) {
+  lock_guard<mutex> l(catalog_lock_);
+  if (!active_catalogd_version_checker_->CheckActiveCatalogdVersion(
+          is_registration_reply, active_catalogd_version)) {
+    return;
+  }
+  if (catalogd_registration.address.hostname.empty()
+      || catalogd_registration.address.port == 0) {
+    return;
+  }
+  LOG(INFO) << "Get notification of active catalogd: "
+            << TNetworkAddressToString(catalogd_registration.address);
+  bool is_matching = (catalogd_registration.address.hostname == FLAGS_hostname
+      && catalogd_registration.address.port == FLAGS_catalog_service_port);
+  if (is_matching) {
+    if (!is_active_) {
+      is_active_ = true;
+      active_status_metric_->SetValue(true);
+      num_ha_active_status_change_metric_->Increment(1);
+      // Reset last_sent_catalog_version_ when the catalogd become active. This will
+      // lead to non-delta catalog update for next IMPALA_CATALOG_TOPIC which also
+      // instruct the statestore to clear all entries for the catalog update topic.
+      last_sent_catalog_version_ = 0;
+      // Regenerate Catalog Service ID.
+      catalog_->RegenerateServiceId();
+      // Clear pending topic updates.
+      pending_topic_updates_.clear();
+      if (FLAGS_catalogd_ha_reset_metadata_on_failover) {
+        // Reset all metadata when the catalogd becomes active.
+        TResetMetadataRequest req;
+        TResetMetadataResponse resp;
+        req.__set_header(TCatalogServiceRequestHeader());
+        req.header.__set_want_minimal_response(false);
+        req.__set_is_refresh(false);
+        req.__set_sync_ddl(false);
+        Status status = catalog_->ResetMetadata(req, &resp);
+        if (!status.ok()) {
+          LOG(ERROR) << "Failed to reset metadata triggered by catalogd failover.";
+        }
+      } else {
+        // Refresh DataSource objects when the catalogd becomes active.
+        Status status = catalog_->RefreshDataSources();
+        if (!status.ok()) {
+          LOG(ERROR) << "Failed to refresh data sources triggered by catalogd failover.";
+        }
+      }
+      // Signal the catalog update gathering thread to start.
+      topic_updates_ready_ = false;
+      catalog_update_cv_.NotifyOne();
+      LOG(INFO) << "This catalogd instance is changed to active status";
+    }
+  } else {
+    if (is_active_) {
+      is_active_ = false;
+      active_status_metric_->SetValue(false);
+      num_ha_active_status_change_metric_->Increment(1);
+      LOG(INFO) << "This catalogd instance is changed to inactive status. "
+                << "Current active catalogd: "
+                << TNetworkAddressToString(catalogd_registration.address)
+                << ", active_catalogd_version: "
+                << active_catalogd_version;
+      // Regenerate Catalog Service ID.
+      catalog_->RegenerateServiceId();
+    }
+  }
+
+  is_ha_determined_ = true;
+}
+
+bool CatalogServer::IsActive() {
+  lock_guard<mutex> l(catalog_lock_);
+  return is_active_;
 }
 
 [[noreturn]] void CatalogServer::GatherCatalogUpdatesThread() {
@@ -461,6 +787,23 @@ void CatalogServer::UpdateCatalogTopicCallback(
     }
     partial_fetch_rpc_queue_len_metric_->SetValue(
         response.catalog_partial_fetch_rpc_queue_len);
+    num_file_metadata_loading_threads_metric_->SetValue(
+        response.catalog_num_file_metadata_loading_threads);
+    num_file_metadata_loading_tasks_metric_->SetValue(
+        response.catalog_num_file_metadata_loading_tasks);
+    num_tables_loading_file_metadata_metric_->SetValue(
+        response.catalog_num_tables_loading_file_metadata);
+    num_tables_loading_metadata_metric_->SetValue(
+        response.catalog_num_tables_loading_metadata);
+    num_tables_async_loading_metadata_metric_->SetValue(
+        response.catalog_num_tables_async_loading_metadata);
+    num_tables_waiting_for_async_loading_metric_->SetValue(
+        response.catalog_num_tables_waiting_for_async_loading);
+    num_dbs_metric_->SetValue(response.catalog_num_dbs);
+    num_tables_metric_->SetValue(response.catalog_num_tables);
+    num_functions_metric_->SetValue(response.catalog_num_functions);
+    num_hms_clients_idle_metric_->SetValue(response.catalog_num_hms_clients_idle);
+    num_hms_clients_in_use_metric_->SetValue(response.catalog_num_hms_clients_in_use);
     TEventProcessorMetrics eventProcessorMetrics = response.event_metrics;
     MetastoreEventMetrics::refresh(&eventProcessorMetrics);
   }
@@ -654,18 +997,84 @@ void CatalogServer::GetCatalogUsage(Document* document) {
 
 void CatalogServer::EventMetricsUrlCallback(
     const Webserver::WebRequest& req, Document* document) {
+  auto& allocator = document->GetAllocator();
   TEventProcessorMetricsSummaryResponse event_processor_summary_response;
   Status status = catalog_->GetEventProcessorSummary(&event_processor_summary_response);
   if (!status.ok()) {
-    Value error(status.GetDetail().c_str(), document->GetAllocator());
-    document->AddMember("error", error, document->GetAllocator());
+    Value error(status.GetDetail().c_str(), allocator);
+    document->AddMember("error", error, allocator);
     return;
   }
 
   Value event_processor_summary(
-      event_processor_summary_response.summary.c_str(), document->GetAllocator());
-  document->AddMember(
-      "event_processor_metrics", event_processor_summary, document->GetAllocator());
+      event_processor_summary_response.summary.c_str(), allocator);
+  document->AddMember("event_processor_metrics", event_processor_summary, allocator);
+  if (event_processor_summary_response.__isset.error_msg) {
+    Value error_msg(event_processor_summary_response.error_msg.c_str(), allocator);
+    document->AddMember("event_processor_error_msg", error_msg, allocator);
+  }
+  const TEventBatchProgressInfo& progress_info =
+      event_processor_summary_response.progress;
+  JsonObjWrapper progress_info_obj(allocator);
+  // Add lag info
+  progress_info_obj.AddMember("last_synced_event_id", progress_info.last_synced_event_id);
+  progress_info_obj.AddMember("last_synced_event_time_s",
+      progress_info.last_synced_event_time_s);
+  progress_info_obj.AddMember("latest_event_id", progress_info.latest_event_id);
+  progress_info_obj.AddMember("latest_event_time_s", progress_info.latest_event_time_s);
+  int64_t lag_time = max(0L,
+      progress_info.latest_event_time_s - progress_info.last_synced_event_time_s);
+  progress_info_obj.AddMember("lag_time",
+      PrettyPrinter::Print(lag_time, TUnit::TIME_S));
+  progress_info_obj.AddMember("last_synced_event_time",
+      ToStringFromUnix(progress_info.last_synced_event_time_s));
+  progress_info_obj.AddMember("latest_event_time",
+      ToStringFromUnix(progress_info.latest_event_time_s));
+  // Add current batch info
+  if (progress_info.num_hms_events > 0) {
+    int progress = 0;
+    if (progress_info.num_filtered_events > 0) {
+      progress =
+          100 * progress_info.current_event_index / progress_info.num_filtered_events;
+    }
+    int64_t now_ms = UnixMillis();
+    int64_t elapsed_ms = max(0L, now_ms - progress_info.current_batch_start_time_ms);
+    progress_info_obj.AddMember("num_hms_events", progress_info.num_hms_events);
+    progress_info_obj.AddMember("num_filtered_events", progress_info.num_filtered_events);
+    progress_info_obj.AddMember("num_synced_events", progress_info.current_event_index);
+    progress_info_obj.AddMember("synced_percent", progress);
+    progress_info_obj.AddMember("min_event_id", progress_info.min_event_id);
+    progress_info_obj.AddMember("max_event_id", progress_info.max_event_id);
+    progress_info_obj.AddMember("min_event_time",
+        ToStringFromUnix(progress_info.min_event_time_s));
+    progress_info_obj.AddMember("max_event_time",
+        ToStringFromUnix(progress_info.max_event_time_s));
+    progress_info_obj.AddMember("start_time",
+        ToStringFromUnixMillis(progress_info.current_batch_start_time_ms));
+    progress_info_obj.AddMember("elapsed_time",
+        PrettyPrinter::Print(elapsed_ms, TUnit::TIME_MS));
+    progress_info_obj.AddMember("start_time_of_event",
+        ToStringFromUnixMillis(progress_info.current_event_start_time_ms));
+    progress_info_obj.AddMember("elapsed_time_current_event",
+        PrettyPrinter::Print(max(0L,
+            now_ms - progress_info.current_event_start_time_ms), TUnit::TIME_MS));
+    if (progress_info.__isset.current_event) {
+      JsonObjWrapper current_event(allocator);
+      current_event.AddMember("event_id", progress_info.current_event.eventId);
+      current_event.AddMember("event_time",
+          ToStringFromUnix(progress_info.current_event.eventTime));
+      current_event.AddMember("event_type", progress_info.current_event.eventType);
+      current_event.AddMember("cat_name", progress_info.current_event.catName);
+      current_event.AddMember("db_name", progress_info.current_event.dbName);
+      current_event.AddMember("tbl_name", progress_info.current_event.tableName);
+      progress_info_obj.value.AddMember("current_event", current_event.value, allocator);
+    }
+    if (progress_info.current_event_batch_size > 1) {
+      progress_info_obj.AddMember("current_event_batch_size",
+          progress_info.current_event_batch_size);
+    }
+  }
+  document->AddMember("progress-info", progress_info_obj.value, allocator);
 }
 
 void CatalogServer::CatalogObjectsUrlCallback(const Webserver::WebRequest& req,
@@ -717,17 +1126,22 @@ void CatalogServer::CatalogObjectsUrlCallback(const Webserver::WebRequest& req,
 
 void CatalogServer::OperationUsageUrlCallback(
     const Webserver::WebRequest& req, Document* document) {
-  TGetOperationUsageResponse opeartion_usage;
-  Status status = catalog_->GetOperationUsage(&opeartion_usage);
+  TGetOperationUsageResponse operation_usage;
+  Status status = catalog_->GetOperationUsage(&operation_usage);
   if (!status.ok()) {
     Value error(status.GetDetail().c_str(), document->GetAllocator());
     document->AddMember("error", error, document->GetAllocator());
     return;
   }
+  GetCatalogOpSummary(operation_usage, document);
+  GetCatalogOpRecords(operation_usage, document);
+}
 
+void CatalogServer::GetCatalogOpSummary(const TGetOperationUsageResponse& operation_usage,
+    Document* document) {
   // Add the catalog operation counters to the document
   Value catalog_op_list(kArrayType);
-  for (const auto& catalog_op : opeartion_usage.catalog_op_counters) {
+  for (const auto& catalog_op : operation_usage.catalog_op_counters) {
     Value catalog_op_obj(kObjectType);
     Value op_name(catalog_op.catalog_op_name.c_str(), document->GetAllocator());
     catalog_op_obj.AddMember("catalog_op_name", op_name, document->GetAllocator());
@@ -742,7 +1156,7 @@ void CatalogServer::OperationUsageUrlCallback(
 
   // Create a summary and add it to the document
   map<string, int> aggregated_operations;
-  for (const auto& catalog_op : opeartion_usage.catalog_op_counters) {
+  for (const auto& catalog_op : operation_usage.catalog_op_counters) {
     aggregated_operations[catalog_op.catalog_op_name] += catalog_op.op_counter;
   }
   Value catalog_op_summary(kArrayType);
@@ -758,6 +1172,77 @@ void CatalogServer::OperationUsageUrlCallback(
   document->AddMember("catalog_op_summary", catalog_op_summary, document->GetAllocator());
 }
 
+static void CatalogOpListToJson(const vector<TCatalogOpRecord>& catalog_ops,
+    Value* catalog_op_list, Document* document) {
+  for (const auto& catalog_op : catalog_ops) {
+    Value obj(kObjectType);
+    Value op_name(catalog_op.catalog_op_name.c_str(), document->GetAllocator());
+    obj.AddMember("catalog_op_name", op_name, document->GetAllocator());
+
+    Value thread_id;
+    thread_id.SetInt64(catalog_op.thread_id);
+    obj.AddMember("thread_id", thread_id, document->GetAllocator());
+
+    Value query_id(PrintId(catalog_op.query_id).c_str(), document->GetAllocator());
+    obj.AddMember("query_id", query_id, document->GetAllocator());
+
+    Value client_ip(catalog_op.client_ip.c_str(), document->GetAllocator());
+    obj.AddMember("client_ip", client_ip, document->GetAllocator());
+
+    Value coordinator(catalog_op.coordinator_hostname.c_str(), document->GetAllocator());
+    obj.AddMember("coordinator", coordinator, document->GetAllocator());
+
+    Value user(catalog_op.user.c_str(), document->GetAllocator());
+    obj.AddMember("user", user, document->GetAllocator());
+
+    Value target_name(catalog_op.target_name.c_str(), document->GetAllocator());
+    obj.AddMember("target_name", target_name, document->GetAllocator());
+
+    Value start_time(ToStringFromUnixMillis(catalog_op.start_time_ms,
+        TimePrecision::Millisecond).c_str(), document->GetAllocator());
+    obj.AddMember("start_time", start_time, document->GetAllocator());
+
+    int64_t end_time_ms;
+    if (catalog_op.finish_time_ms > 0) {
+      end_time_ms = catalog_op.finish_time_ms;
+      Value finish_time(ToStringFromUnixMillis(catalog_op.finish_time_ms,
+          TimePrecision::Millisecond).c_str(), document->GetAllocator());
+      obj.AddMember("finish_time", finish_time, document->GetAllocator());
+    } else {
+      end_time_ms = UnixMillis();
+    }
+
+    int64_t duration_ms = end_time_ms - catalog_op.start_time_ms;
+    const string& printed_duration = PrettyPrinter::Print(duration_ms, TUnit::TIME_MS);
+    Value duration(printed_duration.c_str(), document->GetAllocator());
+    obj.AddMember("duration", duration, document->GetAllocator());
+
+    Value status(catalog_op.status.c_str(), document->GetAllocator());
+    obj.AddMember("status", status, document->GetAllocator());
+
+    Value details(catalog_op.details.c_str(), document->GetAllocator());
+    obj.AddMember("details", details, document->GetAllocator());
+
+    catalog_op_list->PushBack(obj, document->GetAllocator());
+  }
+}
+
+void CatalogServer::GetCatalogOpRecords(const TGetOperationUsageResponse& response,
+    Document* document) {
+  Value inflight_catalog_ops(kArrayType);
+  CatalogOpListToJson(response.in_flight_catalog_operations, &inflight_catalog_ops,
+      document);
+  document->AddMember("inflight_catalog_operations", inflight_catalog_ops,
+      document->GetAllocator());
+  document->AddMember("num_inflight_catalog_ops",
+      response.in_flight_catalog_operations.size(), document->GetAllocator());
+  Value finished_catalog_ops(kArrayType);
+  CatalogOpListToJson(response.finished_catalog_operations, &finished_catalog_ops,
+      document);
+  document->AddMember("finished_catalog_operations", finished_catalog_ops,
+      document->GetAllocator());
+}
+
 void CatalogServer::TableMetricsUrlCallback(const Webserver::WebRequest& req,
     Document* document) {
   const auto& args = req.parsed_args;
@@ -766,7 +1251,7 @@ void CatalogServer::TableMetricsUrlCallback(const Webserver::WebRequest& req,
   if (object_name_arg != args.end()) {
     // Parse the object name to extract database and table names
     const string& full_tbl_name = object_name_arg->second;
-    int pos = full_tbl_name.find(".");
+    int pos = full_tbl_name.find('.');
     if (pos == string::npos || pos >= full_tbl_name.size() - 1) {
       stringstream error_msg;
       error_msg << "Invalid table name: " << full_tbl_name;
@@ -828,6 +1313,31 @@ void CatalogServer::HealthzHandler(
   }
   *(data) << "Not Available";
   *response = HttpStatusCode::ServiceUnavailable;
+}
+
+void CatalogServer::HadoopVarzHandler(const Webserver::WebRequest& req,
+    Document* document) {
+  TGetAllHadoopConfigsResponse response;
+  Status status  = catalog_->GetAllHadoopConfigs(&response);
+  if (!status.ok()) {
+    LOG(ERROR) << "Error getting cluster configuration for hadoop-varz: "
+               << status.GetDetail();
+    Value error(status.GetDetail().c_str(), document->GetAllocator());
+    document->AddMember("error", error, document->GetAllocator());
+    return;
+  }
+
+  Value configs(kArrayType);
+  typedef map<string, string> ConfigMap;
+  for (const auto& config: response.configs) {
+    Value key(config.first.c_str(), document->GetAllocator());
+    Value value(config.second.c_str(), document->GetAllocator());
+    Value config_json(kObjectType);
+    config_json.AddMember("key", key, document->GetAllocator());
+    config_json.AddMember("value", value, document->GetAllocator());
+    configs.PushBack(config_json, document->GetAllocator());
+  }
+  document->AddMember("configs", configs, document->GetAllocator());
 }
 
 }

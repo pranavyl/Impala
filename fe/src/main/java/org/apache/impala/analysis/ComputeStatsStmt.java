@@ -260,17 +260,23 @@ public class ComputeStatsStmt extends StatementBase {
       }
       if (ignoreColumn(c)) continue;
 
-      // NDV approximation function. Add explicit alias for later identification when
-      // updating the Metastore.
       String colRefSql = ToSqlUtils.getIdentSql(c.getName());
-      if (isIncremental_) {
-        columnStatsSelectList.add("NDV_NO_FINALIZE(" + colRefSql + ") AS " + colRefSql);
-      } else if (isSampling()) {
-        columnStatsSelectList.add(String.format("SAMPLED_NDV(%s, %.10f) AS %s",
-            colRefSql, effectiveSamplePerc_, colRefSql));
+
+      if (c.getType().isBinary()) {
+        // NDV is not calculated for BINARY columns (similarly to Hive).
+        columnStatsSelectList.add("NULL AS " + colRefSql);
       } else {
-        // Regular (non-incremental) compute stats without sampling.
-        columnStatsSelectList.add("NDV(" + colRefSql + ") AS " + colRefSql);
+        // NDV approximation function. Add explicit alias for later identification when
+        // updating the Metastore.
+        if (isIncremental_) {
+          columnStatsSelectList.add("NDV_NO_FINALIZE(" + colRefSql + ") AS " + colRefSql);
+        } else if (isSampling()) {
+          columnStatsSelectList.add(String.format("SAMPLED_NDV(%s, %.10f) AS %s",
+              colRefSql, effectiveSamplePerc_, colRefSql));
+        } else {
+          // Regular (non-incremental) compute stats without sampling.
+          columnStatsSelectList.add("NDV(" + colRefSql + ") AS " + colRefSql);
+        }
       }
 
       // Count the number of NULL values.
@@ -397,12 +403,24 @@ public class ComputeStatsStmt extends StatementBase {
       throw new AnalysisException(String.format(
           "COMPUTE STATS not supported for nested collection: %s", tableName_));
     }
+    if (tableRef instanceof SystemTableRef) {
+      throw new AnalysisException(String.format(
+          "COMPUTE STATS not supported for system table: %s", tableName_));
+    }
     table_ = analyzer.getTable(tableName_, Privilege.ALTER, Privilege.SELECT);
 
     if (!(table_ instanceof FeFsTable)) {
       if (partitionSet_ != null) {
         throw new AnalysisException("COMPUTE INCREMENTAL ... PARTITION not supported " +
             "for non-HDFS table " + tableName_);
+      }
+      isIncremental_ = false;
+    }
+
+    if (table_ instanceof FeIcebergTable) {
+      if (partitionSet_ != null) {
+        throw new AnalysisException("COMPUTE INCREMENTAL ... PARTITION not supported " +
+            "for Iceberg table " + tableName_);
       }
       isIncremental_ = false;
     }
@@ -816,9 +834,8 @@ public class ComputeStatsStmt extends StatementBase {
     // TODO(todd): can we avoid loading all the partitions for this?
     Collection<? extends FeFsPartition> partitions =
         FeCatalogUtils.loadAllPartitions(hdfsTable);
-    Map<HdfsScanNode.SampledPartitionMetadata, List<FileDescriptor>> sample =
-            FeFsTable.Utils.getFilesSample(hdfsTable,
-        partitions, samplePerc, minSampleBytes, sampleSeed);
+    Map<Long, List<FileDescriptor>> sample = FeFsTable.Utils.getFilesSample(
+        hdfsTable, partitions, samplePerc, minSampleBytes, sampleSeed);
     long sampleFileBytes = 0;
     for (List<FileDescriptor> fds: sample.values()) {
       for (FileDescriptor fd: fds) sampleFileBytes += fd.getFileLength();
@@ -1005,6 +1022,18 @@ public class ComputeStatsStmt extends StatementBase {
       }
     }
     return false;
+  }
+
+  public PartitionSet getPartitionSet() {
+    return partitionSet_;
+  }
+
+  public TableName getTableName() {
+    return tableName_;
+  }
+
+  public boolean isIncremental() {
+    return isIncremental_;
   }
 
   @Override

@@ -19,26 +19,33 @@
 #ifndef IMPALA_RUNTIME_KRPC_DATA_STREAM_SENDER_H
 #define IMPALA_RUNTIME_KRPC_DATA_STREAM_SENDER_H
 
-#include <vector>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
-#include "exec/data-sink.h"
 #include "codegen/impala-ir.h"
 #include "common/global-types.h"
 #include "common/object-pool.h"
 #include "common/status.h"
+#include "exec/data-sink.h"
 #include "exprs/scalar-expr.h"
-#include "runtime/row-batch.h"
+#include "runtime/mem-tracker.h"
+#include "runtime/outbound-row-batch.h"
+#include "util/container-util.h"
 #include "util/runtime-profile.h"
+
+#include "gen-cpp/common.pb.h"
 
 namespace impala {
 
 class KrpcDataStreamSender;
 class MemTracker;
+class NetworkAddressPB;
+class PlanFragmentDestinationPB;
+class RowBatch;
 class RowDescriptor;
 class TDataStreamSink;
 class TNetworkAddress;
-class PlanFragmentDestinationPB;
 
 class KrpcDataStreamSenderConfig : public DataSinkConfig {
  public:
@@ -103,7 +110,7 @@ class KrpcDataStreamSender : public DataSink {
   /// 'per_channel_buffer_size' is the soft limit in bytes of the buffering into the
   /// per-channel's accumulating row batch before it will be sent.
   /// NOTE: supported partition types are UNPARTITIONED (broadcast), HASH_PARTITIONED,
-  /// and RANDOM.
+  /// KUDU, RANDOM, and DIRECTED (used for sending rows from Iceberg delete files).
   KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
       const KrpcDataStreamSenderConfig& sink_config, const TDataStreamSink& sink,
       const google::protobuf::RepeatedPtrField<PlanFragmentDestinationPB>& destinations,
@@ -156,12 +163,43 @@ class KrpcDataStreamSender : public DataSink {
 
  private:
   class Channel;
+  class IcebergPositionDeleteChannel;
+
+  // Per partition structure to collect rows before sending the OutboundRowBatch to
+  // Channel. Only used in HASH/KUDU partitioning.
+  struct PartitionRowCollector {
+    std::unique_ptr<OutboundRowBatch> collector_batch_;
+    Channel* channel_ = nullptr;
+    int num_rows_ = 0;
+    int row_batch_capacity_ = 0;
+
+    // Copies a single row into collector_batch_ and flushes it (SendCurrentBatch())
+    // once row count or memory capacity is reached. This call may block if capacity is
+    // reached and channel_'s preceding RPC is still in progress. Returns error status
+    // if serialization failed or if the preceding RPC failed. Returns OK otherwise.
+    Status IR_ALWAYS_INLINE AppendRow(
+        const TupleRow* row, const RowDescriptor* row_desc);
+
+    // Finalizes and compresses collector_batch_ and sends it with channel_'s
+    // TransmitData(). This call may block if channel_'s preceding RPC is still
+    // in progress. Swaps collector_batch_ with the channel's outbound_batch_.
+    // Returns error status if compression failed or if the preceding RPC failed.
+    // Returns OK otherwise.
+    Status SendCurrentBatch();
+  };
+  std::vector<PartitionRowCollector> partition_row_collectors_;
 
   /// Serializes the src batch into the serialized row batch 'dest' and updates
   /// various stat counters.
+  /// 'compress' decides whether compression is attempted after serialization.
   /// 'num_receivers' is the number of receivers this batch will be sent to. Used for
   /// updating the stat counters.
-  Status SerializeBatch(RowBatch* src, OutboundRowBatch* dest, int num_receivers = 1);
+  Status SerializeBatch(
+      RowBatch* src, OutboundRowBatch* dest, bool compress, int num_receivers = 1);
+
+  // Like SerializeBatch, but the batch is already serialized and only compression is
+  // needed.
+  Status PrepareBatchForSend(OutboundRowBatch* batch, bool compress);
 
   /// Returns 'partition_expr_evals_[i]'. Used by the codegen'd HashRow() IR function.
   ScalarExprEvaluator* GetPartitionExprEvaluator(int i);
@@ -172,7 +210,7 @@ class KrpcDataStreamSender : public DataSink {
 
   /// Evaluates the input row against partition expressions and hashes the expression
   /// values. Returns the final hash value.
-  uint64_t HashRow(TupleRow* row);
+  uint64_t HashRow(TupleRow* row, uint64_t seed);
 
   /// Used when 'partition_type_' is HASH_PARTITIONED. Call HashRow() against each row
   /// in the input batch and adds it to the corresponding channel based on the hash value.
@@ -180,8 +218,11 @@ class KrpcDataStreamSender : public DataSink {
   /// insertion into the channel fails. Returns OK status otherwise.
   Status HashAndAddRows(RowBatch* batch);
 
-  /// Adds the given row to 'channels_[channel_id]'.
-  Status AddRowToChannel(const int channel_id, TupleRow* row);
+  /// Functions to dump the content of the "filename to hosts" related mappings into logs.
+  void DumpFilenameToHostsMapping() const;
+  void DumpDestinationHosts() const;
+
+  bool IsDirectedMode() const { return !filepath_to_hosts_.empty(); }
 
   /// Sender instance id, unique within a fragment.
   const int sender_id_;
@@ -198,15 +239,20 @@ class KrpcDataStreamSender : public DataSink {
   /// Index of the current channel to send to if random_ == true.
   int current_channel_idx_ = 0;
 
-  /// Index of the next OutboundRowBatch to use for serialization.
-  int next_batch_idx_ = 0;
+  /// Pointer to OutboundRowBatch that will be used for serialization.
+  /// Swapped with in_flight_batch_ (UNPARTITIONED case) or the channel's outbound_batch_
+  /// (PARTITIONED case) after serialization.
+  std::unique_ptr<OutboundRowBatch> serialization_batch_;
 
-  /// The outbound row batches are double-buffered so that we can serialize the next
-  /// batch while the other is still referenced by the in-flight RPC. Each entry contains
-  /// a RowBatchHeaderPB and buffers for the serialized tuple offsets and data. Used only
-  /// when the partitioning strategy is UNPARTITIONED.
-  static const int NUM_OUTBOUND_BATCHES = 2;
-  OutboundRowBatch outbound_batches_[NUM_OUTBOUND_BATCHES];
+  /// Buffer used for compression after serialization. Swapped with the OutboundRowBatch's
+  /// tuple_data_ if the compressed data is smaller.
+  std::unique_ptr<TrackedString> compression_scratch_;
+
+  /// Pointer to OutboundRowBatch referenced by the in-flight RPC(s). Used only
+  /// when the partitioning strategy is UNPARTITIONED. In the broadcasting case
+  /// multiple channels use it at the same time to hold the buffers backing the RPC
+  /// sidecars.
+  std::unique_ptr<OutboundRowBatch> in_flight_batch_;
 
   /// If true, this sender has called FlushFinal() successfully.
   /// Not valid to call Send() anymore.
@@ -220,14 +266,23 @@ class KrpcDataStreamSender : public DataSink {
   const std::vector<ScalarExpr*>& partition_exprs_;
   std::vector<ScalarExprEvaluator*> partition_expr_evals_;
 
-  /// Time for serializing row batches.
+  /// Time for serializing row batches. In case of Kudu/Hash partitioning
+  /// this mainly included compression time, while in other cases also
+  /// contains deep copying tuples to OutboundRowBatch.
   RuntimeProfile::Counter* serialize_batch_timer_ = nullptr;
+
+  /// "Active" time spent in TransmitData(). Waiting for the previous RPC to
+  /// finish is not included.
+  RuntimeProfile::Counter* transmit_data_timer_ = nullptr;
 
   /// Number of TransmitData() RPC retries due to remote service being busy.
   RuntimeProfile::Counter* rpc_retry_counter_ = nullptr;
 
   /// Total number of times RPC fails or the remote responds with a non-retryable error.
   RuntimeProfile::Counter* rpc_failure_counter_ = nullptr;
+
+  /// Total number of successful TransmitData() and EndDataStream() RPCs.
+  RuntimeProfile::Counter* rpc_success_counter_ = nullptr;
 
   /// Total number of bytes sent. Updated on RPC completion.
   RuntimeProfile::Counter* bytes_sent_counter_ = nullptr;
@@ -261,6 +316,11 @@ class KrpcDataStreamSender : public DataSink {
   /// Identifier of the destination plan node.
   PlanNodeId dest_node_id_;
 
+  /// Memory tracker from Parent Memory Tracker for tracking memory of OutBoundRowBatch
+  /// serialization
+  std::shared_ptr<MemTracker> outbound_rb_mem_tracker_;
+  std::shared_ptr<CharMemTrackerAllocator> char_mem_tracker_allocator_;
+
   /// Used for Kudu partitioning to round-robin rows that don't correspond to a partition
   /// or when errors are encountered.
   int next_unknown_partition_;
@@ -271,6 +331,19 @@ class KrpcDataStreamSender : public DataSink {
   /// Pointer for the codegen'd HashAndAddRows() function.
   /// NULL if codegen is disabled or failed.
   const CodegenFnPtr<KrpcDataStreamSenderConfig::HashAndAddRowsFn>& hash_and_add_rows_fn_;
+
+  /// Mapping to store which data file is read on which hosts.
+  const std::unordered_map<std::string, std::vector<NetworkAddressPB>>&
+      filepath_to_hosts_;
+
+  /// A mapping between host addresses to channels. Used for DIRECTED distribution mode
+  /// where only one channel is associated with each host address.
+  std::unordered_map<NetworkAddressPB, Channel*> host_to_channel_;
+  /// A mapping from Channel to IcebergPositionDeleteChannel. Only used in DIRECTED mode
+  /// where IcebergPositionDeleteChannel applies a specific serialization algorithm on
+  /// position delete records.
+  std::unordered_map<Channel*, std::unique_ptr<IcebergPositionDeleteChannel>>
+    channel_to_ice_channel_;
 };
 
 } // namespace impala

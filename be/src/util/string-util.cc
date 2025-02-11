@@ -58,7 +58,7 @@ Status TruncateUp(const string& str, int32_t max_length, string* result) {
 bool CommaSeparatedContains(const std::string& cs_list, const std::string& item) {
   size_t pos = 0;
   while (pos < cs_list.size()) {
-    size_t comma_pos = cs_list.find(",", pos);
+    size_t comma_pos = cs_list.find(',', pos);
     if (comma_pos == string::npos) return cs_list.compare(pos, string::npos, item) == 0;
     if (cs_list.compare(pos, comma_pos - pos, item) == 0) return true;
     pos = comma_pos + 1;
@@ -102,7 +102,7 @@ int FindUtf8PosForward(const uint8_t* ptr, const int len, int index) {
       --index;
     }
     if (index == 0 || pos == len) break;
-    pos += BitUtil::NumBytesInUTF8Encoding(ptr[pos]);
+    pos += BitUtil::NumBytesInUtf8Encoding(ptr[pos]);
     --index;
   }
   if (pos >= len) return len;
@@ -123,7 +123,7 @@ int FindUtf8PosBackward(const uint8_t* ptr, const int len, int index) {
       return -1;
     }
     // Get bytes length of the located character.
-    int bytes_len = BitUtil::NumBytesInUTF8Encoding(ptr[pos]);
+    int bytes_len = BitUtil::NumBytesInUtf8Encoding(ptr[pos]);
     // If there are not enough bytes after the first byte, i.e. last_pos-pos < bytes_len,
     // we consider the bytes belong to a malformed character, and count them as one
     // character.
@@ -143,4 +143,11 @@ int FindUtf8PosBackward(const uint8_t* ptr, const int len, int index) {
   DCHECK_EQ(pos, -1);
   return -1;
 }
+
+void StringStreamPop::move_back() {
+  if (tellp() > 0) {
+    seekp(-1, std::ios_base::cur);
+  }
+}
+
 }

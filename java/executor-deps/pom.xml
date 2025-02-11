@@ -34,7 +34,7 @@ under the License.
   <parent>
     <groupId>org.apache.impala</groupId>
     <artifactId>impala-parent</artifactId>
-    <version>4.0.0-SNAPSHOT</version>
+    <version>4.5.0-SNAPSHOT</version>
   </parent>
   <modelVersion>4.0.0</modelVersion>
   <groupId>org.apache.impala</groupId>
@@ -44,14 +44,6 @@ under the License.
   <name>Impala Executor Dependencies</name>
 
   <dependencies>
-
-    <!-- Pin json-smart dependency. -->
-    <dependency>
-      <groupId>net.minidev</groupId>
-      <artifactId>json-smart</artifactId>
-      <version>${json-smart.version}</version>
-    </dependency>
-
     <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-hdfs-client</artifactId>
@@ -63,11 +55,6 @@ under the License.
       <artifactId>hadoop-common</artifactId>
       <version>${hadoop.version}</version>
       <exclusions>
-        <!-- Exclude json-smart to pin the version -->
-        <exclusion>
-          <groupId>net.minidev</groupId>
-          <artifactId>json-smart</artifactId>
-        </exclusion>
         <exclusion>
           <groupId>org.eclipse.jetty</groupId>
           <artifactId>*</artifactId>
@@ -85,12 +72,22 @@ under the License.
           <groupId>com.sun.jersey</groupId>
           <artifactId>jersey-servlet</artifactId>
         </exclusion>
+        <exclusion>
+          <groupId>log4j</groupId>
+          <artifactId>log4j</artifactId>
+        </exclusion>
       </exclusions>
     </dependency>
 
+    <!--
+       hadoop-cloud-storage includes several dependencies that Impala needs:
+       Hadoop's AWS support, Azure support, GCS connector, Knox support, etc.
+       hadoop-cloud-storage has been carefully tuned to include the right shaded
+       dependencies.
+    -->
     <dependency>
       <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-aws</artifactId>
+      <artifactId>hadoop-cloud-storage</artifactId>
       <version>${hadoop.version}</version>
       <!-- Exclude the aws-java-sdk-bundle dependency because the Impala minimal
            version of this dependency is used instead. -->
@@ -98,6 +95,26 @@ under the License.
         <exclusion>
           <groupId>com.amazonaws</groupId>
           <artifactId>aws-java-sdk-bundle</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>com.cloudera</groupId>
+          <artifactId>jwtprovider-api</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>com.cloudera</groupId>
+          <artifactId>jwtprovider-knox</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>org.eclipse.jetty</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>log4j</groupId>
+          <artifactId>log4j</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>org.apache.logging.log4j</groupId>
+          <artifactId>log4j-slf4j-impl</artifactId>
         </exclusion>
       </exclusions>
     </dependency>
@@ -115,58 +132,26 @@ under the License.
     </dependency>
 
     <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-azure</artifactId>
-      <version>${hadoop.version}</version>
-      <exclusions>
-        <exclusion>
-          <groupId>org.eclipse.jetty</groupId>
-          <artifactId>*</artifactId>
-        </exclusion>
-      </exclusions>
-    </dependency>
-
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-azure-datalake</artifactId>
-      <version>${hadoop.version}</version>
-    </dependency>
-
-    <dependency>
-        <groupId>com.google.cloud.bigdataoss</groupId>
-        <artifactId>gcs-connector</artifactId>
-        <version>${gcs.version}</version>
-    </dependency>
-
-    <dependency>
       <groupId>com.qcloud.cos</groupId>
       <artifactId>hadoop-cos</artifactId>
       <version>${cos.version}</version>
     </dependency>
 
     <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-aliyun</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+
+    <dependency>
       <groupId>org.apache.hbase</groupId>
       <artifactId>hbase-client</artifactId>
       <version>${hbase.version}</version>
-      <exclusions>
-        <!-- Exclude json-smart to pin the version -->
-        <exclusion>
-          <groupId>net.minidev</groupId>
-          <artifactId>json-smart</artifactId>
-        </exclusion>
-      </exclusions>
     </dependency>
 
     <dependency>
       <groupId>org.apache.hbase</groupId>
       <artifactId>hbase-common</artifactId>
-      <exclusions>
-        <!-- Exclude json-smart to pin the version -->
-        <exclusion>
-          <groupId>net.minidev</groupId>
-          <artifactId>json-smart</artifactId>
-        </exclusion>
-      </exclusions>
       <version>${hbase.version}</version>
     </dependency>
 
@@ -184,26 +169,12 @@ under the License.
       </exclusions>
     </dependency>
 
-    <!-- IMPALA-8766: Include Knox jars on the classpath -->
     <dependency>
-      <groupId>org.apache.knox</groupId>
-      <artifactId>gateway-cloud-bindings</artifactId>
-      <version>${knox.version}</version>
-      <exclusions>
-        <!-- Impala currently doesn't support GCS, so exclude those jars -->
-        <exclusion>
-          <groupId>com.google.cloud.bigdataoss</groupId>
-          <artifactId>*</artifactId>
-        </exclusion>
-      </exclusions>
-    </dependency>
-
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-ozone-filesystem-hadoop3</artifactId>
+      <groupId>org.apache.ozone</groupId>
+      <artifactId>ozone-filesystem-hadoop3</artifactId>
       <version>${ozone.version}</version>
       <!-- Remove all transitive dependencies from the Apache Ozone dependency.
-      hadoop-ozone-filesystem-hadoop3 is a shaded-jar, which already includes
+      ozone-filesystem-hadoop3 is a shaded-jar, which already includes
       all required transitive dependencies. For some reason, Ozone still pulls
       in some transitive dependencies even though they are not needed. -->
       <exclusions>
@@ -221,7 +192,7 @@ under the License.
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-dependency-plugin</artifactId>
-        <version>3.1.1</version>
+        <version>3.5.0</version>
         <executions>
           <execution>
             <id>write-executor-classpath</id>
@@ -238,4 +209,41 @@ under the License.
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <profile>
+      <!--
+        This profile aims to include huawei OBS dependencies.
+        This profile is disabled by default.
+        To active this profile, set environment variable 'ENABLE_OBS_FILESYSTEM' to 'true',
+        or use 'mvn package -Pobs-filesystem'.
+      -->
+      <id>obs-filesystem</id>
+      <activation>
+        <property>
+          <name>env.ENABLE_OBS_FILESYSTEM</name>
+          <value>true</value>
+        </property>
+      </activation>
+      <dependencies>
+        <!-- HuaweiCloud SDK. -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-huaweicloud</artifactId>
+            <version>${obs.version}</version>
+        </dependency>
+      </dependencies>
+      <repositories>
+        <!-- HuaweiCloud SDK repository. -->
+        <repository>
+          <id>huaweicloud.repo</id>
+          <url>https://repo.huaweicloud.com/repository/maven/huaweicloudsdk</url>
+          <name>HuaweiCloud SDK Repository</name>
+          <snapshots>
+            <enabled>false</enabled>
+          </snapshots>
+        </repository>
+      </repositories>
+    </profile>
+  </profiles>
 </project>

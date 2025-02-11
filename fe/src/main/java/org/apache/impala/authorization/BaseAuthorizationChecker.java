@@ -28,6 +28,7 @@ import org.apache.impala.catalog.FeIncompleteTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.util.EventSequence;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -104,7 +105,8 @@ public abstract class BaseAuthorizationChecker implements AuthorizationChecker {
    * Override this method to add custom post-authorization check.
    */
   @Override
-  public void postAuthorize(AuthorizationContext authzCtx, boolean authzOk) {
+  public void postAuthorize(AuthorizationContext authzCtx, boolean authzOk,
+      boolean analysisOk) {
     if (authzCtx.getTimeline().isPresent()) {
       EventSequence timeline = authzCtx.getTimeline().get();
       long durationMs = timeline.markEvent(String.format("Authorization finished (%s)",
@@ -175,10 +177,9 @@ public abstract class BaseAuthorizationChecker implements AuthorizationChecker {
     }
 
     // Check all masked requests. If a masked request has an associated error message,
-    // an AuthorizationException is thrown if authorization fails. Masked requests with
-    // no error message are used to check if the user can access the runtime profile.
-    // These checks don't result in an AuthorizationException but set the
-    // 'user_has_profile_access' flag in queryCtx_.
+    // an AuthorizationException is thrown if authorization fails. Otherwise, the custom
+    // AuthorizationException handler of the statement will be called and the user will
+    // not be authorized to access the runtime profile by default if authorization fails.
     for (Pair<PrivilegeRequest, String> maskedReq : analyzer.getMaskedPrivilegeReqs()) {
       try {
         authzCtx.setRetainAudits(false);
@@ -187,6 +188,8 @@ public abstract class BaseAuthorizationChecker implements AuthorizationChecker {
         analysisResult.setUserHasProfileAccess(false);
         if (!Strings.isNullOrEmpty(maskedReq.second)) {
           throw new AuthorizationException(maskedReq.second);
+        } else {
+          analysisResult.getStmt().handleAuthorizationException(analysisResult);
         }
         break;
       } finally {
@@ -214,8 +217,16 @@ public abstract class BaseAuthorizationChecker implements AuthorizationChecker {
       return;
     }
     // Populate column names to check column masking policies in blocking updates.
+    // No need to do this for REFRESH if allow_catalog_cache_op_from_masked_users=true.
+    // Note that db.getTable() could be a heavy operation in local catalog mode since it
+    // triggers metadata loading on the table if it's unloaded in catalogd. Skipping this
+    // improves the performance of "INVALIDATE METADATA <table>" statements. For REFRESH
+    // statements, the performance doesn't differ a lot since there are other places that
+    // use db.getTable() (see IMPALA-12591).
     if (config_.isEnabled() && request.getAuthorizable() != null
-        && request.getAuthorizable().getType() == Type.TABLE) {
+        && request.getAuthorizable().getType() == Type.TABLE
+        && (request.getPrivilege() != Privilege.REFRESH
+          || !BackendConfig.INSTANCE.allowCatalogCacheOpFromMaskedUsers())) {
       Preconditions.checkNotNull(dbName);
       AuthorizableTable authorizableTable = (AuthorizableTable) request.getAuthorizable();
       FeDb db = catalog.getDb(dbName);
@@ -255,18 +266,6 @@ public abstract class BaseAuthorizationChecker implements AuthorizationChecker {
     boolean hasColumnSelectPriv = false;
     for (PrivilegeRequest request: requests) {
       if (request.getAuthorizable().getType() == Authorizable.Type.TABLE) {
-        // Recall that this method will still be called even if authorization is not
-        // enabled. In this regard, we only deny access to a view not authorized at
-        // the creation time when authorization is enabled, i.e.,
-        // when config_.isEnabled() is true.
-        // TODO(IMPALA-10122): Remove the following if-then statement once we can
-        // properly process a PrivilegeRequest for a view whose creation was not
-        // authorized.
-        if (config_.isEnabled() && ((AuthorizableTable) request.getAuthorizable())
-            .isViewCreatedWithoutAuthz()) {
-            hasTableSelectPriv = false;
-            break;
-        }
         try {
           authorizePrivilegeRequest(authzCtx, analysisResult, catalog, request);
         } catch (AuthorizationException e) {
@@ -306,6 +305,7 @@ public abstract class BaseAuthorizationChecker implements AuthorizationChecker {
    * Throws an AuthorizationException if the dbName is a system db
    * and the user is trying to modify it.
    * Returns true if this is a system db and the action is allowed.
+   * Return false if authorization should be checked in the usual way.
    */
   private boolean checkSystemDbAccess(FeCatalog catalog, String dbName,
       Privilege privilege)
@@ -316,6 +316,9 @@ public abstract class BaseAuthorizationChecker implements AuthorizationChecker {
         case VIEW_METADATA:
         case ANY:
           return true;
+        case SELECT:
+          // Check authorization for SELECT on system tables in the usual way.
+          return false;
         default:
           throw new AuthorizationException("Cannot modify system database.");
       }

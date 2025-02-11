@@ -28,6 +28,7 @@ import java.util.stream.Collectors;
 
 import org.apache.hadoop.hive.common.FileUtils;
 import org.apache.hadoop.hive.common.StatsSetupConst;
+import org.apache.hadoop.hive.metastore.api.ColumnStatisticsData;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.impala.analysis.Expr;
@@ -39,18 +40,28 @@ import org.apache.impala.catalog.CatalogObject.ThriftObjectType;
 import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.local.CatalogdMetaProvider;
 import org.apache.impala.catalog.local.LocalCatalog;
+import org.apache.impala.catalog.local.LocalFsTable;
+import org.apache.impala.catalog.local.LocalHbaseTable;
+import org.apache.impala.catalog.local.LocalIcebergTable;
+import org.apache.impala.catalog.local.LocalKuduTable;
+import org.apache.impala.catalog.local.LocalView;
 import org.apache.impala.catalog.local.MetaProvider;
+import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.NotImplementedException;
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TColumnDescriptor;
 import org.apache.impala.thrift.TGetCatalogMetricsResult;
 import org.apache.impala.thrift.THdfsPartition;
+import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableStats;
+import org.apache.impala.thrift.TTableType;
 import org.apache.impala.util.AcidUtils;
 import org.apache.impala.util.MetaStoreUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.codahale.metrics.Snapshot;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.cache.CacheStats;
@@ -98,18 +109,17 @@ public abstract class FeCatalogUtils {
    * @throws TableLoadingException if any type is invalid
    */
   public static ImmutableList<Column> fieldSchemasToColumns(
-      List<FieldSchema> partCols, List<FieldSchema> nonPartCols,
-      String tableName, boolean isFullAcidTable) throws TableLoadingException {
+      org.apache.hadoop.hive.metastore.api.Table msTbl) throws TableLoadingException {
+    boolean isFullAcidTable = AcidUtils.isFullAcidTable(msTbl.getParameters());
     int pos = 0;
     ImmutableList.Builder<Column> ret = ImmutableList.builder();
-    for (FieldSchema s : Iterables.concat(partCols, nonPartCols)) {
-      if (isFullAcidTable && pos == partCols.size()) {
-        ret.add(AcidUtils.getRowIdColumnType(pos));
-        ++pos;
+    for (FieldSchema s : Iterables.concat(msTbl.getPartitionKeys(),
+                                          msTbl.getSd().getCols())) {
+      if (isFullAcidTable && pos == msTbl.getPartitionKeys().size()) {
+        ret.add(AcidUtils.getRowIdColumnType(pos++));
       }
-      Type type = parseColumnType(s, tableName);
-      ret.add(new Column(s.getName(), type, s.getComment(), pos));
-      ++pos;
+      Type type = parseColumnType(s, msTbl.getTableName());
+      ret.add(new Column(s.getName(), type, s.getComment(), pos++));
     }
     return ret.build();
   }
@@ -150,8 +160,8 @@ public abstract class FeCatalogUtils {
    * Given the list of column stats returned from the metastore, inject those
    * stats into matching columns in 'table'.
    */
-  public static void injectColumnStats(List<ColumnStatisticsObj> colStats,
-      FeTable table) {
+  public static void injectColumnStats(
+      List<ColumnStatisticsObj> colStats, FeTable table, SideloadTableStats testStats) {
     for (ColumnStatisticsObj stats: colStats) {
       Column col = table.getColumn(stats.getColName());
       Preconditions.checkNotNull(col, "Unable to find column %s in table %s",
@@ -162,14 +172,20 @@ public abstract class FeCatalogUtils {
             "has type %s", table.getFullName(), col.getName(), col.getType()));
         continue;
       }
+      ColumnStatisticsData colStatsData = stats.getStatsData();
+      if (testStats != null && testStats.hasColumn(stats.getColName())) {
+        colStatsData = testStats.getColumnStats(stats.getColName());
+        Preconditions.checkNotNull(colStatsData);
+        LOG.info("Sideload stats for " + table.getFullName() + "." + stats.getColName()
+            + ". " + colStatsData);
+      }
 
-      if (!col.updateStats(stats.getStatsData())) {
+      if (!col.updateStats(colStatsData)) {
         LOG.warn(String.format(
             "Failed to load column stats for %s, column %s. Stats may be " +
             "incompatible with column type %s. Consider regenerating statistics " +
             "for %s.", table.getFullName(), col.getName(), col.getType(),
             table.getFullName()));
-        continue;
       }
     }
   }
@@ -393,6 +409,55 @@ public abstract class FeCatalogUtils {
   }
 
   /**
+   * Returns the FULL thrift object for a FeTable. The result can be directly loaded into
+   * the catalog cache of catalogd. See CatalogOpExecutor#copyTestCaseData().
+   */
+  public static TTable feTableToThrift(FeTable table) throws ImpalaException {
+    if (table instanceof Table) return ((Table) table).toThrift();
+    // In local-catalog mode, coordinator caches the metadata in finer grained manner.
+    // Construct the thrift table using fine-grained APIs.
+    TTable res = new TTable(table.getDb().getName(), table.getName());
+    res.setTable_stats(table.getTTableStats());
+    res.setMetastore_table(table.getMetaStoreTable());
+    res.setClustering_columns(new ArrayList<>());
+    for (Column c : table.getClusteringColumns()) {
+      res.addToClustering_columns(c.toThrift());
+    }
+    res.setColumns(new ArrayList<>());
+    for (Column c : table.getNonClusteringColumns()) {
+      res.addToColumns(c.toThrift());
+    }
+    res.setVirtual_columns(new ArrayList<>());
+    for (VirtualColumn c : table.getVirtualColumns()) {
+      res.addToVirtual_columns(c.toThrift());
+    }
+    if (table instanceof LocalFsTable) {
+      res.setTable_type(TTableType.HDFS_TABLE);
+      res.setHdfs_table(((LocalFsTable) table).toTHdfsTable(
+          CatalogObject.ThriftObjectType.FULL));
+    } else if (table instanceof LocalKuduTable) {
+      res.setTable_type(TTableType.KUDU_TABLE);
+      res.setKudu_table(((LocalKuduTable) table).toTKuduTable());
+    } else if (table instanceof LocalHbaseTable) {
+      res.setTable_type(TTableType.HBASE_TABLE);
+      res.setHbase_table(FeHBaseTable.Util.getTHBaseTable((FeHBaseTable) table));
+    } else if (table instanceof LocalIcebergTable) {
+      res.setTable_type(TTableType.ICEBERG_TABLE);
+      LocalIcebergTable iceTable = (LocalIcebergTable) table;
+      res.setIceberg_table(FeIcebergTable.Utils.getTIcebergTable(iceTable));
+      res.setHdfs_table(iceTable.transformToTHdfsTable(/*unused*/true,
+          ThriftObjectType.FULL));
+    } else if (table instanceof LocalView) {
+      res.setTable_type(TTableType.VIEW);
+      // Metadata of the view are stored in msTable. Nothing else need to add here.
+    } else {
+      throw new NotImplementedException("Unsupported type to export: " +
+          table.getClass());
+    }
+    return res;
+  }
+
+  /**
    * Populates cache metrics in the input TGetCatalogMetricsResult object.
    * No-op if CatalogdMetaProvider is not the configured metadata provider.
    */
@@ -419,6 +484,10 @@ public abstract class FeCatalogUtils {
     metrics.setCache_hit_rate(stats.hitRate());
     metrics.setCache_load_exception_rate(stats.loadExceptionRate());
     metrics.setCache_miss_rate(stats.missRate());
+
+    Snapshot cacheEntrySize = ((CatalogdMetaProvider) provider).getCacheEntrySize();
+    metrics.setCache_entry_median_size(cacheEntrySize.getMedian());
+    metrics.setCache_entry_99th_size(cacheEntrySize.get99thPercentile());
   }
 
 

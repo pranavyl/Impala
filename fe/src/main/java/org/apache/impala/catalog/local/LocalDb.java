@@ -19,11 +19,14 @@ package org.apache.impala.catalog.local;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.stream.Collectors;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.hadoop.hive.metastore.api.Database;
+import org.apache.hadoop.hive.metastore.api.PrincipalType;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.impala.analysis.ColumnDef;
 import org.apache.impala.analysis.KuduPartitionParam;
@@ -35,9 +38,13 @@ import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Function.CompareMode;
 import org.apache.impala.catalog.TableLoadingException;
+import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TBriefTableMeta;
 import org.apache.impala.thrift.TDatabase;
 import org.apache.impala.thrift.TFunctionCategory;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.util.FunctionUtils;
 import org.apache.impala.util.PatternMatcher;
 import org.apache.thrift.TException;
@@ -46,6 +53,8 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 
 /**
@@ -55,6 +64,7 @@ import com.google.common.collect.Maps;
  * each catalog instance.
  */
 public class LocalDb implements FeDb {
+  private final static Logger LOG = LoggerFactory.getLogger(LocalDb.class);
   private final LocalCatalog catalog_;
   /** The lower-case name of the database. */
   private final String name_;
@@ -112,7 +122,18 @@ public class LocalDb implements FeDb {
       // Table doesn't exist.
       return null;
     }
-    return tables_.get(tblName);
+    FeTable tbl = tables_.get(tblName);
+    if (tbl instanceof LocalIncompleteTable && tbl.getMetaStoreTable() == null) {
+      // Add msTable if it's cached.
+      Pair<Table, MetaProvider.TableMetaRef> tblMeta =
+          catalog_.getMetaProvider().getTableIfPresent(name_, tblName);
+      if (tblMeta != null) {
+        tbl = new LocalIncompleteTable(this, tblMeta.first, tblMeta.second,
+            tbl.getTableType(), tbl.getTableComment());
+        tables_.put(tblName, tbl);
+      }
+    }
+    return tbl;
   }
 
   @Override
@@ -123,14 +144,15 @@ public class LocalDb implements FeDb {
     FeTable tbl = getTableIfCached(tblName);
     if (tbl instanceof LocalIncompleteTable) {
       // The table exists but hasn't been loaded yet.
-      try{
+      try {
         tbl = LocalTable.load(this, tblName);
       } catch (TableLoadingException tle) {
         // If the table fails to load (eg a Kudu table that doesn't have
         // a backing table, or some other catalogd-side issue), turn it into
         // an IncompleteTable. This allows statements like DROP TABLE to still
         // analyze.
-        tbl = new FailedLoadLocalTable(this, tblName, tle);
+        tbl = new FailedLoadLocalTable(this, tblName, tbl.getTableType(),
+            tbl.getTableComment(), tle);
       }
       tables_.put(tblName, tbl);
     }
@@ -139,10 +161,10 @@ public class LocalDb implements FeDb {
 
   @Override
   public FeKuduTable createKuduCtasTarget(Table msTbl, List<ColumnDef> columnDefs,
-      List<ColumnDef> primaryKeyColumnDefs,
-      List<KuduPartitionParam> kuduPartitionParams) {
-    return LocalKuduTable.createCtasTarget(this, msTbl, columnDefs, primaryKeyColumnDefs,
-        kuduPartitionParams);
+      List<ColumnDef> primaryKeyColumnDefs, boolean isPrimaryKeyUnique,
+      List<KuduPartitionParam> kuduPartitionParams) throws ImpalaRuntimeException {
+    return LocalKuduTable.createCtasTarget(this, msTbl, columnDefs, isPrimaryKeyUnique,
+        primaryKeyColumnDefs, kuduPartitionParams);
   }
 
   @Override
@@ -152,7 +174,19 @@ public class LocalDb implements FeDb {
 
   @Override
   public List<String> getAllTableNames() {
+    return getAllTableNames(/*tableTypes*/ Collections.emptySet());
+  }
+
+  @Override
+  public List<String> getAllTableNames(Set<TImpalaTableType> tableTypes) {
     loadTableNames();
+    if (!tableTypes.isEmpty()) {
+      return tables_.values().stream()
+          .filter(table ->
+              tableTypes.stream().anyMatch(type -> type.equals(table.getTableType())))
+          .map(table -> table.getName())
+          .collect(Collectors.toList());
+    }
     return ImmutableList.copyOf(tables_.keySet());
   }
 
@@ -292,6 +326,7 @@ public class LocalDb implements FeDb {
   @Override // FeDb
   public String getOwnerUser() {
     Database db = getMetaStoreDb();
-    return db == null? null : db.getOwnerName();
+    return db == null ? null :
+        (db.getOwnerType() == PrincipalType.USER ? db.getOwnerName() : null);
   }
 }

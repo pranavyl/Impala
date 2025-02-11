@@ -18,7 +18,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# This will create/control/destroy a local hdfs/yarn/kms/kudu cluster.
+# This will create/control/destroy a local hdfs/yarn/kms or ozone + kudu cluster.
 #
 # All roles run on 127.0.0.1, just like the standard mini cluster included with hadoop.
 # The difference is with this cluster, each role runs in its own process and has its own
@@ -41,7 +41,7 @@ shift $(($OPTIND-1))
 
 DIR=$(dirname $0)
 NODE_COUNT=3
-if [[ "$TARGET_FILESYSTEM" == "hdfs" && "$ERASURE_CODING" = true ]]; then
+if [[ "$ERASURE_CODING" = true ]]; then
   NODE_COUNT=5
 fi
 NODE_PREFIX=node-
@@ -56,13 +56,14 @@ export KILL_CLUSTER_MARKER=IBelongToTheMiniCluster
 if [[ "$TARGET_FILESYSTEM" == "hdfs" ]]; then
   # The check above indicates that the regular mini-cluster is in use.
   SUPPORTED_SERVICES=(hdfs kms yarn)
+elif [[ "$TARGET_FILESYSTEM" == "ozone" ]]; then
+  SUPPORTED_SERVICES=(kms ozone)
 else
   # Either a remote distributed file system or a local non-distributed file system is
   # in use. Currently the only service that is expected to work is Kudu, though in theory
   # the other services could work after the proper configuration changes.
   SUPPORTED_SERVICES=()
 fi
-SUPPORTED_SERVICES+=(kudu)
 
 # All DataNodes and NodeManagers need a unique but fixed address. The IP is fixed at
 # 127.0.0.1, so the only difference is the port. The address must be fixed because it is
@@ -73,6 +74,7 @@ DATANODE_FREE_PORT_START=31000
 DATANODE_FREE_HTTP_PORT_START=31010
 DATANODE_FREE_IPC_PORT_START=31020
 DATANODE_FREE_HTTPS_PORT_START=31030
+DATANODE_FREE_CLIENT_PORT_START=31040
 NODEMANAGER_FREE_PORT_START=31100
 NODEMANAGER_FREE_LOCALIZER_PORT_START=31120
 NODEMANAGER_FREE_WEBUI_PORT_START=31140
@@ -86,6 +88,7 @@ export YARN_WEBUI_PORT=8088   # same as default
 export KMS_WEBUI_PORT=9600    # changed to make room for non-ephemeral HBase ports
                               # (HADOOP-12811)
 export KUDU_WEBUI_PORT=8051   # same as default
+export OZONE_WEBUI_PORT=9874  # same as default for OM WebUI
 
 # Empty dirs that should be included in the templates. Since git ignores empty dirs it is
 # easier to maintain them here.
@@ -182,6 +185,13 @@ function cluster_exists {
   fi
 }
 
+function kudu_cluster_exists {
+  # Just use the first master as an indicator.
+  if [[ ! -e "$IMPALA_CLUSTER_NODES_DIR/${NODE_PREFIX}1/var/lib/kudu/master" ]]; then
+    return 1
+  fi
+}
+
 function create_cluster {
   mkdir -p "$IMPALA_CLUSTER_NODES_DIR"
 
@@ -216,7 +226,7 @@ function create_cluster {
     if [[ $NODE_IDX -gt 1 ]]; then
       # Remove master role scripts from slave nodes
       rm -f "$NODE_DIR/etc/init.d/"{hdfs-namenode,yarn-resourcemanager} \
-            "$NODE_DIR/etc/init.d/"{kms,kudu-master}
+            "$NODE_DIR/etc/init.d/"{kms,kudu-master,ozone-scm,ozone-manager}
       # Only run one YARN nodemanager (more memory-efficient to scale up a
       # single NM than run several)
       rm -f "$NODE_DIR/etc/init.d/yarn-nodemanager"
@@ -227,17 +237,26 @@ function create_cluster {
 
     # Add some easy access links closer to IMPALA_HOME
     EASY_ACCESS_LOG_LINK="$EASY_ACCESS_LOG_DIR/cdh$CDH_MAJOR_VERSION-$NODE"
-    if [[ ! -e "$EASY_ACCESS_LOG_LINK" ]]; then
-      mkdir -p "$EASY_ACCESS_LOG_DIR"
-      ln -s "$NODE_DIR/var/log" "$EASY_ACCESS_LOG_DIR"
-      mv "$IMPALA_CLUSTER_LOGS_DIR/log" "$EASY_ACCESS_LOG_LINK"
+    if [[ -e "$EASY_ACCESS_LOG_LINK" ]]; then
+      rm "${EASY_ACCESS_LOG_LINK}"
     fi
+    mkdir -p "$EASY_ACCESS_LOG_DIR"
+    ln -s "$NODE_DIR/var/log" "$EASY_ACCESS_LOG_DIR"
+    mv "$EASY_ACCESS_LOG_DIR/log" "$EASY_ACCESS_LOG_LINK"
 
     # Template population
     DATANODE_PORT=$((DATANODE_FREE_PORT_START++))
     DATANODE_HTTP_PORT=$((DATANODE_FREE_HTTP_PORT_START++))
     DATANODE_IPC_PORT=$((DATANODE_FREE_IPC_PORT_START++))
     DATANODE_HTTPS_PORT=$((DATANODE_FREE_HTTPS_PORT_START++))
+    DATANODE_CLIENT_PORT=$((DATANODE_FREE_CLIENT_PORT_START++))
+    ULIMIT_LOCKED_MEM="$(ulimit -l)"
+    if [[ "${ULIMIT_LOCKED_MEM}" == "unlimited" ]]; then
+      # Use a default of 64MB for HDFS caching. Should match memlock in bootstrap_system.
+      ULIMIT_LOCKED_MEM=65536
+    fi
+    # Allocate slightly less than memlock to each datanode.
+    DATANODE_LOCKED_MEM=$((ULIMIT_LOCKED_MEM*1000))
     NODEMANAGER_PORT=$((NODEMANAGER_FREE_PORT_START++))
     NODEMANAGER_LOCALIZER_PORT=$((NODEMANAGER_FREE_LOCALIZER_PORT_START++))
     NODEMANAGER_WEBUI_PORT=$((NODEMANAGER_FREE_WEBUI_PORT_START++))
@@ -247,14 +266,17 @@ function create_cluster {
         "DATANODE_HTTP_PORT=$DATANODE_HTTP_PORT," \
         "DATANODE_IPC_PORT=$DATANODE_IPC_PORT," \
         "DATANODE_HTTPS_PORT=$DATANODE_HTTPS_PORT," \
+        "DATANODE_CLIENT_PORT=$DATANODE_CLIENT_PORT," \
         "NODEMANAGER_PORT=$NODEMANAGER_PORT," \
         "NODEMANAGER_LOCALIZER_PORT=$NODEMANAGER_LOCALIZER_PORT," \
         "NODEMANAGER_WEBUI_PORT=$NODEMANAGER_WEBUI_PORT," \
         "KUDU_TS_RPC_PORT=$KUDU_TS_RPC_PORT," \
-        "and KUDU_TS_WEBUI_PORT=$KUDU_TS_WEBUI_PORT"
+        "and KUDU_TS_WEBUI_PORT=$KUDU_TS_WEBUI_PORT;" \
+        "DATANODE_LOCKED_MEM=$DATANODE_LOCKED_MEM"
 
     export NODE NODE_DIR
     export DATANODE_PORT DATANODE_HTTP_PORT DATANODE_IPC_PORT DATANODE_HTTPS_PORT
+    export DATANODE_CLIENT_PORT DATANODE_LOCKED_MEM
     export NODEMANAGER_PORT NODEMANAGER_LOCALIZER_PORT NODEMANAGER_WEBUI_PORT
     export KUDU_TS_RPC_PORT KUDU_TS_WEBUI_PORT
     for TEMPLATE_PATH in $(find "$NODE_DIR" -name "*$TEMPLATE_SUFFIX"); do
@@ -291,6 +313,8 @@ function create_cluster {
       ACTUAL_PATH="${TEMPLATE_PATH%$PY_TEMPLATE_SUFFIX}".xml
       $IMPALA_HOME/bin/generate_xml_config.py $TEMPLATE_PATH $ACTUAL_PATH
       rm $TEMPLATE_PATH
+      # Remove pycache if created
+      rm -rf $(dirname $TEMPLATE_PATH)/__pycache__
     done
   done
 }
@@ -322,7 +346,40 @@ function start_cluster {
     sleep 10
     check_cluster_status
   fi
+
+  if [[ "${TARGET_FILESYSTEM}" = "ozone" ]]; then
+    local replication=''
+    echo "Creating Ozone volume/bucket"
+    if [ -n "${OZONE_ERASURECODE_POLICY:-}" ]; then
+      replication="--type EC --replication ${OZONE_ERASURECODE_POLICY}"
+      echo "with erasure coding ${OZONE_ERASURECODE_POLICY}"
+    fi
+
+    local bucketkey=''
+    if $USE_OZONE_ENCRYPTION; then
+      echo "Ozone encryption enabled for ${OZONE_VOLUME}/test-warehouse"
+
+      # Encryption is done at the bucket level, so ensure the keys are available first.
+      ${IMPALA_HOME}/testdata/bin/setup-dfs-keys.sh testkey
+      bucketkey='--bucketkey testkey'
+    fi
+
+    ozone sh volume create ${OZONE_VOLUME} || true
+    ozone sh bucket create ${bucketkey} ${replication} \
+        ${OZONE_VOLUME}/test-warehouse || true
+  fi
+
   return $?
+}
+
+function start_kudu_cluster {
+  if ! kudu_cluster_exists; then
+    echo "The Kudu cluster must be created first"
+    return 1
+  fi
+  start "kudu"
+  sleep 10
+  check_kudu_cluster_status
 }
 
 function start {
@@ -403,23 +460,42 @@ function check_cluster_status {
     return 1
   fi
 
+  for SERVICE in ${SUPPORTED_SERVICES[@]-}; do
+    check_status $SERVICE
+  done
+}
+
+function check_kudu_cluster_status {
+  if ! kudu_cluster_exists; then
+    echo "The Kudu cluster does not exist"
+    return 1
+  fi
+
+  check_status "kudu"
+}
+
+function check_status {
+  if [[ $# -ne 1 ]]; then
+    echo stop must be called with a single argument -- the service to check. 1>&2
+    exit 1
+  fi
+  local SERVICE=$1
+
   ROLE_COUNT=0
   NOT_RUNNING=()
   for NODE_DIR in "$IMPALA_CLUSTER_NODES_DIR/$NODE_PREFIX"*; do
-    for SERVICE in ${SUPPORTED_SERVICES[@]-}; do
-      for SCRIPT in $(find "$NODE_DIR" -path "*/etc/init.d/$SERVICE*" $FIND_EXECUTABLE_FILTER \
-          -type f); do
-        ROLE_COUNT=$((ROLE_COUNT + 1))
-        if ! "$SCRIPT" status &>/dev/null; then
-          NOT_RUNNING+=("\n$(basename $SCRIPT) is not running on $(basename $NODE_DIR)")
-        fi
-      done
+    for SCRIPT in $(find "$NODE_DIR" -path "*/etc/init.d/$SERVICE*" $FIND_EXECUTABLE_FILTER \
+        -type f); do
+      ROLE_COUNT=$((ROLE_COUNT + 1))
+      if ! "$SCRIPT" status &>/dev/null; then
+        NOT_RUNNING+=("\n$(basename $SCRIPT) is not running on $(basename $NODE_DIR)")
+      fi
     done
   done
 
   case ${#NOT_RUNNING[@]} in
-    0) echo "The cluster is running"; return;;
-    $ROLE_COUNT) echo "The cluster is not running"; return 1;;
+    0) echo "The ${SERVICE} cluster is running"; return;;
+    $ROLE_COUNT) echo "The ${SERVICE} cluster is not running"; return 1;;
     *) echo -e "${NOT_RUNNING[@]}"; return 1;;
   esac
 }
@@ -433,6 +509,12 @@ function stop_cluster {
   fi
   # Kill everything anyways just in case a git clean -xdf was done
   pkill -u $USER -f $KILL_CLUSTER_MARKER || true
+}
+
+function stop_kudu_cluster {
+  if kudu_cluster_exists; then
+    stop "kudu"
+  fi
 }
 
 function stop {
@@ -460,7 +542,7 @@ function delete_data {
   # Delete namenode, datanode and KMS data while preserving directory structure.
   rm -rf "$IMPALA_CLUSTER_NODES_DIR/$NODE_PREFIX"*/data/dfs/{nn,dn}/*
   rm -f "$IMPALA_CLUSTER_NODES_DIR/$NODE_PREFIX"*/data/kms.keystore
-  delete_kudu_data
+  rm -rf "$IMPALA_CLUSTER_NODES_DIR/$NODE_PREFIX"*/data/ozone
 }
 
 function delete_kudu_data {
@@ -468,6 +550,7 @@ function delete_kudu_data {
 }
 
 function delete_cluster {
+  # Delete all cluster data and directory structure.
   pkill -u $USER -f $KILL_CLUSTER_MARKER || true
   rm -rf "$IMPALA_CLUSTER_NODES_DIR"
 }
@@ -487,7 +570,8 @@ function get_hadoop_client_conf_dir {
 COMMAND=$1
 shift
 case $COMMAND in
-  check_cluster_status | cluster_exists | is_kerberized)
+  check_cluster_status | check_kudu_cluster_status | cluster_exists | \
+        kudu_cluster_exists | is_kerberized)
     # Use an "if" to avoid triggering the ERR trap.
     if ! $COMMAND "$@"; then
       exit 1

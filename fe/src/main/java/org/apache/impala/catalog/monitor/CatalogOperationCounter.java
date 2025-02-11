@@ -17,7 +17,7 @@
 
 package org.apache.impala.catalog.monitor;
 
-import org.apache.commons.lang.mutable.MutableLong;
+import org.apache.commons.lang3.mutable.MutableLong;
 import org.apache.impala.thrift.TOperationUsageCounter;
 import org.apache.impala.thrift.TTableName;
 
@@ -95,6 +95,7 @@ public abstract class CatalogOperationCounter {
    */
   protected String getTableName(Optional<TTableName> tTableName) {
     if (tTableName.isPresent()) {
+      if (tTableName.get().table_name.isEmpty()) return tTableName.get().db_name;
       return tTableName.get().db_name + "." + tTableName.get().table_name;
     } else {
       return "Not available";

@@ -1965,6 +1965,108 @@ public class ParserTest extends FrontendTestBase {
   }
 
   @Test
+  public void TestOptimize() {
+    ParsesOk("optimize table t");
+    ParsesOk("optimize table t (file_size_threshold_mb=10)");
+    ParsesOk("optimize table t (file_size_threshold_mb=0)");
+    ParserError("optimize table t file_size_threshold_mb=10");
+    ParserError("optimize table t file_size_threshold_mb 10");
+    ParserError("optimize table t (file_size_threshold_mb=-10)");
+    ParserError("optimize table t (file_size_threshold_mb=0.1)");
+    ParserError("optimize table t 10");
+    ParserError("optimize t");
+    ParserError("optimize table t for system_time as of now()");
+    ParserError("optimize table t for system_version as of 12345");
+  }
+
+  @Test
+  public void TestMerge() {
+    ParsesOk("merge into t using s on t.id = s.id "
+        + "when matched then update set t.a = s.a");
+    ParsesOk("merge into target t using source s on t.id = s.id "
+        + "when matched then update set t.a = s.a");
+    ParsesOk("merge into t using s on t.id = s.id when matched then delete");
+    ParsesOk("merge into t using s on t.id = s.id when not matched "
+        + "then insert (a,b,c) values (a,b,c)");
+    ParsesOk("merge into t using s on t.id = s.id when matched and t.a > s.b "
+        + "then delete");
+    ParsesOk("merge into t using s on t.id = s.id "
+        + "when matched and t.a > s.b or t.b < s.c then update set t.a = s.a");
+    ParsesOk("merge into t using s on t.id = s.id "
+        + "when matched and t.a > s.b or t.b < s.c then update set t.a = s.a "
+        + "when not matched then insert (a,b,c) values (a,b,c)");
+    ParsesOk("merge into t using s on t.id = s.id "
+        + "when matched and t.a > s.b or t.b < s.c then update set t.a = s.a "
+        + "when not matched then insert (a,b,c) values (a,b,c) "
+        + "when matched then delete");
+    ParsesOk("merge into t using (select a, b, c, d, id) as s on t.id = s.id "
+        + "when matched and t.a > s.b or t.b < s.c then update set t.a = s.a "
+        + "when matched then update set t.a = s.a "
+        + "when not matched then insert (a,b,c) values (a,b,c)");
+    ParsesOk("merge into t using (select id from s) s on t.id = s.id "
+        + "when matched then update set t.a = s.a");
+    ParsesOk("merge into t using s on t.id = s.id when matched "
+        + "then update set t.a = s.a");
+    ParsesOk("merge into t using s on t.id = s.id when not matched "
+        + "then insert values(a,b,c)");
+    ParsesOk("merge into t using s on t.id = s.id when not matched by target "
+        + "then insert values(a,b,c)");
+    ParsesOk("merge into t using s on t.id = s.id when not matched by target "
+        + "and t.a > 10 then insert values(a,b,c)");
+    ParsesOk("merge into t using s on t.id = s.id when not matched by source "
+        + "then delete");
+    ParsesOk("merge into t using s on t.id = s.id when not matched by source "
+        + "and funcn(a) > 10 then delete");
+    ParsesOk("merge into t using s on t.id = s.id when not matched by source "
+        + "then update set b = 12");
+    ParsesOk("merge into t using s on t.id = s.id when not matched by source "
+        + "and func(b) != func(a) then update set b = 12");
+    ParsesOk("merge into t using s on t.id = s.id when not matched "
+        + "then insert *");
+    ParsesOk("merge into t using s on t.id = s.id when not matched "
+        + "and i > 10 then insert *");
+    ParsesOk("merge into t using s on t.id = s.id when matched "
+        + "then update set *");
+    ParsesOk("merge into t using s on t.id = s.id when matched "
+        + "and i > 10 then update set *");
+
+    ParserError("merge into t using s on t.id = s.id "
+        + "when matched and t.a > s.b then delete from");
+    ParserError("merge into t using s on t.id = s.id "
+        + "when matched and t.a > s.b then insert (a,b,c) values (a,b,c)");
+    ParserError("merge into t using s on t.id = s.id "
+        + "when not matched and t.a > s.b then update set a = b");
+    ParserError("merge into t using s on t.id = s.id "
+        + "when not matched and t.a > s.b then delete");
+    ParserError("merge into t using s on t.id = s.id "
+        + "when not matched by target then delete");
+    ParserError("merge into t using s on t.id = s.id "
+        + "when not matched by target and a = 1 then delete");
+    ParserError("merge into t using s on t.id = s.id "
+        + "when not matched by target then update set b = a");
+    ParserError("merge into t using s on t.id = s.id "
+        + "when not matched by target and x = y then update set b = a, c = d");
+    ParserError("merge into t using s on t.id = s.id "
+        + "when not matched by source then insert values (1, 2, 3)");
+    ParserError("merge into t using s on t.id = s.id "
+        + "when not matched by source and a <> b then insert values (1, 2, 3)");
+    ParserError("merge into t using s on t.id = s.id when not matched "
+        + "and i > 10 then update *");
+    ParserError("merge into t using s on t.id = s.id when matched "
+        + "and i > 10 then insert *");
+
+    // Invalid column permutation
+    ParserError("merge into target t using (select * from source) s "
+        + "on t.id = s.id "
+        + "when not matched then insert (t.id, t.a, t.b) values(id, a, b)");
+    // Multiple values clause
+    ParserError("merge into target t using (select * from source) s "
+        + "on t.id = s.id "
+        + "when not matched then "
+        + "insert (t.id, t.a, t.b) values(id, a, b), (a,b,c)");
+  }
+
+  @Test
   public void TestUse() {
     ParserError("USE");
     ParserError("USE db1 db2");
@@ -1975,10 +2077,24 @@ public class ParserTest extends FrontendTestBase {
   public void TestShow() {
     // Short form ok
     ParsesOk("SHOW TABLES");
+    ParsesOk("SHOW VIEWS");
     // Well-formed pattern
     ParsesOk("SHOW TABLES 'tablename|othername'");
+    ParsesOk("SHOW VIEWS 'tablename|othername'");
+    ParsesOk("SHOW TABLES LIKE 'tablename|othername'");
+    ParsesOk("SHOW VIEWS LIKE 'tablename|othername'");
+    ParsesOk("SHOW TABLES IN db LIKE 'tablename|othername'");
+    ParsesOk("SHOW VIEWS IN db LIKE 'tablename|othername'");
     // Empty pattern ok
     ParsesOk("SHOW TABLES ''");
+    ParsesOk("SHOW VIEWS ''");
+    // Querying metadata tables: SHOW METADATA TABLES IN db.tbl
+    ParsesOk("SHOW METADATA TABLES IN tbl");
+    ParsesOk("SHOW METADATA TABLES IN tbl 'e*'");
+    ParsesOk("SHOW METADATA TABLES IN tbl LIKE 'e*'");
+    ParsesOk("SHOW METADATA TABLES IN db.tbl");
+    ParsesOk("SHOW METADATA TABLES IN db.tbl 'e*'");
+    ParsesOk("SHOW METADATA TABLES IN db.tbl LIKE 'e*'");
     // Databases
     ParsesOk("SHOW DATABASES");
     ParsesOk("SHOW SCHEMAS");
@@ -2028,6 +2144,11 @@ public class ParserTest extends FrontendTestBase {
     ParserError("SHOW");
     // Malformed pattern (no quotes)
     ParserError("SHOW TABLES tablename");
+    ParserError("SHOW VIEWS tablename");
+    // Missing keyword METADATA when listing metadata tables
+    ParserError("SHOW TABLES IN db.tbl");
+    // Trying to list the metadata tables of a metadata table
+    ParserError("SHOW METADATA TABLES IN db.tbl.files");
     // Invalid SHOW DATA SOURCE statements
     ParserError("SHOW DATA");
     ParserError("SHOW SOURCE");
@@ -2305,6 +2426,7 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("ALTER TABLE Foo ADD PARTITION (i=NULL)");
     ParsesOk("ALTER TABLE Foo ADD PARTITION (i=NULL, j=2, k=NULL)");
     ParsesOk("ALTER TABLE Foo ADD PARTITION (i=abc, j=(5*8+10), k=!true and false)");
+    ParsesOk("ALTER TABLE Foo ADD PARTITION (i=1) SET FILEFORMAT PARQUET");
 
     // Multiple partition specs
     ParsesOk("ALTER TABLE Foo ADD PARTITION (i=1, s='one') " +
@@ -2793,10 +2915,33 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("CREATE TABLE foo (i INT, j INT, PRIMARY KEY (j, i)) STORED AS KUDU");
     ParsesOk("CREATE TABLE foo (i INT PRIMARY KEY, PRIMARY KEY(i)) STORED AS KUDU");
     ParsesOk("CREATE TABLE foo (i INT PRIMARY KEY, j INT PRIMARY KEY) STORED AS KUDU");
+    ParsesOk("CREATE TABLE foo (i INT NON UNIQUE PRIMARY KEY) STORED AS KUDU");
+    ParsesOk("CREATE TABLE foo (i INT NON UNIQUE PRIMARY KEY, "
+        + "NON UNIQUE PRIMARY KEY(i)) STORED AS KUDU");
+    ParsesOk("CREATE TABLE foo (i INT, j INT, NON UNIQUE PRIMARY KEY (i, j)) "
+        + "STORED AS KUDU");
+    ParsesOk("CREATE TABLE foo (i INT NON UNIQUE PRIMARY KEY, "
+        + "j INT NON UNIQUE PRIMARY KEY) STORED AS KUDU");
     ParserError("CREATE TABLE foo (i INT) PRIMARY KEY (i) STORED AS KUDU");
     ParserError("CREATE TABLE foo (i INT, PRIMARY KEY) STORED AS KUDU");
     ParserError("CREATE TABLE foo (PRIMARY KEY(a), a INT) STORED AS KUDU");
-    ParserError("CREATE TABLE foo (i INT) PRIMARY KEY (i) STORED AS KUDU");
+    ParserError("CREATE TABLE foo (i INT) NON UNIQUE PRIMARY KEY (i) STORED AS KUDU");
+    ParserError("CREATE TABLE foo (i INT, NON UNIQUE PRIMARY KEY) STORED AS KUDU");
+    ParserError("CREATE TABLE foo (NON UNIQUE PRIMARY KEY(a), a INT) STORED AS KUDU");
+
+    // Create external JDBC tables.
+    ParsesOk("CREATE TABLE foo (i INT, j STRING) STORED AS JDBC");
+    ParsesOk("CREATE TABLE IF NOT EXISTS foo (i INT) COMMENT 'comment' " +
+        "STORED AS JDBC TBLPROPERTIES ('key1'='value1', 'key2'='value2')");
+    ParserError("CREATE TABLE foo (i INT) PRIMARY KEY (i) STORED AS JDBC");
+
+    // Supported storage engines
+    ParsesOk("CREATE TABLE foo (i INT) STORED BY KUDU");
+    ParsesOk("CREATE TABLE foo (i INT) STORED BY ICEBERG");
+    ParsesOk("CREATE TABLE foo (i INT) STORED BY JDBC");
+    ParserError("CREATE TABLE foo (i INT) STORED BY PARQUET");
+    ParserError("CREATE TABLE foo (i INT) STORED BY FOOBAR");
+    ParserError("CREATE TABLE foo (i INT) STORED BY");
 
     // Primary key and foreign key specification.
     ParsesOk("create table foo(id int, year int, primary key (id))");
@@ -2839,6 +2984,8 @@ public class ParserTest extends FrontendTestBase {
       ParserError(String.format("CREATE TABLE Foo (i int) %s (a='c')", propType));
     }
     ParsesOk("CREATE TABLE Foo (i int) WITH SERDEPROPERTIES ('a'='b') " +
+        "TBLPROPERTIES ('c'='d', 'e'='f')");
+    ParsesOk("CREATE TABLE Foo (i int) STORED BY JDBC " +
         "TBLPROPERTIES ('c'='d', 'e'='f')");
     // TBLPROPERTIES must go after SERDEPROPERTIES
     ParserError("CREATE TABLE Foo (i int) TBLPROPERTIES ('c'='d', 'e'='f') " +
@@ -3036,6 +3183,8 @@ public class ParserTest extends FrontendTestBase {
                   "%s %s %s %s %s) STORED AS KUDU", enc, comp, def, block, nul));
               ParsesOk(String.format("CREATE TABLE Foo (i int PRIMARY KEY " +
                   "%s %s %s %s %s) STORED AS KUDU", enc, comp, block, def, nul));
+              ParsesOk(String.format("CREATE TABLE Foo (i int NON UNIQUE PRIMARY KEY " +
+                  "%s %s %s %s %s) STORED AS KUDU", nul, enc, comp, def, block));
             }
           }
         }
@@ -3052,6 +3201,32 @@ public class ParserTest extends FrontendTestBase {
     ParserError("CREATE TABLE Foo(a int PRIMARY KEY, b int BLOCK_SIZE 1+1) " +
         "STORED AS KUDU");
     ParserError("CREATE TABLE Foo(a int PRIMARY KEY BLOCK_SIZE -1) STORED AS KUDU");
+
+    // Supported bucketed table
+    ParsesOk("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i) INTO 24 BUCKETS");
+    ParsesOk("CREATE TABLE bucketed_test (i int COMMENT 'hello', a int, s string) " +
+        "CLUSTERED BY (i, a) INTO 24 BUCKETS");
+
+    ParsesOk("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "PARTITIONED BY(dt string) CLUSTERED BY (i) INTO 24 BUCKETS");
+    ParsesOk("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i) SORT BY(s) INTO 24 BUCKETS");
+    ParsesOk("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "PARTITIONED BY(dt string) CLUSTERED BY (i) SORT BY (s) " +
+        "INTO 24 BUCKETS");
+
+    ParserError("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i)");
+    ParserError("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "CLUSTERED INTO 24 BUCKETS ");
+    ParserError("CREATE TABLE (i int, s string) CLUSTERED INTO 24 BUCKETS");
+    ParserError("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i) INTO BUCKETS");
+    ParserError("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "PARTITIONED BY(dt string) CLUSTERED BY (i) INTO BUCKETS");
+    ParserError("CREATE TABLE bucketed_test (i int COMMENT 'hello', s string) " +
+        "CLUSTERED BY (i) INTO 12 BUCKETS SORT BY (s)");
   }
 
   @Test
@@ -3062,6 +3237,7 @@ public class ParserTest extends FrontendTestBase {
         "API_VERSION \"V1\"");
     ParsesOk("CREATE DATA SOURCE foo LOCATION '/x/foo@hi_^!#.jar' CLASS 'com.bar.Foo' " +
         "API_VERSION 'V1'");
+    ParsesOk("CREATE DATA SOURCE foo CLASS 'com.bar.Foo' API_VERSION 'V1'");
 
     ParserError("CREATE DATA foo LOCATION '/foo.jar' CLASS 'com.bar.Foo' " +
         "API_VERSION 'V1'");
@@ -3076,8 +3252,6 @@ public class ParserTest extends FrontendTestBase {
     ParserError("CREATE DATA SOURCE foo LOCATION '/x/foo.jar' CLASS 'com.bar.Foo' " +
         "API_VERSION V1");
     ParserError("CREATE DATA SOURCE LOCATION '/x/foo.jar' CLASS 'com.bar.Foo' " +
-        "API_VERSION 'V1'");
-    ParserError("CREATE DATA SOURCE foo CLASS 'com.bar.Foo' " +
         "API_VERSION 'V1'");
     ParserError("CREATE DATA SOURCE foo LOCATION CLASS 'com.bar.Foo' " +
         "API_VERSION 'V1'");
@@ -3128,6 +3302,16 @@ public class ParserTest extends FrontendTestBase {
     // Mismatched number of columns in column definition and view definition parses ok.
     ParsesOk("CREATE VIEW Bar (x, y) AS SELECT 1, 2, 3");
 
+    ParsesOk("CREATE VIEW Bar (x, y, z) TBLPROPERTIES ('a' = 'b') AS SELECT 1, 2, 3");
+    ParsesOk("CREATE VIEW Bar (x, y, z) TBLPROPERTIES ('a' = 'b', 'c' = 'd')" +
+        " AS SELECT 1, 2, 3");
+    ParsesOk("CREATE VIEW Bar TBLPROPERTIES ('a' = 'b') AS VALUES(1, 2, 3)");
+    ParsesOk("CREATE VIEW Bar TBLPROPERTIES ('a' = 'b') AS SELECT 1, 2, 3");
+    ParsesOk("CREATE VIEW Bar TBLPROPERTIES ('a' = 'b', 'c' = 'd')" +
+        " AS SELECT 1, 2, 3");
+    ParsesOk("CREATE VIEW Foo.Bar COMMENT 'test' TBLPROPERTIES ('a' = 'b')" +
+        " AS SELECT a, b, c from t");
+
     // No view name.
     ParserError("CREATE VIEW AS SELECT c FROM t");
     // Missing AS keyword
@@ -3148,6 +3332,9 @@ public class ParserTest extends FrontendTestBase {
     ParserError("CREATE VIEW Foo.Bar (x) AS ALTER TABLE Foo COLUMNS (i int, s string)");
     ParserError("CREATE VIEW Foo.Bar (x) AS CREATE VIEW Foo.Bar AS SELECT 1");
     ParserError("CREATE VIEW Foo.Bar (x) AS ALTER VIEW Foo.Bar AS SELECT 1");
+
+    ParserError("CREATE VIEW Bar (x, y, z) TBLPROPERTIES () AS SELECT 1, 2, 3");
+    ParserError("CREATE VIEW Bar (x, y, z) TBLPROPERTIES (i int) AS SELECT 1, 2, 3");
   }
 
   @Test
@@ -3169,6 +3356,9 @@ public class ParserTest extends FrontendTestBase {
 
     // Mismatched number of columns in column definition and view definition parses ok.
     ParsesOk("ALTER VIEW Bar (x, y) AS SELECT 1, 2, 3");
+
+    ParsesOk("ALTER VIEW Foo.Bar SET TBLPROPERTIES ('pro1' = '1', 'pro2' = '2')");
+    ParsesOk("ALTER VIEW Foo.Bar UNSET TBLPROPERTIES ('pro1', 'pro2')");
 
     // Must be ALTER VIEW not ALTER TABLE.
     ParserError("ALTER TABLE Foo.Bar AS SELECT 1, 2, 3");
@@ -3193,6 +3383,11 @@ public class ParserTest extends FrontendTestBase {
     ParserError("ALTER VIEW Foo.Bar AS ALTER TABLE Foo COLUMNS (i int, s string)");
     ParserError("ALTER VIEW Foo.Bar AS CREATE VIEW Foo.Bar AS SELECT 1, 2, 3");
     ParserError("ALTER VIEW Foo.Bar AS ALTER VIEW Foo.Bar AS SELECT 1, 2, 3");
+
+    ParserError("ALTER VIEW Foo.Bar SET TBLPROPERTIES ()");
+    ParserError("ALTER VIEW Foo.Bar SET TBLPROPERTIES (int COMMENT 'x')");
+    ParserError("ALTER VIEW Foo.Bar UNSET TBLPROPERTIES ()");
+    ParserError("ALTER VIEW Foo.Bar UNSET TBLPROPERTIES (int COMMENT 'x')");
   }
 
   @Test
@@ -3240,11 +3435,20 @@ public class ParserTest extends FrontendTestBase {
     // Flexible partitioning
     ParsesOk("CREATE TABLE Foo PRIMARY KEY (i) PARTITION BY HASH(i) PARTITIONS 4 AS " +
         "SELECT 1");
-    ParserError("CREATE TABLE Foo PARTITION BY HASH(i) PARTITIONS 4 AS SELECT 1");
+    ParsesOk("CREATE TABLE Foo PARTITION BY HASH(i) PARTITIONS 4 AS SELECT 1");
     ParsesOk("CREATE TABLE Foo PRIMARY KEY (a) PARTITION BY HASH(a) PARTITIONS 4 " +
         "TBLPROPERTIES ('a'='b', 'c'='d') AS SELECT * from bar");
     ParsesOk("CREATE TABLE Foo PRIMARY KEY (a) PARTITION BY RANGE(a) " +
         "(PARTITION 1 < VALUES < 10, PARTITION 10 <= VALUES < 20, PARTITION VALUE = 30) " +
+        "STORED AS KUDU AS SELECT * FROM Bar");
+    ParsesOk("CREATE TABLE Foo NON UNIQUE PRIMARY KEY (a) " +
+        "PARTITION BY HASH (a) PARTITIONS 2 " +
+        "STORED AS KUDU AS SELECT * FROM Bar");
+    ParsesOk("CREATE TABLE Foo PARTITION BY RANGE(a) " +
+        "(PARTITION 1 < VALUES < 10, PARTITION 10 <= VALUES < 20, " +
+        " PARTITION VALUE = 30) " +
+        "STORED AS KUDU AS SELECT * FROM Bar");
+    ParsesOk("CREATE TABLE Foo PARTITION BY HASH (a) PARTITIONS 2 " +
         "STORED AS KUDU AS SELECT * FROM Bar");
   }
 
@@ -3504,8 +3708,9 @@ public class ParserTest extends FrontendTestBase {
         "^\n" +
         "Encountered: IDENTIFIER\n" +
         "Expected: ALTER, COMMENT, COMPUTE, COPY, CREATE, DELETE, DESCRIBE, DROP, " +
-            "EXPLAIN, GRANT, INSERT, INVALIDATE, LOAD, REFRESH, REVOKE, SELECT, SET, " +
-            "SHOW, TRUNCATE, UPDATE, UPSERT, USE, VALUES, WITH\n");
+        "EXPLAIN, GRANT, INSERT, INVALIDATE, KILL, LOAD, MERGE, OPTIMIZE, REFRESH, " +
+        "REVOKE, SELECT, SET, SHOW, TRUNCATE, UNSET, UPDATE, UPSERT, USE, VALUES, " +
+        "WITH\n");
 
     // missing select list
     ParserError("select from t",
@@ -3513,9 +3718,12 @@ public class ParserTest extends FrontendTestBase {
         "select from t\n" +
         "       ^\n" +
         "Encountered: FROM\n" +
-        "Expected: ALL, CASE, CAST, DATE, DEFAULT, DISTINCT, EXISTS, FALSE, GROUPING, " +
+        "Expected: ALL, CASE, CAST, DATE, DISTINCT, EXISTS, FALSE, GROUPING, " +
         "IF, INTERVAL, LEFT, NOT, NULL, REPLACE, RIGHT, STRAIGHT_JOIN, TRUNCATE, TRUE, " +
-        "UNNEST, IDENTIFIER");
+        "UNNEST, IDENTIFIER\n" +
+        "\n" +
+        "Hint: reserved words have to be escaped when used as an identifier, e.g. `from`"
+        );
 
     // missing from
     ParserError("select c, b, c where a = 5",
@@ -3523,9 +3731,12 @@ public class ParserTest extends FrontendTestBase {
         "select c, b, c where a = 5\n" +
         "               ^\n" +
         "Encountered: WHERE\n" +
-        "Expected: AND, AS, BETWEEN, DEFAULT, DIV, EXCEPT, FROM, ILIKE, IN, INTERSECT, " +
+        "Expected: AND, AS, BETWEEN, DIV, EXCEPT, FROM, ILIKE, IN, INTERSECT, " +
         "IREGEXP, IS, LIKE, LIMIT, ||, MINUS, NOT, OR, ORDER, REGEXP, RLIKE, UNION, " +
-        "COMMA, IDENTIFIER\n");
+        "COMMA, IDENTIFIER\n" +
+        "\n" +
+        "Hint: reserved words have to be escaped when used as an identifier, e.g. `where`"
+        );
 
     // missing table list
     ParserError("select c, b, c from where a = 5",
@@ -3533,7 +3744,10 @@ public class ParserTest extends FrontendTestBase {
         "select c, b, c from where a = 5\n" +
         "                    ^\n" +
         "Encountered: WHERE\n" +
-        "Expected: DEFAULT, UNNEST, IDENTIFIER\n");
+        "Expected: UNNEST, IDENTIFIER\n" +
+        "\n" +
+        "Hint: reserved words have to be escaped when used as an identifier, e.g. `where`"
+        );
 
     // missing predicate in where clause (no group by)
     ParserError("select c, b, c from t where",
@@ -3541,7 +3755,7 @@ public class ParserTest extends FrontendTestBase {
         "select c, b, c from t where\n" +
         "                           ^\n" +
         "Encountered: EOF\n" +
-        "Expected: CASE, CAST, DATE, DEFAULT, EXISTS, FALSE, GROUPING, IF, INTERVAL, " +
+        "Expected: CASE, CAST, DATE, EXISTS, FALSE, GROUPING, IF, INTERVAL, " +
         "LEFT, NOT, NULL, REPLACE, RIGHT, STRAIGHT_JOIN, TRUNCATE, TRUE, UNNEST, " +
         "IDENTIFIER");
 
@@ -3551,9 +3765,12 @@ public class ParserTest extends FrontendTestBase {
         "select c, b, c from t where group by a, b\n" +
         "                            ^\n" +
         "Encountered: GROUP\n" +
-        "Expected: CASE, CAST, DATE, DEFAULT, EXISTS, FALSE, GROUPING, IF, INTERVAL, " +
+        "Expected: CASE, CAST, DATE, EXISTS, FALSE, GROUPING, IF, INTERVAL, " +
         "LEFT, NOT, NULL, REPLACE, RIGHT, STRAIGHT_JOIN, TRUNCATE, TRUE, UNNEST, " +
-        "IDENTIFIER");
+        "IDENTIFIER\n" +
+        "\n" +
+        "Hint: reserved words have to be escaped when used as an identifier, e.g. `group`"
+        );
 
     // unmatched string literal starting with "
     ParserError("select c, \"b, c from t",
@@ -3615,7 +3832,7 @@ public class ParserTest extends FrontendTestBase {
         "...c,c,c,c,c,c,c,c,cd,c,d,d, ,c, from t\n" +
         "                             ^\n" +
         "Encountered: COMMA\n" +
-        "Expected: CASE, CAST, DATE, DEFAULT, EXISTS, FALSE, GROUPING, IF, INTERVAL, " +
+        "Expected: CASE, CAST, DATE, EXISTS, FALSE, GROUPING, IF, INTERVAL, " +
         "LEFT, NOT, NULL, REPLACE, RIGHT, TRUNCATE, TRUE, UNNEST, IDENTIFIER");
 
     // Parsing identifiers that have different names printed as EXPECTED
@@ -3636,7 +3853,7 @@ public class ParserTest extends FrontendTestBase {
         "USE ` `\n" +
         "    ^\n" +
         "Encountered: EMPTY IDENTIFIER\n" +
-        "Expected: DEFAULT, IDENTIFIER\n");
+        "Expected: IDENTIFIER\n");
 
     // Expecting = token
     ParserError("SET foo",
@@ -3652,7 +3869,7 @@ public class ParserTest extends FrontendTestBase {
          "\n" +
          "^\n" +
          "Encountered: EOF\n" +
-         "Expected: ALL, CASE, CAST, DATE, DEFAULT, DISTINCT, EXISTS, FALSE, GROUPING, " +
+         "Expected: ALL, CASE, CAST, DATE, DISTINCT, EXISTS, FALSE, GROUPING, " +
          "IF, INTERVAL, LEFT, NOT, NULL, REPLACE, RIGHT, " +
          "STRAIGHT_JOIN, TRUNCATE, TRUE, UNNEST, IDENTIFIER\n");
     ParserError("SELECT\n\n",
@@ -3660,7 +3877,7 @@ public class ParserTest extends FrontendTestBase {
          "\n" +
          "^\n" +
          "Encountered: EOF\n" +
-         "Expected: ALL, CASE, CAST, DATE, DEFAULT, DISTINCT, EXISTS, FALSE, GROUPING, " +
+         "Expected: ALL, CASE, CAST, DATE, DISTINCT, EXISTS, FALSE, GROUPING, " +
          "IF, INTERVAL, LEFT, NOT, NULL, REPLACE, RIGHT, " +
          "STRAIGHT_JOIN, TRUNCATE, TRUE, UNNEST, IDENTIFIER\n");
   }
@@ -4335,8 +4552,12 @@ public class ParserTest extends FrontendTestBase {
   }
 
   @Test
-  public void TestCreateBucketedTable() {
-    ParserError("Create table bucketed_tbl(order_id int, order_name string)"
-            + "clustered by (order_id) into 5 buckets", "Syntax error");
+  public void TestUnreservedKeywords() {
+    // Test if "unreserved keywords" can be used as identifiers, such as table names and
+    // column names.
+    final String[] unreservedKeywords = { "DEFAULT", "KILL", "QUERY" };
+    for (String keyword : unreservedKeywords) {
+      ParsesOk(String.format("CREATE TABLE %s (%s INT);", keyword, keyword));
+    }
   }
 }

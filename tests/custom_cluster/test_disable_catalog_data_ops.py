@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
 import pytest
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
@@ -27,7 +28,8 @@ class TestDisableCatalogDataOps(CustomClusterTestSuite):
   # and adding specifically one java-udf and one avro table.
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      catalogd_args="--logbuflevel=-1 --disable_catalog_data_ops_debug_only=true")
+      catalogd_args="--logbuflevel=-1 --disable_catalog_data_ops_debug_only=true",
+      disable_log_buffering=True)
   def test_disable_catalog_data_ops(self):
     # Expects that all Java UDF loading messages are for skip and that none of them load.
     self.assert_catalogd_log_contains(

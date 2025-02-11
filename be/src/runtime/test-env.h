@@ -18,8 +18,9 @@
 #ifndef IMPALA_RUNTIME_TEST_ENV
 #define IMPALA_RUNTIME_TEST_ENV
 
-#include "runtime/io/disk-io-mgr.h"
+#include "codegen/llvm-codegen-cache.h"
 #include "runtime/exec-env.h"
+#include "runtime/io/disk-io-mgr.h"
 #include "runtime/runtime-state.h"
 
 namespace impala {
@@ -76,9 +77,22 @@ class TestEnv {
   /// Return total of mem tracker consumption for all queries.
   int64_t TotalQueryMemoryConsumption();
 
+  /// Reset the codegen cache.
+  void ResetCodegenCache(MetricGroup* metrics = nullptr) {
+    if (metrics == nullptr) {
+      exec_env_->codegen_cache_.reset();
+      return;
+    }
+    exec_env_->codegen_cache_.reset(new CodeGenCache(metrics));
+  }
+
+  /// Get a full URI for the provided path based on the default filesystem.
+  std::string GetDefaultFsPath(const std::string& path);
+
   ExecEnv* exec_env() { return exec_env_.get(); }
   MetricGroup* metrics() { return exec_env_->metrics(); }
   TmpFileMgr* tmp_file_mgr() { return exec_env_->tmp_file_mgr(); }
+  CodeGenCache* codegen_cache() { return exec_env_->codegen_cache_.get(); }
 
  private:
   /// Recreate global metric groups.

@@ -83,6 +83,22 @@ struct TPlanFragment {
   // Maximum number of required threads that will be executing concurrently for this plan
   // fragment, i.e. the number of threads that this query needs to execute successfully.
   10: optional i64 thread_reservation
+
+  // The effective number of parallelism for this fragment that dictated by the frontend
+  // planner. If the frontend planner set this to a positive number, the backend scheduler
+  // must make sure that it schedules no more than this many instance fragments. Must be
+  // greater than 0 if query option COMPUTE_PROCESSING_COST=true. Currently not enforced
+  // when fragment need to exceed max_fs_writers query option (see IMPALA-8125).
+  14: optional i32 effective_instance_count
+
+  // If true, the fragment must be scheduled on the coordinator. In this case 'partition'
+  // must be UNPARTITIONED.
+  15: required bool is_coordinator_only
+
+  // Marker on whether this is a dominant fragment or not. Only possible to be true if
+  // COMPUTE_PROCESSING_COST=true. Otherwise, always false.
+  // See PlanFragment.java for definition of dominant fragment.
+  16: optional bool is_dominant = false
 }
 
 // location information for a single scan range

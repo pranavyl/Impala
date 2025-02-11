@@ -29,7 +29,13 @@ fi
 # IMPALA-8815: don't allow additional potentially incompatible jars to get onto
 # the ranger classpath. We should only need the test cluster configs on the classpath.
 unset CLASSPATH
-. $IMPALA_HOME/bin/impala-config.sh
+. $IMPALA_HOME/bin/impala-config.sh > /dev/null 2>&1
 
-JAVA_OPTS="-Xdebug -Xrunjdwp:transport=dt_socket,server=y,suspend=n,address=30130" \
+# Required to start Ranger with Java 11
+if [[ ! -d "${RANGER_HOME}"/ews/logs ]]; then
+  mkdir -p "${RANGER_HOME}"/ews/logs
+fi
+
+JAVA_DBG_SOCKET="-Xrunjdwp:transport=dt_socket,server=y,suspend=n,address=30130"
+JAVA_OPTS="-XX:+IgnoreUnrecognizedVMOptions -Xdebug ${JAVA_DBG_SOCKET}" \
     "${RANGER_HOME}"/ews/ranger-admin-services.sh restart

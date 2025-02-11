@@ -39,14 +39,8 @@ STRING,STRING,STRING,STRING
 ---- QUERY
 SHOW PARTITIONS iceberg_hadoop_tables;
 ---- RESULTS
-0,1,1000,'level','IDENTITY'
-0,1,1001,'level_trunc','TRUNCATE 10'
-0,2,1002,'event_time','IDENTITY'
-0,2,1003,'event_time_hour','HOUR'
-0,2,1004,'event_time_bucket','BUCKET 1000'
-0,3,1005,'register_time_day','DAY'
 ---- TYPES
-BIGINT,BIGINT,BIGINT,STRING,STRING
+STRING, BIGINT,BIGINT
 ====
 ---- QUERY
 DROP TABLE iceberg_hadoop_tables;
@@ -66,15 +60,6 @@ DESCRIBE iceberg_hadoop_tables;
 STRING,STRING,STRING,STRING
 ====
 ---- QUERY
-CREATE EXTERNAL TABLE iceberg_hadoop_tbls_external(
-  level STRING
-)
-STORED AS ICEBERG
-TBLPROPERTIES('iceberg.catalog'='hadoop.tables');
----- RESULTS
-'Location is necessary for external iceberg table.'
-====
----- QUERY
 CREATE TABLE iceberg_hadoop_tbls_with_loc(
   level STRING
 )
@@ -85,13 +70,13 @@ PARTITIONED BY SPEC
   TRUNCATE(15, level)
 )
 STORED AS ICEBERG
-LOCATION '/$DATABASE.iceberg_test_with_location'
+LOCATION '$WAREHOUSE_LOCATION_PREFIX/other/$DATABASE.iceberg_test_with_location'
 TBLPROPERTIES('iceberg.catalog'='hadoop.tables');
 CREATE EXTERNAL TABLE iceberg_hadoop_tbls_external(
   level STRING
 )
 STORED AS ICEBERG
-LOCATION '/$DATABASE.iceberg_test_with_location'
+LOCATION '$WAREHOUSE_LOCATION_PREFIX/other/$DATABASE.iceberg_test_with_location'
 TBLPROPERTIES('iceberg.catalog'='hadoop.tables');
 ---- RESULTS
 'Table has been created.'
@@ -106,16 +91,13 @@ STRING,STRING,STRING,STRING
 ---- QUERY
 SHOW PARTITIONS iceberg_hadoop_tbls_external;
 ---- RESULTS
-0,1,1000,'level','IDENTITY'
-0,1,1001,'level_bucket','BUCKET 12345'
-0,1,1002,'level_trunc','TRUNCATE 15'
 ---- TYPES
-BIGINT,BIGINT,BIGINT,STRING,STRING
+STRING,BIGINT,BIGINT
 ====
 ---- QUERY
 CREATE EXTERNAL TABLE iceberg_hadoop_tbls_external_empty_col
 STORED AS ICEBERG
-LOCATION '/$DATABASE.iceberg_test_with_location'
+LOCATION '$WAREHOUSE_LOCATION_PREFIX/other/$DATABASE.iceberg_test_with_location'
 TBLPROPERTIES('iceberg.catalog'='hadoop.tables');
 ---- RESULTS
 'Table has been created.'
@@ -126,15 +108,6 @@ DESCRIBE iceberg_hadoop_tbls_external_empty_col;
 'level','string','','true'
 ---- TYPES
 STRING,STRING,STRING,STRING
-====
----- QUERY
-SHOW PARTITIONS iceberg_hadoop_tbls_external_empty_col;
----- RESULTS
-0,1,1000,'level','IDENTITY'
-0,1,1001,'level_bucket','BUCKET 12345'
-0,1,1002,'level_trunc','TRUNCATE 15'
----- TYPES
-BIGINT,BIGINT,BIGINT,STRING,STRING
 ====
 ---- QUERY
 DROP TABLE iceberg_hadoop_tbls_with_loc;
@@ -164,7 +137,7 @@ PARTITIONED BY SPEC
 )
 STORED AS ICEBERG
 TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
-'iceberg.catalog_location'='/$DATABASE/hadoop_catalog_test');
+'iceberg.catalog_location'='$WAREHOUSE_LOCATION_PREFIX/other/$DATABASE/hadoop_catalog_test');
 ---- RESULTS
 'Table has been created.'
 ====
@@ -180,18 +153,6 @@ DESCRIBE iceberg_hadoop_catalog;
 'struct_test','struct<\n  f1:bigint,\n  f2:bigint\n>','','true'
 ---- TYPES
 STRING,STRING,STRING,STRING
-====
----- QUERY
-SHOW PARTITIONS iceberg_hadoop_catalog;
----- RESULTS
-0,1,1000,'level','IDENTITY'
-0,1,1001,'level_trunc','TRUNCATE 10'
-0,2,1002,'event_time','IDENTITY'
-0,2,1003,'event_time_hour','HOUR'
-0,2,1004,'event_time_bucket','BUCKET 1000'
-0,3,1005,'register_time_day','DAY'
----- TYPES
-BIGINT,BIGINT,BIGINT,STRING,STRING
 ====
 ---- QUERY
 DROP TABLE iceberg_hadoop_catalog;
@@ -210,13 +171,13 @@ PARTITIONED BY SPEC
 )
 STORED AS ICEBERG
 TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
-'iceberg.catalog_location'='/$DATABASE/hadoop_catalog_test');
+'iceberg.catalog_location'='$WAREHOUSE_LOCATION_PREFIX/other/$DATABASE/hadoop_catalog_test');
 CREATE EXTERNAL TABLE iceberg_hadoop_cat_external(
   level STRING
 )
 STORED AS ICEBERG
 TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
-'iceberg.catalog_location'='/$DATABASE/hadoop_catalog_test', 'iceberg.table_identifier'='$DATABASE.iceberg_hadoop_catalog');
+'iceberg.catalog_location'='$WAREHOUSE_LOCATION_PREFIX/other/$DATABASE/hadoop_catalog_test', 'iceberg.table_identifier'='$DATABASE.iceberg_hadoop_catalog');
 ---- RESULTS
 'Table has been created.'
 ====
@@ -226,15 +187,6 @@ DESCRIBE iceberg_hadoop_cat_external;
 'level','string','','true'
 ---- TYPES
 STRING,STRING,STRING,STRING
-====
----- QUERY
-SHOW PARTITIONS iceberg_hadoop_cat_external;
----- RESULTS
-0,1,1000,'level','IDENTITY'
-0,1,1001,'level_bucket','BUCKET 12345'
-0,1,1002,'level_trunc','TRUNCATE 10'
----- TYPES
-BIGINT,BIGINT,BIGINT,STRING,STRING
 ====
 ---- QUERY
 DROP TABLE iceberg_hadoop_catalog;
@@ -248,13 +200,13 @@ CREATE TABLE iceberg_hadoop_cat_drop(
 )
 STORED AS ICEBERG
 TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
-'iceberg.catalog_location'='/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test');
+'iceberg.catalog_location'='$WAREHOUSE_LOCATION_PREFIX/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test');
 CREATE TABLE iceberg_hadoop_cat_query(
   level STRING
 )
 STORED AS ICEBERG
 TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
-'iceberg.catalog_location'='/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test');
+'iceberg.catalog_location'='$WAREHOUSE_LOCATION_PREFIX/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test');
 DROP TABLE iceberg_hadoop_cat_drop;
 SELECT * FROM iceberg_hadoop_cat_query;
 ---- TYPES
@@ -265,7 +217,7 @@ string
 DESCRIBE FORMATTED iceberg_hadoop_cat_query;
 ---- RESULTS: VERIFY_IS_SUBSET
 'Location:           ','$NAMENODE/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test/$DATABASE/iceberg_hadoop_cat_query','NULL'
-'','iceberg.catalog_location','/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test'
+'','iceberg.catalog_location','$WAREHOUSE_LOCATION_PREFIX/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test'
 '','write.format.default','parquet             '
 '','iceberg.catalog     ','hadoop.catalog      '
 ---- TYPES
@@ -277,12 +229,12 @@ CREATE TABLE iceberg_hadoop_cat_with_ident(
 )
 STORED AS ICEBERG
 TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
-'iceberg.catalog_location'='/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test',
+'iceberg.catalog_location'='$WAREHOUSE_LOCATION_PREFIX/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test',
 'iceberg.table_identifier'='org.db.tbl');
 DESCRIBE FORMATTED iceberg_hadoop_cat_with_ident;
 ---- RESULTS: VERIFY_IS_SUBSET
 'Location:           ','$NAMENODE/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test/org/db/tbl','NULL'
-'','iceberg.catalog_location','/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test'
+'','iceberg.catalog_location','$WAREHOUSE_LOCATION_PREFIX/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test'
 '','write.format.default','parquet             '
 '','iceberg.catalog     ','hadoop.catalog      '
 ---- TYPES
@@ -295,7 +247,7 @@ INSERT INTO iceberg_hadoop_cat_with_ident values ("ice");
 CREATE EXTERNAL TABLE iceberg_hadoop_cat_with_ident_ext
 STORED AS ICEBERG
 TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
-'iceberg.catalog_location'='/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test',
+'iceberg.catalog_location'='$WAREHOUSE_LOCATION_PREFIX/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test',
 'iceberg.table_identifier'='org.db.tbl');
 ---- RESULTS
 'Table has been created.'
@@ -304,7 +256,7 @@ TBLPROPERTIES('iceberg.catalog'='hadoop.catalog',
 DESCRIBE FORMATTED iceberg_hadoop_cat_with_ident_ext;
 ---- RESULTS: VERIFY_IS_SUBSET
 'Location:           ','$NAMENODE/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test/org/db/tbl','NULL'
-'','iceberg.catalog_location','/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test'
+'','iceberg.catalog_location','$WAREHOUSE_LOCATION_PREFIX/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test'
 '','write.format.default','parquet             '
 '','iceberg.catalog     ','hadoop.catalog      '
 ---- TYPES
@@ -336,7 +288,7 @@ PARTITIONED BY SPEC
 )
 STORED AS ICEBERG
 TBLPROPERTIES('write.format.default'='orc','iceberg.catalog'='hadoop.catalog',
-'iceberg.catalog_location'='/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test');
+'iceberg.catalog_location'='$WAREHOUSE_LOCATION_PREFIX/test-warehouse/$DATABASE/hadoop_catalog_test/iceberg_test');
 ---- RESULTS
 'Table has been created.'
 ====
@@ -352,16 +304,6 @@ DESCRIBE iceberg_hadoop_cat_with_orc;
 'struct_test','struct<\n  f1:bigint,\n  f2:bigint\n>','','true'
 ---- TYPES
 STRING,STRING,STRING,STRING
-====
----- QUERY
-SHOW PARTITIONS iceberg_hadoop_cat_with_orc;
----- RESULTS
-0,1,1000,'level','IDENTITY'
-0,2,1001,'event_time','IDENTITY'
-0,2,1002,'event_time_hour','HOUR'
-0,3,1003,'register_time_day','DAY'
----- TYPES
-BIGINT,BIGINT,BIGINT,STRING,STRING
 ====
 ---- QUERY
 DROP TABLE iceberg_hadoop_cat_with_orc;
@@ -475,10 +417,285 @@ DESCRIBE iceberg_old_style_partitions;
 STRING,STRING,STRING,STRING
 ====
 ---- QUERY
-SHOW PARTITIONS iceberg_old_style_partitions;
+create table ice_part_hadoop_tbl (
+  col_year date,
+  col_month date,
+  col_day date,
+  col_hour timestamp,
+  col_truncate string,
+  col_bucket int,
+  col_identity int
+) partitioned by spec (
+  year(col_year),
+  month(col_month),
+  day(col_day),
+  hour(col_hour),
+  truncate(2, col_truncate),
+  bucket(2, col_bucket),
+  col_identity
+) stored as iceberg TBLPROPERTIES('iceberg.catalog' = 'hadoop.tables');
 ---- RESULTS
-0,6,1000,'level','IDENTITY'
-0,7,1001,'event_id','IDENTITY'
+'Table has been created.'
+====
+---- QUERY
+describe formatted ice_part_hadoop_tbl;
+---- RESULTS: VERIFY_IS_NOT_IN
+'Num Buckets:        ','0                   ','NULL'
+'Bucket Columns:     ','[]                  ','NULL'
+---- RESULTS: VERIFY_IS_SUBSET
+'','NULL','NULL'
+'# Partition Transform Information','NULL','NULL'
+'# col_name            ','transform_type      ','NULL'
+'col_year','YEAR','NULL'
+'col_month','MONTH','NULL'
+'col_day','DAY','NULL'
+'col_hour','HOUR','NULL'
+'col_truncate','TRUNCATE[2]','NULL'
+'col_bucket','BUCKET[2]','NULL'
+'col_identity','IDENTITY','NULL'
+'','external.table.purge','TRUE                '
 ---- TYPES
-BIGINT,BIGINT,BIGINT,STRING,STRING
+string, string, string
+====
+---- QUERY
+create table ice_part_hadoop_catalog (
+  col_year date,
+  col_month date,
+  col_day date,
+  col_hour timestamp,
+  col_truncate string,
+  col_bucket int,
+  col_identity int
+) partitioned by spec (
+  year(col_year),
+  month(col_month),
+  day(col_day),
+  hour(col_hour),
+  truncate(2, col_truncate),
+  bucket(2, col_bucket),
+  col_identity
+) stored as iceberg TBLPROPERTIES(
+  'iceberg.catalog' = 'hadoop.catalog',
+  'iceberg.catalog_location' = '$WAREHOUSE_LOCATION_PREFIX/other/$DATABASE/hadoop_catalog_test'
+);
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+describe formatted ice_part_hadoop_catalog;
+---- RESULTS: VERIFY_IS_NOT_IN
+'Num Buckets:        ','0                   ','NULL'
+'Bucket Columns:     ','[]                  ','NULL'
+---- RESULTS: VERIFY_IS_SUBSET
+'','NULL','NULL'
+'# Partition Transform Information','NULL','NULL'
+'# col_name            ','transform_type      ','NULL'
+'col_year','YEAR','NULL'
+'col_month','MONTH','NULL'
+'col_day','DAY','NULL'
+'col_hour','HOUR','NULL'
+'col_truncate','TRUNCATE[2]','NULL'
+'col_bucket','BUCKET[2]','NULL'
+'col_identity','IDENTITY','NULL'
+'','external.table.purge','TRUE                '
+---- TYPES
+string, string, string
+====
+---- QUERY
+create table ice_part_catalogs (
+  col_year date,
+  col_month date,
+  col_day date,
+  col_hour timestamp,
+  col_truncate string,
+  col_bucket int,
+  col_identity int
+) partitioned by spec (
+  year(col_year),
+  month(col_month),
+  day(col_day),
+  hour(col_hour),
+  truncate(2, col_truncate),
+  bucket(2, col_bucket),
+  col_identity
+) stored as iceberg TBLPROPERTIES('iceberg.catalog' = 'ice_hadoop_cat');
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+describe formatted ice_part_catalogs;
+---- RESULTS: VERIFY_IS_NOT_IN
+'Num Buckets:        ','0                   ','NULL'
+'Bucket Columns:     ','[]                  ','NULL'
+---- RESULTS: VERIFY_IS_SUBSET
+'','NULL','NULL'
+'# Partition Transform Information','NULL','NULL'
+'# col_name            ','transform_type      ','NULL'
+'col_year','YEAR','NULL'
+'col_month','MONTH','NULL'
+'col_day','DAY','NULL'
+'col_hour','HOUR','NULL'
+'col_truncate','TRUNCATE[2]','NULL'
+'col_bucket','BUCKET[2]','NULL'
+'col_identity','IDENTITY','NULL'
+'','external.table.purge','TRUE                '
+---- TYPES
+string, string, string
+====
+---- QUERY
+create table ice_non_partition (i int, s string, ts timestamp, d date) stored as iceberg;
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+describe formatted ice_non_partition;
+---- RESULTS: VERIFY_IS_NOT_IN
+'# Partition Transform Information','NULL','NULL'
+'# col_name            ','transform_type      ','NULL'
+'Num Buckets:        ','0                   ','NULL'
+'Bucket Columns:     ','[]                  ','NULL'
+---- RESULTS: VERIFY_IS_SUBSET
+'','external.table.purge','TRUE                '
+---- TYPES
+string, string, string
+====
+---- QUERY
+# Create with keyword 'stored by'
+create table iceberg_stored_by (i int, s string, ts timestamp, d date) stored by iceberg;
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+describe formatted iceberg_stored_by;
+---- RESULTS: VERIFY_IS_SUBSET
+'','table_type          ','ICEBERG             '
+---- TYPES
+string, string, string
+====
+---- QUERY
+create table ice_tbl (i int) stored as iceberg tblproperties('external.table.purge'='FALSE');
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+describe formatted ice_tbl;
+---- RESULTS: VERIFY_IS_SUBSET
+'','external.table.purge','FALSE               '
+---- TYPES
+string, string, string
+====
+---- QUERY
+create table ice_hive_cat_tbl (i int) stored as iceberg tblproperties(
+  'iceberg.catalog' = 'ice_hive_cat',
+  'external.table.purge' = 'FALSE'
+);
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+describe formatted ice_hive_cat_tbl;
+---- RESULTS: VERIFY_IS_SUBSET
+'','external.table.purge','FALSE               '
+---- TYPES
+string, string, string
+====
+---- QUERY
+create table ice_hadoop_tbl (i int) stored as iceberg tblproperties(
+  'iceberg.catalog' = 'hadoop.tables',
+  'external.table.purge' = 'FALSE'
+);
+---- ERRORS
+The table property 'external.table.purge' will be set to 'TRUE' on newly created managed Iceberg tables.
+---- RESULTS
+'Table has been created.'
+====
+---- QUERY
+describe formatted ice_hadoop_tbl;
+---- RESULTS: VERIFY_IS_SUBSET
+'','external.table.purge','TRUE                '
+---- TYPES
+string, string, string
+====
+---- QUERY
+# Create an Iceberg table with PKs and check if 'identifier-field-ids' are populated.
+create table ice_tbl_with_pk
+    (i int not null, s string not null, d date not null, primary key(i, d) not enforced)
+    stored as iceberg;
+describe formatted ice_tbl_with_pk;
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:'','current-schema.*','.*identifier-field-ids\\\\":\[1,3\].*'
+---- TYPES
+string, string, string
+====
+---- QUERY
+# Similar as above, but the table is also partitioned.
+create table ice_tbl_with_pk_partitioned
+    (i int not null, s string not null, d date, primary key(i, s) not enforced)
+    partitioned by spec (s)
+    stored as iceberg;
+describe formatted ice_tbl_with_pk_partitioned;
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:'','current-schema.*','.*identifier-field-ids\\\\":\[1,2\].*'
+---- TYPES
+string, string, string
+====
+---- QUERY
+# Primary key on partition columns with partition transform.
+create table ice_tbl_with_pk_partition_transform
+    (i int not null, s string not null, d date not null, primary key(s, d) not enforced)
+    partitioned by spec (day(d), truncate(3,s), bucket(10, s))
+    stored as iceberg;
+describe formatted ice_tbl_with_pk_partition_transform;
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:'','current-schema.*','.*identifier-field-ids\\\\":\[2,3\].*'
+---- TYPES
+string, string, string
+====
+---- QUERY
+# When source table has primary keys the CTAS by default won't use it for the target
+# table.
+create table ctas_pk_in_source_not_used
+  stored as iceberg
+  as select * from ice_tbl_with_pk;
+describe formatted ctas_pk_in_source_not_used;
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:'.*','current-schema.*','.*'
+---- RESULTS: VERIFY_IS_NOT_IN
+row_regex:'.*','current-schema.*','.*identifier-field-ids.*'
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Primary key provided to a CTAS statement.
+create table ctas_pk_unpartitioned
+  primary key(d) not enforced
+  stored as iceberg
+  as select * from ice_tbl_with_pk;
+describe formatted ctas_pk_unpartitioned;
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:'.*','current-schema.*','.*identifier-field-ids\\\\":\[3\].*'
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Similar as above but the table is partitioned.
+create table ctas_pk_partitioned
+  primary key(s, d) not enforced
+  partitioned by spec (d)
+  stored as iceberg
+  as select * from ice_tbl_with_pk;
+describe formatted ctas_pk_partitioned;
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:'.*','current-schema.*','.*identifier-field-ids\\\\":\[2,3\].*'
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Create table like inherits the 'identifier-field-ids' from the source table.
+create table ice_like_pk like ice_tbl_with_pk_partitioned;
+describe formatted ice_like_pk;
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:'.*','current-schema.*','.*identifier-field-ids\\\\":\[1,2\].*'
+---- TYPES
+STRING,STRING,STRING
 ====

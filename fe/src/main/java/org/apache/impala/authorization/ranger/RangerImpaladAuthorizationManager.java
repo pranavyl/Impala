@@ -133,6 +133,9 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
         // The branch for SHOW ROLES.
         Preconditions.checkState(!params.isIs_show_current_roles());
         Set<RangerRole> roles = plugin_.get().getRoles().getRangerRoles();
+        if (null == roles) {
+          roles = Collections.emptySet();
+        }
         roleNames = roles.stream().map(RangerRole::getName).collect(Collectors.toSet());
       }
 
@@ -288,11 +291,18 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
         privilege.getColumn_name(), accessResult);
     Optional<String> uri = getResourceName(RangerImpalaResourceBuilder.URL,
         privilege.getUri(), accessResult);
-    Optional<String> udf = getResourceName(RangerImpalaResourceBuilder.UDF, ANY,
+    Optional<String> storageType = getResourceName(
+        RangerImpalaResourceBuilder.STORAGE_TYPE, privilege.getStorage_type(),
         accessResult);
+    Optional<String> storageUri = getResourceName(
+        RangerImpalaResourceBuilder.STORAGE_URL, privilege.getStorage_url(),
+        accessResult);
+    Optional<String> udf = getResourceName(RangerImpalaResourceBuilder.UDF,
+        privilege.getFn_name(), accessResult);
 
     return new RangerResultRow(type, principal, database.orElse(""), table.orElse(""),
-        column.orElse(""), uri.orElse(""), udf.orElse(""), level, grantOption, longTime);
+        column.orElse(""), uri.orElse(""), storageType.orElse(""), storageUri.orElse(""),
+        udf.orElse(""), level, grantOption, longTime);
   }
 
   private static List<RangerAccessRequest> buildAccessRequests(TPrivilege privilege) {
@@ -307,22 +317,30 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
       resources.add(RangerUtil.createColumnResource(privilege));
     } else if (privilege.getUri() != null) {
       resources.add(RangerUtil.createUriResource(privilege));
+    } else if (privilege.getFn_name() != null) {
+      resources.add(RangerUtil.createFunctionResource(privilege));
     } else if (privilege.getDb_name() != null) {
       // DB is used by column and function resources.
       resources.add(RangerUtil.createColumnResource(privilege));
       resources.add(RangerUtil.createFunctionResource(privilege));
+    } else if (privilege.getStorage_url() != null ||
+        privilege.getStorage_type() != null) {
+      resources.add(RangerUtil.createStorageHandlerUriResource(privilege));
     } else {
-      // Server is used by column, function, and URI resources.
+      // Server is used by column, function, URI, and storage handler URI resources.
       resources.add(RangerUtil.createColumnResource(privilege));
       resources.add(RangerUtil.createUriResource(privilege));
+      resources.add(RangerUtil.createStorageHandlerUriResource(privilege));
       resources.add(RangerUtil.createFunctionResource(privilege));
     }
 
     List<RangerAccessRequest> requests = new ArrayList<>();
     for (Map<String, String> resource : resources) {
-      requests.add(new RangerAccessRequestImpl(
-          new RangerAccessResourceImpl(Collections.unmodifiableMap(resource)),
-          RangerPolicyEngine.ANY_ACCESS, null, null));
+      RangerAccessRequestImpl request = new RangerAccessRequestImpl();
+      request.setResource(
+          new RangerAccessResourceImpl(Collections.unmodifiableMap(resource)));
+      request.setAccessType(RangerPolicyEngine.ANY_ACCESS);
+      requests.add(request);
     }
     return requests;
   }
@@ -387,6 +405,8 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
           resourceResult.addColumnResult(row);
         } else if (!row.table_.equals("*") && !row.table_.isEmpty()) {
           resourceResult.addTableResult(row);
+        } else if (!row.udf_.equals("*") && !row.udf_.isEmpty()) {
+          resourceResult.addUdfResult(row);
         } else if (!row.database_.equals("*") && !row.database_.isEmpty()) {
           resourceResult.addDatabaseResult(row);
         } else {
@@ -425,6 +445,7 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
     private List<RangerResultRow> database = new ArrayList<>();
     private List<RangerResultRow> table = new ArrayList<>();
     private List<RangerResultRow> column = new ArrayList<>();
+    private List<RangerResultRow> udf = new ArrayList<>();
 
     public RangerResourceResult() { }
 
@@ -448,6 +469,11 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
       return this;
     }
 
+    public RangerResourceResult addUdfResult(RangerResultRow result) {
+      udf.add(result);
+      return this;
+    }
+
     /**
      * For each disjoint List corresponding to a given resource, if there exists a
      * RangerResultRow indicating the specified principal's privilege of
@@ -461,6 +487,7 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
       results.addAll(filterIfAll(database));
       results.addAll(filterIfAll(table));
       results.addAll(filterIfAll(column));
+      results.addAll(filterIfAll(udf));
       return results;
     }
 
@@ -489,20 +516,25 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
     private final String table_;
     private final String column_;
     private final String uri_;
+    private final String storageType_;
+    private final String storageUri_;
     private final String udf_;
     private final TPrivilegeLevel privilege_;
     private final boolean grantOption_;
     private final Long createTime_;
 
     public RangerResultRow(TPrincipalType principalType, String principalName,
-        String database, String table, String column, String uri, String udf,
-        TPrivilegeLevel privilege, boolean grantOption, Long createTime) {
+        String database, String table, String column, String uri, String storageType,
+        String storageUri, String udf, TPrivilegeLevel privilege, boolean grantOption,
+        Long createTime) {
       this.principalType_ = principalType;
       this.principalName_ = principalName;
       this.database_ = database;
       this.table_ = table;
       this.column_ = column;
       this.uri_ = uri;
+      this.storageType_ = storageType;
+      this.storageUri_ = storageUri;
       this.udf_ = udf;
       this.privilege_ = privilege;
       this.grantOption_ = grantOption;
@@ -518,6 +550,8 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
       schema.addToColumns(new TColumn("table", Type.STRING.toThrift()));
       schema.addToColumns(new TColumn("column", Type.STRING.toThrift()));
       schema.addToColumns(new TColumn("uri", Type.STRING.toThrift()));
+      schema.addToColumns(new TColumn("storage_type", Type.STRING.toThrift()));
+      schema.addToColumns(new TColumn("storage_uri", Type.STRING.toThrift()));
       schema.addToColumns(new TColumn("udf", Type.STRING.toThrift()));
       schema.addToColumns(new TColumn("privilege", Type.STRING.toThrift()));
       schema.addToColumns(new TColumn("grant_option", Type.BOOLEAN.toThrift()));
@@ -535,6 +569,8 @@ public class RangerImpaladAuthorizationManager implements AuthorizationManager {
       rowBuilder.add(table_);
       rowBuilder.add(column_);
       rowBuilder.add(uri_);
+      rowBuilder.add(storageType_);
+      rowBuilder.add(storageUri_);
       rowBuilder.add(udf_);
       rowBuilder.add(privilege_.name().toLowerCase());
       rowBuilder.add(grantOption_);

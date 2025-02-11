@@ -75,6 +75,9 @@ class ImpalaHttpHandler {
   void HadoopVarzHandler(const Webserver::WebRequest& req,
       rapidjson::Document* document);
 
+  /// Add description strings for the query record table header tooltips.
+  void AddQueryRecordTips(rapidjson::Document* document);
+
   /// Returns two sorted lists of queries, one in-flight and one completed, as well as a
   /// list of active backends and their plan-fragment count.
   //
@@ -145,7 +148,8 @@ class ImpalaHttpHandler {
 
   /// Helper method to put query profile in 'document' with required format.
   void QueryProfileHelper(const Webserver::WebRequest& req,
-      rapidjson::Document* document, TRuntimeProfileFormat::type format);
+      rapidjson::Document* document, TRuntimeProfileFormat::type format,
+      bool internal_profile = false);
 
   /// Upon return, 'document' will contain the query profile as a base64 encoded object in
   /// 'contents'.
@@ -198,10 +202,13 @@ class ImpalaHttpHandler {
   void QueryMemoryHandler(const Webserver::WebRequest& req,
       rapidjson::Document* output);
 
+  /// Utility method to print progress something as n/m(xx%).
+  std::string ProgressToString(int64_t num_completed, int64_t total);
+
   /// Helper method to render a single QueryStateRecord as a Json object Used by
   /// QueryStateHandler().
-  void QueryStateToJson(const ImpalaServer::QueryStateRecord& record,
-      rapidjson::Value* value, rapidjson::Document* document);
+  void QueryStateToJson(const QueryStateRecord& record,
+      rapidjson::Value* value, rapidjson::Document* document, bool inflight);
 
   /// Json callback for /backends, which prints a table of known backends.
   /// "backends" : [
@@ -274,5 +281,19 @@ class ImpalaHttpHandler {
   /// supplied argument. Produces no JSON output.
   void ResetResourcePoolStatsHandler(
       const Webserver::WebRequest& req, rapidjson::Document* document);
+
+  /// Fill the sessions information into the document.
+  void FillSessionsInfo(rapidjson::Document* document);
+
+  /// Fill the hs2 users information into the document.
+  void FillUsersInfo(rapidjson::Document* document);
+
+  /// Fill the client hosts information into the document.
+  void FillClientHostsInfo(rapidjson::Document* document,
+      const ThriftServer::ConnectionContextList& connection_contexts);
+
+  /// Fill the connections information into the document.
+  void FillConnectionsInfo(rapidjson::Document* document,
+      const ThriftServer::ConnectionContextList& connection_contexts);
 };
 }

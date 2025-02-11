@@ -23,8 +23,8 @@ import static org.apache.hadoop.fs.CommonConfigurationKeysPublic
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.security.authentication.util.KerberosName;
 import org.apache.impala.analysis.SqlScanner;
-import org.apache.impala.common.PrintUtils;
 import org.apache.impala.thrift.TBackendGflags;
+import org.apache.impala.thrift.TGeospatialLibrary;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
@@ -144,10 +144,6 @@ public class BackendConfig {
   }
 
   public boolean isInsertEventsEnabled() { return backendCfg_.enable_insert_events; }
-
-  public boolean isOrcScannerEnabled() {
-    return backendCfg_.enable_orc_scanner;
-  }
 
   /**
    * Returns the value of the `authorization_factory_class` flag or `null` if
@@ -358,5 +354,199 @@ public class BackendConfig {
   @VisibleForTesting
   public void setEnableSyncToLatestEventOnDdls(boolean flag) {
     backendCfg_.enable_sync_to_latest_event_on_ddls = flag;
+  }
+
+  public boolean enableReloadEvents() {
+    return backendCfg_.enable_reload_events;
+  }
+
+  @VisibleForTesting
+  public void setEnableReloadEvents(boolean flag) {
+    backendCfg_.enable_reload_events = flag;
+  }
+
+  public boolean enableSkippingOlderEvents() {
+    return backendCfg_.enable_skipping_older_events;
+  }
+
+  @VisibleForTesting
+  public void setSkippingOlderEvents(boolean flag) {
+    backendCfg_.enable_skipping_older_events = flag;
+  }
+
+  public boolean pullTableTypesAndComments() {
+    return backendCfg_.pull_table_types_and_comments;
+  }
+
+  public boolean useHmsColumnOrderForHBaseTables() {
+    return backendCfg_.use_hms_column_order_for_hbase_tables;
+  }
+
+  public String getIgnoredDirPrefixList() {
+    return backendCfg_.ignored_dir_prefix_list;
+  }
+
+  public TGeospatialLibrary getGeospatialLibrary() {
+    return backendCfg_.geospatial_library;
+  }
+
+  public double getQueryCpuCountDivisor() { return backendCfg_.query_cpu_count_divisor; }
+
+  public boolean isProcessingCostUseEqualExprWeight() {
+    return backendCfg_.processing_cost_use_equal_expr_weight;
+  }
+
+  public long getMinProcessingPerThread() {
+    return backendCfg_.min_processing_per_thread;
+  }
+
+  public boolean isSkipResourceCheckingOnLastExecutorGroupSet() {
+    return backendCfg_.skip_resource_checking_on_last_executor_group_set;
+  }
+
+  public int getThriftRpcMaxMessageSize() {
+    // With IMPALA-13020, the C++ max message size is a 64-bit integer,
+    // but the Java max message size is still 32-bit. Cap the Java value
+    // at Integer.MAX_VALUE;
+    return (int) Math.min(backendCfg_.thrift_rpc_max_message_size, Integer.MAX_VALUE);
+  }
+
+  public String getFileMetadataReloadProperties() {
+    return backendCfg_.file_metadata_reload_properties;
+  }
+
+  @VisibleForTesting
+  public void setFileMetadataReloadProperties(String newPropertiesConfig) {
+    backendCfg_.file_metadata_reload_properties = newPropertiesConfig;
+  }
+
+  public float getScanRangeCostFactor() {
+    return (float) backendCfg_.scan_range_cost_factor;
+  }
+
+  public boolean useJammWeigher() {
+    return backendCfg_.use_jamm_weigher;
+  }
+
+  public int icebergReloadNewFilesThreshold() {
+    return backendCfg_.iceberg_reload_new_files_threshold;
+  }
+
+  public boolean icebergAllowDatafileInTableLocationOnly() {
+    return backendCfg_.iceberg_allow_datafiles_in_table_location_only;
+  }
+
+  public void setIcebergAllowDatafileInTableLocationOnly(boolean flag) {
+    backendCfg_.iceberg_allow_datafiles_in_table_location_only = flag;
+  }
+
+  public boolean icebergAlwaysAllowMergeOnReadOperations() {
+    return backendCfg_.iceberg_always_allow_merge_on_read_operations;
+  }
+
+  public long dataStreamSenderBufferSizeUsedByPlanner() {
+    return backendCfg_.data_stream_sender_buffer_size_used_by_planner;
+  }
+
+  public boolean enableReadingPuffinStats() {
+    return backendCfg_.enable_reading_puffin_stats;
+  }
+
+  public boolean isJsonScannerEnabled() {
+    return backendCfg_.enable_json_scanner;
+  }
+
+  public double getMaxFilterErrorRateFromFullScan() {
+    return backendCfg_.max_filter_error_rate_from_full_scan;
+  }
+
+  public int catalogOperationLogSize() {
+    return backendCfg_.catalog_operation_log_size >= 0 ?
+        backendCfg_.catalog_operation_log_size : Integer.MAX_VALUE;
+  }
+
+  public String getHostname() {
+    return backendCfg_.hostname;
+  }
+
+  public boolean allowCatalogCacheOpFromMaskedUsers() {
+    return backendCfg_.allow_catalog_cache_op_from_masked_users;
+  }
+
+  public String debugActions() { return backendCfg_.debug_actions; }
+
+  public void setDebugActions(String debugActions) {
+    backendCfg_.debug_actions = debugActions;
+  }
+
+  public boolean isInvalidateMetadataOnEventProcessFailureEnabled() {
+    return backendCfg_.invalidate_metadata_on_event_processing_failure;
+  }
+
+  public boolean isInvalidateGlobalMetadataOnEventProcessFailureEnabled() {
+    return backendCfg_.invalidate_global_metadata_on_event_processing_failure;
+  }
+
+  public void setInvalidateGlobalMetadataOnEventProcessFailure(boolean isEnabled) {
+    backendCfg_.invalidate_global_metadata_on_event_processing_failure = isEnabled;
+  }
+
+  public String getProcessEventFailureEventTypes() {
+    return backendCfg_.inject_process_event_failure_event_types;
+  }
+
+  public double getProcessEventFailureRatio() {
+    return backendCfg_.inject_process_event_failure_ratio;
+  }
+
+  public boolean enableWorkloadMgmt() {
+    return backendCfg_.enable_workload_mgmt;
+  }
+
+  @VisibleForTesting
+  public void setEnableWorkloadMgmt(boolean enableWorkloadMgmt) {
+    backendCfg_.enable_workload_mgmt = enableWorkloadMgmt;
+  }
+
+  public String queryLogTableName() {
+    return backendCfg_.query_log_table_name;
+  }
+
+  public boolean isMinimalTopicMode() {
+    return backendCfg_.catalog_topic_mode.equalsIgnoreCase("minimal");
+  }
+
+  public double getQueryCpuRootFactor() { return backendCfg_.query_cpu_root_factor; }
+
+  public String getDefaultSkippedHmsEventTypes() {
+    return backendCfg_.default_skipped_hms_event_types;
+  }
+
+  public String getCommonHmsEventTypes() {
+    return backendCfg_.common_hms_event_types;
+  }
+
+  public int getDbcpMaxConnPoolSize() {
+    return backendCfg_.dbcp_max_conn_pool_size;
+  }
+
+  public int getDbcpMaxWaitMillisForConn() {
+    return backendCfg_.dbcp_max_wait_millis_for_conn;
+  }
+
+  public int getDbcpDataSourceIdleTimeoutInSeconds() {
+    return backendCfg_.dbcp_data_source_idle_timeout;
+  }
+
+  public boolean isReleaseBuild() {
+    return backendCfg_.is_release_build;
+  }
+
+  public boolean isCatalogdHAEnabled() {
+    return backendCfg_.enable_catalogd_ha;
+  }
+
+  public String getInjectedGroupMembersDebugOnly() {
+    return backendCfg_.injected_group_members_debug_only;
   }
 }

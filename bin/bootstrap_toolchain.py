@@ -39,7 +39,7 @@
 #   other. The way to specify a single consistent set of components is via a build
 #   number. This determines the location in s3 to get the artifacts.
 # DOWNLOAD_CDH_COMPONENTS - When set to true, this script will also download and extract
-#   the CDP Hadoop components (i.e. Hadoop, Hive, HBase, Ranger, etc) into
+#   the CDP Hadoop components (i.e. Hadoop, Hive, HBase, Ranger, Ozone, etc) into
 #   CDP_COMPONENTS_HOME as appropriate.
 # IMPALA_<PACKAGE>_VERSION - The version expected for <PACKAGE>. This is typically
 #   configured in bin/impala-config.sh and must exist for every package. This is used
@@ -53,13 +53,13 @@
 #
 # The script is directly executable, and it takes no parameters:
 #     ./bootstrap_toolchain.py
+
+from __future__ import absolute_import, division, print_function
 import logging
-import glob
 import multiprocessing.pool
 import os
 import platform
 import random
-import re
 import shutil
 import subprocess
 import sys
@@ -69,48 +69,27 @@ import time
 from collections import namedtuple
 from string import Template
 
-# Maps return values from 'lsb_release -irs' to the corresponding OS labels for both the
-# toolchain and the CDP components.
-# For Ubuntu20.04, the toolchain and CDP components to be mapped to are still 18.04
-# based, due to the unavailability of 20.04 parts on EC2.
-OsMapping = namedtuple('OsMapping', ['lsb_release', 'toolchain', 'cdh'])
+# Maps the ID + major version of the VERSION_ID from /etc/os-release to the corresponding
+# OS label for the toolchain. See https://github.com/chef/os_release for a database of
+# /etc/os-release files.
+OsMapping = namedtuple('OsMapping', ['release', 'toolchain'])
 OS_MAPPING = [
-  OsMapping("centos5", "ec2-package-centos-5", None),
-  OsMapping("centos6", "ec2-package-centos-6", "redhat6"),
-  OsMapping("centos7", "ec2-package-centos-7", "redhat7"),
-  OsMapping("centos8", "ec2-package-centos-8", "redhat8"),
-  OsMapping("redhatenterpriseserver5", "ec2-package-centos-5", None),
-  OsMapping("redhatenterpriseserver6", "ec2-package-centos-6", "redhat6"),
-  OsMapping("redhatenterpriseserver7", "ec2-package-centos-7", "redhat7"),
-  OsMapping("redhatenterprise8", "ec2-package-centos-8", "redhat8"),
-  OsMapping("redhatenterpriseserver8", "ec2-package-centos-8", "redhat8"),
-  OsMapping("debian6", "ec2-package-debian-6", None),
-  OsMapping("debian7", "ec2-package-debian-7", None),
-  OsMapping("debian8", "ec2-package-debian-8", "debian8"),
-  OsMapping("suselinux11", "ec2-package-sles-11", None),
-  OsMapping("suselinux12", "ec2-package-sles-12", "sles12"),
-  OsMapping("suse12", "ec2-package-sles-12", "sles12"),
-  OsMapping("ubuntu12.04", "ec2-package-ubuntu-12-04", None),
-  OsMapping("ubuntu14.04", "ec2-package-ubuntu-14-04", None),
-  OsMapping("ubuntu15.04", "ec2-package-ubuntu-14-04", None),
-  OsMapping("ubuntu15.10", "ec2-package-ubuntu-14-04", None),
-  OsMapping('ubuntu16.04', "ec2-package-ubuntu-16-04", "ubuntu1604"),
-  OsMapping('ubuntu18.04', "ec2-package-ubuntu-18-04", "ubuntu1804"),
-  OsMapping('ubuntu20.04', "ec2-package-ubuntu-18-04", "ubuntu1804")
+  OsMapping("rhel7", "ec2-package-centos-7"),
+  OsMapping("centos7", "ec2-package-centos-7"),
+  OsMapping("rhel8", "ec2-package-centos-8"),
+  OsMapping("centos8", "ec2-package-centos-8"),
+  OsMapping("rocky8", "ec2-package-centos-8"),
+  OsMapping("almalinux8", "ec2-package-centos-8"),
+  OsMapping("rhel9", "ec2-package-rocky-9"),
+  OsMapping("rocky9", "ec2-package-rocky-9"),
+  OsMapping("almalinux9", "ec2-package-rocky-9"),
+  OsMapping("sles12", "ec2-package-sles-12"),
+  OsMapping("sles15", "ec2-package-sles-15"),
+  OsMapping('ubuntu16', "ec2-package-ubuntu-16-04"),
+  OsMapping('ubuntu18', "ec2-package-ubuntu-18-04"),
+  OsMapping('ubuntu20', "ec2-package-ubuntu-20-04"),
+  OsMapping('ubuntu22', "ec2-package-ubuntu-22-04")
 ]
-
-
-def check_output(cmd_args):
-  """Run the command and return the output. Raise an exception if the command returns
-     a non-zero return code. Similar to subprocess.check_output() which is only provided
-     in python 2.7.
-  """
-  process = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-  stdout, _ = process.communicate()
-  if process.wait() != 0:
-    raise Exception("Command with args '%s' failed with exit code %s:\n%s"
-        % (cmd_args, process.returncode, stdout))
-  return stdout
 
 
 def get_toolchain_compiler():
@@ -132,20 +111,20 @@ def wget_and_unpack_package(download_path, file_name, destination, wget_no_clobb
       download_path, destination, file_name, attempt))
     # --no-clobber avoids downloading the file if a file with the name already exists
     try:
-      cmd = ["wget", download_path,
+      cmd = ["wget", "-q", download_path,
              "--output-document={0}/{1}".format(destination, file_name)]
       if wget_no_clobber:
         cmd.append("--no-clobber")
-      check_output(cmd)
+      subprocess.check_call(cmd)
       break
-    except Exception, e:
+    except subprocess.CalledProcessError as e:
       if attempt == NUM_ATTEMPTS:
         raise
       logging.error("Download failed; retrying after sleep: " + str(e))
       time.sleep(10 + random.random() * 5)  # Sleep between 10 and 15 seconds.
   logging.info("Extracting {0}".format(file_name))
-  check_output(["tar", "xzf", os.path.join(destination, file_name),
-                "--directory={0}".format(destination)])
+  subprocess.check_call(["tar", "xzf", os.path.join(destination, file_name),
+                         "--directory={0}".format(destination)])
   os.unlink(os.path.join(destination, file_name))
 
 
@@ -214,10 +193,11 @@ class TemplatedDownloadUnpackTarball(DownloadUnpackTarball):
 class EnvVersionedPackage(TemplatedDownloadUnpackTarball):
   def __init__(self, name, url_prefix_tmpl, destination_basedir, explicit_version=None,
                archive_basename_tmpl=None, unpack_directory_tmpl=None, makedir=False,
-               template_subs_in={}):
+               template_subs_in={}, target_comp=None):
     template_subs = template_subs_in
     template_subs["name"] = name
-    template_subs["version"] = self.__compute_version(name, explicit_version)
+    template_subs["version"] = self.__compute_version(name, explicit_version,
+        target_comp)
     # The common case is that X.tar.gz unpacks to X directory. archive_basename_tmpl
     # allows overriding the value of X (which defaults to ${name}-${version}).
     # If X.tar.gz unpacks to Y directory, then unpack_directory_tmpl allows overriding Y.
@@ -226,17 +206,19 @@ class EnvVersionedPackage(TemplatedDownloadUnpackTarball):
     archive_name_tmpl = archive_basename_tmpl + ".tar.gz"
     if unpack_directory_tmpl is None:
       unpack_directory_tmpl = archive_basename_tmpl
-    url_tmpl = self.__compute_url(name, archive_name_tmpl, url_prefix_tmpl)
+    url_tmpl = self.__compute_url(name, archive_name_tmpl, url_prefix_tmpl, target_comp)
     super(EnvVersionedPackage, self).__init__(url_tmpl, archive_name_tmpl,
         destination_basedir, unpack_directory_tmpl, makedir, template_subs)
 
-  def __compute_version(self, name, explicit_version):
+  def __compute_version(self, name, explicit_version, target_comp=None):
     if explicit_version is not None:
       return explicit_version
     else:
       # When getting the version from the environment, we need to standardize the name
       # to match expected environment variables.
       std_env_name = name.replace("-", "_").upper()
+      if target_comp:
+        std_env_name += '_' + target_comp.upper()
       version_env_var = "IMPALA_{0}_VERSION".format(std_env_name)
       env_version = os.environ.get(version_env_var)
       if not env_version:
@@ -244,10 +226,12 @@ class EnvVersionedPackage(TemplatedDownloadUnpackTarball):
           name, version_env_var))
       return env_version
 
-  def __compute_url(self, name, archive_name_tmpl, url_prefix_tmpl):
+  def __compute_url(self, name, archive_name_tmpl, url_prefix_tmpl, target_comp=None):
     # The URL defined in the environment (IMPALA_*_URL) takes precedence. If that is
     # not defined, use the standard URL (url_prefix + archive_name)
     std_env_name = name.replace("-", "_").upper()
+    if target_comp:
+      std_env_name += '_' + target_comp.upper()
     url_env_var = "IMPALA_{0}_URL".format(std_env_name)
     url_tmpl = os.environ.get(url_env_var)
     if not url_tmpl:
@@ -262,14 +246,24 @@ class ToolchainPackage(EnvVersionedPackage):
       logging.error("Impala environment not set up correctly, make sure "
           "$IMPALA_TOOLCHAIN_PACKAGES_HOME is set.")
       sys.exit(1)
+    target_comp = None
+    if ":" in name:
+      parts = name.split(':')
+      name = parts[0]
+      target_comp = parts[1]
     compiler = get_toolchain_compiler()
     label = get_platform_release_label(release=platform_release).toolchain
-    toolchain_build_id = os.environ["IMPALA_TOOLCHAIN_BUILD_ID"]
+    # Most common return values for machine are x86_64 or aarch64
+    arch = platform.machine()
+    if arch not in ['aarch64', 'x86_64']:
+      raise Exception("Unsupported architecture '{}' for pre-built native-toolchain. "
+          "Fetch and build it locally by setting NATIVE_TOOLCHAIN_HOME".format(arch))
+    toolchain_build_id = os.environ["IMPALA_TOOLCHAIN_BUILD_ID_{}".format(arch.upper())]
     toolchain_host = os.environ["IMPALA_TOOLCHAIN_HOST"]
-    template_subs = {'compiler': compiler, 'label': label,
+    template_subs = {'compiler': compiler, 'label': label, 'arch': arch,
                      'toolchain_build_id': toolchain_build_id,
                      'toolchain_host': toolchain_host}
-    archive_basename_tmpl = "${name}-${version}-${compiler}-${label}"
+    archive_basename_tmpl = "${name}-${version}-${compiler}-${label}-${arch}"
     url_prefix_tmpl = "https://${toolchain_host}/build/${toolchain_build_id}/" + \
         "${name}/${version}-${compiler}/"
     unpack_directory_tmpl = "${name}-${version}"
@@ -278,7 +272,8 @@ class ToolchainPackage(EnvVersionedPackage):
                                            explicit_version=explicit_version,
                                            archive_basename_tmpl=archive_basename_tmpl,
                                            unpack_directory_tmpl=unpack_directory_tmpl,
-                                           template_subs_in=template_subs)
+                                           template_subs_in=template_subs,
+                                           target_comp=target_comp)
 
   def needs_download(self):
     # If the directory doesn't exist, we need the download
@@ -348,6 +343,7 @@ class ApacheComponent(EnvVersionedPackage):
                                        unpack_directory_tmpl=unpack_directory_tmpl,
                                        makedir=makedir, template_subs_in=template_subs)
 
+
 class ToolchainKudu(ToolchainPackage):
   def __init__(self, platform_label=None):
     super(ToolchainKudu, self).__init__('kudu', platform_release=platform_label)
@@ -375,45 +371,47 @@ def try_get_platform_release_label():
     return None
 
 
-# Cache "lsb_release -irs" to avoid excessive logging from sh, and
-# to shave a little bit of time.
-lsb_release_cache = None
+# Cache the /etc/os-release calculation to shave a little bit of time.
+os_release_cache = None
 
 
 def get_platform_release_label(release=None):
   """Gets the right package label from the OS version. Raise exception if not found.
-     'release' can be provided to override the underlying OS version.
+     'release' can be provided to override the underlying OS version. This uses
+     ID and VERSION_ID from /etc/os-release to identify a distribution. Specifically,
+     this returns the concatenation of the ID and the major version component
+     of VERSION_ID. i.e. ID=ubuntu VERSION_ID=16.04 => ubuntu16
   """
-  global lsb_release_cache
+  global os_release_cache
   if not release:
-    if lsb_release_cache:
-      release = lsb_release_cache
+    if os_release_cache:
+      release = os_release_cache
     else:
-      lsb_release = check_output(["lsb_release", "-irs"])
-      release = "".join(map(lambda x: x.lower(), lsb_release.split()))
-      # Only need to check against the major release if RHEL, CentOS or Suse
-      for distro in ['centos', 'redhatenterprise', 'redhatenterpriseserver', 'suse']:
-        if distro in release:
-          release = release.split('.')[0]
-          break
-      lsb_release_cache = release
+      os_id = None
+      os_major_version = None
+      with open("/etc/os-release") as f:
+        for line in f:
+          # We assume that ID and VERSION_ID are present and don't contain '=' inside
+          # the actual value. This is true for all distributions we currently support.
+          if line.startswith("ID="):
+            os_id = line.split("=")[1].strip().strip('"')
+          elif line.startswith("VERSION_ID="):
+            os_version_id = line.split("=")[1].strip().strip('"')
+            # Some distributions have a major version that doesn't change (e.g. 3.12.0
+            # and 3.12.0). The distributions that we support don't do this. This
+            # calculation would need to change for that circumstance.
+            os_major_version = os_version_id.split(".")[0]
+
+      if os_id is None or os_major_version is None:
+        raise Exception("Error parsing /etc/os-release: "
+            "os_id={0} os_major_version={1}".format(os_id, os_major_version))
+
+      release = "{0}{1}".format(os_id, os_major_version)
+      os_release_cache = release
   for mapping in OS_MAPPING:
-    if re.search(mapping.lsb_release, release):
+    if mapping.release == release:
       return mapping
   raise Exception("Could not find package label for OS version: {0}.".format(release))
-
-
-def check_output(cmd_args):
-  """Run the command and return the output. Raise an exception if the command returns
-     a non-zero return code. Similar to subprocess.check_output() which is only provided
-     in python 2.7.
-  """
-  process = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-  stdout, _ = process.communicate()
-  if process.wait() != 0:
-    raise Exception("Command with args '%s' failed with exit code %s:\n%s"
-        % (cmd_args, process.returncode, stdout))
-  return stdout
 
 
 def check_custom_toolchain(toolchain_packages_home, packages):
@@ -453,6 +451,17 @@ def create_directory_from_env_var(env_var):
     os.makedirs(dir_name)
 
 
+def get_unique_toolchain_downloads(packages):
+  toolchain_packages = [ToolchainPackage(p) for p in packages]
+  unique_pkg_directories = set()
+  unique_packages = []
+  for p in toolchain_packages:
+    if p.pkg_directory() not in unique_pkg_directories:
+      unique_packages.append(p)
+      unique_pkg_directories.add(p.pkg_directory())
+  return unique_packages
+
+
 def get_toolchain_downloads():
   toolchain_packages = []
   # The LLVM and GCC packages are the largest packages in the toolchain (Kudu is handled
@@ -462,15 +471,24 @@ def get_toolchain_downloads():
       "llvm", explicit_version=os.environ.get("IMPALA_LLVM_DEBUG_VERSION"))
   gcc_package = ToolchainPackage("gcc")
   toolchain_packages += [llvm_package, llvm_package_asserts, gcc_package]
-  toolchain_packages += map(ToolchainPackage,
-      ["avro", "binutils", "boost", "breakpad", "bzip2", "calloncehack", "cctz", "cmake",
-       "crcutil", "curl", "flatbuffers", "gdb", "gflags", "glog", "gperftools", "gtest",
-       "jwt-cpp", "libev", "libunwind", "lz4", "openldap", "openssl", "orc", "protobuf",
-       "python", "rapidjson", "re2", "snappy", "thrift", "tpc-h", "tpc-ds", "zlib",
-       "zstd"])
+  toolchain_packages += [ToolchainPackage(p) for p in
+      ["avro", "binutils", "boost", "breakpad", "bzip2", "calloncehack", "cctz",
+       "cloudflarezlib", "cmake", "crcutil", "curl", "flatbuffers", "gdb", "gflags",
+       "glog", "gperftools", "jwt-cpp", "libev", "libunwind", "lz4", "mold",
+       "openldap", "orc", "protobuf", "python", "rapidjson", "re2", "snappy", "tpc-h",
+       "tpc-ds", "zlib", "zstd"]]
+  python3_package = ToolchainPackage(
+      "python", explicit_version=os.environ.get("IMPALA_PYTHON3_VERSION"))
+  gtest_package = ToolchainPackage(
+      "googletest", explicit_version=os.environ.get("IMPALA_GTEST_VERSION"))
+  toolchain_packages += [python3_package, gtest_package]
+  toolchain_packages += get_unique_toolchain_downloads(
+      ["thrift:cpp", "thrift:java", "thrift:py"])
   protobuf_package_clang = ToolchainPackage(
       "protobuf", explicit_version=os.environ.get("IMPALA_PROTOBUF_CLANG_VERSION"))
   toolchain_packages += [protobuf_package_clang]
+  if platform.machine() == 'aarch64':
+    toolchain_packages.append(ToolchainPackage("hadoop-client"))
   # Check whether this platform is supported (or whether a valid custom toolchain
   # has been provided).
   if not try_get_platform_release_label() \
@@ -485,32 +503,79 @@ def get_toolchain_downloads():
 
 def get_hadoop_downloads():
   cluster_components = []
-  hadoop = CdpComponent("hadoop")
-  hbase = CdpComponent("hbase", archive_basename_tmpl="hbase-${version}-bin",
-                       unpack_directory_tmpl="hbase-${version}")
+  use_apache_hadoop = os.environ["USE_APACHE_HADOOP"] == "true"
+  use_apache_hbase = os.environ["USE_APACHE_HBASE"] == "true"
   use_apache_hive = os.environ["USE_APACHE_HIVE"] == "true"
+  use_apache_tez = os.environ["USE_APACHE_TEZ"] == "true"
+  use_apache_ranger = os.environ["USE_APACHE_RANGER"] == "true"
+  use_apache_ozone = os.environ["USE_APACHE_OZONE"] == "true"
+  if use_apache_hadoop:
+    hadoop = ApacheComponent("hadoop",
+                             component_path_tmpl="${name}/common/${name}-${version}/",
+                             archive_basename_tmpl="${name}-${version}")
+  else:
+    hadoop = CdpComponent("hadoop")
+
+  if use_apache_hbase:
+    hbase = ApacheComponent("hbase",
+                            component_path_tmpl="${name}/${version}/",
+                            archive_basename_tmpl="${name}-${version}-hadoop3-bin",
+                            unpack_directory_tmpl="${name}-${version}-hadoop3")
+  else:
+    hbase = CdpComponent("hbase",
+                         archive_basename_tmpl="hbase-${version}-bin",
+                         unpack_directory_tmpl="hbase-${version}")
+
   if use_apache_hive:
     hive = ApacheComponent("hive", archive_basename_tmpl="apache-hive-${version}-bin")
     hive_src = ApacheComponent("hive", archive_basename_tmpl="apache-hive-${version}-src")
   else:
     hive = CdpComponent("hive", archive_basename_tmpl="apache-hive-${version}-bin")
     hive_src = CdpComponent("hive-source",
-                          explicit_version=os.environ.get("IMPALA_HIVE_VERSION"),
-                          archive_basename_tmpl="hive-${version}-source",
-                          unpack_directory_tmpl="hive-${version}")
-  tez = CdpComponent("tez", archive_basename_tmpl="tez-${version}-minimal",
-                     makedir=True)
+                            explicit_version=os.environ.get("IMPALA_HIVE_VERSION"),
+                            archive_basename_tmpl="hive-${version}-source",
+                            unpack_directory_tmpl="hive-${version}")
+  if use_apache_tez:
+    tez = ApacheComponent("tez",
+                          component_path_tmpl="${name}/${version}/",
+                          archive_basename_tmpl="apache-${name}-${version}-bin")
+  else:
+    tez = CdpComponent("tez",
+                       archive_basename_tmpl="tez-${version}-minimal",
+                       makedir=True)
+  if use_apache_ranger:
+    url_prefix_tmpl = "https://${toolchain_host}/build/apache_components/tarballs/"
+    archive_basename_tmpl = "${name}-${version}-admin"
+    template_subs = {
+      "toolchain_host": os.environ["IMPALA_TOOLCHAIN_HOST"],
+    }
+    destination_basedir = os.environ["APACHE_COMPONENTS_HOME"]
+    ranger = EnvVersionedPackage("ranger",
+                                 url_prefix_tmpl,
+                                 destination_basedir,
+                                 archive_basename_tmpl=archive_basename_tmpl,
+                                 template_subs_in=template_subs)
+  else:
+    ranger = CdpComponent("ranger", archive_basename_tmpl="ranger-${version}-admin")
+
+  if use_apache_ozone:
+    ozone = ApacheComponent("ozone", component_path_tmpl="ozone/${version}")
+  else:
+    ozone = CdpComponent("ozone")
+
   use_override_hive = \
       "HIVE_VERSION_OVERRIDE" in os.environ and os.environ["HIVE_VERSION_OVERRIDE"] != ""
+  use_override_ranger = \
+      "RANGER_VERSION_OVERRIDE" in os.environ and \
+      os.environ["RANGER_VERSION_OVERRIDE"] != ""
   # If we are using a locally built Hive we do not have a need to pull hive as a
-  # dependency
-  if use_override_hive:
-    cluster_components.extend([hadoop, hbase, tez])
-  else:
-    cluster_components.extend([hadoop, hbase, hive, hive_src, tez])
-  # Ranger is always CDP
-  cluster_components.append(CdpComponent("ranger",
-                                         archive_basename_tmpl="ranger-${version}-admin"))
+  # dependency. The same applies to Ranger.
+  cluster_components.extend([hadoop, hbase, ozone])
+  if not use_override_hive:
+    cluster_components.extend([hive, hive_src])
+  if not use_override_ranger:
+    cluster_components.extend([ranger])
+  cluster_components.extend([tez])
   return cluster_components
 
 
@@ -551,11 +616,14 @@ def main():
   downloads = []
   if os.getenv("SKIP_TOOLCHAIN_BOOTSTRAP", "false") != "true":
     downloads += get_toolchain_downloads()
-  kudu_download = None
   if os.getenv("DOWNLOAD_CDH_COMPONENTS", "false") == "true":
     create_directory_from_env_var("CDP_COMPONENTS_HOME")
+  if os.getenv("DOWNLOAD_APACHE_COMPONENTS", "false") == "true":
     create_directory_from_env_var("APACHE_COMPONENTS_HOME")
-    if platform.processor() != "aarch64":
+  if (os.getenv("DOWNLOAD_CDH_COMPONENTS", "false") == "true"
+      or os.getenv("DOWNLOAD_APACHE_COMPONENTS", "false") == "true"):
+    if os.getenv("SKIP_TOOLCHAIN_BOOTSTRAP", "false") != "true":
+      # Kudu is currently sourced from native-toolchain
       downloads += get_kudu_downloads()
     downloads += get_hadoop_downloads()
 

@@ -17,23 +17,28 @@
 
 package org.apache.impala.analysis;
 
+import com.google.common.base.Preconditions;
+
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.List;
 
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.thrift.TLoadDataReq;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.util.FsPermissionChecker;
-
-import com.google.common.base.Preconditions;
+import org.apache.orc.OrcFile;
+import org.apache.parquet.hadoop.ParquetFileWriter;
 
 /**
  * Represents a LOAD DATA statement for moving data into an existing table:
@@ -48,6 +53,14 @@ import com.google.common.base.Preconditions;
  * (preserving the extension).
  * Loading hidden files is not supported and any hidden files in the source or
  * destination are preserved, even if OVERWRITE is true.
+ *
+ * Notes on Iceberg data loading:
+ * Iceberg files have specific field ids, therefore native parquet tables cannot be added
+ * to the data directory with only moving the files. To rewrite the files with the
+ * necessary metadata the LOAD DATA operation will be executed with 3 sub-queries:
+ *  1. CREATE temporary table
+ *  2. INSERT INTO from the temporary table to the target table
+ *  3. DROP temporary table
  */
 public class LoadDataStmt extends StatementBase {
   private final TableName tableName_;
@@ -57,6 +70,10 @@ public class LoadDataStmt extends StatementBase {
 
   // Set during analysis
   private String dbName_;
+  private FeTable table_;
+  private String createTmpTblQuery_;
+  private String insertTblQuery_;
+  private String dropTmpTblQuery_;
 
   public LoadDataStmt(TableName tableName, HdfsUri sourceDataPath, boolean overwrite,
       PartitionSpec partitionSpec) {
@@ -99,27 +116,35 @@ public class LoadDataStmt extends StatementBase {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     dbName_ = analyzer.getTargetDbName(tableName_);
-    FeTable table = analyzer.getTable(tableName_, Privilege.INSERT);
-    if (!(table instanceof FeFsTable)) {
+    table_ = analyzer.getTable(tableName_, Privilege.INSERT);
+    if (!(table_ instanceof FeFsTable)) {
       throw new AnalysisException("LOAD DATA only supported for HDFS tables: " +
           dbName_ + "." + getTbl());
     }
-    analyzer.checkTableCapability(table, Analyzer.OperationType.WRITE);
-    analyzer.ensureTableNotTransactional(table, "LOAD DATA");
+    analyzer.checkTableCapability(table_, Analyzer.OperationType.WRITE);
+    analyzer.ensureTableNotTransactional(table_, "LOAD DATA");
 
     // Analyze the partition spec, if one was specified.
     if (partitionSpec_ != null) {
-      partitionSpec_.setTableName(tableName_);
-      partitionSpec_.setPartitionShouldExist();
-      partitionSpec_.setPrivilegeRequirement(Privilege.INSERT);
-      partitionSpec_.analyze(analyzer);
+      if (table_ instanceof FeIcebergTable) {
+        throw new AnalysisException("PARTITION clause is not supported for Iceberg " +
+            "tables.");
+      } else {
+        partitionSpec_.setTableName(tableName_);
+        partitionSpec_.setPartitionShouldExist();
+        partitionSpec_.setPrivilegeRequirement(Privilege.INSERT);
+        partitionSpec_.analyze(analyzer);
+      }
     } else {
-      if (table.getMetaStoreTable().getPartitionKeysSize() > 0) {
+      if (table_.getMetaStoreTable().getPartitionKeysSize() > 0) {
         throw new AnalysisException("Table is partitioned but no partition spec was " +
             "specified: " + dbName_ + "." + getTbl());
       }
     }
-    analyzePaths(analyzer, (FeFsTable) table);
+    analyzePaths(analyzer, (FeFsTable) table_);
+    if (table_ instanceof FeIcebergTable) {
+      analyzeLoadIntoIcebergTable();
+    }
   }
 
   /**
@@ -158,6 +183,7 @@ public class LoadDataStmt extends StatementBase {
       // TODO: Disable permission checking for S3A as well (HADOOP-13892)
       boolean shouldCheckPerms =
           FileSystemUtil.FsType.getFsType(fs.getScheme()) != FileSystemUtil.FsType.ADLS;
+      boolean authzEnabled = analyzer.isAuthzEnabled();
 
       if (fs.isDirectory(source)) {
         if (FileSystemUtil.getTotalNumVisibleFiles(source) == 0) {
@@ -169,8 +195,8 @@ public class LoadDataStmt extends StatementBase {
               "INPATH location '%s' cannot contain non-hidden subdirectories.",
               sourceDataPath_));
         }
-        if (!checker.getPermissions(fs, source).checkPermissions(
-            FsAction.READ_WRITE) && shouldCheckPerms) {
+        if (shouldCheckPerms && !checker
+          .checkAccess(source, fs, FsAction.READ_WRITE, authzEnabled)) {
           throw new AnalysisException(String.format("Unable to LOAD DATA from %s " +
               "because Impala does not have READ and WRITE permissions on this directory",
               source));
@@ -182,15 +208,15 @@ public class LoadDataStmt extends StatementBase {
               "INPATH location '%s' points to a hidden file.", source));
         }
 
-        if (!checker.getPermissions(fs, source.getParent()).checkPermissions(
-            FsAction.WRITE) && shouldCheckPerms) {
+        if (shouldCheckPerms && !checker
+          .checkAccess(source.getParent(), fs, FsAction.WRITE, authzEnabled)) {
           throw new AnalysisException(String.format("Unable to LOAD DATA from %s " +
               "because Impala does not have WRITE permissions on its parent " +
               "directory %s", source, source.getParent()));
         }
 
-        if (!checker.getPermissions(fs, source).checkPermissions(
-            FsAction.READ) && shouldCheckPerms) {
+        if (shouldCheckPerms && !checker
+          .checkAccess(source, fs, FsAction.READ, authzEnabled)) {
           throw new AnalysisException(String.format("Unable to LOAD DATA from %s " +
               "because Impala does not have READ permissions on this file", source));
         }
@@ -206,6 +232,61 @@ public class LoadDataStmt extends StatementBase {
     }
   }
 
+  /**
+   * Creates the child queries that are used to load data into Iceberg tables:
+   *   1. a temporary table is created which points to the data directory
+   *   2. an insert query copies the data from the source table to the destination table
+   *   3. a drop table deletes the temporary table and the data
+   */
+  private void analyzeLoadIntoIcebergTable() throws AnalysisException {
+    Path sourcePath = sourceDataPath_.getPath();
+    String tmpTableName = QueryStringBuilder.createTmpTableName(dbName_,
+        tableName_.getTbl());
+    QueryStringBuilder.Create createTableQueryBuilder =
+        QueryStringBuilder.Create.builder().table(tmpTableName, true);
+    try {
+      FileSystem fs = sourcePath.getFileSystem(FileSystemUtil.getConfiguration());
+      Path filePathForLike = sourcePath;
+      // LIKE <file format> clause needs a file to infer schema, for directories: list
+      // the files under the directory and pick the first one.
+      if (fs.isDirectory(sourcePath)) {
+        RemoteIterator<? extends FileStatus> fileStatuses = FileSystemUtil.listFiles(fs,
+            sourcePath, true, "");
+        while (fileStatuses.hasNext()) {
+          FileStatus fileStatus = fileStatuses.next();
+          String fileName = fileStatus.getPath().getName();
+          if (fileStatus.isFile() && !FileSystemUtil.isHiddenFile(fileName)) {
+            filePathForLike = fileStatus.getPath();
+            break;
+          }
+        }
+      }
+      String magicString = FileSystemUtil.readMagicString(filePathForLike);
+      if (magicString.substring(0, 4).equals(ParquetFileWriter.MAGIC_STR)) {
+        createTableQueryBuilder.like("PARQUET", "%s").storedAs("PARQUET");
+      } else if (magicString.substring(0, 3).equals(OrcFile.MAGIC)) {
+        createTableQueryBuilder.like("ORC", "%s").storedAs("ORC");
+      } else {
+        throw new AnalysisException(String.format("INPATH contains unsupported LOAD "
+            + "format, file '%s' has '%s' magic string.", filePathForLike, magicString));
+      }
+      createTableQueryBuilder.tableLocation("%s");
+      createTableQueryBuilder.property("TEMPORARY", "true");
+    } catch (IOException e) {
+      throw new AnalysisException("Failed to generate CREATE TABLE subquery "
+          + "statement. ", e);
+    }
+    createTmpTblQuery_ = createTableQueryBuilder.build();
+    QueryStringBuilder.Insert insertTblQueryBuilder = QueryStringBuilder.Insert.builder()
+        .overwrite(overwrite_)
+        .table(tableName_.toString());
+    QueryStringBuilder.Select insertSelectTblQueryBuilder =
+        QueryStringBuilder.Select.builder().selectList("*").from(tmpTableName);
+    insertTblQueryBuilder.select(insertSelectTblQueryBuilder);
+    insertTblQuery_ = insertTblQueryBuilder.build();
+    dropTmpTblQuery_ = QueryStringBuilder.Drop.builder().table(tmpTableName).build();
+  }
+
   public TLoadDataReq toThrift() {
     TLoadDataReq loadDataReq = new TLoadDataReq();
     loadDataReq.setTable_name(new TTableName(getDb(), getTbl()));
@@ -213,6 +294,12 @@ public class LoadDataStmt extends StatementBase {
     loadDataReq.setOverwrite(overwrite_);
     if (partitionSpec_ != null) {
       loadDataReq.setPartition_spec(partitionSpec_.toThrift());
+    }
+    if (table_ instanceof FeIcebergTable) {
+      loadDataReq.setIceberg_tbl(true);
+      loadDataReq.setCreate_tmp_tbl_query_template(createTmpTblQuery_);
+      loadDataReq.setInsert_into_dst_tbl_query(insertTblQuery_);
+      loadDataReq.setDrop_tmp_tbl_query(dropTmpTblQuery_);
     }
     return loadDataReq;
   }

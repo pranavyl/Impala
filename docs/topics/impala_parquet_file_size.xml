@@ -21,7 +21,7 @@ under the License.
 <concept rev="parquet_block_size" id="parquet_file_size">
 
   <title>PARQUET_FILE_SIZE Query Option</title>
-  <titlealts audience="PDF"><navtitle>PARQUET_FILE_SIZE</navtitle></titlealts>
+  <titlealts audience="PDF"><navtitle>PARQUET FILE SIZE</navtitle></titlealts>
   <prolog>
     <metadata>
       <data name="Category" value="Impala"/>
@@ -92,6 +92,9 @@ INSERT OVERWRITE parquet_table SELECT * FROM text_table;
 
     <p conref="../shared/impala_common.xml#common/isilon_blurb"/>
     <p conref="../shared/impala_common.xml#common/isilon_block_size_caveat"/>
+
+    <p conref="../shared/impala_common.xml#common/ozone_blurb"/>
+    <p conref="../shared/impala_common.xml#common/ozone_block_size_caveat"/>
 
     <p conref="../shared/impala_common.xml#common/related_info"/>
 

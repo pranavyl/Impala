@@ -19,7 +19,7 @@
 
 #include "common/constant-strings.h"
 #include "common/thread-debug-info.h"
-#include "exec/kudu-util.h"
+#include "exec/kudu/kudu-util.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "rpc/rpc-mgr.h"
@@ -89,7 +89,7 @@ Status ControlService::Init() {
   return Status::OK();
 }
 
-Status ControlService::GetProxy(const TNetworkAddress& address, const string& hostname,
+Status ControlService::GetProxy(const NetworkAddressPB& address, const string& hostname,
     unique_ptr<ControlServiceProxy>* proxy) {
   // Create a ControlService proxy to the destination.
   RETURN_IF_ERROR(ExecEnv::GetInstance()->rpc_mgr()->GetProxy(address, hostname, proxy));
@@ -150,7 +150,16 @@ void ControlService::ExecQueryFInstances(const ExecQueryFInstancesRequestPB* req
              << " coord=" << query_ctx.coord_hostname << ":"
              << query_ctx.coord_ip_address.port
              << " #instances=" << fragment_info.fragment_instance_ctxs.size();
-  Status resp_status = ExecEnv::GetInstance()->query_exec_mgr()->StartQuery(
+  Status resp_status;
+  if (UNLIKELY(fragment_info.fragments.size() == 0
+      || fragment_info.fragment_instance_ctxs.size() == 0)) {
+    resp_status = Status(Substitute("ExecQueryFInstances() failed: query_id=: $0, "
+        "no instance in TExecPlanFragmentInfo", PrintId(query_ctx.query_id)));
+    LOG(ERROR) << resp_status.msg().msg();
+    RespondAndReleaseRpc(resp_status, response, rpc_context);
+    return;
+  }
+  resp_status = ExecEnv::GetInstance()->query_exec_mgr()->StartQuery(
       request, query_ctx, fragment_info);
   if (!resp_status.ok()) {
     LOG(INFO) << "ExecQueryFInstances() failed: query_id=" << PrintId(query_ctx.query_id)
@@ -212,6 +221,17 @@ void ControlService::RespondAndReleaseRpc(
   rpc_context->RespondSuccess();
 }
 
+template <typename ResponsePBType>
+void ControlService::RespondAndReleaseRpc(
+    const vector<Status>& statuses, ResponsePBType* response, RpcContext* rpc_context) {
+  for (int i = 0; i < statuses.size(); ++i) {
+    statuses[i].ToProto(response->add_statuses());
+  }
+  // Release the memory against the control service's memory tracker.
+  mem_tracker_->Release(rpc_context->GetTransferSize());
+  rpc_context->RespondSuccess();
+}
+
 void ControlService::CancelQueryFInstances(const CancelQueryFInstancesRequestPB* request,
     CancelQueryFInstancesResponsePB* response, RpcContext* rpc_context) {
   DCHECK(request->has_query_id());
@@ -239,5 +259,15 @@ void ControlService::RemoteShutdown(const RemoteShutdownParamsPB* req,
       response->mutable_shutdown_status());
 
   RespondAndReleaseRpc(status, response, rpc_context);
+}
+
+void ControlService::KillQuery(const KillQueryRequestPB* request,
+    KillQueryResponsePB* response, RpcContext* rpc_context) {
+  // Currently, we only support killing one query in one KILL QUERY statement.
+  DCHECK_EQ(request->query_ids_size(), 1);
+  const TUniqueId& query_id = ProtoToQueryId(request->query_ids(0));
+  Status status = ExecEnv::GetInstance()->impala_server()->KillQuery(
+      query_id, request->requesting_user(), request->is_admin());
+  RespondAndReleaseRpc(vector{status}, response, rpc_context);
 }
 }

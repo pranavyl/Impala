@@ -27,14 +27,14 @@ import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.catalog.MetaStoreClientPool;
 import org.apache.impala.catalog.TableLoadingMgr;
 import org.apache.impala.catalog.events.MetastoreEvents.EventFactoryForSyncToLatestEvent;
-import org.apache.impala.catalog.metastore.CatalogMetastoreServer;
 import org.apache.impala.catalog.events.NoOpEventProcessor;
 import org.apache.impala.catalog.metastore.NoOpCatalogMetastoreServer;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.hive.executor.TestHiveJavaFunctionFactory;
 import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.service.FeSupport;
-import org.apache.impala.thrift.TUniqueId;
+import org.apache.impala.util.NoOpEventSequence;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -46,17 +46,20 @@ import java.util.UUID;
  */
 public class CatalogServiceTestCatalog extends CatalogServiceCatalog {
   private CatalogOpExecutor opExecutor_;
-  private CatalogServiceTestCatalog(boolean loadInBackground, int numLoadingThreads,
-      TUniqueId catalogServiceId, MetaStoreClientPool metaStoreClientPool)
-      throws ImpalaException {
-    super(loadInBackground, numLoadingThreads, catalogServiceId,
-        System.getProperty("java.io.tmpdir"), metaStoreClientPool);
+  protected CatalogServiceTestCatalog(boolean loadInBackground, int numLoadingThreads,
+      MetaStoreClientPool metaStoreClientPool) throws ImpalaException {
+    super(loadInBackground, numLoadingThreads, System.getProperty("java.io.tmpdir"),
+        metaStoreClientPool);
 
     // Cache pools are typically loaded asynchronously, but as there is no fixed execution
     // order for tests, the cache pools are loaded synchronously before the tests are
     // executed.
     CachePoolReader rd = new CachePoolReader(false);
     rd.run();
+  }
+
+  public interface BaseTestCatalogSupplier {
+    public abstract CatalogServiceTestCatalog get() throws ImpalaException;
   }
 
   public static CatalogServiceTestCatalog create() {
@@ -68,29 +71,34 @@ public class CatalogServiceTestCatalog extends CatalogServiceCatalog {
    * authorization config.
    */
   public static CatalogServiceTestCatalog createWithAuth(AuthorizationFactory factory) {
+    return createWithAuth(factory,
+        () -> new CatalogServiceTestCatalog(false, 16, new MetaStoreClientPool(0, 0)));
+  }
+
+  public static CatalogServiceTestCatalog createWithAuth(
+      AuthorizationFactory factory, BaseTestCatalogSupplier catalogSupplier) {
     FeSupport.loadLibrary();
     CatalogServiceTestCatalog cs;
     try {
       if (MetastoreShim.getMajorVersion() > 2) {
         MetastoreShim.setHiveClientCapabilities();
       }
-      cs = new CatalogServiceTestCatalog(false, 16, new TUniqueId(),
-          new MetaStoreClientPool(0, 0));
+      cs = catalogSupplier.get();
       cs.setAuthzManager(factory.newAuthorizationManager(cs));
       cs.setMetastoreEventProcessor(NoOpEventProcessor.getInstance());
       cs.setCatalogMetastoreServer(NoOpCatalogMetastoreServer.INSTANCE);
       cs.setCatalogOpExecutor(new CatalogOpExecutor(cs,
           new NoopAuthorizationFactory().getAuthorizationConfig(),
-          new NoopAuthorizationFactory.NoopAuthorizationManager()));
-      cs.setEventFactoryForSyncToLatestEvent(new EventFactoryForSyncToLatestEvent(
-          cs.getCatalogOpExecutor()));
-      cs.reset();
+          new NoopAuthorizationFactory.NoopAuthorizationManager(),
+          new TestHiveJavaFunctionFactory()));
+      cs.setEventFactoryForSyncToLatestEvent(
+          new EventFactoryForSyncToLatestEvent(cs.getCatalogOpExecutor()));
+      cs.reset(NoOpEventSequence.INSTANCE);
     } catch (ImpalaException e) {
       throw new IllegalStateException(e.getMessage(), e);
     }
     return cs;
   }
-
   /**
    * Creates a transient test catalog instance backed by an embedded HMS derby database on
    * the local filesystem. The derby database is created from scratch and has no table
@@ -105,22 +113,23 @@ public class CatalogServiceTestCatalog extends CatalogServiceCatalog {
       MetastoreShim.setHiveClientCapabilities();
     }
     CatalogServiceTestCatalog cs = new CatalogServiceTestCatalog(false, 16,
-        new TUniqueId(), new EmbeddedMetastoreClientPool(0, derbyPath));
+        new EmbeddedMetastoreClientPool(0, derbyPath));
     cs.setAuthzManager(new NoopAuthorizationManager());
     cs.setMetastoreEventProcessor(NoOpEventProcessor.getInstance());
     cs.setCatalogOpExecutor(new CatalogOpExecutor(cs,
         new NoopAuthorizationFactory().getAuthorizationConfig(),
-        new NoopAuthorizationFactory.NoopAuthorizationManager()));
+        new NoopAuthorizationFactory.NoopAuthorizationManager(),
+        new TestHiveJavaFunctionFactory()));
     cs.setEventFactoryForSyncToLatestEvent(
         new EventFactoryForSyncToLatestEvent(cs.getCatalogOpExecutor()));
-    cs.reset();
+    cs.reset(NoOpEventSequence.INSTANCE);
     return cs;
   }
 
   @Override
   public AuthorizationPolicy getAuthPolicy() { return authPolicy_; }
 
-  private void setCatalogOpExecutor(CatalogOpExecutor opExecutor) {
+  protected void setCatalogOpExecutor(CatalogOpExecutor opExecutor) {
     opExecutor_ = opExecutor;
   }
 

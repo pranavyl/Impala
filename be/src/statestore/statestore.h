@@ -31,14 +31,19 @@
 
 #include "common/atomic.h"
 #include "common/status.h"
+#include "gen-cpp/StatestoreHaService.h"
 #include "gen-cpp/StatestoreService.h"
+#include "gen-cpp/StatestoreService_types.h"
 #include "gen-cpp/StatestoreSubscriber.h"
 #include "gen-cpp/Types_types.h"
 #include "rpc/thrift-client.h"
 #include "runtime/client-cache.h"
 #include "statestore/failure-detector.h"
+#include "statestore/statestore-catalogd-mgr.h"
+#include "statestore/statestore-service-client-wrapper.h"
 #include "statestore/statestore-subscriber-client-wrapper.h"
 #include "util/aligned-new.h"
+#include "util/condition-variable.h"
 #include "util/metrics-fwd.h"
 #include "util/thread-pool.h"
 #include "util/webserver.h"
@@ -50,7 +55,9 @@ namespace impala {
 class Status;
 
 typedef ClientCache<StatestoreSubscriberClientWrapper> StatestoreSubscriberClientCache;
-typedef TUniqueId RegistrationId;
+typedef ClientCache<StatestoreHaServiceClientWrapper> StatestoreHaClientCache;
+
+std::string SubscriberTypeToString(TStatestoreSubscriberType::type t);
 
 /// The Statestore is a soft-state key-value store that maintains a set of Topics, which
 /// are maps from string keys to byte array values.
@@ -104,6 +111,49 @@ typedef TUniqueId RegistrationId;
 /// These empty updates are important so that subscribers can keep track of the current
 /// version number and report back their progress in receiving the topic contents.
 ///
+/// The Statestore is the central manager of the cluster. Subscribers join in the cluster
+/// through registration. To avoid incompatibility issues between the different components
+/// in the cluster, statestore uses protocol version to isolate cluster components, and
+/// only accepts the registration requests from the subscribers with compatible protocol
+/// versions. This ensure all of components in a cluster could communicate with compatible
+/// APIs and message format in the wire.
+///
+/// Statestore HA:
+/// To support statestore HA, we add the preemptive behavior for statestored. When HA is
+/// enabled, the preemptive behavior allows the statestored with the higher priority to
+/// become active and the paired statestored becomes standby. The active statestored acts
+/// as the owner of the Impala cluster and provides statestore service for the cluster
+/// members.
+/// By default, preemption is disabled on the statestored which is running as single
+/// statestore instance in an Impala cluster. For deployment with statestore HA enabled,
+/// the preemption must be enabled with starting flag "enable_statestored_ha" on two
+/// statestoreds in the HA pair and all the subscribers.
+/// To avoid introduce external dependency like Apache ZooKeeper, standby statestored is
+/// used to monitor the health of active statestored. The basic idea is to have two
+/// statestore instances as HA pair in Active-Passive mode. The both primary and standby
+/// statestored send heartbeats to all subscribers. Subscribers send heartbeat response
+/// to standby statestored with their connection state with active statestored so that
+/// standby statestored could monitor the connection state between active statestore and
+/// the subscribers. Active statestored also sends heartbeats to standby statestored.
+/// Automatic fail-over will be triggered if standby statestored does not receive
+/// heartbeats from active statestored and the majority of the subscribers do not receive
+/// heartbeats from active statestored.
+/// In the scenario where standby statestored is still receiving heartbeats from active
+/// statestored, but majority of subscribers are unable to reach the active statestored,
+/// warning messages will be logged on standby statestored.
+/// The statestored in an Active-Passive HA pair can be assigned an instance priority
+/// value to indicate a preference for which statestored should assume the active role.
+/// The statestore ID which is generated for each statestored can be used as instance
+/// priority value. The lower numerical value in statestore ID corresponds to a higher
+/// priority. The statestored with the higher priority is designated as active, the other
+/// statestored is designated as standby after initial HA handshake. Only the active
+/// statestored propagates the IMPALA_CATALOG_TOPIC and elected active catalogd to the
+/// cluster members.
+/// To make a specific statestored in the HA pair as active instance, the statestored must
+/// be started with starting flag "statestore_force_active" so that the statestored will
+/// be assigned with active role in HA handshake. This allows administrator to manually
+/// perform statestore service fail over.
+///
 /// +================+
 /// | Implementation |
 /// +================+
@@ -111,16 +161,13 @@ typedef TUniqueId RegistrationId;
 /// Locking:
 /// --------
 /// The lock acquisition order is:
-/// 1. 'subscribers_lock_'
-/// 2. 'topics_map_lock_'
-/// 3. Subscriber::transient_entry_lock_
-/// 4. Topic::lock_ (terminal)
+/// 1. 'ha_lock_'
+/// 2. 'subscribers_lock_'
+/// 3. 'topics_map_lock_'
+/// 4. Subscriber::transient_entry_lock_
+/// 5. Topic::lock_ (terminal)
 class Statestore : public CacheLineAligned {
  public:
-  /// A SubscriberId uniquely identifies a single subscriber, and is
-  /// provided by the subscriber at registration time.
-  typedef std::string SubscriberId;
-
   /// A TopicId uniquely identifies a single topic
   typedef std::string TopicId;
 
@@ -153,9 +200,17 @@ class Statestore : public CacheLineAligned {
   Status RegisterSubscriber(const SubscriberId& subscriber_id,
       const TNetworkAddress& location,
       const std::vector<TTopicRegistration>& topic_registrations,
-      RegistrationId* registration_id) WARN_UNUSED_RESULT;
+      TStatestoreSubscriberType::type subscriber_type,
+      bool subscribe_catalogd_change,
+      const TCatalogRegistration& catalogd_registration,
+      RegistrationId* registration_id,
+      bool* has_active_catalogd,
+      int64_t* active_catalogd_version,
+      TCatalogRegistration* active_catalogd_registration);
 
-  void RegisterWebpages(Webserver* webserver);
+  /// Registers webpages for the input webserver. If metrics_only is set then only
+  /// '/healthz' page is registered.
+  void RegisterWebpages(Webserver* webserver, bool metrics_only);
 
   /// The main processing loop. Runs infinitely.
   void MainLoop();
@@ -168,6 +223,12 @@ class Statestore : public CacheLineAligned {
   /// Returns the Thrift API interface that proxies requests onto the local Statestore.
   const std::shared_ptr<StatestoreServiceIf>& thrift_iface() const {
     return thrift_iface_;
+  }
+
+  /// Returns the Thrift API interface that proxies requests onto the local Statestore
+  /// HA Service.
+  const std::shared_ptr<StatestoreHaServiceIf>& ha_thrift_iface() const {
+    return ha_thrift_iface_;
   }
 
   /// Names of prioritized topics that are handled in a separate threadpool. The topic
@@ -184,6 +245,55 @@ class Statestore : public CacheLineAligned {
   /// Amount of time in ms that it takes the statestore to decide that a executor is down
   /// after it stops responding to heartbeats.
   static int64_t FailedExecutorDetectionTimeMs();
+
+  /// Return statestore-ID.
+  const TUniqueId& GetStateStoreId() const { return statestore_id_; }
+
+  /// Return protocol version of statestore service.
+  StatestoreServiceVersion::type GetProtocolVersion() const {
+    return protocol_version_;
+  }
+
+  /// Disable network if the input parameter disable_network is set as true.
+  /// statestored will not send heartbeat and HA handshake messages when network is
+  /// disabled. This is used to simulate network failure for unit-test.
+  void SetStatestoreDebugAction(bool disable_network);
+
+  /// Initialize statestore HA.
+  Status InitStatestoreHa(
+      int32_t state_store_ha_port, const TNetworkAddress& peer_statestore_addr);
+
+  // Return true if this statestore instance is in active role.
+  bool IsActive();
+
+  // Return the version of active status.
+  int64_t GetActiveVersion(bool* is_active);
+
+  /// Send RPC to negotiate the role with peer statestored for Statestore HA.
+  Status SendHaHandshake(TStatestoreHaHandshakeResponse* response);
+
+  /// Called to process HA handshake request from peer statstore
+  Status ReceiveHaHandshakeRequest(const TUniqueId& subscriber_id,
+      const string& src_statestore_address, bool src_force_active,
+      bool* dst_statestore_active);
+
+  /// Called to process HA heartbeat from active statestore
+  void HaHeartbeatRequest(const TUniqueId& dst_statestore_id,
+      const TUniqueId& src_statestore_id);
+
+  /// Sends and monitors the HA heartbeats between two statestore instances.
+  [[noreturn]] void MonitorStatestoredHaHeartbeat();
+
+  /// Send HA heartbeat to peer statestore instance.
+  Status SendHaHeartbeat();
+
+  /// Return the network address of peer statestore instance.
+  std::string GetPeerStatestoreHaAddress() {
+    return TNetworkAddressToString(peer_statestore_ha_addr_);
+  }
+
+  // Update the subscriber's catalog information.
+  void UpdateSubscriberCatalogInfo(const SubscriberId& subscriber_id);
 
  private:
   /// A TopicEntry is a single entry in a topic, and logically is a <string, byte string>
@@ -356,7 +466,9 @@ class Statestore : public CacheLineAligned {
    public:
     Subscriber(const SubscriberId& subscriber_id, const RegistrationId& registration_id,
         const TNetworkAddress& network_address,
-        const std::vector<TTopicRegistration>& subscribed_topics);
+        const std::vector<TTopicRegistration>& subscribed_topics,
+        TStatestoreSubscriberType::type subscriber_type,
+        bool subscribe_catalogd_change);
 
     /// Information about a subscriber's subscription to a specific topic.
     struct TopicSubscription {
@@ -399,11 +511,24 @@ class Statestore : public CacheLineAligned {
     const TNetworkAddress& network_address() const { return network_address_; }
     const SubscriberId& id() const { return subscriber_id_; }
     const RegistrationId& registration_id() const { return registration_id_; }
+    TStatestoreSubscriberType::type subscriber_type() const { return subscriber_type_; }
+    int64_t catalogd_version() const { return catalogd_version_; }
+    const TNetworkAddress& catalogd_address() const { return catalogd_address_; }
+    int64_t last_update_catalogd_time() const { return last_update_catalogd_time_; }
 
     /// Returns the time elapsed (in seconds) since the last heartbeat.
     double SecondsSinceHeartbeat() const {
       return (static_cast<double>(MonotonicMillis() - last_heartbeat_ts_.Load()))
           / 1000.0;
+    }
+    /// Returns the time elapsed (in milli seconds) since the last heartbeat.
+    int64_t MilliSecondsSinceHeartbeat() const {
+      return MonotonicMillis() - last_heartbeat_ts_.Load();
+    }
+
+    /// Return true if the subscriber received heartbeat.
+    bool receivedHeartbeat() const {
+      return received_heartbeat_.Load();
     }
 
     /// Get the Topics map that would be used to store 'topic_id'.
@@ -450,7 +575,21 @@ class Statestore : public CacheLineAligned {
         TopicEntry::Version version);
 
     /// Refresh the subscriber's last heartbeat timestamp to the current monotonic time.
-    void RefreshLastHeartbeatTimestamp();
+    void RefreshLastHeartbeatTimestamp(bool received_heartbeat);
+
+    /// Check if the subscriber is Catalog daemon.
+    bool IsCatalogd() const {
+      return subscriber_type_ == TStatestoreSubscriberType::CATALOGD;
+    }
+
+    /// Check if the subscriber wants to receive the notification of catalogd change.
+    bool IsSubscribedCatalogdChange() const {
+      return subscribe_catalogd_change_;
+    }
+
+    /// The subscriber updates the catalog information.
+    void UpdateCatalogInfo(
+        int64_t catalogd_version, const TNetworkAddress& catalogd_address);
 
    private:
     /// Unique human-readable identifier for this subscriber, set by the subscriber itself
@@ -466,6 +605,12 @@ class Statestore : public CacheLineAligned {
     /// The location of the subscriber service that this subscriber runs.
     const TNetworkAddress network_address_;
 
+    /// Subscriber type
+    TStatestoreSubscriberType::type subscriber_type_;
+
+    /// Indicate if the subscriber subscribe to the notification of updating catalogd.
+    bool subscribe_catalogd_change_;
+
     /// Maps of topic subscriptions to current TopicSubscription, with separate maps for
     /// priority and non-priority topics. The state describes whether updates on the
     /// topic are 'transient' (i.e., to be deleted upon subscriber failure) or not
@@ -477,6 +622,8 @@ class Statestore : public CacheLineAligned {
     /// The timestamp of the last successful heartbeat in milliseconds. A timestamp much
     /// older than the heartbeat frequency implies an unresponsive subscriber.
     AtomicInt64 last_heartbeat_ts_{0};
+    /// True if the subscriber received heartbeat.
+    AtomicBool received_heartbeat_{false};
 
     /// Lock held when adding or deleting transient entries. See class comment for lock
     /// acquisition order.
@@ -485,7 +632,22 @@ class Statestore : public CacheLineAligned {
     /// True once DeleteAllTransientEntries() has been called during subscriber
     /// unregisteration. Protected by 'transient_entry_lock_'
     bool unregistered_ = false;
+
+    // Version of catalogd.
+    int64_t catalogd_version_ = 0L;
+
+    // Address of catalogd.
+    TNetworkAddress catalogd_address_;
+
+    // The last time to update the catalogd.
+    int64_t last_update_catalogd_time_ = 0L;
   };
+
+  /// Unique identifier for this statestore instance.
+  TUniqueId statestore_id_;
+
+  /// Protocol version of the statestore.
+  StatestoreServiceVersion::type protocol_version_;
 
   /// Protects access to subscribers_ and subscriber_uuid_generator_. See the class
   /// comment for the lock acquisition order.
@@ -499,9 +661,17 @@ class Statestore : public CacheLineAligned {
   /// Subscribers are held in shared_ptrs so that RegisterSubscriber() may overwrite their
   /// entry in this map while UpdateSubscriber() tries to update an existing registration
   /// without risk of use-after-free.
-  typedef boost::unordered_map<SubscriberId, std::shared_ptr<Subscriber>>
-    SubscriberMap;
+  typedef boost::unordered_map<SubscriberId, std::shared_ptr<Subscriber>> SubscriberMap;
   SubscriberMap subscribers_;
+
+  /// CatalogD Manager
+  StatestoreCatalogdMgr catalog_manager_;
+
+  /// Condition variable for sending the notifications of updating catalogd.
+  ConditionVariable update_catalod_cv_;
+
+  /// Condition variable for sending the notifications of updating role of statestored.
+  ConditionVariable update_statestored_cv_;
 
   /// Used to generated unique IDs for each new registration.
   boost::uuids::random_generator subscriber_uuid_generator_;
@@ -518,9 +688,11 @@ class Statestore : public CacheLineAligned {
 
     ScheduledSubscriberUpdate() {}
 
-    ScheduledSubscriberUpdate(int64_t next_update_time, SubscriberId s_id,
-        RegistrationId r_id): deadline(next_update_time), subscriber_id(s_id),
-        registration_id(r_id) {}
+    ScheduledSubscriberUpdate(
+        int64_t next_update_time, SubscriberId s_id, RegistrationId r_id)
+      : deadline(next_update_time),
+        subscriber_id(std::move(s_id)),
+        registration_id(std::move(r_id)) {}
   };
 
   /// The statestore has three pools of threads that send messages to subscribers
@@ -566,6 +738,12 @@ class Statestore : public CacheLineAligned {
   /// Thread that monitors the heartbeats of all subscribers.
   std::unique_ptr<Thread> heartbeat_monitoring_thread_;
 
+  /// Thread to send notification of updating catalogd.
+  std::unique_ptr<Thread> update_catalogd_thread_;
+
+  /// Thread to send notification of updating role of statestored.
+  std::unique_ptr<Thread> update_statestored_thread_;
+
   /// Indicates whether the statestore has been initialized and the service is ready.
   std::atomic_bool service_started_{false};
 
@@ -579,14 +757,37 @@ class Statestore : public CacheLineAligned {
   /// of time.
   boost::scoped_ptr<StatestoreSubscriberClientCache> heartbeat_client_cache_;
 
+  /// Cache of subscriber clients used for UpdateCatalogd() RPCs. Only one client per
+  /// subscriber should be used, but the cache helps with the client lifecycle on
+  /// failure.
+  boost::scoped_ptr<StatestoreSubscriberClientCache> update_catalogd_client_cache_;
+
+  /// Cache of subscriber clients used for UpdateStatestoredRole() RPCs. Only one client
+  /// per subscriber should be used, but the cache helps with the client lifecycle on
+  /// failure.
+  boost::scoped_ptr<StatestoreSubscriberClientCache> update_statestored_client_cache_;
+
+  /// statestore client cache - only one client is ever used. Initialized in constructor.
+  /// The StatestoreHaClientCache is created with num_retries = 1 and wait_ms = 0.
+  /// Connections are still retried, but the retry mechanism is driven by DoRpcWithRetry.
+  /// Clients should always use DoRpcWithRetry rather than DoRpc to ensure that both RPCs
+  /// and connections are retried.
+  boost::scoped_ptr<StatestoreHaClientCache> ha_client_cache_;
+
   /// Container for the internal statestore service.
   boost::scoped_ptr<ThriftServer> thrift_server_;
+
+  /// Container for the internal statestore HA service.
+  boost::scoped_ptr<ThriftServer> ha_thrift_server_;
 
   /// Pointer to the MetricGroup for this statestore. Not owned.
   MetricGroup* metrics_;
 
-  /// Thrift API implementation which proxies requests onto this Statestore
+  /// Thrift API implementation which proxies requests onto this Statestore Service
   std::shared_ptr<StatestoreServiceIf> thrift_iface_;
+
+  /// Thrift API implementation which proxies requests onto this Statestore HA Service
+  std::shared_ptr<StatestoreHaServiceIf> ha_thrift_iface_;
 
   /// Failure detector for subscribers. If a subscriber misses a configurable number of
   /// consecutive heartbeat messages, it is considered failed and a) its transient topic
@@ -597,9 +798,71 @@ class Statestore : public CacheLineAligned {
   /// carry over to any new registrations of the previous subscriber.
   boost::scoped_ptr<MissedHeartbeatFailureDetector> failure_detector_;
 
+  /// Lock to protect statestored HA related variables:
+  std::mutex ha_lock_;
+
+  /// Network address of peer statestore instance for StatestoreHaService.
+  TNetworkAddress peer_statestore_ha_addr_;
+
+  /// Unique identifier for peer statestore instance.
+  TUniqueId peer_statestore_id_;
+
+  /// Local network address for StatestoreHaService.
+  TNetworkAddress local_statestore_ha_addr_;
+
+  /// True if the statestore instance is active.
+  bool is_active_ = false;
+
+  /// The version of active statestore. It's set as the number of microseconds that have
+  /// passed since the Unix epoch.
+  /// The HA notifications could be received by subscribers out of order due to network
+  /// delays. This variable is sent in HA notifications to guarantee that only latest
+  /// notification takes effect on subscribers. We can not use an incrementing counter
+  /// for this purpose, otherwise the version will be reset when statestored is restarted.
+  int64_t active_version_ = 0;
+
+  /// True if the peer statestore instance has been detected.
+  bool found_peer_ = false;
+
+  /// True if the statestore instance is in recovery mode.
+  bool in_recovery_mode_ = false;
+
+  /// Starting time to enter recovery mode.
+  int64_t recovery_start_time_;
+
+  /// Number of HA heartbeat received in active state.
+  /// Reset this variable whenever `is_active_` is set to true.
+  int num_received_heartbeat_in_active_ = 0;
+
+  /// Disable network if this variable is set as true by statestore service API.
+  /// This is only used for unit-test.
+  AtomicBool disable_network_{false};
+
+  /// Failure detector for active statestore. If the standby statestore misses a
+  /// configurable number of consecutive heartbeat messages, it is considered failed and
+  /// if it does not receive heartbeat responses from more than 50% of subscribers,
+  /// active statestore enter "looking" state .
+  boost::scoped_ptr<MissedHeartbeatFailureDetector> ha_standby_ss_failure_detector_;
+
+  /// Failure detector for standby statestore. It tracks heartbeat messages from the
+  /// active statestore.
+  boost::scoped_ptr<impala::TimeoutFailureDetector> ha_active_ss_failure_detector_;
+
+  /// Record of connection state between active statestore and subscribers.
+  typedef boost::unordered_map<SubscriberId, TStatestoreConnState::type>
+      ActiveConnStateMap;
+  ActiveConnStateMap active_conn_states_;
+
+  /// Number of subscriber which lost connection with active statestored.
+  int failed_conn_state_count_ = 0;
+
+  /// Thread that sends and monitors the HA heartbeats between two statestore instances.
+  std::unique_ptr<Thread> ha_monitoring_thread_;
+
   /// Metric that track the registered, non-failed subscribers.
   IntGauge* num_subscribers_metric_;
   SetMetric<std::string>* subscriber_set_metric_;
+  IntGauge* num_subscribers_received_heartbeat_metric_;
 
   /// Metrics shared across all topics to sum the size in bytes of keys, values and both
   IntGauge* key_size_metric_;
@@ -614,6 +877,42 @@ class Statestore : public CacheLineAligned {
 
   /// Same as above, but for SendHeartbeat() RPCs.
   StatsMetric<double>* heartbeat_duration_metric_;
+
+  /// Metric to count the total number of successful UpdateCatalogd RPCs sent by
+  /// statestore.
+  IntCounter* successful_update_catalogd_rpc_metric_;
+
+  /// Metric to count the total number of failed UpdateCatalogd RPCs sent by statestore.
+  IntCounter* failed_update_catalogd_rpc_metric_;
+
+  /// Metric to count the total number of successful UpdateCStatestoredRole RPCs sent by
+  /// statestore.
+  IntCounter* successful_update_statestored_role_rpc_metric_;
+
+  /// Metric to count the total number of failed UpdateStatestoredRole RPCs sent by
+  /// statestore.
+  IntCounter* failed_update_statestored_role_rpc_metric_;
+
+  /// Metric to count the total number of requests for clearing topic entries from
+  /// catalogd. Catalogd indicates to clear topic entries when it is restarted or its
+  /// role has been changed from standby to active.
+  IntCounter* clear_topic_entries_metric_;
+
+  /// Metric that tracks the address of active catalogd for catalogd HA
+  StringProperty* active_catalogd_address_metric_;
+
+  /// Metric that tracks if the statestored is active when statestored HA is enabled.
+  BooleanProperty* active_status_metric_;
+
+  /// Metric that tracks if the statestore service is started and ready to accept
+  /// connections.
+  BooleanProperty* service_started_metric_;
+
+  /// Metric that tracks if the statestored is in HA recovery mode.
+  BooleanProperty* in_ha_recovery_mode_metric_;
+
+  /// Metric that tracks if the statestored is connected with peer statestored.
+  BooleanProperty* connected_peer_metric_;
 
   /// Utility method to add an update to the given thread pool, and to fail if the thread
   /// pool is already at capacity. Assumes that subscribers_lock_ is held by the caller.
@@ -724,9 +1023,30 @@ class Statestore : public CacheLineAligned {
   /// id.
   [[noreturn]] void MonitorSubscriberHeartbeat();
 
+  /// Monitors the notification of updating catalogd.
+  [[noreturn]] void MonitorUpdateCatalogd();
+
+  /// Monitors the notification of updating statestored's role.
+  [[noreturn]] void MonitorUpdateStatestoredRole();
+
+  /// Send notification of updating catalogd to the coordinators.
+  void SendUpdateCatalogdNotification(int64_t* last_active_catalogd_version,
+      vector<std::shared_ptr<Subscriber>>& receivers);
+
+  /// Send notification of updating statestored's role to all subscribers.
+  void SendUpdateStatestoredRoleNotification(int64_t* last_active_statestored_version,
+      vector<std::shared_ptr<Subscriber>>& receivers);
+
   /// Raw callback to indicate whether the service is ready.
   void HealthzHandler(const Webserver::WebRequest& req, std::stringstream* data,
       HttpStatusCode* response);
+
+  // Return true if this statestore instance is in recovery mode.
+  bool IsInRecoveryMode();
+
+  /// Json callback for /catalog_ha_info.
+  void CatalogHAInfoHandler(const Webserver::WebRequest& req,
+      rapidjson::Document* document);
 };
 
 } // namespace impala

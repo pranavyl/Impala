@@ -133,6 +133,9 @@ class Webserver {
   /// Returns the authentication mode configured by the startup flags.
   static AuthMode GetConfiguredAuthMode();
 
+  /// Parses form-uri-encoded data and returns key/value pairs.
+  static ArgumentMap GetVars(const std::string& data);
+
  private:
   /// Contains all information relevant to rendering one Url. Each Url has one callback
   /// that produces the output to render. The callback either produces a Json document
@@ -206,13 +209,19 @@ class Webserver {
   bool JWTTokenAuth(const std::string& jwt_token, struct sq_connection* connection,
       struct sq_request_info* request_info);
 
+  /// Checks and returns true if the OAuth token in Authorization header could be verified
+  /// and the token has a valid username.
+  bool OAuthTokenAuth(const std::string& oauth_token, struct sq_connection* connection,
+      struct sq_request_info* request_info);
+
   // Handle Basic authentication for this request. Returns an error if authentication was
   // unsuccessful.
   Status HandleBasic(struct sq_connection* connection,
       struct sq_request_info* request_info, std::vector<std::string>* response_headers);
 
   // Adds a 'Set-Cookie' header to 'response_headers', if cookie support is enabled.
-  void AddCookie(struct sq_request_info* request_info, vector<string>* response_headers);
+  // Returns the random value portion of the cookie in 'rand' for use in CSRF prevention.
+  void AddCookie(const char* user, vector<string>* response_headers, string* rand);
 
   // Get username from Authorization header.
   bool GetUsernameFromAuthHeader(struct sq_connection* connection,
@@ -225,7 +234,8 @@ class Webserver {
   ///   pretty-printed.
   void RenderUrlWithTemplate(const struct sq_connection* connection,
       const WebRequest& arguments, const UrlHandler& url_handler,
-      std::stringstream* output, ContentType* content_type);
+      std::stringstream* output, ContentType* content_type,
+      const std::string& csrf_token);
 
   /// Called when an error is encountered, e.g. when a handler for a URI cannot be found.
   void ErrorHandler(const WebRequest& req, rapidjson::Document* document);
@@ -233,12 +243,13 @@ class Webserver {
   /// Builds a map of argument name to argument value from a typical URL argument
   /// string (that is, "key1=value1&key2=value2.."). If no value is given for a
   /// key, it is entered into the map as (key, "").
-  void BuildArgumentMap(const std::string& args, ArgumentMap* output);
+  static void BuildArgumentMap(const std::string& args, ArgumentMap* output);
 
   /// Adds a __common__ object to document with common data that every webpage might want
   /// to read (e.g. the names of links to write to the navbar).
   void GetCommonJson(rapidjson::Document* document,
-      const struct sq_connection* connection, const WebRequest& req);
+      const struct sq_connection* connection, const WebRequest& req,
+      const std::string& csrf_token);
 
   /// Lock guarding the path_handlers_ map
   boost::shared_mutex url_handlers_lock_;
@@ -284,6 +295,10 @@ class Webserver {
   /// An incoming connection will be accepted if the JWT token could be verified.
   bool use_jwt_ = false;
 
+  /// If true, the OAuth token in Authorization header will be used for authentication.
+  /// An incoming connection will be accepted if the OAuth token could be verified.
+  bool use_oauth_ = false;
+
   /// Used to validate usernames/passwords If LDAP authentication is in use.
   std::unique_ptr<ImpalaLdap> ldap_;
 
@@ -314,6 +329,11 @@ class Webserver {
   /// attempts.
   IntCounter* total_jwt_token_auth_success_ = nullptr;
   IntCounter* total_jwt_token_auth_failure_ = nullptr;
+
+  /// If 'use_oauth_' is true, metrics for the number of successful and failed OAuth auth
+  /// attempts.
+  IntCounter* total_oauth_token_auth_success_ = nullptr;
+  IntCounter* total_oauth_token_auth_failure_ = nullptr;
 };
 
 }

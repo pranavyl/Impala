@@ -17,16 +17,21 @@
 
 # General Impala query tests
 
+from __future__ import absolute_import, division, print_function
 import pytest
 import re
 from copy import deepcopy
 
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfEC, SkipIfCatalogV2, SkipIfNotHdfsMinicluster
+from tests.common.skip import (
+    SkipIfEC, SkipIfCatalogV2, SkipIfNotHdfsMinicluster, SkipIfFS)
 from tests.common.test_dimensions import (
-   create_uncompressed_text_dimension, create_exec_option_dimension_from_dict,
-   create_client_protocol_dimension, hs2_parquet_constraint,
-   extend_exec_option_dimension)
+    create_uncompressed_text_dimension, create_uncompressed_json_dimension,
+    create_exec_option_dimension_from_dict, create_client_protocol_dimension,
+    hs2_parquet_constraint, extend_exec_option_dimension, FILE_FORMAT_TO_STORED_AS_MAP,
+    add_exec_option_dimension, create_exec_option_dimension)
+from tests.util.filesystem_utils import get_fs_path
+from subprocess import check_call
 
 class TestQueries(ImpalaTestSuite):
 
@@ -37,6 +42,11 @@ class TestQueries(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestQueries, cls).add_test_dimensions()
+    single_node_option = ([0, 100] if cls.exploration_strategy() == 'exhaustive'
+        else [0])
+    cls.ImpalaTestMatrix.add_dimension(create_exec_option_dimension(
+      exec_single_node_option=single_node_option))
+
     if cls.exploration_strategy() == 'core':
       cls.ImpalaTestMatrix.add_constraint(lambda v:
           v.get_value('table_format').file_format == 'parquet')
@@ -48,8 +58,7 @@ class TestQueries(ImpalaTestSuite):
 
     # Adding a test dimension here to test the small query opt in exhaustive.
     if cls.exploration_strategy() == 'exhaustive':
-      extend_exec_option_dimension(cls, "exec_single_node_rows_threshold", "100")
-      extend_exec_option_dimension(cls, "ASYNC_CODEGEN", 1)
+      extend_exec_option_dimension(cls, "async_codegen", 1)
       extend_exec_option_dimension(cls, "debug_action", cls.debug_actions)
       cls.ImpalaTestMatrix.add_constraint(cls.debug_action_constraint)
 
@@ -57,7 +66,7 @@ class TestQueries(ImpalaTestSuite):
   def debug_action_constraint(cls, vector):
     exec_option = vector.get_value("exec_option")
 
-    is_async = exec_option.get("ASYNC_CODEGEN") == 1
+    is_async = exec_option.get("async_codegen") == 1
     using_async_debug_actions = exec_option.get("debug_action") == cls.debug_actions
     codegen_enabled = exec_option["disable_codegen"] == 0
 
@@ -101,10 +110,14 @@ class TestQueries(ImpalaTestSuite):
     self.run_test_case('QueryTest/limit', vector)
 
   def test_top_n(self, vector):
-    if vector.get_value('table_format').file_format == 'hbase':
+    file_format = vector.get_value('table_format').file_format
+    if file_format == 'hbase':
       pytest.xfail(reason="IMPALA-283 - select count(*) produces inconsistent results")
     # QueryTest/top-n is also run in test_sort with disable_outermost_topn = 1
     self.run_test_case('QueryTest/top-n', vector)
+
+    if file_format in ['parquet', 'orc']:
+      self.run_test_case('QueryTest/top-n-complex', vector)
 
   def test_union(self, vector):
     self.run_test_case('QueryTest/union', vector)
@@ -129,7 +142,8 @@ class TestQueries(ImpalaTestSuite):
     self.run_test_case('QueryTest/except', vector)
 
   def test_sort(self, vector):
-    if vector.get_value('table_format').file_format == 'hbase':
+    file_format = vector.get_value('table_format').file_format
+    if file_format == 'hbase':
       pytest.xfail(reason="IMPALA-283 - select count(*) produces inconsistent results")
     vector.get_value('exec_option')['disable_outermost_topn'] = 1
     vector.get_value('exec_option')['analytic_rank_pushdown_threshold'] = 0
@@ -137,9 +151,14 @@ class TestQueries(ImpalaTestSuite):
     # We can get the sort tests for free from the top-n file
     self.run_test_case('QueryTest/top-n', vector)
 
+    if file_format in ['parquet', 'orc']:
+      self.run_test_case('QueryTest/sort-complex', vector)
+
   def test_partitioned_top_n(self, vector):
     """Test partitioned Top-N operator."""
     self.run_test_case('QueryTest/partitioned-top-n', vector)
+    if vector.get_value('table_format').file_format in ['parquet', 'orc']:
+      self.run_test_case('QueryTest/partitioned-top-n-complex', vector)
 
   def test_inline_view(self, vector):
     if vector.get_value('table_format').file_format == 'hbase':
@@ -183,6 +202,7 @@ class TestQueries(ImpalaTestSuite):
       pytest.xfail("TODO: Enable with clause tests for hbase")
     self.run_test_case('QueryTest/with-clause', vector)
 
+  # TODO: Although it is not specified this test only runs in exhaustive.
   def test_misc(self, vector):
     table_format = vector.get_value('table_format')
     if table_format.file_format in ['hbase', 'rc', 'parquet', 'kudu']:
@@ -220,10 +240,6 @@ class TestQueriesTextTables(ImpalaTestSuite):
     vector.get_value('exec_option')['abort_on_error'] = 1
     self.run_test_case('QueryTest/strict-mode-abort', vector)
 
-  @SkipIfCatalogV2.data_sources_unsupported()
-  def test_data_source_tables(self, vector):
-    self.run_test_case('QueryTest/data-source-tables', vector)
-
   def test_range_constant_propagation(self, vector):
     self.run_test_case('QueryTest/range-constant-propagation', vector)
 
@@ -233,16 +249,45 @@ class TestQueriesTextTables(ImpalaTestSuite):
     vector.get_value('exec_option')['num_nodes'] = 1
     self.run_test_case('QueryTest/distinct-estimate', vector)
 
-  @SkipIfEC.oom
   def test_random(self, vector):
     # These results will vary slightly depending on how the values get split up
     # so only run with 1 node and on text.
     vector.get_value('exec_option')['num_nodes'] = 1
     self.run_test_case('QueryTest/random', vector)
 
-  @SkipIfEC.oom
   def test_values(self, vector):
     self.run_test_case('QueryTest/values', vector)
+
+
+# Tests in this class are only run against json/none either because that's the only
+# format that is supported, or the tests don't exercise the file format.
+class TestQueriesJsonTables(ImpalaTestSuite):
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestQueriesJsonTables, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(
+        create_uncompressed_json_dimension(cls.get_workload()))
+    add_exec_option_dimension(cls, 'disable_optimized_json_count_star', [0, 1])
+
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  def test_complex(self, vector):
+    vector.get_value('exec_option')['abort_on_error'] = 0
+    self.run_test_case('QueryTest/complex_json', vector)
+
+  def test_multiline(self, vector):
+    vector.get_value('exec_option')['abort_on_error'] = 0
+    self.run_test_case('QueryTest/multiline_json', vector)
+
+  def test_malformed(self, vector):
+    vector.get_value('exec_option')['abort_on_error'] = 0
+    self.run_test_case('QueryTest/malformed_json', vector)
+
+  def test_overflow(self, vector):
+    vector.get_value('exec_option')['abort_on_error'] = 0
+    self.run_test_case('QueryTest/overflow_json', vector)
 
 # Tests in this class are only run against Parquet because the tests don't exercise the
 # file format.
@@ -257,7 +302,6 @@ class TestQueriesParquetTables(ImpalaTestSuite):
   def get_workload(cls):
     return 'functional-query'
 
-  @SkipIfEC.oom
   @pytest.mark.execute_serially
   def test_very_large_strings(self, vector):
     """Regression test for IMPALA-1619. Doesn't need to be run on all file formats.
@@ -281,19 +325,19 @@ class TestHdfsQueries(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestHdfsQueries, cls).add_test_dimensions()
+    # Adding a test dimension here to test the small query opt in exhaustive.
+    single_node_option = ([0, 100] if cls.exploration_strategy() == 'exhaustive'
+        else [0])
+    cls.ImpalaTestMatrix.add_dimension(create_exec_option_dimension(
+      exec_single_node_option=single_node_option))
     # Kudu doesn't support AllTypesAggMultiFilesNoPart (KUDU-1271, KUDU-1570).
     cls.ImpalaTestMatrix.add_constraint(lambda v:
         v.get_value('table_format').file_format != 'kudu')
-
-    # Adding a test dimension here to test the small query opt in exhaustive.
-    if cls.exploration_strategy() == 'exhaustive':
-      extend_exec_option_dimension(cls, "exec_single_node_rows_threshold", "100")
 
   @classmethod
   def get_workload(cls):
     return 'functional-query'
 
-  @SkipIfEC.oom
   def test_hdfs_scan_node(self, vector):
     self.run_test_case('QueryTest/hdfs-scan-node', vector)
 
@@ -328,6 +372,48 @@ class TestPartitionKeyScans(ImpalaTestSuite):
 
   def test_partition_key_scans_with_joins(self, vector):
     self.run_test_case('QueryTest/partition-key-scans-with-joins', vector)
+
+
+class TestPartitionKeyScansWithMultipleBlocks(ImpalaTestSuite):
+  """Tests for queries that exercise partition key scan optimisation with data files
+  that contain multiple blocks."""
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestPartitionKeyScansWithMultipleBlocks, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format not in ('kudu', 'hbase'))
+
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  def _build_alltypes_multiblocks_table(self, vector, unique_database):
+    file_format = vector.get_value('table_format').file_format
+    db_suffix = vector.get_value('table_format').db_suffix()
+    src_tbl_name = 'functional' + db_suffix + '.alltypes'
+    src_tbl_loc = self._get_table_location(src_tbl_name, vector)
+    source_file = src_tbl_loc + '/year=2010/month=12/*'
+    tbl_loc = get_fs_path("/test-warehouse/%s.db/alltypes_multiblocks"
+        % (unique_database))
+    file_path = tbl_loc + "/year=2010/month=12"
+
+    check_call(['hdfs', 'dfs', '-mkdir', '-p', file_path])
+    self.client.execute("""create table if not exists %s.alltypes_multiblocks
+        like functional.alltypes stored as %s location '%s';"""
+        % (unique_database, FILE_FORMAT_TO_STORED_AS_MAP[file_format], tbl_loc))
+
+    # set block size to 1024 so the target file occupies multiple blocks
+    check_call(['hdfs', 'dfs', '-Ddfs.block.size=1024', '-cp', '-f', '-d',
+        source_file, file_path])
+    self.client.execute("alter table %s.alltypes_multiblocks recover partitions"
+        % (unique_database))
+
+  @SkipIfFS.hdfs_small_block
+  def test_partition_key_scans_with_multiple_blocks_table(self, vector, unique_database):
+    self._build_alltypes_multiblocks_table(vector, unique_database)
+    result = self.execute_query_expect_success(self.client,
+          "SELECT max(year) FROM %s.alltypes_multiblocks" % (unique_database))
+    assert int(result.get_data()) == 2010
 
 class TestTopNReclaimQuery(ImpalaTestSuite):
   """Test class to validate that TopN periodically reclaims tuple pool memory

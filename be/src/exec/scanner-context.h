@@ -136,7 +136,7 @@ class ScannerContext {
     /// The callback takes the file offset of the asynchronous read (this may be more
     /// than file_offset() due to data being assembled in the boundary buffer).
     typedef boost::function<int (int64_t)> ReadPastSizeCallback;
-    void set_read_past_size_cb(ReadPastSizeCallback cb) { read_past_size_cb_ = cb; }
+    void set_read_past_size_cb(ReadPastSizeCallback cb) { read_past_size_cb_ = move(cb); }
 
     /// Return the number of bytes left in the range for this stream.
     int64_t bytes_left() { return scan_range_->bytes_to_read() - total_bytes_returned_; }
@@ -387,6 +387,11 @@ class ScannerContext {
   ///
   /// Returns the added stream. The returned stream is owned by this context.
   Stream* AddStream(io::ScanRange* range, int64_t reservation);
+
+  /// Add and start a stream to this ScannerContext for 'range'.
+  /// Returns the added stream through output parameter 'stream'.
+  Status AddAndStartStream(
+      io::ScanRange* range, int64_t reservation, ScannerContext::Stream** stream);
 
   /// Returns true if RuntimeState::is_cancelled() is true, or if scan node is not
   /// multi-threaded and is done (finished, cancelled or reached it's limit).

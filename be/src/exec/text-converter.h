@@ -34,7 +34,7 @@ class LlvmCodeGen;
 class MemPool;
 class SlotDescriptor;
 class Status;
-struct StringValue;
+class StringValue;
 class Tuple;
 class TupleDescriptor;
 
@@ -61,8 +61,8 @@ class TextConverter {
   /// 'pool' is unused.
   /// Unsuccessful conversions are turned into NULLs.
   /// Returns true if the value was written successfully.
-  bool WriteSlot(const SlotDescriptor* slot_desc, Tuple* tuple,
-      const char* data, int len, bool copy_string, bool need_escape, MemPool* pool);
+  bool WriteSlot(const SlotDescriptor* slot_desc, Tuple* tuple, const char* data, int len,
+      bool copy_string, bool need_escape, MemPool* pool);
 
   /// Removes escape characters from len characters of the null-terminated string src,
   /// and copies the unescaped string into dest, changing *len to the unescaped length.
@@ -85,12 +85,13 @@ class TextConverter {
   /// be used for partitions that contain escapes.
   /// strict_mode: If set, numerical overflow/underflow are considered to be parse
   /// errors.
-  static Status CodegenWriteSlot(LlvmCodeGen* codegen,
-      TupleDescriptor* tuple_desc, SlotDescriptor* slot_desc, llvm::Function** fn,
-      const char* null_col_val, int len, bool check_null, bool strict_mode = false);
+  static Status CodegenWriteSlot(LlvmCodeGen* codegen, TupleDescriptor* tuple_desc,
+      SlotDescriptor* slot_desc, llvm::Function** fn, const char* null_col_val, int len,
+      bool check_null, bool strict_mode = false);
 
   /// Returns whether codegen is supported for the given type.
   static bool SupportsCodegenWriteSlot(const ColumnType& col_type);
+
  private:
   char escape_char_;
   /// Special string to indicate NULL column values.

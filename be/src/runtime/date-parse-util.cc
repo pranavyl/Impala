@@ -100,7 +100,7 @@ bool DateParser::ParseSimpleDateFormat(const char* str, int len, bool accept_tim
 
   const DateTimeFormatContext* dt_ctx =
       SimpleDateFormatTokenizer::GetDefaultFormatContext(str, trimmed_len,
-          accept_time_toks);
+          accept_time_toks, false);
   if (dt_ctx != nullptr) return ParseSimpleDateFormat(str, trimmed_len, *dt_ctx, date);
 
   // Generating context lazily as a fall back if default formats fail.
@@ -126,6 +126,24 @@ bool DateParser::ParseIsoSqlFormat(const char* str, int len,
 
   *date = DateValue(dt_result.year, dt_result.month, dt_result.day);
   return date->IsValid();
+}
+
+// Formats date into dst using the default format
+// Format:  yyyy-MM-dd
+// Offsets: 0123456789
+int DateParser::FormatDefault(const DateValue& date, char* dst) {
+  int year, month, day;
+  if (!date.ToYearMonthDay(&year, &month, &day)) {
+    *dst = '\0';
+    return -1;
+  }
+  else {
+    ZeroPad(dst, year, 4);
+    ZeroPad(dst + 5, month, 2);
+    ZeroPad(dst + 8, day, 2);
+    dst[7] = dst[4] = '-';
+    return SimpleDateFormatTokenizer::DEFAULT_DATE_FMT_LEN;
+  }
 }
 
 string DateParser::Format(const DateTimeFormatContext& dt_ctx, const DateValue& date) {

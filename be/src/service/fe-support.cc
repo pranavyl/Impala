@@ -43,6 +43,7 @@
 #include "runtime/mem-pool.h"
 #include "runtime/raw-value.h"
 #include "runtime/runtime-state.h"
+#include "scheduling/cluster-membership-mgr.h"
 #include "service/impala-server.h"
 #include "service/query-options.h"
 #include "util/bloom-filter.h"
@@ -78,7 +79,8 @@ Java_org_apache_impala_service_FeSupport_NativeFeInit(
   // exceptions to the FE.
   InitCommonRuntime(1, &name, true,
       external_fe ? TestInfo::NON_TEST : TestInfo::FE_TEST, external_fe);
-  THROW_IF_ERROR(LlvmCodeGen::InitializeLlvm(true), env, JniUtil::internal_exc_class());
+  THROW_IF_ERROR(
+      LlvmCodeGen::InitializeLlvm(name, true), env, JniUtil::internal_exc_class());
   ExecEnv* exec_env = new ExecEnv(external_fe); // This also caches it from the process.
   THROW_IF_ERROR(exec_env->InitForFeSupport(), env, JniUtil::internal_exc_class());
 }
@@ -135,7 +137,7 @@ static void SetTColumnValue(
     case TYPE_STRING:
     case TYPE_VARCHAR: {
       const StringValue* string_val = reinterpret_cast<const StringValue*>(value);
-      tmp.assign(static_cast<char*>(string_val->ptr), string_val->len);
+      tmp.assign(string_val->Ptr(), string_val->Len());
       col_val->binary_val.swap(tmp);
       col_val->__isset.binary_val = true;
       break;
@@ -180,7 +182,6 @@ Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow(
   jbyteArray result_bytes = NULL;
   TQueryCtx query_ctx;
   TExprBatch expr_batch;
-  JniLocalFrame jni_frame;
   TResultRow expr_results;
   vector<TColumnValue> results;
   ObjectPool obj_pool;
@@ -210,9 +211,6 @@ Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow(
     fragment_state.ReleaseResources();
     state.ReleaseResources();
   });
-
-  THROW_IF_ERROR_RET(
-      jni_frame.push(env), env, JniUtil::internal_exc_class(), result_bytes);
 
   MemPool expr_mem_pool(state.query_mem_tracker());
 
@@ -259,9 +257,9 @@ Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow(
     if (type.IsVarLenStringType()) {
       const StringValue* string_val = reinterpret_cast<const StringValue*>(result);
       if (string_val != nullptr) {
-        if (string_val->len > max_result_size) {
+        if (string_val->Len() > max_result_size) {
           status = Status(TErrorCode::EXPR_REWRITE_RESULT_LIMIT_EXCEEDED,
-              string_val->len, max_result_size);
+              string_val->Len(), max_result_size);
           goto error;
         }
       }
@@ -450,6 +448,7 @@ Java_org_apache_impala_service_FeSupport_NativeLookupSymbol(
       JniUtil::internal_exc_class(), nullptr);
 
   vector<ColumnType> arg_types;
+  arg_types.reserve(lookup.arg_types.size());
   for (int i = 0; i < lookup.arg_types.size(); ++i) {
     arg_types.push_back(ColumnType::FromThrift(lookup.arg_types[i]));
   }
@@ -645,6 +644,35 @@ Java_org_apache_impala_service_FeSupport_NativeParseQueryOptions(
   return result_bytes;
 }
 
+// Get a list of known coordinators.
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_org_apache_impala_service_FeSupport_NativeGetCoordinators(
+    JNIEnv* env, jclass caller_class) {
+  ClusterMembershipMgr::SnapshotPtr membership_snapshot =
+      ExecEnv::GetInstance()->cluster_membership_mgr()->GetSnapshot();
+  DCHECK(membership_snapshot != nullptr);
+  vector<TNetworkAddress> coordinators = membership_snapshot->GetCoordinatorAddresses();
+
+  TAddressesList addresses_container;
+  addresses_container.__set_addresses(coordinators);
+  jbyteArray result_bytes = nullptr;
+  THROW_IF_ERROR_RET(SerializeThriftMsg(env, &addresses_container, &result_bytes), env,
+      JniUtil::internal_exc_class(), result_bytes);
+  return result_bytes;
+}
+
+// Get the number of live queries.
+extern "C" JNIEXPORT jlong JNICALL
+Java_org_apache_impala_service_FeSupport_NativeNumLiveQueries(
+    JNIEnv* env, jclass caller_class) {
+  ImpalaServer* server = ExecEnv::GetInstance()->impala_server();
+  if (LIKELY(server != nullptr)) {
+    return server->NumLiveQueries();
+  }
+  // Allow calling without an ImpalaServer, such as during PlannerTest.
+  return 0;
+}
+
 // Returns the log (base 2) of the minimum number of bytes we need for a Bloom filter
 // with 'ndv' unique elements and a false positive probability of less than 'fpp'.
 extern "C"
@@ -652,6 +680,14 @@ JNIEXPORT jint JNICALL
 Java_org_apache_impala_service_FeSupport_MinLogSpaceForBloomFilter(
     JNIEnv* env, jclass fe_support_class, jlong ndv, jdouble fpp) {
   return BloomFilter::MinLogSpace(ndv, fpp);
+}
+
+/// Returns the expected false positive rate for the given ndv and log_bufferpool_space.
+extern "C"
+JNIEXPORT jdouble JNICALL
+Java_org_apache_impala_service_FeSupport_FalsePositiveProbForBloomFilter(
+    JNIEnv* env, jclass fe_support_class, jlong ndv, jint log_bufferpool_space) {
+  return BloomFilter::FalsePositiveProb(ndv, log_bufferpool_space);
 }
 
 extern "C"
@@ -685,6 +721,46 @@ Java_org_apache_impala_service_FeSupport_nativeParseDateString(JNIEnv* env,
 
   jbyteArray result_bytes = NULL;
   THROW_IF_ERROR_RET(SerializeThriftMsg(env, &parse_str_result, &result_bytes), env,
+      JniUtil::internal_exc_class(), result_bytes);
+  return result_bytes;
+}
+
+// Native method to make a request to catalog server to get the null partition name.
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_org_apache_impala_service_FeSupport_NativeGetNullPartitionName(
+    JNIEnv* env, jclass fe_support_class, jbyteArray thrift_struct) {
+  TGetNullPartitionNameRequest request;
+  THROW_IF_ERROR_RET(DeserializeThriftMsg(env, thrift_struct, &request), env,
+      JniUtil::internal_exc_class(), nullptr);
+  CatalogOpExecutor catalog_op_executor(ExecEnv::GetInstance(), nullptr, nullptr);
+  TGetNullPartitionNameResponse result;
+  Status status = catalog_op_executor.GetNullPartitionName(request, &result);
+  if (!status.ok()) {
+    LOG(ERROR) << status.GetDetail();
+    status.ToThrift(&result.status);
+  }
+  jbyteArray result_bytes = nullptr;
+  THROW_IF_ERROR_RET(SerializeThriftMsg(env, &result, &result_bytes), env,
+      JniUtil::internal_exc_class(), result_bytes);
+  return result_bytes;
+}
+
+// Native method to make a request to catalog server to get the latest compactions.
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_org_apache_impala_service_FeSupport_NativeGetLatestCompactions(
+    JNIEnv* env, jclass fe_support_class, jbyteArray thrift_struct) {
+  TGetLatestCompactionsRequest request;
+  THROW_IF_ERROR_RET(DeserializeThriftMsg(env, thrift_struct, &request), env,
+      JniUtil::internal_exc_class(), nullptr);
+  CatalogOpExecutor catalog_op_executor(ExecEnv::GetInstance(), nullptr, nullptr);
+  TGetLatestCompactionsResponse result;
+  Status status = catalog_op_executor.GetLatestCompactions(request, &result);
+  if (!status.ok()) {
+    LOG(ERROR) << status.GetDetail();
+    status.ToThrift(&result.status);
+  }
+  jbyteArray result_bytes = nullptr;
+  THROW_IF_ERROR_RET(SerializeThriftMsg(env, &result, &result_bytes), env,
       JniUtil::internal_exc_class(), result_bytes);
   return result_bytes;
 }
@@ -756,9 +832,29 @@ static JNINativeMethod native_methods[] = {
     (void*)::Java_org_apache_impala_service_FeSupport_MinLogSpaceForBloomFilter
   },
   {
+    const_cast<char*>("FalsePositiveProbForBloomFilter"), const_cast<char*>("(JI)D"),
+    (void*)::Java_org_apache_impala_service_FeSupport_FalsePositiveProbForBloomFilter
+  },
+  {
     const_cast<char*>("nativeParseDateString"),
     const_cast<char*>("(Ljava/lang/String;)[B"),
     (void*)::Java_org_apache_impala_service_FeSupport_nativeParseDateString
+  },
+  {
+    const_cast<char*>("NativeGetNullPartitionName"), const_cast<char*>("([B)[B"),
+    (void*) ::Java_org_apache_impala_service_FeSupport_NativeGetNullPartitionName
+  },
+  {
+    const_cast<char*>("NativeGetLatestCompactions"), const_cast<char*>("([B)[B"),
+    (void*) ::Java_org_apache_impala_service_FeSupport_NativeGetLatestCompactions
+  },
+  {
+    const_cast<char*>("NativeGetCoordinators"), const_cast<char*>("()[B"),
+    (void*)::Java_org_apache_impala_service_FeSupport_NativeGetCoordinators
+  },
+  {
+    const_cast<char*>("NativeNumLiveQueries"), const_cast<char*>("()J"),
+    (void*)::Java_org_apache_impala_service_FeSupport_NativeNumLiveQueries
   },
 };
 

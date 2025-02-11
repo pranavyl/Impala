@@ -90,7 +90,7 @@ public class HiveJdbcClientPool implements Closeable {
      */
     public ResultSet execQuery(String query) throws SQLException {
       validateConnection();
-      LOG.debug("Executing: " + query);
+      LOG.info("Executing: " + query);
       return stmt_.executeQuery(query);
     }
 
@@ -99,7 +99,7 @@ public class HiveJdbcClientPool implements Closeable {
      */
     public boolean executeSql(String sql) throws SQLException {
       validateConnection();
-      LOG.debug("Executing sql : " + sql);
+      LOG.info("Executing sql : " + sql);
       return stmt_.execute(sql);
     }
   }
@@ -152,8 +152,10 @@ public class HiveJdbcClientPool implements Closeable {
     while (closedCount > 0) {
       try {
         HiveJdbcClient client = freeClients_.poll(5 * 60, TimeUnit.SECONDS);
-        if (client.stmt_ != null) { client.stmt_.close(); }
-        if (client.conn_ != null) { client.conn_.close(); }
+        if (client != null) {
+          if (client.stmt_ != null) { client.stmt_.close(); }
+          if (client.conn_ != null) { client.conn_.close(); }
+        }
         closedCount--;
       } catch (Exception e) {
         throw new RuntimeException(e);

@@ -21,7 +21,10 @@
 #include <fstream>
 #include <gflags/gflags.h>
 #include <rapidjson/document.h>
+#include <sys/stat.h>
 #include <sys/sysinfo.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
 
 #include "gutil/strings/join.h"
 #include "gutil/strings/util.h"
@@ -33,6 +36,7 @@
 #include "testutil/gtest-util.h"
 #include "testutil/scoped-flag-setter.h"
 #include "util/counting-barrier.h"
+#include "util/disk-info.h"
 #include "util/filesystem-util.h"
 #include "util/simple-logger.h"
 #include "util/thread.h"
@@ -66,11 +70,22 @@ DECLARE_string(data_cache_eviction_policy);
 DECLARE_string(data_cache_trace_dir);
 DECLARE_int32(max_data_cache_trace_file_size);
 DECLARE_int32(data_cache_trace_percentage);
+DECLARE_int32(data_cache_num_async_write_threads);
+DECLARE_string(data_cache_async_write_buffer_limit);
+DECLARE_bool(data_cache_keep_across_restarts);
 
 namespace impala {
 namespace io {
 
 using boost::filesystem::path;
+
+struct DataCacheTestParam {
+  DataCacheTestParam(const std::string& eviction_policy, int32 num_write_threads)
+    : eviction_policy(eviction_policy),
+      num_write_threads(num_write_threads) { }
+  std::string eviction_policy;
+  int32 num_write_threads;
+};
 
 class DataCacheBaseTest : public testing::Test {
  public:
@@ -86,6 +101,14 @@ class DataCacheBaseTest : public testing::Test {
     return data_cache_trace_dir_;
   }
 
+  /// A function for testing, we need to make sure that all the store tasks have completed
+  /// before any lookup when running test case in async write mode.
+  static void WaitForAsyncWrite(const DataCache& cache) {
+    while (cache.current_buffer_size_.Load() != 0) {
+      usleep(500);
+    }
+  }
+
   //
   // Use multiple threads to insert and read back a set of ranges from test_buffer().
   // Depending on the setting, the working set may or may not fit in the cache.
@@ -98,15 +121,21 @@ class DataCacheBaseTest : public testing::Test {
   //                             per thread; If false, the prefix for filenames is empty
   // 'expect_misses'           : If true, expect there will be cache misses when reading
   //                             from the cache
+  // 'test_readonly'           : Only for testing read-only, if true, set data cache
+  //                             read-only after create all threads, and check number of
+  //                             writes later
   //
   void MultiThreadedReadWrite(DataCache* cache, int64_t max_start_offset,
-      bool use_per_thread_filename, bool expect_misses) {
+      bool use_per_thread_filename, bool expect_misses, double* write_time_ms,
+      bool test_readonly = false) {
     // Barrier to synchronize all threads so no thread will start probing the cache until
     // all insertions are done.
     CountingBarrier barrier(NUM_THREADS);
 
     vector<unique_ptr<Thread>> threads;
     int num_misses[NUM_THREADS];
+    int64_t write_times_us[NUM_THREADS];
+    int64_t num_writes = 0;
     for (int i = 0; i < NUM_THREADS; ++i) {
       unique_ptr<Thread> thread;
       num_misses[i] = 0;
@@ -114,22 +143,62 @@ class DataCacheBaseTest : public testing::Test {
       ASSERT_OK(Thread::Create("data-cache-test", thread_name,
           boost::bind(&DataCacheBaseTest::ThreadFn, this,
              use_per_thread_filename ? thread_name : "", cache, max_start_offset,
-             &barrier, &num_misses[i]), &thread));
+             &barrier, &num_misses[i], &write_times_us[i]), &thread));
       threads.emplace_back(std::move(thread));
+      // If testing read only, set it read only after starting half of the threads.
+      if (i == (NUM_THREADS / 2) && test_readonly) {
+        // Set read-only before the writes are complete, and record the total write count
+        // of the cache after read-only set.
+        num_writes = cache->SetDataCacheReadOnly();
+      }
     }
+
     int cache_misses = 0;
+    int64_t avg_write_time_us = 0;
     for (int i = 0; i < NUM_THREADS; ++i) {
       threads[i]->Join();
       cache_misses += num_misses[i];
+      avg_write_time_us += write_times_us[i];
     }
+    *write_time_ms = static_cast<double>(avg_write_time_us / NUM_THREADS) / 1000;
     if (expect_misses) {
       ASSERT_GT(cache_misses, 0);
     } else {
       ASSERT_EQ(0, cache_misses);
     }
 
+    if (test_readonly) {
+      // Revoke read-only and check the total write count, which should not have increased
+      // due to read-only.
+      ASSERT_EQ(num_writes, cache->RevokeDataCacheReadOnly());
+      return;
+    }
+
     // Verify the backing files don't exceed size limits.
     ASSERT_OK(cache->CloseFilesAndVerifySizes());
+  }
+
+  void MockDisk(std::string name, bool is_rotational) {
+    mock_fs_ = "/tmp" / boost::filesystem::unique_path();
+    ASSERT_OK(FileSystemUtil::RemoveAndCreateDirectory(mock_fs_.string()));
+    boost::filesystem::path proc_fs = mock_fs_ / "proc";
+    ASSERT_OK(FileSystemUtil::RemoveAndCreateDirectory(proc_fs.string()));
+    boost::filesystem::path sys_fs = mock_fs_ / "sys";
+    boost::filesystem::path dev_queue = sys_fs / "block" / name / "queue";
+    ASSERT_OK(FileSystemUtil::RemoveAndCreateDirectory(dev_queue.string()));
+
+    {
+      struct stat s;
+      stat(BASE_CACHE_DIR, &s);
+      std::ofstream partitions((proc_fs / "partitions").string());
+      partitions << "major minor #blocks name\n";
+      partitions << major(s.st_dev) << " " << minor(s.st_dev) << " 1 " << name << "\n";
+
+      std::ofstream rotational((dev_queue / "rotational").string());
+      rotational << (is_rotational ? "1" : "0");
+    }
+
+    DiskInfo::Init(proc_fs.string(), sys_fs.string());
   }
 
  protected:
@@ -141,7 +210,7 @@ class DataCacheBaseTest : public testing::Test {
   }
 
   // Create a bunch of test directories in which the data cache will reside.
-  void SetupWithParameters(std::string eviction_policy) {
+  void SetupWithParameters(DataCacheTestParam param) {
     test_env_.reset(new TestEnv());
     flag_saver_.reset(new google::FlagSaver());
     ASSERT_OK(test_env_->Init());
@@ -162,7 +231,11 @@ class DataCacheBaseTest : public testing::Test {
     FLAGS_data_cache_write_concurrency = NUM_THREADS;
 
     // This is parameterized to allow testing LRU and LIRS
-    FLAGS_data_cache_eviction_policy = eviction_policy;
+    FLAGS_data_cache_eviction_policy = param.eviction_policy;
+
+    // This is parameterized to allow testing asynchronous write.
+    FLAGS_data_cache_num_async_write_threads = param.num_write_threads;
+    FLAGS_data_cache_async_write_buffer_limit = "1G";
   }
 
   // Delete all the test directories created.
@@ -178,6 +251,13 @@ class DataCacheBaseTest : public testing::Test {
     boost::filesystem::remove_all(path(data_cache_trace_dir_));
     flag_saver_.reset();
     test_env_.reset();
+
+    // Reset DiskInfo in case it was mocked.
+    if (!mock_fs_.empty()) {
+      boost::filesystem::remove_all(mock_fs_);
+      mock_fs_.clear();
+    }
+    DiskInfo::Init();
   }
 
  private:
@@ -185,6 +265,7 @@ class DataCacheBaseTest : public testing::Test {
   char test_buffer_[TEST_BUFFER_SIZE];
   vector<string> data_cache_dirs_;
   string data_cache_trace_dir_;
+  boost::filesystem::path mock_fs_;
 
   // Saved configuration flags for restoring the values at the end of the test.
   std::unique_ptr<google::FlagSaver> flag_saver_;
@@ -199,23 +280,29 @@ class DataCacheBaseTest : public testing::Test {
   // of cache keys which indirectly control the cache footprint. 'num_misses' records
   // the number of cache misses.
   void ThreadFn(const string& fname_prefix, DataCache* cache, int64_t max_start_offset,
-      CountingBarrier* store_barrier, int* num_misses) {
+      CountingBarrier* store_barrier, int* num_misses, int64_t* write_time_us) {
     const string& custom_fname = Substitute("$0file", fname_prefix);
     vector<int64_t> offsets;
     for (int64_t offset = 0; offset < max_start_offset; ++offset) {
       offsets.push_back(offset);
     }
     random_shuffle(offsets.begin(), offsets.end());
+    int64_t write_start_time = UnixMicros();
     for (int64_t offset : offsets) {
       cache->Store(custom_fname, MTIME, offset, test_buffer() + offset,
           TEMP_BUFFER_SIZE);
     }
+    *write_time_us = UnixMicros() - write_start_time;
     // Wait until all threads have finished inserting. Since different threads may be
     // inserting the same cache key and collide, only one thread which wins the race will
     // insert the cache entry. Make sure other threads which lose out on the race will
     // wait for the insertion to complete first before proceeding.
     store_barrier->Notify();
     store_barrier->Wait();
+
+    // Before continue, we should wait for all asynchronous store tasks (if there are)
+    // finished.
+    WaitForAsyncWrite(*cache);
     for (int64_t offset : offsets) {
       uint8_t buffer[TEMP_BUFFER_SIZE];
       memset(buffer, 0, TEMP_BUFFER_SIZE);
@@ -233,7 +320,7 @@ class DataCacheBaseTest : public testing::Test {
 
 class DataCacheTest :
     public DataCacheBaseTest,
-    public ::testing::WithParamInterface<std::string> {
+    public ::testing::WithParamInterface<DataCacheTestParam> {
  public:
   DataCacheTest()
       : DataCacheBaseTest() {
@@ -245,15 +332,19 @@ class DataCacheTest :
   }
 };
 
-INSTANTIATE_TEST_CASE_P(DataCacheTestTypes, DataCacheTest,
-    ::testing::Values("LRU", "LIRS"));
+INSTANTIATE_TEST_SUITE_P(DataCacheTestTypes, DataCacheTest,::testing::Values(
+    DataCacheTestParam("LRU", 0),
+    DataCacheTestParam("LRU", NUM_THREADS),
+    DataCacheTestParam("LIRS", 0),
+    DataCacheTestParam("LIRS", NUM_THREADS)));
 
 // This test exercises the basic insertion and lookup paths by inserting a known set of
 // offsets which fit in the cache entirely. Also tries reading entries which are never
 // inserted into the cache.
 TEST_P(DataCacheTest, TestBasics) {
   const int64_t cache_size = DEFAULT_CACHE_SIZE;
-  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)));
+  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)),
+      FLAGS_data_cache_num_async_write_threads);
   ASSERT_OK(cache.Init());
 
   // Temporary buffer for holding results read from the cache.
@@ -273,6 +364,9 @@ TEST_P(DataCacheTest, TestBasics) {
         ASSERT_EQ(0, memcmp(test_buffer() + offset, buffer, TEMP_BUFFER_SIZE));
       }
     }
+    // Before continue, we should wait for all asynchronous store tasks (if there are)
+    // finished.
+    WaitForAsyncWrite(cache);
   }
 
   // Read the same range inserted previously but with a different filename.
@@ -310,6 +404,7 @@ TEST_P(DataCacheTest, TestBasics) {
   uint8_t buffer2[TEMP_BUFFER_SIZE + 10];
   const int64_t larger_entry_size = TEMP_BUFFER_SIZE + 10;
   ASSERT_TRUE(cache.Store(FNAME, MTIME, 0, test_buffer(), larger_entry_size));
+  WaitForAsyncWrite(cache);
   memset(buffer2, 0, larger_entry_size);
   ASSERT_EQ(larger_entry_size,
       cache.Lookup(FNAME, MTIME, 0, larger_entry_size, buffer2));
@@ -337,13 +432,28 @@ TEST_P(DataCacheTest, TestBasics) {
   ASSERT_EQ(0, cache.Lookup(FNAME, MTIME, 0, -5000, buffer));
 }
 
+TEST_P(DataCacheTest, NonCanonicalPath) {
+  DataCache cache("/noncanonical/../file/./system/path:1M",
+      FLAGS_data_cache_num_async_write_threads);
+  ASSERT_ERROR_MSG(cache.Init(), "/noncanonical/../file/./system/path is not a canonical"
+      " path");
+}
+
+TEST_P(DataCacheTest, NonExistantPath) {
+  DataCache cache("/invalid/file/system/path:1M",
+      FLAGS_data_cache_num_async_write_threads);
+  ASSERT_ERROR_MSG(cache.Init(), "Encountered exception while verifying existence of "
+      "directory path /invalid/file/system/path: No such file or directory");
+}
+
 // Tests backing file rotation by setting FLAGS_data_cache_file_max_size_bytes to be 1/4
 // of the cache size. This forces rotation of backing files.
 TEST_P(DataCacheTest, RotateFiles) {
   // Set the maximum size of backing files to be 1/4 of the cache size.
   FLAGS_data_cache_file_max_size_bytes = DEFAULT_CACHE_SIZE / 4;
   const int64_t cache_size = DEFAULT_CACHE_SIZE;
-  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)));
+  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)),
+      FLAGS_data_cache_num_async_write_threads);
   ASSERT_OK(cache.Init());
 
   // Read and then insert a range of offsets. Expected all misses in the first iteration
@@ -362,6 +472,7 @@ TEST_P(DataCacheTest, RotateFiles) {
         ASSERT_EQ(0, memcmp(test_buffer() + offset, buffer, TEMP_BUFFER_SIZE));
       }
     }
+    WaitForAsyncWrite(cache);
   }
 
   // Make sure the cache's destructor removes all backing files.
@@ -385,7 +496,8 @@ TEST_P(DataCacheTest, RotateAndDeleteFiles) {
   FLAGS_data_cache_max_opened_files = 1;
 
   const int64_t cache_size = DEFAULT_CACHE_SIZE;
-  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)));
+  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)),
+      FLAGS_data_cache_num_async_write_threads);
   ASSERT_OK(cache.Init());
 
   // Read and insert a working set the same size of the cache. Expected all misses
@@ -397,6 +509,7 @@ TEST_P(DataCacheTest, RotateAndDeleteFiles) {
       ASSERT_EQ(0, cache.Lookup(FNAME, MTIME, offset, TEMP_BUFFER_SIZE, buffer));
       ASSERT_TRUE(cache.Store(FNAME, MTIME, offset, test_buffer() + offset,
           TEMP_BUFFER_SIZE));
+      WaitForAsyncWrite(cache);
     }
   }
 
@@ -439,7 +552,8 @@ TEST_P(DataCacheTest, LRUEviction) {
   // This test is specific to LRU
   if (FLAGS_data_cache_eviction_policy != "LRU") return;
   const int64_t cache_size = DEFAULT_CACHE_SIZE;
-  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)));
+  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)),
+      FLAGS_data_cache_num_async_write_threads);
   ASSERT_OK(cache.Init());
 
   // Read and then insert range chunks of size TEMP_BUFFER_SIZE from the test buffer.
@@ -451,6 +565,7 @@ TEST_P(DataCacheTest, LRUEviction) {
       ASSERT_EQ(0, cache.Lookup(FNAME, MTIME, offset, TEMP_BUFFER_SIZE, buffer));
       ASSERT_TRUE(cache.Store(FNAME, MTIME, offset, test_buffer() + offset,
           TEMP_BUFFER_SIZE));
+      WaitForAsyncWrite(cache);
     }
   }
   // Verifies that the cache is full.
@@ -471,6 +586,7 @@ TEST_P(DataCacheTest, LRUEviction) {
   const string& alt_fname = "random";
   offset = 0;
   ASSERT_TRUE(cache.Store(alt_fname, MTIME, offset, large_buffer.get(), cache_size));
+  WaitForAsyncWrite(cache);
 
   // Verifies that all previous entries are all evicted.
   for (offset = 0; offset < 1028; ++offset) {
@@ -492,28 +608,40 @@ TEST_P(DataCacheTest, LRUEviction) {
 // collision during insertion, all entries in the working set should be found.
 TEST_P(DataCacheTest, MultiThreadedNoMisses) {
   int64_t cache_size = DEFAULT_CACHE_SIZE;
-  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)));
+  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)),
+      FLAGS_data_cache_num_async_write_threads);
   ASSERT_OK(cache.Init());
 
   int64_t max_start_offset = NUM_CACHE_ENTRIES_NO_EVICT;
   bool use_per_thread_filename = false;
   bool expect_misses = false;
+  double wait_time_ms;
   MultiThreadedReadWrite(&cache, max_start_offset, use_per_thread_filename,
-      expect_misses);
+      expect_misses, &wait_time_ms);
+  LOG(INFO) << "MultiThreadedNoMisses, "
+            << FLAGS_data_cache_eviction_policy << ", "
+            << (FLAGS_data_cache_num_async_write_threads > 0 ? "Async" : "Sync")
+            << ", write_time_ms: " << wait_time_ms;
 }
 
 // Inserts a working set which is known to be larger than the cache's capacity.
 // Expect some cache misses in lookups.
 TEST_P(DataCacheTest, MultiThreadedWithMisses) {
   int64_t cache_size = DEFAULT_CACHE_SIZE;
-  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)));
+  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)),
+      FLAGS_data_cache_num_async_write_threads);
   ASSERT_OK(cache.Init());
 
   int64_t max_start_offset = 1024;
   bool use_per_thread_filename = true;
   bool expect_misses = true;
+  double wait_time_ms;
   MultiThreadedReadWrite(&cache, max_start_offset, use_per_thread_filename,
-      expect_misses);
+      expect_misses, &wait_time_ms);
+  LOG(INFO) << "MultiThreadedWithMisses, "
+            << FLAGS_data_cache_eviction_policy << ", "
+            << (FLAGS_data_cache_num_async_write_threads > 0 ? "Async" : "Sync")
+            << ", write_time_ms: " << wait_time_ms;
 }
 
 // Test insertion and lookup with a cache configured with multiple partitions.
@@ -521,14 +649,20 @@ TEST_P(DataCacheTest, MultiPartitions) {
   StringPiece delimiter(",");
   string cache_base = JoinStrings(data_cache_dirs(), delimiter);
   const int64_t cache_size = DEFAULT_CACHE_SIZE;
-  DataCache cache(Substitute("$0:$1", cache_base, std::to_string(cache_size)));
+  DataCache cache(Substitute("$0:$1", cache_base, std::to_string(cache_size)),
+      FLAGS_data_cache_num_async_write_threads);
   ASSERT_OK(cache.Init());
 
   int64_t max_start_offset = 512;
   bool use_per_thread_filename = false;
   bool expect_misses = false;
+  double wait_time_ms;
   MultiThreadedReadWrite(&cache, max_start_offset, use_per_thread_filename,
-      expect_misses);
+      expect_misses, &wait_time_ms);
+  LOG(INFO) << "MultiPartitions, "
+            << FLAGS_data_cache_eviction_policy << ", "
+            << (FLAGS_data_cache_num_async_write_threads > 0 ? "Async" : "Sync")
+            << ", write_time_ms: " << wait_time_ms;
 }
 
 // Tests insertion of a working set whose size is 1/8 of the total memory size.
@@ -538,8 +672,11 @@ TEST_P(DataCacheTest, LargeFootprint) {
   struct sysinfo info;
   ASSERT_EQ(0, sysinfo(&info));
   ASSERT_GT(info.totalram, 0);
+  // Set sufficient buffer size limits to prevent async store failures.
+  FLAGS_data_cache_async_write_buffer_limit = std::to_string(info.totalram);
   DataCache cache(
-      Substitute("$0:$1", data_cache_dirs()[0], std::to_string(info.totalram)));
+      Substitute("$0:$1", data_cache_dirs()[0], std::to_string(info.totalram)),
+      FLAGS_data_cache_num_async_write_threads);
   ASSERT_OK(cache.Init());
 
   const int64_t footprint = info.totalram / 8;
@@ -547,6 +684,7 @@ TEST_P(DataCacheTest, LargeFootprint) {
     int64_t offset = i * TEST_BUFFER_SIZE;
     ASSERT_TRUE(cache.Store(FNAME, MTIME, offset, test_buffer(), TEST_BUFFER_SIZE));
   }
+  WaitForAsyncWrite(cache);
   uint8_t buffer[TEST_BUFFER_SIZE];
   for (int64_t i = 0; i < footprint / TEST_BUFFER_SIZE; ++i) {
     int64_t offset = i * TEST_BUFFER_SIZE;
@@ -573,13 +711,19 @@ TEST_P(DataCacheTest, AccessTraceAnonymization) {
     ASSERT_OK(FileSystemUtil::RemoveAndCreateDirectory(FLAGS_data_cache_trace_dir));
     {
       DataCache cache(Substitute(
-          "$0:$1", data_cache_dirs()[0], std::to_string(cache_size)));
+          "$0:$1", data_cache_dirs()[0], std::to_string(cache_size)),
+          FLAGS_data_cache_num_async_write_threads);
       ASSERT_OK(cache.Init());
 
       bool use_per_thread_filename = true;
       bool expect_misses = true;
+      double wait_time_ms;
       MultiThreadedReadWrite(&cache, max_start_offset, use_per_thread_filename,
-                             expect_misses);
+          expect_misses, &wait_time_ms);
+      LOG(INFO) << "AccessTraceAnonymization, "
+                << FLAGS_data_cache_eviction_policy << ", "
+                << (FLAGS_data_cache_num_async_write_threads > 0 ? "Async" : "Sync")
+                << ", write_time_ms: " << wait_time_ms;
     }
 
     // Part 1: Read the trace files and ensure that the JSON entries are valid
@@ -589,7 +733,7 @@ TEST_P(DataCacheTest, AccessTraceAnonymization) {
     ASSERT_OK(SimpleLogger::GetLogFiles(trace_dir, trace::TRACE_FILE_PREFIX,
         &trace_files));
 
-    for (string filename : trace_files) {
+    for (const string& filename : trace_files) {
       trace::TraceFileIterator trace_file_iter(filename);
       ASSERT_OK(trace_file_iter.Init());
       while (true) {
@@ -639,13 +783,19 @@ TEST_P(DataCacheTest, AccessTraceSubsetPercentage) {
     ASSERT_OK(FileSystemUtil::RemoveAndCreateDirectory(FLAGS_data_cache_trace_dir));
     {
       DataCache cache(Substitute(
-          "$0:$1", data_cache_dirs()[0], std::to_string(cache_size)));
+          "$0:$1", data_cache_dirs()[0], std::to_string(cache_size)),
+          FLAGS_data_cache_num_async_write_threads);
       ASSERT_OK(cache.Init());
 
       bool use_per_thread_filename = true;
       bool expect_misses = true;
+      double wait_time_ms;
       MultiThreadedReadWrite(&cache, max_start_offset, use_per_thread_filename,
-                             expect_misses);
+          expect_misses, &wait_time_ms);
+      LOG(INFO) << "AccessTraceSubsetPercentage, "
+                << FLAGS_data_cache_eviction_policy << ", "
+                << (FLAGS_data_cache_num_async_write_threads > 0 ? "Async" : "Sync")
+                << ", write_time_ms: " << wait_time_ms;
     }
 
     // Replay the trace and record the counts
@@ -677,6 +827,176 @@ TEST_P(DataCacheTest, AccessTraceSubsetPercentage) {
       replay_stats.misses + replay_stats.stores + replay_stats.failed_stores;
     EXPECT_EQ(num_original_trace_events, num_replay_trace_events);
   }
+}
+
+TEST_P(DataCacheTest, RotationalDisk) {
+  // Set to default to test disk detection and mock disk access.
+  FLAGS_data_cache_write_concurrency = 0;
+  MockDisk("sda", /*is_rotational*/ true);
+
+  const int64_t cache_size = DEFAULT_CACHE_SIZE;
+  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)),
+      FLAGS_data_cache_num_async_write_threads);
+  ASSERT_OK(cache.Init());
+  ASSERT_EQ(1, cache.partitions_[0]->data_cache_write_concurrency_);
+}
+
+TEST_P(DataCacheTest, NonRotationalDisk) {
+  // Set to default to test disk detection and mock disk access.
+  FLAGS_data_cache_write_concurrency = 0;
+  MockDisk("nvme0n1", /*is_rotational*/ false);
+
+  const int64_t cache_size = DEFAULT_CACHE_SIZE;
+  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)),
+      FLAGS_data_cache_num_async_write_threads);
+  ASSERT_OK(cache.Init());
+  ASSERT_EQ(8, cache.partitions_[0]->data_cache_write_concurrency_);
+}
+
+TEST_P(DataCacheTest, InvalidDisk) {
+  // Set to default to test disk detection and mock disk access.
+  FLAGS_data_cache_write_concurrency = 0;
+  MockDisk("won't parse", /*is_rotational*/ false);
+
+  const int64_t cache_size = DEFAULT_CACHE_SIZE;
+  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)),
+      FLAGS_data_cache_num_async_write_threads);
+  ASSERT_OK(cache.Init());
+  ASSERT_EQ(1, cache.partitions_[0]->data_cache_write_concurrency_);
+}
+
+TEST_P(DataCacheTest, OutOfWriteBufferLimit) {
+  // This test is specific to asynchronous write
+  if (FLAGS_data_cache_num_async_write_threads == 0) return;
+
+  // Setting a lower buffer size limit will fail to insert data larger than this value at
+  // once.
+  FLAGS_data_cache_async_write_buffer_limit = Substitute("$0", TEMP_BUFFER_SIZE << 1);
+
+  const int64_t cache_size = DEFAULT_CACHE_SIZE;
+  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)),
+      FLAGS_data_cache_num_async_write_threads);
+  ASSERT_OK(cache.Init());
+
+  // Continuously inserting a large amount of entries, there will be a certain number of
+  // store tasks fail due to the write buffer limit.
+  int32_t count = 0;
+  for (int64_t offset = 0; offset < NUM_CACHE_ENTRIES_NO_EVICT; ++offset) {
+    if (cache.Store(FNAME, MTIME, offset, test_buffer() + offset, TEMP_BUFFER_SIZE)) {
+      ++count;
+    }
+  }
+  EXPECT_LT(count, NUM_CACHE_ENTRIES_NO_EVICT);
+}
+
+TEST_P(DataCacheTest, SetReadOnly) {
+  const int64_t cache_size = DEFAULT_CACHE_SIZE;
+  DataCache cache(Substitute("$0:$1", data_cache_dirs()[0], std::to_string(cache_size)));
+  ASSERT_OK(cache.Init());
+
+  int64_t max_start_offset = NUM_CACHE_ENTRIES_NO_EVICT;
+  bool use_per_thread_filename = false;
+  // Set read-only for the first multi-threaded read-write test, which should expect there
+  // will be cache misses when reading from the cache.
+  bool expect_misses = true;
+  bool test_readonly = true;
+  double wait_time_ms = 0;
+  MultiThreadedReadWrite(&cache, max_start_offset, use_per_thread_filename,
+      expect_misses, &wait_time_ms, test_readonly);
+  LOG(INFO) << "SetReadOnly, "
+          << FLAGS_data_cache_eviction_policy << ", "
+          << (FLAGS_data_cache_num_async_write_threads > 0 ? "Async" : "Sync")
+          << ", write_time_ms: " << wait_time_ms;
+
+  // For the second test, do not set read-only, and no cache misses should occur.
+  expect_misses = false;
+  test_readonly = false;
+  MultiThreadedReadWrite(&cache, max_start_offset, use_per_thread_filename,
+      expect_misses, &wait_time_ms, test_readonly);
+  LOG(INFO) << "SetReadOnly, "
+        << FLAGS_data_cache_eviction_policy << ", "
+        << (FLAGS_data_cache_num_async_write_threads > 0 ? "Async" : "Sync")
+        << ", write_time_ms: " << wait_time_ms;
+}
+
+TEST_P(DataCacheTest, DumpAndLoad) {
+  FLAGS_data_cache_keep_across_restarts = true;
+
+  const int64_t cache_size = DEFAULT_CACHE_SIZE;
+  unique_ptr<DataCache> cache = make_unique<DataCache>(Substitute("$0:$1",
+      data_cache_dirs()[0], std::to_string(cache_size)));
+  ASSERT_OK(cache->Init());
+
+  int64_t max_start_offset = NUM_CACHE_ENTRIES_NO_EVICT;
+  for (int64_t offset = 0; offset < max_start_offset; ++offset) {
+    ASSERT_TRUE(cache->Store(FNAME, MTIME, offset, test_buffer() + offset,
+        TEMP_BUFFER_SIZE));
+  }
+  WaitForAsyncWrite(*cache);
+
+  // After completing the normal write, dump the cached data and then create a new data
+  // cache to load the dump file to initialize.
+  ASSERT_OK(cache->Dump());
+  cache.reset(new DataCache(Substitute("$0:$1", data_cache_dirs()[0],
+      std::to_string(cache_size))));
+  ASSERT_OK(cache->Init());
+
+  // There is no need to write again, just lookup all entries written before the dump one
+  // by one, should all hit the cache.
+  uint8_t buffer[TEMP_BUFFER_SIZE];
+  for (int64_t offset = 0; offset < max_start_offset; ++offset) {
+    memset(buffer, 0, TEMP_BUFFER_SIZE);
+    int64_t bytes_read =
+        cache->Lookup(FNAME, MTIME, offset, TEMP_BUFFER_SIZE, buffer);
+    ASSERT_EQ(TEMP_BUFFER_SIZE, bytes_read);
+    ASSERT_EQ(0, memcmp(buffer, test_buffer() + offset, TEMP_BUFFER_SIZE));
+  }
+}
+
+TEST_P(DataCacheTest, ChangeConfBeforeLoad) {
+  FLAGS_data_cache_keep_across_restarts = true;
+
+  const int64_t cache_size = DEFAULT_CACHE_SIZE;
+  unique_ptr<DataCache> cache = make_unique<DataCache>(Substitute("$0:$1",
+      data_cache_dirs()[0], std::to_string(cache_size)));
+  ASSERT_OK(cache->Init());
+
+  int64_t max_start_offset = NUM_CACHE_ENTRIES_NO_EVICT;
+  for (int64_t offset = 0; offset < max_start_offset; ++offset) {
+    ASSERT_TRUE(cache->Store(FNAME, MTIME, offset, test_buffer() + offset,
+        TEMP_BUFFER_SIZE));
+  }
+  WaitForAsyncWrite(*cache);
+
+  // After completing the normal write, dump the cached data and change some configs, then
+  // create a new data cache to load the dump file to initialize.
+  ASSERT_OK(cache->Dump());
+  const int64_t new_cache_size = DEFAULT_CACHE_SIZE / 2;
+  FLAGS_data_cache_eviction_policy =
+      FLAGS_data_cache_eviction_policy == "LRU" ? "LIRS" : "LRU";
+  cache.reset(new DataCache(Substitute("$0:$1", data_cache_dirs()[0],
+      std::to_string(new_cache_size))));
+  ASSERT_OK(cache->Init());
+
+  // Since we have reduced the data cache size and the previous writes have already
+  // reached the capacity limit, some data must have been discarded during the load
+  // process due to the new capacity limit. Therefore, there should be some misses.
+  int num_misses = 0;
+  uint8_t buffer[TEMP_BUFFER_SIZE];
+  for (int64_t offset = 0; offset < max_start_offset; ++offset) {
+    memset(buffer, 0, TEMP_BUFFER_SIZE);
+    int64_t bytes_read =
+        cache->Lookup(FNAME, MTIME, offset, TEMP_BUFFER_SIZE, buffer);
+    if (bytes_read == TEMP_BUFFER_SIZE) {
+      ASSERT_EQ(0, memcmp(buffer, test_buffer() + offset, TEMP_BUFFER_SIZE));
+    } else {
+      ASSERT_EQ(bytes_read, 0);
+      ++num_misses;
+    }
+  }
+
+  EXPECT_GT(num_misses, 0);
+  EXPECT_LT(num_misses, NUM_CACHE_ENTRIES_NO_EVICT);
 }
 
 } // namespace io

@@ -29,6 +29,11 @@
 #include "common/names.h"
 #include "common/thread-debug-info.h"
 
+// Dumps used for debugging and diffing ExecRequests in text form.
+DEFINE_string(dump_exec_request_path, "",
+    "If set, dump TExecRequest structures to {dump_exec_request_path}/"
+    "TExecRequest-{internal|external}.{query_id.hi}-{query_id.lo}");
+
 DECLARE_string(debug_actions);
 
 namespace impala {
@@ -47,48 +52,93 @@ void QueryDriver::CreateClientRequestState(const TQueryCtx& query_ctx,
   DCHECK(client_request_state_ == nullptr);
   ExecEnv* exec_env = ExecEnv::GetInstance();
   lock_guard<SpinLock> l(client_request_state_lock_);
-  exec_request_ = make_unique<TExecRequest>();
-  client_request_state_ =
-      make_unique<ClientRequestState>(query_ctx, exec_env->frontend(), parent_server_,
-          session_state, exec_request_.get(), query_handle->query_driver().get());
+  client_request_state_ = make_unique<ClientRequestState>(query_ctx, exec_env->frontend(),
+      parent_server_, move(session_state), query_handle->query_driver().get());
   DCHECK(query_handle != nullptr);
   (*query_handle).SetClientRequestState(client_request_state_.get());
 }
 
-Status QueryDriver::RunFrontendPlanner(const TQueryCtx& query_ctx) {
+void DumpTExecReq(const TExecRequest& exec_request, const char* dump_type,
+    const TUniqueId& query_id) {
+  if (FLAGS_dump_exec_request_path.empty()) return;
+  int depth = 0;
+  std::stringstream tmpstr;
+  string fn(Substitute("$0/TExecRequest-$1.$2", FLAGS_dump_exec_request_path,
+      dump_type, PrintId(query_id, "-")));
+  std::ofstream ofs(fn);
+  tmpstr << exec_request;
+  std::string s = tmpstr.str();
+  const char *p = s.c_str();
+  const int len = s.length();
+  for (int i = 0; i < len; ++i) {
+    const char ch = p[i];
+    ofs << ch;
+    if (ch == '(') {
+      depth++;
+    } else if (ch == ')' && depth > 0) {
+      depth--;
+    } else if (ch == ',') {
+    } else {
+      continue;
+    }
+    ofs << '\n' << std::setw(depth) << " ";
+  }
+}
+
+Status QueryDriver::DoFrontendPlanning(const TQueryCtx& query_ctx, bool use_request) {
   // Takes the TQueryCtx and calls into the frontend to initialize the TExecRequest for
   // this query.
-  DCHECK(client_request_state_ != nullptr);
-  DCHECK(exec_request_ != nullptr);
+  TExecRequest exec_request;
   RETURN_IF_ERROR(
       DebugAction(query_ctx.client_request.query_options, "FRONTEND_PLANNER"));
   RETURN_IF_ERROR(client_request_state_->UpdateQueryStatus(
-      ExecEnv::GetInstance()->frontend()->GetExecRequest(
-          query_ctx, exec_request_.get())));
+      ExecEnv::GetInstance()->frontend()->GetExecRequest(query_ctx, &exec_request)));
+
+  DumpTExecReq(exec_request, "internal", client_request_state_->query_id());
+  if (use_request) exec_request_.reset(new TExecRequest(move(exec_request)));
+  return Status::OK();
+}
+
+Status QueryDriver::RunFrontendPlanner(const TQueryCtx& query_ctx) {
+  DCHECK(client_request_state_ != nullptr);
+  DCHECK(exec_request_ == nullptr);
+  RETURN_IF_ERROR(DoFrontendPlanning(query_ctx));
+
+  client_request_state_->SetExecRequest(exec_request_.get());
   return Status::OK();
 }
 
 Status QueryDriver::SetExternalPlan(
-    const TQueryCtx& query_ctx, const TExecRequest& external_exec_request) {
-  // Takes the TQueryCtx and calls into the frontend to initialize the TExecRequest for
-  // this query.
+    const TQueryCtx& query_ctx, TExecRequest external_exec_request) {
   DCHECK(client_request_state_ != nullptr);
-  DCHECK(exec_request_ != nullptr);
+  DCHECK(exec_request_ == nullptr);
+
+  if (!FLAGS_dump_exec_request_path.empty()) {
+    // Create and dump Impala planner results so we can compare with the external plan.
+    RETURN_IF_ERROR(DoFrontendPlanning(query_ctx, false));
+  }
+
   RETURN_IF_ERROR(
       DebugAction(query_ctx.client_request.query_options, "FRONTEND_PLANNER"));
-  *exec_request_.get() = external_exec_request;
   // Update query_id in the external request
-  exec_request_->query_exec_request.query_ctx.__set_query_id(
+  external_exec_request.query_exec_request.query_ctx.__set_query_id(
       client_request_state_->query_id());
   // Update coordinator related internal addresses in the external request
-  exec_request_->query_exec_request.query_ctx.__set_coord_hostname(
+  external_exec_request.query_exec_request.query_ctx.__set_coord_hostname(
       ExecEnv::GetInstance()->configured_backend_address().hostname);
-  const TNetworkAddress& address = ExecEnv::GetInstance()->krpc_address();
+  const TNetworkAddress& address =
+      FromNetworkAddressPB(ExecEnv::GetInstance()->krpc_address());
   DCHECK(IsResolvedAddress(address));
-  exec_request_->query_exec_request.query_ctx.__set_coord_ip_address(address);
+  external_exec_request.query_exec_request.query_ctx.__set_coord_ip_address(address);
   // Update local_time_zone in the external request
-  exec_request_->query_exec_request.query_ctx.__set_local_time_zone(
+  external_exec_request.query_exec_request.query_ctx.__set_local_time_zone(
       query_ctx.local_time_zone);
+  external_exec_request.query_exec_request.query_ctx.__set_now_string(
+      query_ctx.now_string);
+  exec_request_.reset(new TExecRequest(move(external_exec_request)));
+
+  DumpTExecReq(*exec_request_, "external", client_request_state_->query_id());
+  client_request_state_->SetExecRequest(exec_request_.get());
   return Status::OK();
 }
 
@@ -123,8 +173,15 @@ void QueryDriver::TryQueryRetry(
   const TUniqueId& query_id = client_request_state->query_id();
   DCHECK(client_request_state->schedule() != nullptr);
 
+  DCHECK(exec_request_ != nullptr);
   if (exec_request_->query_options.retry_failed_queries) {
     lock_guard<mutex> l(*client_request_state->lock());
+
+    if (client_request_state->stmt_type() != TStmtType::QUERY) {
+      // Retrying DML queries would be useful but currently it is
+      // buggy / untested (see IMPALA-10585).
+      return;
+    }
 
     // Queries can only be retried if no rows for the query have been fetched
     // (IMPALA-9225).
@@ -208,7 +265,7 @@ void QueryDriver::TryQueryRetry(
 }
 
 void QueryDriver::RetryQueryFromThread(
-    const Status& error, shared_ptr<QueryDriver> query_driver) {
+    const Status& error, const shared_ptr<QueryDriver>& query_driver) {
   // This method does not require holding the ClientRequestState::lock_ for the original
   // query. This ensures that the client can still interact (e.g. poll the state) of the
   // original query while the new query is being created. This is necessary as it might
@@ -233,15 +290,10 @@ void QueryDriver::RetryQueryFromThread(
 
   shared_ptr<ImpalaServer::SessionState> session = request_state->session();
 
-  // Cancel the query. 'check_inflight' should be false because (1) a retry can be
-  // triggered when the query is in the INITIALIZED state, and (2) the user could have
+  // Cancel the query. We don't worry about whether it's inflight because (1) a retry can
+  // be triggered when the query is in the INITIALIZED state, and (2) the user could have
   // already cancelled the query.
-  Status status = request_state->Cancel(false, nullptr);
-  if (!status.ok()) {
-    status.AddDetail(Substitute("Failed to retry query $0", PrintId(query_id)));
-    discard_result(request_state->UpdateQueryStatus(status));
-    return;
-  }
+  request_state->Cancel(nullptr);
 
   unique_ptr<ClientRequestState> retry_request_state = nullptr;
   CreateRetriedClientRequestState(request_state, &retry_request_state, &session);
@@ -266,7 +318,8 @@ void QueryDriver::RetryQueryFromThread(
   retry_query_handle.SetHandle(query_driver, retry_request_state.get());
 
   // Register the new query.
-  status = parent_server_->RegisterQuery(retry_query_id, session, &retry_query_handle);
+  Status status =
+      parent_server_->RegisterQuery(retry_query_id, session, &retry_query_handle);
   if (!status.ok()) {
     string error_msg = Substitute(
         "RegisterQuery for new query with id $0 failed", PrintId(retry_query_id));
@@ -281,6 +334,10 @@ void QueryDriver::RetryQueryFromThread(
   // be retried.
   retry_request_state->SetBlacklistedExecutorAddresses(
       client_request_state_->GetBlacklistedExecutorAddresses());
+
+  // Copy pending RPCs to the retry request. Whichever query ends up succeding
+  // will reap them.
+  retry_request_state->CopyRPCs(*client_request_state_);
 
   // Run the new query.
   status = retry_request_state->Exec();
@@ -317,7 +374,7 @@ void QueryDriver::RetryQueryFromThread(
       // the retried query, it actually finalizes the original ClientRequestState. So we
       // have to explicitly finalize 'retry_request_state', otherwise we'll hit some
       // illegal states in destroying it.
-      RETURN_VOID_IF_ERROR(retry_request_state->Finalize(false, nullptr));
+      retry_request_state->Finalize(nullptr);
       return;
     }
   }
@@ -331,7 +388,7 @@ void QueryDriver::RetryQueryFromThread(
     string error_msg = Substitute(
         "SetQueryInFlight for new query with id $0 failed", PrintId(retry_query_id));
     HandleRetryFailure(&status, &error_msg, request_state, retry_query_id);
-    RETURN_VOID_IF_ERROR(retry_request_state->Finalize(false, nullptr));
+    retry_request_state->Finalize(nullptr);
     return;
   }
 
@@ -346,7 +403,8 @@ void QueryDriver::RetryQueryFromThread(
           "Failed to retry query since the original query was unregistered");
       string error_msg = Substitute("Query was unregistered");
       HandleRetryFailure(&status, &error_msg, request_state, retry_query_id);
-      RETURN_VOID_IF_ERROR(retry_request_state->Finalize(true, nullptr));
+      DCHECK(retry_request_state->is_inflight());
+      retry_request_state->Finalize(nullptr);
       return;
     }
     lock_guard<SpinLock> l(client_request_state_lock_);
@@ -361,6 +419,19 @@ void QueryDriver::RetryQueryFromThread(
   // Close the original query.
   QueryHandle query_handle;
   query_handle.SetHandle(query_driver, request_state);
+  // Do the work of close that needs to be done synchronously, otherwise we'll
+  // hit some illegal states in destroying the request_state. It's possible (but rare)
+  // that the query is not marked inflight yet; what happens in that case is:
+  //   1. RegisterQuery (adds the original ID to query_driver_map_), then Exec.
+  //   2. Query fails and retries with a new query ID (this function). The retried query
+  //      won't also retry on failure, so this problem doesn't recurse.
+  //   3. We Finalize the query and CloseClientRequestState; it will fail to remove the
+  //      original ID from inflight_queries, and add it to prestopped_queries for later.
+  //   4. At some point later SetQueryInflight executes; it will remove the original ID
+  //      from prestopped_queries and skip adding it to inflight_queries.
+  //   5. When the query is closed, UnregisterQuery calls query_driver->Unregister, which
+  //      removes both the original and retry query ID from query_driver_map_.
+  query_handle->Finalize(nullptr);
   parent_server_->CloseClientRequestState(query_handle);
   parent_server_->MarkSessionInactive(session);
 }
@@ -373,8 +444,8 @@ void QueryDriver::CreateRetriedClientRequestState(ClientRequestState* request_st
   // query has been retried. Making a copy avoids any race conditions on the
   // exec_request_ since the retry_exec_request_ needs to set a new query id on the
   // TExecRequest object.
-  retry_exec_request_ = make_unique<TExecRequest>(*exec_request_);
-  TQueryCtx query_ctx = retry_exec_request_->query_exec_request.query_ctx;
+  unique_ptr<TExecRequest> exec_request = make_unique<TExecRequest>(*exec_request_);
+  TQueryCtx query_ctx = exec_request->query_exec_request.query_ctx;
   if (query_ctx.client_request.query_options.spool_all_results_for_retries) {
     // Reset this flag in the retry query since we won't retry again, so results can be
     // returned immediately.
@@ -382,8 +453,17 @@ void QueryDriver::CreateRetriedClientRequestState(ClientRequestState* request_st
     VLOG_QUERY << "Unset SPOOL_ALL_RESULTS_FOR_RETRIES when retrying query "
         << PrintId(client_request_state_->query_id());
   }
+  if (UNLIKELY(query_ctx.client_request.query_options.__isset.debug_action)) {
+    // We need to be able to test actions that don't reproduce in the retried query. If we
+    // later need to target retried queries, we can add a separate query option for that.
+    query_ctx.client_request.query_options.__set_debug_action("");
+    VLOG_QUERY << "Unset DEBUG_ACTION when retrying query "
+        << PrintId(client_request_state_->query_id());
+  }
   parent_server_->PrepareQueryContext(&query_ctx);
-  retry_exec_request_->query_exec_request.__set_query_ctx(query_ctx);
+  exec_request->query_exec_request.__set_query_ctx(query_ctx);
+  // Move to a const owner to ensure TExecRequest will not be modified after this.
+  retry_exec_request_ = move(exec_request);
 
   ScopedThreadContext tdi_context(GetThreadDebugInfo(), query_ctx.query_id);
 
@@ -391,14 +471,13 @@ void QueryDriver::CreateRetriedClientRequestState(ClientRequestState* request_st
   ExecEnv* exec_env = ExecEnv::GetInstance();
   *retry_request_state =
       make_unique<ClientRequestState>(query_ctx, exec_env->frontend(), parent_server_,
-          *session, retry_exec_request_.get(), request_state->parent_driver());
+          *session, request_state->parent_driver());
+  (*retry_request_state)->SetExecRequest(retry_exec_request_.get());
   (*retry_request_state)->SetOriginalId(request_state->query_id());
-  (*retry_request_state)
-      ->set_user_profile_access(
-          (*retry_request_state)->exec_request().user_has_profile_access);
-  if ((*retry_request_state)->exec_request().__isset.result_set_metadata) {
-    (*retry_request_state)
-        ->set_result_metadata((*retry_request_state)->exec_request().result_set_metadata);
+  (*retry_request_state)->set_user_profile_access(
+      retry_exec_request_->user_has_profile_access);
+  if (retry_exec_request_->__isset.result_set_metadata) {
+    (*retry_request_state)->set_result_metadata(retry_exec_request_->result_set_metadata);
   }
 }
 
@@ -414,6 +493,13 @@ void QueryDriver::HandleRetryFailure(Status* status, string* error_msg,
 
 Status QueryDriver::Finalize(
     QueryHandle* query_handle, bool check_inflight, const Status* cause) {
+  // If the query's not inflight yet, return an appropriate error. If the query
+  // has been finalized and removed from inflight_queries (but not yet removed
+  // from query_driver_map_) we want to fall-through to the next check.
+  if (check_inflight && !(*query_handle)->is_inflight() && !finalized_.Load()) {
+    return Status("Query not yet running");
+  }
+
   if (!finalized_.CompareAndSwap(false, true)) {
     // Return error as-if the query was already unregistered, so that it appears to the
     // client as-if unregistration already happened. We don't need a distinct
@@ -422,12 +508,19 @@ Status QueryDriver::Finalize(
     return Status::Expected(
         TErrorCode::INVALID_QUERY_HANDLE, PrintId(client_request_state_->query_id()));
   }
-  RETURN_IF_ERROR((*query_handle)->Finalize(check_inflight, cause));
+  (*query_handle)->Finalize(cause);
   return Status::OK();
 }
 
 Status QueryDriver::Unregister(ImpalaServer::QueryDriverMap* query_driver_map) {
   DCHECK(finalized_.Load());
+  // Wait until retry_query_thread_ finishes, otherwise the resources for this thread
+  // may not be released.
+  if (retry_query_thread_.get() != nullptr) {
+    retry_query_thread_->Join();
+    retry_query_thread_.reset();
+  }
+  DCHECK(retry_query_thread_.get() == nullptr);
   const TUniqueId* query_id = nullptr;
   const TUniqueId* retry_query_id = nullptr;
   {
@@ -453,10 +546,18 @@ Status QueryDriver::Unregister(ImpalaServer::QueryDriverMap* query_driver_map) {
   return Status::OK();
 }
 
+void QueryDriver::IncludeInQueryLog(const bool include) noexcept{
+  include_in_query_log_ = include;
+}
+
+bool QueryDriver::IncludedInQueryLog() const noexcept {
+  return include_in_query_log_;
+}
+
 void QueryDriver::CreateNewDriver(ImpalaServer* impala_server, QueryHandle* query_handle,
     const TQueryCtx& query_ctx, shared_ptr<ImpalaServer::SessionState> session_state) {
   query_handle->query_driver_ = std::make_shared<QueryDriver>(impala_server);
   query_handle->query_driver_->CreateClientRequestState(
-      query_ctx, session_state, query_handle);
+      query_ctx, move(session_state), query_handle);
 }
 }

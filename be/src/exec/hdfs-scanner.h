@@ -31,6 +31,7 @@
 #include "common/object-pool.h"
 #include "common/status.h"
 #include "exec/exec-node.inline.h"
+#include "exec/file-metadata-utils.h"
 #include "exec/hdfs-scan-node-base.h"
 #include "exec/scanner-context.h"
 #include "runtime/io/disk-io-mgr.h"
@@ -178,6 +179,9 @@ class HdfsScanner {
   /// Return the plan id of the scan node that this scanner is associated with.
   int GetScanNodeId() const { return scan_node_->id(); }
 
+  /// Returns type of scanner: e.g. rcfile, seqfile
+  virtual THdfsFileFormat::type file_format() const = 0;
+
   /// Not inlined in IR so it can be replaced with a constant.
   int IR_NO_INLINE tuple_byte_size() const { return tuple_byte_size_; }
   int IR_NO_INLINE tuple_byte_size(const TupleDescriptor& desc) const {
@@ -192,7 +196,7 @@ class HdfsScanner {
         return i;
       }
     }
-    DCHECK(false);
+    DCHECK(false) << "Runtime filter id " << filter_id << " not found!";
     return -1;
   }
 
@@ -238,6 +242,9 @@ class HdfsScanner {
 
   /// Context for this scanner
   ScannerContext* context_ = nullptr;
+
+  /// Utility class for handling file metadata.
+  FileMetadataUtils file_metadata_utils_;
 
   /// Object pool for objects with same lifetime as scanner.
   ObjectPool obj_pool_;
@@ -378,16 +385,9 @@ class HdfsScanner {
   vector<LocalFilterStats> filter_stats_;
 
   /// Counter for the number of batches returned from GetNext(). Only updated by the
-  /// GetNext() API (i.e. mt_dop > 0), not the ProcessSplit() API.
+  /// GetNext() API (i.e. PlanNode::num_instances_per_node() > 0),
+  /// not the ProcessSplit() API.
   int64_t getnext_batches_returned_ = 0;
-
-  /// Size of the file footer for ORC and Parquet. This is a guess. If this value is too
-  /// little, we will need to issue another read.
-  static const int64_t FOOTER_SIZE = 1024 * 100;
-  static_assert(FOOTER_SIZE <= READ_SIZE_MIN_VALUE,
-      "FOOTER_SIZE can not be greater than READ_SIZE_MIN_VALUE.\n"
-      "You can increase FOOTER_SIZE if you want, "
-      "just don't forget to increase READ_SIZE_MIN_VALUE as well.");
 
   /// Check runtime filters' effectiveness every BATCHES_PER_FILTER_SELECTIVITY_CHECK
   /// row batches. Will update 'filter_stats_'.
@@ -410,8 +410,8 @@ class HdfsScanner {
   /// Issue just the footer range for each file. This function is only used in parquet
   /// and orc scanners. We'll then parse the footer and pick out the columns we want.
   static Status IssueFooterRanges(HdfsScanNodeBase* scan_node,
-      const THdfsFileFormat::type& file_type, const std::vector<HdfsFileDesc*>& files)
-      WARN_UNUSED_RESULT;
+      const THdfsFileFormat::type& file_type, const std::vector<HdfsFileDesc*>& files,
+      int64_t footer_size_estimate) WARN_UNUSED_RESULT;
 
   /// Implements GetNext(). Should be overridden by subclasses.
   /// Only valid to call if the parent scan node is multi-threaded.
@@ -530,6 +530,26 @@ class HdfsScanner {
   /// create a new one of different type.
   Status UpdateDecompressor(const THdfsCompression::type& compression) WARN_UNUSED_RESULT;
   Status UpdateDecompressor(const std::string& codec) WARN_UNUSED_RESULT;
+
+  /// Fills bytes to buffer from the compressed data in 'stream_' by reading the entire
+  /// file, decompressing it, and setting the 'buffer' to the decompressed buffer.
+  Status DecompressFileToBuffer(uint8_t** buffer, int64_t* bytes_read) WARN_UNUSED_RESULT;
+
+  /// Fills bytes to buffer from the compressed data in 'stream_'. Unlike
+  /// DecompressFileToBuffer(), the entire file does not need to be read at once.
+  /// Buffers from 'stream_' are decompressed as they are read and 'buffer' is set to
+  /// available decompressed data.
+  /// Attaches decompression buffers from previous calls that might still be referenced
+  /// by returned batches to 'pool'. If 'pool' is nullptr the buffers are freed instead.
+  Status DecompressStreamToBuffer(uint8_t** buffer, int64_t* bytes_read, MemPool* pool,
+      bool* eosr) WARN_UNUSED_RESULT;
+
+  /// Used by DecompressStreamToBuffer() to decompress data from 'stream_'.
+  /// Returns COMPRESSED_FILE_DECOMPRESSOR_NO_PROGRESS if it needs more input.
+  /// If bytes_to_read > 0, will read specified size.
+  /// If bytes_to_read = -1, will call GetBuffer().
+  Status DecompressStream(int64_t bytes_to_read, uint8_t** decompressed_buffer,
+      int64_t* decompressed_len, bool *eosr) WARN_UNUSED_RESULT;
 
   /// Utility function to report parse errors for each field.
   /// If errors[i] is nonzero, fields[i] had a parse error.
@@ -684,6 +704,10 @@ class HdfsScanner {
   /// WriteCompleteTuple() because it's easier than writing IR to access
   /// conjunct_evals_.
   ScalarExprEvaluator* GetConjunctEval(int idx) const;
+
+  /// Returns error if this scanner doesn't support a slot in the tuple, e.g. virtual
+  /// columns.
+  Status ValidateSlotDescriptors() const;
 
   /// Unit test constructor
   HdfsScanner();

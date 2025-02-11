@@ -63,9 +63,14 @@ class ClusterMembershipMgrTest : public testing::Test {
  protected:
   ClusterMembershipMgrTest() {}
 
-  /// Returns the size of the default executor group of the current membership in 'cmm'.
+  /// Returns the size of the default executor group of the current membership in 'cmm'
+  /// if the default executor group exists, otherwise returns 0.
   int GetDefaultGroupSize(const ClusterMembershipMgr& cmm) const {
     const string& group_name = ImpalaServer::DEFAULT_EXECUTOR_GROUP_NAME;
+    if (cmm.GetSnapshot()->executor_groups.find(group_name)
+        == cmm.GetSnapshot()->executor_groups.end()) {
+      return 0;
+    }
     return cmm.GetSnapshot()->executor_groups.find(group_name)->second.NumExecutors();
   }
 
@@ -346,6 +351,25 @@ TEST_F(ClusterMembershipMgrTest, TwoInstances) {
   ASSERT_EQ(0, returned_topic_deltas.size());
   ASSERT_EQ(1, cmm2.GetSnapshot()->current_backends.size());
   ASSERT_EQ(1, GetDefaultGroupSize(cmm2));
+}
+
+TEST_F(ClusterMembershipMgrTest, IsBlacklisted) {
+  const int NUM_BACKENDS = 2;
+  for (int i = 0; i < NUM_BACKENDS; ++i) CreateBackend();
+  EXPECT_EQ(NUM_BACKENDS, backends_.size());
+  EXPECT_EQ(backends_.size(), offline_.size());
+
+  while (!offline_.empty()) CreateCMM(offline_.front());
+  EXPECT_EQ(0, offline_.size());
+  EXPECT_EQ(NUM_BACKENDS, starting_.size());
+
+  while (!starting_.empty()) StartBackend(starting_.front());
+  EXPECT_EQ(0, starting_.size());
+  EXPECT_EQ(NUM_BACKENDS, running_.size());
+
+  backends_[0]->cmm->BlacklistExecutor(backends_[1]->desc->backend_id(), Status("error"));
+  ClusterMembershipMgr::SnapshotPtr snapshot = backends_[0]->cmm->GetSnapshot();
+  EXPECT_TRUE(snapshot->executor_blacklist.IsBlacklisted(*(backends_[1]->desc)));
 }
 
 // This test verifies the interaction between the ExecutorBlacklist and
@@ -766,6 +790,51 @@ TEST(ClusterMembershipMgrUnitTest, PopulateExecutorMembershipRequest) {
     EXPECT_EQ(update_req.exec_group_sets[1].exec_group_name_prefix, "bar");
     snapshot_ptr->executor_groups.clear();
   }
+}
+
+template <class T>
+static bool has(const vector<T>& v, const T& m) {
+  return find(v.begin(), v.end(), m) != v.end();
+}
+
+/// Test that we can get a list of coordinators.
+TEST_F(ClusterMembershipMgrTest, GetCoordinatorAddresses) {
+  // Initialize all backends early. Test methods handle state propagation through the
+  // backends_ list, which must be fully initialized before starting backends.
+  Backend* coordinator0 = CreateBackend();
+  const NetworkAddressPB& addr0 = coordinator0->desc->address();
+  CreateCMM(coordinator0);
+  Backend* coordinator1 = CreateBackend();
+  const NetworkAddressPB& addr1 = coordinator1->desc->address();
+  coordinator1->desc->set_is_executor(false);
+  CreateCMM(coordinator1);
+  Backend* executor = CreateBackend();
+  executor->desc->set_is_coordinator(false);
+  CreateCMM(executor);
+
+  EXPECT_EQ(0, coordinator0->cmm->GetSnapshot()->GetCoordinatorAddresses().size());
+
+  StartBackend(coordinator0);
+  vector<TNetworkAddress> orig_coordinators =
+      coordinator0->cmm->GetSnapshot()->GetCoordinatorAddresses();
+  EXPECT_EQ(1, orig_coordinators.size());
+  EXPECT_EQ(FromNetworkAddressPB(addr0), orig_coordinators[0]);
+
+  StartBackend(executor);
+  EXPECT_EQ(orig_coordinators,
+      coordinator0->cmm->GetSnapshot()->GetCoordinatorAddresses());
+  EXPECT_EQ(orig_coordinators, executor->cmm->GetSnapshot()->GetCoordinatorAddresses());
+
+  StartBackend(coordinator1);
+  orig_coordinators = coordinator0->cmm->GetSnapshot()->GetCoordinatorAddresses();
+  EXPECT_EQ(2, orig_coordinators.size());
+  // List of coordinators is unsorted.
+  EXPECT_TRUE(has(orig_coordinators, FromNetworkAddressPB(addr0)));
+  EXPECT_TRUE(has(orig_coordinators, FromNetworkAddressPB(addr1)));
+
+  EXPECT_EQ(orig_coordinators, executor->cmm->GetSnapshot()->GetCoordinatorAddresses());
+  EXPECT_EQ(orig_coordinators,
+      coordinator1->cmm->GetSnapshot()->GetCoordinatorAddresses());
 }
 
 /// TODO: Write a test that makes a number of random changes to cluster membership while

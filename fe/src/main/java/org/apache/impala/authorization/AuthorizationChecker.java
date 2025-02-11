@@ -70,7 +70,7 @@ public interface AuthorizationChecker {
   /**
    * This method is to be executed after an authorization check has occurred.
    */
-  void postAuthorize(AuthorizationContext authzCtx, boolean authzOk)
+  void postAuthorize(AuthorizationContext authzCtx, boolean authzOk, boolean analysisOk)
       throws AuthorizationException, InternalException;
 
   /**
@@ -112,4 +112,9 @@ public interface AuthorizationChecker {
    * This method is to be executed after AnalysisContext#analyze() is completed.
    */
   void postAnalyze(AuthorizationContext authzCtx);
+
+  /**
+   * This method returns whether the role exists for given role
+   */
+  boolean roleExists(String roleName);
 }

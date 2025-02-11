@@ -18,15 +18,19 @@
 # Generates random decimal numbers and verifies that mathematical
 # operations return correct results under decimal_v2.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import decimal
 import math
-import pytest
 import random
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.test_dimensions import create_single_exec_option_dimension
+from tests.common.test_dimensions import (
+  add_mandatory_exec_option,
+  create_single_exec_option_dimension)
 from tests.common.test_vector import ImpalaTestDimension, ImpalaTestMatrix
+
 
 class TestDecimalFuzz(ImpalaTestSuite):
 
@@ -41,13 +45,19 @@ class TestDecimalFuzz(ImpalaTestSuite):
   def add_test_dimensions(cls):
     cls.ImpalaTestMatrix = ImpalaTestMatrix()
     cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
-    cls.iterations = 10000
+
+    total_iterations = 10000
+    batches = list(range(0, 10))
+    cls.iterations = total_iterations / len(batches)
+    cls.ImpalaTestMatrix.add_dimension(ImpalaTestDimension("test_batch", *batches))
+    add_mandatory_exec_option(cls, 'decimal_v2', 'true')
+    add_mandatory_exec_option(cls, 'long_polling_time_ms', 100)
 
   def weighted_choice(self, options):
-    total_weight = sum(options.itervalues())
+    total_weight = sum(options.values())
     numeric_choice = random.uniform(0, total_weight)
     last_choice = None
-    for choice, weight in options.iteritems():
+    for choice, weight in options.items():
       if numeric_choice <= weight:
         return choice
       numeric_choice -= weight
@@ -189,7 +199,7 @@ class TestDecimalFuzz(ImpalaTestSuite):
         return True
       return False
 
-    for num_digits_after_dot in xrange(39):
+    for num_digits_after_dot in range(39):
       # Reduce the number of digits after the dot in the expected_result to different
       # amounts. If it matches the actual result in at least one of the cases, we
       # consider the actual result to be acceptable.
@@ -200,7 +210,7 @@ class TestDecimalFuzz(ImpalaTestSuite):
         return True
     return False
 
-  def execute_one_decimal_op(self):
+  def execute_one_decimal_op(self, query_options):
     '''Executes a single query and compares the result to a result that we computed in
     Python.'''
     op = random.choice(['+', '-', '*', '/', '%'])
@@ -213,8 +223,8 @@ class TestDecimalFuzz(ImpalaTestSuite):
         value2=value2, precision2=precision2, scale2=scale2)
 
     try:
-      result = self.execute_scalar(query, query_options={'decimal_v2': 'true'})
-    except ImpalaBeeswaxException as e:
+      result = self.execute_scalar(query, query_options)
+    except ImpalaBeeswaxException:
       result = None
     if result is not None:
       result = decimal.Decimal(result)
@@ -237,15 +247,15 @@ class TestDecimalFuzz(ImpalaTestSuite):
           expected_result = decimal.Decimal(value1) % decimal.Decimal(value2)
         else:
           assert False
-      except decimal.InvalidOperation as e:
+      except decimal.InvalidOperation:
         expected_result = None
-      except decimal.DivisionByZero as e:
+      except decimal.DivisionByZero:
         expected_result = None
       assert self.result_equals(expected_result, result)
 
   def test_decimal_ops(self, vector):
-    for _ in xrange(self.iterations):
-      self.execute_one_decimal_op()
+    for _ in range(self.iterations):
+      self.execute_one_decimal_op(vector.get_exec_option_dict())
 
   def width_bucket(self, val, min_range, max_range, num_buckets):
     # Multiplying the values by 10**40 guarantees that the numbers can be converted
@@ -263,9 +273,9 @@ class TestDecimalFuzz(ImpalaTestSuite):
 
     range_size = max_range_int - min_range_int
     dist_from_min = val_int - min_range_int
-    return (num_buckets * dist_from_min) / range_size + 1
+    return (num_buckets * dist_from_min) // range_size + 1
 
-  def execute_one_width_bucket(self):
+  def execute_one_width_bucket(self, query_options):
     val, val_prec, val_scale = self.get_decimal()
     min_range, min_range_prec, min_range_scale = self.get_decimal()
     max_range, max_range_prec, max_range_scale = self.get_decimal()
@@ -289,7 +299,7 @@ class TestDecimalFuzz(ImpalaTestSuite):
       return
 
     try:
-      result = self.execute_scalar(query, query_options={'decimal_v2': 'true'})
+      result = self.execute_scalar(query, query_options)
       assert int(result) == expected_result
     except ImpalaBeeswaxException as e:
       if "You need to wrap the arguments in a CAST" not in str(e):
@@ -298,5 +308,5 @@ class TestDecimalFuzz(ImpalaTestSuite):
         raise e
 
   def test_width_bucket(self, vector):
-    for _ in xrange(self.iterations):
-      self.execute_one_width_bucket()
+    for _ in range(self.iterations):
+      self.execute_one_width_bucket(vector.get_exec_option_dict())

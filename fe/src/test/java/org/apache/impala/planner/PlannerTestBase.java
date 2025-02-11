@@ -18,6 +18,7 @@
 package org.apache.impala.planner;
 
 import static org.junit.Assert.fail;
+import org.junit.Assert;
 
 import java.io.FileWriter;
 import java.io.IOException;
@@ -31,22 +32,23 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.apache.commons.lang.exception.ExceptionUtils;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.hadoop.fs.Path;
 import org.apache.impala.analysis.ColumnLineageGraph;
 import org.apache.impala.analysis.DescriptorTable;
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.CatalogException;
+import org.apache.impala.catalog.SideloadTableStats;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.service.Frontend.PlanCtx;
+import org.apache.impala.testutil.StatsJsonParser;
 import org.apache.impala.testutil.TestFileParser;
 import org.apache.impala.testutil.TestFileParser.Section;
 import org.apache.impala.testutil.TestFileParser.TestCase;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.testutil.TestUtils.ResultFilter;
-import org.apache.impala.thrift.ImpalaInternalServiceConstants;
 import org.apache.impala.thrift.QueryConstants;
 import org.apache.impala.thrift.TDescriptorTable;
 import org.apache.impala.thrift.TExecRequest;
@@ -65,8 +67,10 @@ import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TQueryExecRequest;
 import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.thrift.TReplicaPreference;
 import org.apache.impala.thrift.TScanRangeLocationList;
 import org.apache.impala.thrift.TScanRangeSpec;
+import org.apache.impala.thrift.TSlotCountStrategy;
 import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableSink;
 import org.apache.impala.thrift.TTupleDescriptor;
@@ -82,6 +86,7 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -89,8 +94,8 @@ import com.google.common.collect.Sets;
 public class PlannerTestBase extends FrontendTestBase {
   private final static Logger LOG = LoggerFactory.getLogger(PlannerTest.class);
   private final static boolean GENERATE_OUTPUT_FILE = true;
-  private final java.nio.file.Path testDir_ = Paths.get("functional-planner", "queries",
-      "PlannerTest");
+  private final static java.nio.file.Path testDir_ =
+      Paths.get("functional-planner", "queries", "PlannerTest");
   protected static java.nio.file.Path outDir_;
   private static KuduClient kuduClient_;
 
@@ -101,15 +106,14 @@ public class PlannerTestBase extends FrontendTestBase {
   // Map from table ID (TTableId) to the table descriptor with that ID.
   private final Map<Integer, TTableDescriptor> tableMap_ = Maps.newHashMap();
 
-  @BeforeClass
-  public static void setUp() throws Exception {
-    // Mimic the 3 node test mini-cluster.
+  protected static void setUpWithSize(int num_executors, int expected_num_executors)
+      throws Exception {
     TUpdateExecutorMembershipRequest updateReq = new TUpdateExecutorMembershipRequest();
     updateReq.setIp_addresses(Sets.newHashSet("127.0.0.1"));
     updateReq.setHostnames(Sets.newHashSet("localhost"));
     TExecutorGroupSet group_set = new TExecutorGroupSet();
-    group_set.curr_num_executors = 3;
-    group_set.expected_num_executors = 20; // default num_expected_executors startup flag
+    group_set.curr_num_executors = num_executors;
+    group_set.expected_num_executors = expected_num_executors;
     updateReq.setExec_group_sets(new ArrayList<TExecutorGroupSet>());
     updateReq.getExec_group_sets().add(group_set);
     ExecutorMembershipSnapshot.update(updateReq);
@@ -118,6 +122,13 @@ public class PlannerTestBase extends FrontendTestBase {
     String logDir = System.getenv("IMPALA_FE_TEST_LOGS_DIR");
     if (logDir == null) logDir = "/tmp";
     outDir_ = Paths.get(logDir, "PlannerTest");
+  }
+
+  @BeforeClass
+  public static void setUp() throws Exception {
+    // Mimic the 3 node test mini-cluster.
+    // 20 is the default num_expected_executors startup flag.
+    setUpWithSize(3, 20);
   }
 
   @Before
@@ -245,6 +256,11 @@ public class PlannerTestBase extends FrontendTestBase {
         // All partitions of insertTableId are okay.
         if (tableDesc.getId() == insertTableId) continue;
         if (!tableDesc.isSetHdfsTable()) continue;
+        // Iceberg partitions are handled differently, in Impala there's always a single
+        // HMS partition in an Iceberg table and actual partition/file pruning is
+        // handled by Iceberg. This means 'scanRangePartitions' can be empty while the
+        // descriptor table still has the single HMS partition.
+        if (tableDesc.isSetIcebergTable() && scanRangePartitions.isEmpty()) continue;
         THdfsTable hdfsTable = tableDesc.getHdfsTable();
         for (Map.Entry<Long, THdfsPartition> e :
              hdfsTable.getPartitions().entrySet()) {
@@ -347,12 +363,13 @@ public class PlannerTestBase extends FrontendTestBase {
    * Extracts and returns the expected error message from expectedPlan.
    * Returns null if expectedPlan is empty or its first element is not an error message.
    * The accepted format for error messages is the exception string. We currently
-   * support only NotImplementedException and InternalException.
+   * support only NotImplementedException, InternalException, and AnalysisException.
    */
   private String getExpectedErrorMessage(ArrayList<String> expectedPlan) {
     if (expectedPlan == null || expectedPlan.isEmpty()) return null;
     if (!expectedPlan.get(0).contains("NotImplementedException") &&
-        !expectedPlan.get(0).contains("InternalException")) return null;
+        !expectedPlan.get(0).contains("InternalException") &&
+        !expectedPlan.get(0).contains("AnalysisException")) return null;
     return expectedPlan.get(0).trim();
   }
 
@@ -394,6 +411,35 @@ public class PlannerTestBase extends FrontendTestBase {
     return options;
   }
 
+  protected static TQueryOptions tpcdsParquetQueryOptions() {
+    TQueryOptions options = new TQueryOptions();
+    /* Enable minmax overlap filter feature for tpcds Parquet tests. */
+    options.setMinmax_filter_threshold(0.5);
+    /* Disable minmax filter on sorted columns. */
+    options.setMinmax_filter_sorted_columns(false);
+    /* Disable minmax filter on partition columns. */
+    options.setMinmax_filter_partition_columns(false);
+    return options;
+  }
+
+  protected static TQueryOptions tpcdsParquetCpuCostQueryOptions() {
+    return tpcdsParquetQueryOptions()
+        .setCompute_processing_cost(true)
+        .setMax_fragment_instances_per_node(12)
+        .setReplica_preference(TReplicaPreference.REMOTE)
+        .setSlot_count_strategy(TSlotCountStrategy.PLANNER_CPU_ASK)
+        .setPlanner_testcase_mode(true)
+        // Required so that output doesn't vary by whether scanned tables have stats &
+        // numRows property or not.
+        .setDisable_hdfs_num_rows_estimate(true);
+  }
+
+  protected static Set<PlannerTestOption> tpcdsParquetTestOptions() {
+    return ImmutableSet.of(PlannerTestOption.EXTENDED_EXPLAIN,
+        PlannerTestOption.INCLUDE_RESOURCE_HEADER, PlannerTestOption.VALIDATE_RESOURCES,
+        PlannerTestOption.VALIDATE_CARDINALITY);
+  }
+
   /**
    * Produces single-node, distributed, and parallel plans for testCase and compares
    * plan and scan range results.
@@ -408,8 +454,8 @@ public class PlannerTestBase extends FrontendTestBase {
     String query = testCase.getQuery();
     LOG.info("running query " + query);
     if (query.isEmpty()) {
-      throw new IllegalStateException("Cannot plan empty query in line: " +
-          testCase.getStartingLineNum());
+      throw new IllegalStateException("Cannot plan empty query in " +
+          testCase.getFileNameAndLineNum());
     }
     // Set up the query context. Note that we need to deep copy it before planning each
     // time since planning modifies it.
@@ -470,7 +516,8 @@ public class PlannerTestBase extends FrontendTestBase {
           && firstPlanFragment.output_sink.isSetTable_sink()) {
         TTableSink tableSink = firstPlanFragment.output_sink.table_sink;
         if (!seenTableIds.contains(tableSink.target_table_id)
-            || tableSink.target_table_id != DescriptorTable.TABLE_SINK_ID) {
+            || (tableSink.target_table_id != DescriptorTable.TABLE_SINK_ID
+            && !tableSink.isSetIceberg_delete_sink())) {
           throw new IllegalStateException("Table sink id error for target table:\n" +
               tableSink.toString());
         }
@@ -550,16 +597,21 @@ public class PlannerTestBase extends FrontendTestBase {
               PlannerTestOption.DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS)) {
         resultFilters.add(TestUtils.PARTITIONS_FILTER);
       }
+      if (!testOptions.contains(PlannerTestOption.VALIDATE_ICEBERG_SNAPSHOT_IDS)) {
+        resultFilters.add(TestUtils.ICEBERG_SNAPSHOT_ID_FILTER);
+      }
 
       String planDiff = TestUtils.compareOutput(
           Lists.newArrayList(explainStr.split("\n")), expectedPlan, true, resultFilters);
       if (!planDiff.isEmpty()) {
-        errorLog.append(String.format(
-            "\nSection %s of query:\n%s\n\n%s", section, query, planDiff));
-        // Append the VERBOSE explain plan because it contains details about
-        // tuples/sizes/cardinality for easier debugging.
-        String verbosePlan = getVerboseExplainPlan(queryCtx);
-        errorLog.append("\nVerbose plan:\n" + verbosePlan);
+        errorLog.append(String.format("\nSection %s of query at %s:\n%s\n\n%s",
+            section, testCase.getFileNameAndLineNum(), query, planDiff));
+        if (!testOptions.contains(PlannerTestOption.EXTENDED_EXPLAIN)) {
+          // Append the VERBOSE explain plan because it contains details about
+          // tuples/sizes/cardinality for easier debugging.
+          String verbosePlan = getVerboseExplainPlan(queryCtx);
+          errorLog.append("\nVerbose plan:\n" + verbosePlan);
+        }
       }
     }
     return execRequest;
@@ -732,8 +784,11 @@ public class PlannerTestBase extends FrontendTestBase {
     String query = testCase.getQuery();
     ArrayList<String> expectedLineage = testCase.getSectionContents(Section.LINEAGE);
     if (expectedLineage == null || expectedLineage.isEmpty()) return;
+    if (execRequest == null) {
+      errorLog.append("Failed to execute query:\n" + query + "\n");
+      return;
+    }
     TLineageGraph lineageGraph = null;
-    if (execRequest == null) return;
     if (execRequest.isSetQuery_exec_request()) {
       lineageGraph = execRequest.query_exec_request.lineage_graph;
     } else if (execRequest.isSetCatalog_op_request()) {
@@ -803,6 +858,30 @@ public class PlannerTestBase extends FrontendTestBase {
     return builder.toString();
   }
 
+  protected int getRowSize(String query, TQueryOptions queryOptions) {
+    TQueryCtx queryCtx = TestUtils.createQueryContext(Catalog.DEFAULT_DB,
+        System.getProperty("user.name"));
+    queryCtx.client_request.setStmt(query);
+    PlanCtx planCtx = new PlanCtx(queryCtx);
+    queryCtx.client_request.query_options = queryOptions;
+
+    try {
+      TExecRequest execRequest = frontend_.createExecRequest(planCtx);
+    } catch (ImpalaException e) {
+      Assert.fail("Failed to create exec request for '" + query + "': " + e.getMessage());
+    }
+
+    String explainStr = planCtx.getExplainString();
+
+    Pattern rowSizePattern = Pattern.compile("row-size=([0-9]*)B");
+    Matcher m = rowSizePattern.matcher(explainStr);
+    boolean matchFound = m.find();
+    Assert.assertTrue("Row size not found in plan.", matchFound);
+    String rowSizeStr = m.group(1);
+    return Integer.valueOf(rowSizeStr);
+  }
+
+
   /**
    * Assorted binary options that alter the behaviour of planner tests, generally
    * enabling additional more-detailed checks.
@@ -843,7 +922,11 @@ public class PlannerTestBase extends FrontendTestBase {
     DISABLE_HDFS_NUM_ROWS_ESTIMATE,
     // If set, make no attempt to validate the estimated number of rows for any
     // partitions in an hdfs table.
-    DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS
+    DO_NOT_VALIDATE_ROWCOUNT_ESTIMATION_FOR_PARTITIONS,
+    // Verify that the snapshot ids in the plan match to the expected values. We
+    // can only do this for tests that operate on pre-written Iceberg tables,
+    // e.g. functional_parquet.iceberg_partitioned.
+    VALIDATE_ICEBERG_SNAPSHOT_IDS
   }
 
   protected void runPlannerTestFile(String testFile, TQueryOptions options) {
@@ -952,5 +1035,13 @@ public class PlannerTestBase extends FrontendTestBase {
    */
   protected boolean scanRangeLocationsCheckEnabled() {
     return true;
+  }
+
+  protected static Map<String, Map<String, SideloadTableStats>> loadStatsJson(
+      String statsJsonPath) {
+    String fileName = testDir_.resolve(statsJsonPath).toString();
+    StatsJsonParser statsParser = new StatsJsonParser(fileName);
+    statsParser.parseFile();
+    return statsParser.getDbStatsMap();
   }
 }

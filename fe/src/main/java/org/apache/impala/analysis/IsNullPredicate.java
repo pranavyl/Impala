@@ -17,6 +17,8 @@
 
 package org.apache.impala.analysis;
 
+import java.util.Objects;
+
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.Function;
@@ -78,8 +80,13 @@ public class IsNullPredicate extends Predicate {
   }
 
   @Override
-  public boolean localEquals(Expr that) {
+  protected boolean localEquals(Expr that) {
     return super.localEquals(that) && ((IsNullPredicate) that).isNotNull_ == isNotNull_;
+  }
+
+  @Override
+  protected int localHash() {
+    return Objects.hash(super.localHash(), isNotNull_);
   }
 
   @Override
@@ -140,6 +147,9 @@ public class IsNullPredicate extends Predicate {
   }
 
   protected void computeSelectivity() {
+    if (hasValidSelectivityHint()) {
+      return;
+    }
     // TODO: increase this to make sure we don't end up favoring broadcast joins
     // due to underestimated cardinalities?
     Reference<SlotRef> slotRefRef = new Reference<SlotRef>();

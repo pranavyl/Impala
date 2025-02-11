@@ -35,6 +35,9 @@ namespace impala {
 /// RequestPoolService, called via JNI.
 class RequestPoolService {
  public:
+  // Pool name used when the configuration files are not specified.
+  static const std::string DEFAULT_POOL_NAME;
+
   /// Initializes the JNI method stubs if configuration files are specified. If any
   /// method can't be found, or if there is any further error, the constructor will
   /// terminate the process.
@@ -50,6 +53,10 @@ class RequestPoolService {
   /// true, then the returned values are always the default pool values, i.e. pool_name
   /// is ignored.
   Status GetPoolConfig(const std::string& pool_name, TPoolConfig* pool_config);
+
+  /// Returns (in the output parameter) the list of groups for the given user.
+  Status GetHadoopGroups(const TGetHadoopGroupsRequest& request,
+      TGetHadoopGroupsResponse* response);
 
  private:
   /// Metric measuring the time ResolveRequestPool() takes, in milliseconds.
@@ -74,6 +81,7 @@ class RequestPoolService {
   jobject jni_request_pool_service_;
   jmethodID resolve_request_pool_id_;  // RequestPoolService.resolveRequestPool()
   jmethodID get_pool_config_id_;  // RequestPoolService.getPoolConfig()
+  jmethodID get_hadoop_groups_id_;  // RequestPoolService.getHadoopGroups()
   jmethodID ctor_;
 };
 

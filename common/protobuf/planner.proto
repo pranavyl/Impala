@@ -54,6 +54,13 @@ message HdfsFileSplitPB {
   // Java's String.hashCode(), which is consistent. For testing purposes, this can use
   // any consistent hash.
   optional int32 partition_path_hash = 9;
+
+  // The absolute path of the file, it's used only when data files are outside of
+  // the Iceberg table location (IMPALA-11507).
+  optional string absolute_path = 10;
+
+  // Whether this file is encrypted.
+  optional bool is_encrypted = 11;
 }
 
 // Key range for single THBaseScanNode. Corresponds to THBaseKeyRange and should be kept
@@ -73,4 +80,6 @@ message ScanRangePB {
   optional HdfsFileSplitPB hdfs_file_split = 1;
   optional HBaseKeyRangePB hbase_key_range = 2;
   optional bytes kudu_scan_token = 3;
+  optional bytes file_metadata = 4;
+  optional bool is_system_scan = 5;
 }

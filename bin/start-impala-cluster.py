@@ -1,4 +1,4 @@
-#!/usr/bin/env impala-python
+#!/usr/bin/env impala-python3
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -20,6 +20,8 @@
 # Starts up an Impala cluster (ImpalaD + State Store) with the specified number of
 # ImpalaD instances. Each ImpalaD runs on a different port allowing this to be run
 # on a single machine.
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import getpass
 import itertools
 import json
@@ -32,15 +34,17 @@ from datetime import datetime
 from getpass import getuser
 from time import sleep, time
 from optparse import OptionParser, SUPPRESS_HELP
-from subprocess import call, check_call
-from testdata.common import cgroups
+from subprocess import call, check_call, check_output
 from tests.common.environ import build_flavor_timeout
 from tests.common.impala_cluster import (ImpalaCluster, DEFAULT_BEESWAX_PORT,
     DEFAULT_HS2_PORT, DEFAULT_KRPC_PORT, DEFAULT_HS2_HTTP_PORT,
     DEFAULT_STATE_STORE_SUBSCRIBER_PORT, DEFAULT_IMPALAD_WEBSERVER_PORT,
     DEFAULT_STATESTORED_WEBSERVER_PORT, DEFAULT_CATALOGD_WEBSERVER_PORT,
     DEFAULT_ADMISSIOND_WEBSERVER_PORT, DEFAULT_CATALOGD_JVM_DEBUG_PORT,
+    DEFAULT_CATALOG_SERVICE_PORT, DEFAULT_CATALOGD_STATE_STORE_SUBSCRIBER_PORT,
     DEFAULT_EXTERNAL_FE_PORT, DEFAULT_IMPALAD_JVM_DEBUG_PORT,
+    DEFAULT_STATESTORE_SERVICE_PORT, DEFAULT_STATESTORE_HA_SERVICE_PORT,
+    DEFAULT_PEER_STATESTORE_HA_SERVICE_PORT,
     find_user_processes, run_daemon)
 
 LOG = logging.getLogger(os.path.splitext(os.path.basename(__file__))[0])
@@ -49,6 +53,7 @@ LOG.setLevel(level=logging.DEBUG)
 KUDU_MASTER_HOSTS = os.getenv("KUDU_MASTER_HOSTS", "127.0.0.1")
 DEFAULT_IMPALA_MAX_LOG_FILES = os.environ.get("IMPALA_MAX_LOG_FILES", 10)
 INTERNAL_LISTEN_HOST = os.getenv("INTERNAL_LISTEN_HOST", "localhost")
+TARGET_FILESYSTEM = os.getenv("TARGET_FILESYSTEM") or "hdfs"
 
 # Options
 parser = OptionParser()
@@ -81,8 +86,11 @@ parser.add_option("--force_kill", dest="force_kill", action="store_true", defaul
                   help="Force kill impalad and statestore processes.")
 parser.add_option("-a", "--add_executors", dest="add_executors",
                   action="store_true", default=False,
-                  help="Start additional impalad processes. The executor group name must "
-                  "be specified using --impalad_args")
+                  help="Start additional executors. The executor group name must be"
+                  "specified using --impalad_args")
+parser.add_option("--add_impalads", dest="add_impalads",
+                  action="store_true", default=False,
+                  help="Start additional impalad processes.")
 parser.add_option("-r", "--restart_impalad_only", dest="restart_impalad_only",
                   action="store_true", default=False,
                   help="Restarts only the impalad processes")
@@ -101,6 +109,10 @@ parser.add_option("--max_log_files", default=DEFAULT_IMPALA_MAX_LOG_FILES,
                   help="Max number of log files before rotation occurs.")
 parser.add_option("--log_level", type="int", dest="log_level", default=1,
                    help="Set the impalad backend logging level")
+parser.add_option("--ignore_pid_on_log_rotation", dest="ignore_pid_on_log_rotation",
+                  action='store_true', default=False,
+                  help=("Determine if log rotation should ignore or match PID in "
+                        "log file name."))
 parser.add_option("--jvm_args", dest="jvm_args", default="",
                   help="Additional arguments to pass to the JVM(s) during startup.")
 parser.add_option("--env_vars", dest="env_vars", default="",
@@ -130,6 +142,10 @@ parser.add_option("--data_cache_size", dest="data_cache_size", default=0,
 parser.add_option("--data_cache_eviction_policy", dest="data_cache_eviction_policy",
                   default="LRU", help="This specifies the cache eviction policy to use "
                   "for the data cache")
+parser.add_option("--data_cache_num_async_write_threads",
+                  dest="data_cache_num_async_write_threads", default=0,
+                  help="This specifies the number of asynchronous write threads for the "
+                  "data cache, with 0 set means synchronous writes.")
 parser.add_option("--data_cache_enable_tracing", dest="data_cache_enable_tracing",
                   action="store_true", default=False,
                   help="If the data cache is enabled, this enables tracing accesses.")
@@ -141,6 +157,47 @@ parser.add_option("--enable_admission_service", dest="enable_admission_service",
 parser.add_option("--enable_external_fe_support", dest="enable_external_fe_support",
                   action="store_true", default=False,
                   help="If true, impalads will start with the external_fe_port defined.")
+parser.add_option("--geospatial_library", dest="geospatial_library",
+                  action="store", default="HIVE_ESRI",
+                  help="Sets which implementation of geospatial libraries should be "
+                  "initialized")
+parser.add_option("--enable_catalogd_ha", dest="enable_catalogd_ha",
+                  action="store_true", default=False,
+                  help="If true, enables CatalogD HA - the cluster will be launched "
+                  "with two catalogd instances as Active-Passive HA pair.")
+parser.add_option("--jni_frontend_class", dest="jni_frontend_class",
+                  action="store", default="",
+                  help="Use a custom java frontend interface.")
+parser.add_option("--enable_statestored_ha", dest="enable_statestored_ha",
+                  action="store_true", default=False,
+                  help="If true, enables StatestoreD HA - the cluster will be launched "
+                  "with two statestored instances as Active-Passive HA pair.")
+parser.add_option("--reduce_disk_io_threads", default="True", type="choice",
+                  choices=["true", "True", "false", "False"],
+                  help="If true, reduce the number of disk io mgr threads for "
+                  "filesystems that are not the TARGET_FILESYSTEM.")
+parser.add_option("--disable_tuple_caching", default=False, action="store_true",
+                  help="If true, sets the tuple caching feature flag "
+                  "(allow_tuple_caching) to false. This defaults to false to enable "
+                  "tuple caching in the development environment")
+parser.add_option("--tuple_cache_dir", dest="tuple_cache_dir",
+                  default=os.environ.get("TUPLE_CACHE_DIR", None),
+                  help="Specifies a base directory for the result tuple cache.")
+parser.add_option("--tuple_cache_capacity", dest="tuple_cache_capacity",
+                  default=os.environ.get("TUPLE_CACHE_CAPACITY", "1GB"),
+                  help="This specifies the maximum storage usage of the tuple cache "
+                       "each Impala daemon can use.")
+parser.add_option("--tuple_cache_debug_dump_dir", dest="tuple_cache_debug_dump_dir",
+                  default=os.environ.get("TUPLE_CACHE_DEBUG_DUMP_DIR", None),
+                  help="Specifies a base directory for the dumping tuple cache files "
+                       "for debug purposes")
+parser.add_option("--tuple_cache_eviction_policy", dest="tuple_cache_eviction_policy",
+                  default="LRU", help="This specifies the cache eviction policy to use "
+                  "for the tuple cache.")
+parser.add_option("--use_calcite_planner", default="False", type="choice",
+                  choices=["true", "True", "false", "False"],
+                  help="If true, use the Calcite planner for query optimization "
+                  "instead of the Impala planner")
 
 # For testing: list of comma-separated delays, in milliseconds, that delay impalad catalog
 # replica initialization. The ith delay is applied to the ith impalad.
@@ -259,6 +316,11 @@ def build_logging_args(service_name):
   logging"""
   result = ["-logbufsecs=5", "-v={0}".format(options.log_level),
       "-max_log_files={0}".format(options.max_log_files)]
+  if not options.ignore_pid_on_log_rotation:
+    # IMPALA-12595: ignore_pid_on_log_rotation default to False in this script.
+    # This is because multiple impalads still logs to the same log_dir in minicluster
+    # and we want to keep all logs for debugging purpose.
+    result += ["-log_rotation_match_pid=true"]
   if options.docker_network is None:
     # Impala inside a docker container should always log to the same location.
     result += ["-log_filename={0}".format(service_name),
@@ -275,6 +337,74 @@ def impalad_service_name(i):
     return "impalad_node{node_num}".format(node_num=i)
 
 
+def choose_catalogd_ports(instance_num):
+  """Compute the ports for catalogd instance num 'instance_num', returning as a map
+  from the argument name to the port number."""
+  return {'catalog_service_port': DEFAULT_CATALOG_SERVICE_PORT + instance_num,
+          'state_store_subscriber_port':
+              DEFAULT_CATALOGD_STATE_STORE_SUBSCRIBER_PORT + instance_num,
+          'webserver_port': DEFAULT_CATALOGD_WEBSERVER_PORT + instance_num}
+
+
+def build_catalogd_port_args(instance_num):
+  CATALOGD_PORTS = (
+      "-catalog_service_port={catalog_service_port} "
+      "-state_store_subscriber_port={state_store_subscriber_port} "
+      "-webserver_port={webserver_port}")
+  return CATALOGD_PORTS.format(**choose_catalogd_ports(instance_num))
+
+
+def catalogd_service_name(i):
+  """Return the name to use for the ith catalog daemon in the cluster."""
+  if i == 0:
+    # The first catalogd always logs to catalogd.INFO
+    return "catalogd"
+  else:
+    return "catalogd_node{node_num}".format(node_num=i)
+
+
+def choose_statestored_ports(enable_statestored_ha, instance_num):
+  """Compute the ports for statestored instance num 'instance_num', returning as a map
+  from the argument name to the port number."""
+  if not enable_statestored_ha:
+    return {'state_store_port': DEFAULT_STATESTORE_SERVICE_PORT + instance_num,
+            'webserver_port': DEFAULT_STATESTORED_WEBSERVER_PORT + instance_num}
+  else:
+    # Assume two statestore instances will be launched when statestore HA is enabled
+    state_store_peer_ha_port =\
+        DEFAULT_STATESTORE_HA_SERVICE_PORT + ((instance_num + 1) % 2)
+    return {'state_store_port': DEFAULT_STATESTORE_SERVICE_PORT + instance_num,
+            'state_store_ha_port': DEFAULT_STATESTORE_HA_SERVICE_PORT + instance_num,
+            'state_store_peer_ha_port': state_store_peer_ha_port,
+            'webserver_port': DEFAULT_STATESTORED_WEBSERVER_PORT + instance_num}
+
+
+def build_statestored_port_args(enable_statestored_ha, instance_num):
+  if not enable_statestored_ha:
+    STATESTORED_PORTS = (
+        "-state_store_port={state_store_port} "
+        "-webserver_port={webserver_port}")
+    return STATESTORED_PORTS.format(
+        **choose_statestored_ports(enable_statestored_ha, instance_num))
+  else:
+    STATESTORED_PORTS = (
+        "-state_store_port={state_store_port} "
+        "-state_store_ha_port={state_store_ha_port} "
+        "-state_store_peer_ha_port={state_store_peer_ha_port} "
+        "-webserver_port={webserver_port}")
+    return STATESTORED_PORTS.format(
+        **choose_statestored_ports(enable_statestored_ha, instance_num))
+
+
+def statestored_service_name(i):
+  """Return the name to use for the ith statestore daemon in the cluster."""
+  if i == 0:
+    # The first statestored always logs to statestored.INFO
+    return "statestored"
+  else:
+    return "statestored_node{node_num}".format(node_num=i)
+
+
 def combine_arg_list_opts(opt_args):
   """Helper for processing arguments like impalad_args. The input is a list of strings,
   each of which is the string passed into one instance of the argument, e.g. for
@@ -285,24 +415,66 @@ def combine_arg_list_opts(opt_args):
   return list(itertools.chain(*[shlex.split(arg) for arg in opt_args]))
 
 
-def build_statestored_arg_list():
-  """Build a list of command line arguments to pass to the statestored."""
-  return (build_logging_args("statestored") + build_kerberos_args("statestored") +
-      combine_arg_list_opts(options.state_store_args))
+def build_statestored_arg_list(num_statestored, remap_ports):
+  """Build a list of lists of command line arguments to pass to each statestored
+  instance. Build args for two statestored instances if statestored HA is enabled."""
+  statestored_arg_list = []
+  for i in range(num_statestored):
+    service_name = statestored_service_name(i)
+    args = (build_logging_args(service_name)
+        + build_kerberos_args("statestored")
+        + combine_arg_list_opts(options.state_store_args))
+    if remap_ports:
+      statestored_port_args =\
+          build_statestored_port_args(options.enable_statestored_ha, i)
+      args.extend(shlex.split(statestored_port_args))
+    if options.enable_catalogd_ha:
+      args.extend(["-enable_catalogd_ha=true"])
+    if options.enable_statestored_ha:
+      args.extend(["-enable_statestored_ha=true"])
+    statestored_arg_list.append(args)
+  return statestored_arg_list
 
 
-def build_catalogd_arg_list():
-  """Build a list of command line arguments to pass to the catalogd."""
-  return (build_logging_args("catalogd") +
-      ["-kudu_master_hosts", options.kudu_master_hosts] +
-      build_kerberos_args("catalogd") +
-      combine_arg_list_opts(options.catalogd_args))
+def build_catalogd_arg_list(num_catalogd, remap_ports):
+  """Build a list of lists of command line arguments to pass to each catalogd instance.
+  Build args for two catalogd instances if catalogd HA is enabled."""
+  catalogd_arg_list = []
+  for i in range(num_catalogd):
+    service_name = catalogd_service_name(i)
+    args = (build_logging_args(service_name)
+        + ["-kudu_master_hosts", options.kudu_master_hosts]
+        + build_kerberos_args("catalogd")
+        + combine_arg_list_opts(options.catalogd_args))
+    if remap_ports:
+      catalogd_port_args = build_catalogd_port_args(i)
+      args.extend(shlex.split(catalogd_port_args))
+    if options.enable_catalogd_ha:
+      args.extend(["-enable_catalogd_ha=true"])
+    if options.enable_statestored_ha:
+      args.extend(["-enable_statestored_ha=true"])
+      state_store_port = DEFAULT_STATESTORE_SERVICE_PORT
+      args.extend(
+          ["-state_store_port={0}".format(state_store_port)])
+      args.extend(
+          ["-state_store_2_port={0}".format(state_store_port + 1)])
+    catalogd_arg_list.append(args)
+  return catalogd_arg_list
 
 
 def build_admissiond_arg_list():
   """Build a list of command line arguments to pass to the admissiond."""
-  return (build_logging_args("admissiond") + build_kerberos_args("admissiond") +
-      combine_arg_list_opts(options.admissiond_args))
+  args = (build_logging_args("admissiond")
+      + build_kerberos_args("admissiond")
+      + combine_arg_list_opts(options.admissiond_args))
+  if options.enable_statestored_ha:
+    args.extend(["-enable_statestored_ha=true"])
+    state_store_port = DEFAULT_STATESTORE_SERVICE_PORT
+    args.extend(
+        ["-state_store_port={0}".format(state_store_port)])
+    args.extend(
+        ["-state_store_2_port={0}".format(state_store_port + 1)])
+  return args
 
 
 def build_impalad_arg_lists(cluster_size, num_coordinators, use_exclusive_coordinators,
@@ -369,7 +541,7 @@ def build_impalad_arg_lists(cluster_size, num_coordinators, use_exclusive_coordi
           timeout=DISCONNECTED_SESSION_TIMEOUT,
           args=args)
 
-    if i >= num_coordinators:
+    if i - start_idx >= num_coordinators:
       args = "-is_coordinator=false {args}".format(args=args)
     elif use_exclusive_coordinators:
       # Coordinator instance that doesn't execute non-coordinator fragments
@@ -403,6 +575,10 @@ def build_impalad_arg_lists(cluster_size, num_coordinators, use_exclusive_coordi
       args = "-data_cache_eviction_policy={policy} {args}".format(
           policy=options.data_cache_eviction_policy, args=args)
 
+      # Add the number of async write threads.
+      args = "-data_cache_num_async_write_threads={num_threads} {args}".format(
+          num_threads=options.data_cache_num_async_write_threads, args=args)
+
       # Add access tracing arguments if requested
       if options.data_cache_enable_tracing:
         tracing_args = ""
@@ -419,9 +595,102 @@ def build_impalad_arg_lists(cluster_size, num_coordinators, use_exclusive_coordi
             tracing_args=tracing_args)
         args = "{tracing_args} {args}".format(tracing_args=tracing_args, args=args)
 
+    if options.tuple_cache_dir:
+      # create the base directory
+      tuple_cache_path = \
+          os.path.join(options.tuple_cache_dir, "impala-tuplecache-{0}".format(str(i)))
+      # Try creating the directory if it doesn't exist already. May raise exception.
+      if not os.path.exists(tuple_cache_path):
+        os.makedirs(tuple_cache_path)
+      if options.docker_network is None:
+        tuple_cache_path_arg = tuple_cache_path
+      else:
+        # The cache directory will always be mounted at the same path inside the
+        # container. Reuses the data cache dedicated mount.
+        tuple_cache_path_arg = DATA_CACHE_CONTAINER_PATH
+
+      args = "-tuple_cache={dir}:{cap} {args}".format(
+          dir=tuple_cache_path_arg, cap=options.tuple_cache_capacity, args=args)
+
+      # Add the eviction policy
+      args = "-tuple_cache_eviction_policy={policy} {args}".format(
+          policy=options.tuple_cache_eviction_policy, args=args)
+
+      if options.tuple_cache_debug_dump_dir:
+        # create the base directory
+        tuple_cache_debug_dump_path = \
+            os.path.join(options.tuple_cache_debug_dump_dir,
+                         "impala-tuplecache-debugdump-{0}".format(str(i)))
+        # Try creating the directory if it doesn't exist already. May raise exception.
+        if not os.path.exists(tuple_cache_debug_dump_path):
+          os.makedirs(tuple_cache_debug_dump_path)
+        if options.docker_network is None:
+          tuple_cache_debug_dump_path_arg = tuple_cache_debug_dump_path
+        else:
+          # The cache directory will always be mounted at the same path inside the
+          # container. Reuses the data cache dedicated mount.
+          tuple_cache_debug_dump_path_arg = DATA_CACHE_CONTAINER_PATH
+        args = "-tuple_cache_debug_dump_dir={dir} {args}".format(
+            dir=tuple_cache_debug_dump_path_arg, args=args)
+
     if options.enable_admission_service:
       args = "{args} -admission_service_host={host}".format(
           args=args, host=admissiond_host)
+
+    if options.enable_statestored_ha:
+      state_store_port = DEFAULT_STATESTORE_SERVICE_PORT
+      state_store_2_port = DEFAULT_STATESTORE_SERVICE_PORT + 1
+      args = "{args} -enable_statestored_ha=true -state_store_port={state_store_port} "\
+          "-state_store_2_port={state_store_2_port}".format(
+              args=args, state_store_port=state_store_port,
+              state_store_2_port=state_store_2_port)
+
+    if options.reduce_disk_io_threads.lower() == 'true':
+      # This leaves the default value for the TARGET_FILESYSTEM, but it reduces the thread
+      # count for every other filesystem that is not the TARGET_FILESYSTEM.
+      if TARGET_FILESYSTEM != 'abfs':
+        args = "{args} -num_abfs_io_threads=1".format(args=args)
+      if TARGET_FILESYSTEM != 'adls':
+        args = "{args} -num_adls_io_threads=1".format(args=args)
+      if TARGET_FILESYSTEM != 'cosn':
+        args = "{args} -num_cos_io_threads=1".format(args=args)
+      if TARGET_FILESYSTEM != 'gs':
+        args = "{args} -num_gcs_io_threads=1".format(args=args)
+      if TARGET_FILESYSTEM != 'hdfs':
+        args = "{args} -num_remote_hdfs_file_oper_io_threads=1".format(args=args)
+        args = "{args} -num_remote_hdfs_io_threads=1".format(args=args)
+      if TARGET_FILESYSTEM != 'obs':
+        args = "{args} -num_obs_io_threads=1".format(args=args)
+      if TARGET_FILESYSTEM != 'oss':
+        args = "{args} -num_oss_io_threads=1".format(args=args)
+      if TARGET_FILESYSTEM != 'ozone':
+        args = "{args} -num_ozone_io_threads=1".format(args=args)
+      if TARGET_FILESYSTEM != 's3':
+        args = "{args} -num_s3_io_threads=1".format(args=args)
+        args = "{args} -num_s3_file_oper_io_threads=1".format(args=args)
+
+      # SFS (single-file system) doesn't have a corresponding TARGET_FILESYSTEM, and
+      # it can always be restricted.
+      args = "{args} -num_sfs_io_threads=1".format(args=args)
+
+    if "geospatial_library" not in args:
+      args = "{args} -geospatial_library={geospatial_library}".format(
+          args=args, geospatial_library=options.geospatial_library)
+
+    if options.jni_frontend_class != "":
+      args = "-jni_frontend_class={jni_frontend_class} {args}".format(
+          jni_frontend_class=options.jni_frontend_class, args=args)
+
+    if options.disable_tuple_caching:
+      args = "-allow_tuple_caching=false {args}".format(args=args)
+    else:
+      args = "-allow_tuple_caching=true {args}".format(args=args)
+
+    if options.use_calcite_planner.lower() == 'true':
+      args = "-jni_frontend_class={jni_frontend_class} {args}".format(
+          jni_frontend_class="org/apache/impala/calcite/service/CalciteJniFrontend",
+          args=args)
+      os.environ["USE_CALCITE_PLANNER"] = "true"
 
     # Appended at the end so they can override previous args.
     if i < len(per_impalad_args):
@@ -465,7 +734,7 @@ def compute_impalad_mem_limit(cluster_size):
   # memory choice here to max out at 12GB. This should be sufficient for tests.
   #
   # Beware that ASAN builds use more memory than regular builds.
-  physical_mem_gb = psutil.virtual_memory().total / 1024 / 1024 / 1024
+  physical_mem_gb = psutil.virtual_memory().total // 1024 // 1024 // 1024
   available_mem = int(os.getenv("IMPALA_CLUSTER_MAX_MEM_GB", str(physical_mem_gb)))
   mem_limit = int(0.7 * available_mem * 1024 * 1024 * 1024 / cluster_size)
   return min(12 * 1024 * 1024 * 1024, mem_limit)
@@ -485,33 +754,51 @@ class MiniClusterOperations(object):
   def kill_all_impalads(self, force=False):
     kill_matching_processes(["impalad"], force=force)
 
-  def kill_catalogd(self, force=False):
+  def kill_all_catalogds(self, force=False):
     kill_matching_processes(["catalogd"], force=force)
 
-  def kill_statestored(self, force=False):
+  def kill_all_statestoreds(self, force=False):
     kill_matching_processes(["statestored"], force=force)
 
   def kill_admissiond(self, force=False):
     kill_matching_processes(["admissiond"], force=force)
 
   def start_statestore(self):
-    LOG.info("Starting State Store logging to {log_dir}/statestored.INFO".format(
-        log_dir=options.log_dir))
-    output_file = os.path.join(options.log_dir, "statestore-out.log")
-    run_daemon_with_options("statestored", build_statestored_arg_list(), output_file)
-    if not check_process_exists("statestored", 10):
-      raise RuntimeError("Unable to start statestored. Check log or file permissions"
-                         " for more details.")
+    if options.enable_statestored_ha:
+      num_statestored = 2
+    else:
+      num_statestored = 1
+    statestored_arg_lists = build_statestored_arg_list(num_statestored, remap_ports=True)
+    for i in range(num_statestored):
+      service_name = statestored_service_name(i)
+      LOG.info(
+          "Starting State Store logging to {log_dir}/{service_name}.INFO".format(
+              log_dir=options.log_dir, service_name=service_name))
+      output_file = os.path.join(
+          options.log_dir, "{service_name}-out.log".format(service_name=service_name))
+      run_daemon_with_options("statestored", statestored_arg_lists[i], output_file)
+      if not check_process_exists("statestored", 10):
+        raise RuntimeError("Unable to start statestored. Check log or file permissions"
+                           " for more details.")
 
   def start_catalogd(self):
-    LOG.info("Starting Catalog Service logging to {log_dir}/catalogd.INFO".format(
-        log_dir=options.log_dir))
-    output_file = os.path.join(options.log_dir, "catalogd-out.log")
-    run_daemon_with_options("catalogd", build_catalogd_arg_list(), output_file,
-        jvm_debug_port=DEFAULT_CATALOGD_JVM_DEBUG_PORT)
-    if not check_process_exists("catalogd", 10):
-      raise RuntimeError("Unable to start catalogd. Check log or file permissions"
-                         " for more details.")
+    if options.enable_catalogd_ha:
+      num_catalogd = 2
+    else:
+      num_catalogd = 1
+    catalogd_arg_lists = build_catalogd_arg_list(num_catalogd, remap_ports=True)
+    for i in range(num_catalogd):
+      service_name = catalogd_service_name(i)
+      LOG.info(
+          "Starting Catalog Service logging to {log_dir}/{service_name}.INFO".format(
+              log_dir=options.log_dir, service_name=service_name))
+      output_file = os.path.join(
+          options.log_dir, "{service_name}-out.log".format(service_name=service_name))
+      run_daemon_with_options("catalogd", catalogd_arg_lists[i], output_file,
+          jvm_debug_port=DEFAULT_CATALOGD_JVM_DEBUG_PORT + i)
+      if not check_process_exists("catalogd", 10):
+        raise RuntimeError("Unable to start catalogd. Check log or file permissions"
+                           " for more details.")
 
   def start_admissiond(self):
     LOG.info("Starting Admission Control Service logging to {log_dir}/admissiond.INFO"
@@ -539,7 +826,7 @@ class MiniClusterOperations(object):
         cluster_size, num_coordinators, use_exclusive_coordinators, remap_ports=True,
         start_idx=start_idx)
     assert cluster_size == len(impalad_arg_lists)
-    for i in xrange(start_idx, start_idx + cluster_size):
+    for i in range(start_idx, start_idx + cluster_size):
       service_name = impalad_service_name(i)
       LOG.info("Starting Impala Daemon logging to {log_dir}/{service_name}.INFO".format(
           log_dir=options.log_dir, service_name=service_name))
@@ -574,8 +861,8 @@ class DockerMiniClusterOperations(object):
         use_admission_service=options.enable_admission_service)
 
   def kill_all_daemons(self, force=False):
-    self.kill_statestored(force=force)
-    self.kill_catalogd(force=force)
+    self.kill_all_statestoreds(force=force)
+    self.kill_all_catalogds(force=force)
     self.kill_admissiond(force=force)
     self.kill_all_impalads(force=force)
 
@@ -583,39 +870,78 @@ class DockerMiniClusterOperations(object):
     # List all running containers on the network and kill those with the impalad name
     # prefix to make sure that no running container are left over from previous clusters.
     container_name_prefix = self.__gen_container_name__("impalad")
-    for container_id, info in self.__get_network_info__()["Containers"].iteritems():
+    for container_id, info in self.__get_network_info__()["Containers"].items():
       container_name = info["Name"]
       if container_name.startswith(container_name_prefix):
         LOG.info("Stopping container {0}".format(container_name))
         check_call(["docker", "stop", container_name])
 
-  def kill_catalogd(self, force=False):
-    self.__stop_container__("catalogd")
+  def kill_all_catalogds(self, force=False):
+    # List all running containers on the network and kill those with the catalogd name
+    # prefix to make sure that no running container are left over from previous clusters.
+    container_name_prefix = self.__gen_container_name__("catalogd")
+    for container_id, info in self.__get_network_info__()["Containers"].items():
+      container_name = info["Name"]
+      if container_name.startswith(container_name_prefix):
+        LOG.info("Stopping container {0}".format(container_name))
+        check_call(["docker", "stop", container_name])
 
-  def kill_statestored(self, force=False):
-    self.__stop_container__("statestored")
+  def kill_all_statestoreds(self, force=False):
+    # List all running containers on the network and kill those with the statestored name
+    # prefix to make sure that no running container are left over from previous clusters.
+    container_name_prefix = self.__gen_container_name__("statestored")
+    for container_id, info in self.__get_network_info__()["Containers"].items():
+      container_name = info["Name"]
+      if container_name.startswith(container_name_prefix):
+        LOG.info("Stopping container {0}".format(container_name))
+        check_call(["docker", "stop", container_name])
 
   def kill_admissiond(self, force=False):
     self.__stop_container__("admissiond")
 
   def start_statestore(self):
-    self.__run_container__("statestored", build_statestored_arg_list(),
-        {DEFAULT_STATESTORED_WEBSERVER_PORT: DEFAULT_STATESTORED_WEBSERVER_PORT})
+    if not options.enable_statestored_ha:
+      statestored_arg_lists =\
+          build_statestored_arg_list(num_statestored=1, remap_ports=False)
+      self.__run_container__("statestored", statestored_arg_lists[0],
+          {DEFAULT_STATESTORED_WEBSERVER_PORT: DEFAULT_STATESTORED_WEBSERVER_PORT})
+    else:
+      num_statestored = 2
+      statestored_arg_lists =\
+          build_statestored_arg_list(num_statestored, remap_ports=False)
+      for i in range(num_statestored):
+        chosen_ports = choose_statestored_ports(
+            enable_statestored_ha=True, instance_num=i)
+        port_map = {
+            DEFAULT_STATESTORE_SERVICE_PORT: chosen_ports['state_store_port'],
+            DEFAULT_STATESTORE_HA_SERVICE_PORT: chosen_ports['state_store_ha_port'],
+            DEFAULT_PEER_STATESTORE_HA_SERVICE_PORT:
+            chosen_ports['state_store_peer_ha_port'],
+            DEFAULT_STATESTORED_WEBSERVER_PORT: chosen_ports['webserver_port']}
+        self.__run_container__("statestored", statestored_arg_lists[i], port_map, i)
 
   def start_catalogd(self):
-    self.__run_container__("catalogd", build_catalogd_arg_list(),
-          {DEFAULT_CATALOGD_WEBSERVER_PORT: DEFAULT_CATALOGD_WEBSERVER_PORT})
+    if options.enable_catalogd_ha:
+      num_catalogd = 2
+    else:
+      num_catalogd = 1
+    catalogd_arg_lists = build_catalogd_arg_list(num_catalogd, remap_ports=False)
+    for i in range(num_catalogd):
+      chosen_ports = choose_catalogd_ports(i)
+      port_map = {DEFAULT_CATALOG_SERVICE_PORT: chosen_ports['catalog_service_port'],
+                  DEFAULT_CATALOGD_WEBSERVER_PORT: chosen_ports['webserver_port']}
+      self.__run_container__("catalogd", catalogd_arg_lists[i], port_map, i)
 
   def start_admissiond(self):
     self.__run_container__("admissiond", build_admissiond_arg_list(),
-          {DEFAULT_ADMISSIOND_WEBSERVER_PORT: DEFAULT_ADMISSIOND_WEBSERVER_PORT})
+        {DEFAULT_ADMISSIOND_WEBSERVER_PORT: DEFAULT_ADMISSIOND_WEBSERVER_PORT})
 
   def start_impalads(self, cluster_size, num_coordinators, use_exclusive_coordinators):
     impalad_arg_lists = build_impalad_arg_lists(cluster_size, num_coordinators,
         use_exclusive_coordinators, remap_ports=False, admissiond_host="admissiond")
     assert cluster_size == len(impalad_arg_lists)
     mem_limit = compute_impalad_mem_limit(cluster_size)
-    for i in xrange(cluster_size):
+    for i in range(cluster_size):
       chosen_ports = choose_impalad_ports(i)
       port_map = {DEFAULT_BEESWAX_PORT: chosen_ports['beeswax_port'],
                   DEFAULT_HS2_PORT: chosen_ports['hs2_port'],
@@ -655,7 +981,7 @@ class DockerMiniClusterOperations(object):
       port_args = ["-P"]
     else:
       port_args = ["-p{dst}:{src}".format(src=src, dst=dst)
-                   for src, dst in port_map.iteritems()]
+                   for src, dst in port_map.items()]
     # Impersonate the current user for operations against the minicluster. This is
     # necessary because the user name inside the container is "root".
     # TODO: pass in the actual options
@@ -669,6 +995,8 @@ class DockerMiniClusterOperations(object):
       image_tag = daemon + "_debug"
     else:
       image_tag = daemon
+    java_versions = {"8": "", "11": "_java11", "17": "_java17"}
+    image_tag += java_versions[os.getenv('IMPALA_DOCKER_JAVA', '8')]
     host_name = self.__gen_host_name__(daemon, instance)
     container_name = self.__gen_container_name__(daemon, instance)
     # Mount configuration into container so that we don't need to rebuild container
@@ -704,7 +1032,8 @@ class DockerMiniClusterOperations(object):
       mount_args + mem_limit_args + [image_tag] + args)
     LOG.info("Running command {0}".format(run_cmd))
     check_call(run_cmd)
-    port_mapping = check_output(["docker", "port", container_name])
+    port_mapping = check_output(["docker", "port", container_name],
+                                universal_newlines=True)
     LOG.info("Launched container {0} with port mapping:\n{1}".format(
         container_name, port_mapping))
 
@@ -722,7 +1051,8 @@ class DockerMiniClusterOperations(object):
 
   def __get_network_info__(self):
     """Get the output of "docker network inspect" as a python data structure."""
-    output = check_output(["docker", "network", "inspect", self.network_name])
+    output = check_output(["docker", "network", "inspect", self.network_name],
+                          universal_newlines=True)
     # Only one network should be present in the top level array.
     return json.loads(output)[0]
 
@@ -769,10 +1099,6 @@ if __name__ == "__main__":
   if options.docker_network is None:
     cluster_ops = MiniClusterOperations()
   else:
-    if sys.version_info < (2, 7):
-      raise Exception("Docker minicluster only supported on Python 2.7+")
-    # We use some functions in the docker code that don't exist in Python 2.6.
-    from subprocess import check_output
     cluster_ops = DockerMiniClusterOperations(options.docker_network)
 
   # If core-site.xml is missing, it likely means that we are missing config
@@ -785,10 +1111,10 @@ if __name__ == "__main__":
   if options.restart_impalad_only:
     cluster_ops.kill_all_impalads(force=options.force_kill)
   elif options.restart_catalogd_only:
-    cluster_ops.kill_catalogd(force=options.force_kill)
+    cluster_ops.kill_all_catalogds(force=options.force_kill)
   elif options.restart_statestored_only:
-    cluster_ops.kill_statestored(force=options.force_kill)
-  elif options.add_executors:
+    cluster_ops.kill_all_statestoreds(force=options.force_kill)
+  elif options.add_executors or options.add_impalads:
     pass
   else:
     cluster_ops.kill_all_daemons(force=options.force_kill)
@@ -820,6 +1146,11 @@ if __name__ == "__main__":
       cluster_ops.start_impalads(options.cluster_size, num_coordinators,
                                  use_exclusive_coordinators, existing_cluster_size)
       expected_cluster_size += existing_cluster_size
+    elif options.add_impalads:
+      cluster_ops.start_impalads(options.cluster_size, options.num_coordinators,
+                                 options.use_exclusive_coordinators,
+                                 existing_cluster_size)
+      expected_cluster_size += existing_cluster_size
     else:
       cluster_ops.start_statestore()
       cluster_ops.start_catalogd()
@@ -828,7 +1159,7 @@ if __name__ == "__main__":
       cluster_ops.start_impalads(options.cluster_size, options.num_coordinators,
                                  options.use_exclusive_coordinators)
     # Sleep briefly to reduce log spam: the cluster takes some time to start up.
-    sleep(3)
+    sleep(2)
 
     impala_cluster = cluster_ops.get_cluster()
     expected_catalog_delays = 0
@@ -836,9 +1167,13 @@ if __name__ == "__main__":
       for delay in options.catalog_init_delays.split(","):
         if int(delay.strip()) != 0: expected_catalog_delays += 1
     # Check for the cluster to be ready.
-    impala_cluster.wait_until_ready(expected_cluster_size,
-        expected_cluster_size - expected_catalog_delays)
-  except Exception, e:
+    expected_num_ready_impalads = expected_cluster_size - expected_catalog_delays
+    if options.add_impalads:
+      # TODO: This is a hack to make the waiting logic work. We'd better add a dedicated
+      # option for adding a new cluster using the existing catalogd and statestore.
+      expected_num_ready_impalads = options.cluster_size
+    impala_cluster.wait_until_ready(expected_cluster_size, expected_num_ready_impalads)
+  except Exception as e:
     LOG.exception("Error starting cluster")
     sys.exit(1)
 

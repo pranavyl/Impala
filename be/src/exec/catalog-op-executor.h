@@ -57,7 +57,8 @@ class CatalogOpExecutor {
   /// Translates the given compute stats request and its child-query results into
   /// a new table alteration request for updating the stats metadata, and executes
   /// the alteration via Exec();
-  Status ExecComputeStats(const TCatalogOpRequest& compute_stats_request,
+  Status ExecComputeStats(const TCatalogServiceRequestHeader& header,
+      const TCatalogOpRequest& compute_stats_request,
       const apache::hive::service::cli::thrift::TTableSchema& tbl_stats_schema,
       const apache::hive::service::cli::thrift::TRowSet& tbl_stats_data,
       const apache::hive::service::cli::thrift::TTableSchema& col_stats_schema,
@@ -79,6 +80,18 @@ class CatalogOpExecutor {
   Status UpdateTableUsage(const TUpdateTableUsageRequest& req,
       TUpdateTableUsageResponse* resp);
 
+  /// Makes an RPC to the catalog server to get the null partition name.
+  Status GetNullPartitionName(
+      const TGetNullPartitionNameRequest& req, TGetNullPartitionNameResponse* result);
+
+  /// Makes an RPC to the catalog server to get the latest compactions.
+  Status GetLatestCompactions(
+      const TGetLatestCompactionsRequest& req, TGetLatestCompactionsResponse* result);
+
+  /// Makes an RPC to the catalog server to update the status of EventProcessor.
+  Status SetEventProcessorStatus(const TSetEventProcessorStatusRequest& req,
+      TSetEventProcessorStatusResponse* result);
+
   /// Set in Exec(), returns a pointer to the TDdlExecResponse of the DDL execution.
   /// If called before Exec(), this will return NULL. Only set if the
   /// TCatalogOpType is DDL.
@@ -92,6 +105,10 @@ class CatalogOpExecutor {
   const TCatalogUpdateResult* update_catalog_result() const {
     return catalog_update_result_.get();
   }
+
+  /// Set in Exec(), for operations that are executed using the CatalogServer. Returns
+  /// a pointer to the profile of the execution in catalogd.
+  const TRuntimeProfileNode* catalog_profile() const { return catalog_profile_.get(); }
 
  private:
   /// Helper functions used in ExecComputeStats() for setting the thrift structs in params
@@ -111,6 +128,9 @@ class CatalogOpExecutor {
 
   /// Result of executing a DDL request using the CatalogService
   boost::scoped_ptr<TCatalogUpdateResult> catalog_update_result_;
+
+  /// Profile of the execution on Catalog Server side
+  std::unique_ptr<TRuntimeProfileNode> catalog_profile_;
 
   ExecEnv* env_;
   Frontend* fe_;

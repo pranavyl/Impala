@@ -19,16 +19,21 @@ package org.apache.impala.customcluster;
 
 import static org.apache.impala.testutil.LdapUtil.*;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import com.google.common.collect.Range;
+
+import java.io.IOException;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import org.apache.directory.server.annotations.CreateLdapServer;
 import org.apache.directory.server.annotations.CreateTransport;
 import org.apache.directory.server.core.annotations.ApplyLdifFiles;
 import org.apache.directory.server.core.integ.CreateLdapServerRule;
-import org.apache.impala.util.Metrics;
+import org.apache.impala.testutil.WebClient;
 import org.junit.Assume;
 import org.junit.ClassRule;
 
@@ -47,7 +52,7 @@ public class LdapImpalaShellTest {
   // Includes a special character to test HTTP path encoding.
   protected static final String delegateUser_ = "proxyUser$";
 
-  private Metrics metrics = new Metrics();
+  private WebClient client_ = new WebClient();
 
   public void setUp(String extraArgs) throws Exception {
     String uri =
@@ -55,9 +60,13 @@ public class LdapImpalaShellTest {
     String ldapArgs = String.format("--enable_ldap_auth --ldap_uri='%s' "
             + "--ldap_passwords_in_clear_ok %s",
         uri, extraArgs);
-    int ret = CustomClusterRunner.StartImpalaCluster(ldapArgs);
+    int ret = startImpalaCluster(ldapArgs);
     assertEquals(ret, 0);
     verifyMetrics(zero, zero, zero, zero);
+  }
+
+  protected int startImpalaCluster(String args) throws IOException, InterruptedException {
+    return CustomClusterRunner.StartImpalaCluster(args);
   }
 
   /**
@@ -65,31 +74,45 @@ public class LdapImpalaShellTest {
    * transport tests. Python version shipped with CentOS6 is known to
    * have an older version of python resulting in test failures.
    */
-  private boolean pythonSupportsSSLContext() throws Exception {
+  protected boolean pythonSupportsSSLContext() throws Exception {
     // Runs the following command:
     // python -c "import ssl; print hasattr(ssl, 'create_default_context')"
     String[] cmd = {
-        "python", "-c", "import ssl; print hasattr(ssl, 'create_default_context')"};
-    return Boolean.parseBoolean(RunShellCommand.Run(cmd, true, "", "").replace("\n", ""));
+        "python", "-c", "import ssl; print(hasattr(ssl, 'create_default_context'))"};
+    return Boolean.parseBoolean(
+        RunShellCommand.Run(cmd, true, "", "").stdout.replace("\n", ""));
+  }
+
+  /**
+   * Returns list of transport protocols: "beeswax", "hs2" is always available,
+   * "hs2-http" is not available on older version of python.
+   */
+  protected List<String> getProtocolsToTest() throws Exception {
+    List<String> protocolsToTest = Arrays.asList("beeswax", "hs2");
+    if (pythonSupportsSSLContext()) {
+      // http transport tests will fail with older python versions (IMPALA-8873)
+      protocolsToTest = Arrays.asList("beeswax", "hs2", "hs2-http");
+    }
+    return protocolsToTest;
   }
 
   private void verifyMetrics(Range<Long> expectedBasicSuccess,
       Range<Long> expectedBasicFailure, Range<Long> expectedCookieSuccess,
       Range<Long> expectedCookieFailure) throws Exception {
-    long actualBasicSuccess = (long) metrics.getMetric(
+    long actualBasicSuccess = (long) client_.getMetric(
         "impala.thrift-server.hiveserver2-http-frontend.total-basic-auth-success");
     assertTrue("Expected: " + expectedBasicSuccess + ", Actual: " + actualBasicSuccess,
         expectedBasicSuccess.contains(actualBasicSuccess));
-    long actualBasicFailure = (long) metrics.getMetric(
+    long actualBasicFailure = (long) client_.getMetric(
         "impala.thrift-server.hiveserver2-http-frontend.total-basic-auth-failure");
     assertTrue("Expected: " + expectedBasicFailure + ", Actual: " + actualBasicFailure,
         expectedBasicFailure.contains(actualBasicFailure));
 
-    long actualCookieSuccess = (long) metrics.getMetric(
+    long actualCookieSuccess = (long) client_.getMetric(
         "impala.thrift-server.hiveserver2-http-frontend.total-cookie-auth-success");
     assertTrue("Expected: " + expectedCookieSuccess + ", Actual: " + actualCookieSuccess,
         expectedCookieSuccess.contains(actualCookieSuccess));
-    long actualCookieFailure = (long) metrics.getMetric(
+    long actualCookieFailure = (long) client_.getMetric(
         "impala.thrift-server.hiveserver2-http-frontend.total-cookie-auth-failure");
     assertTrue("Expected: " + expectedCookieFailure + ", Actual: " + actualCookieFailure,
         expectedCookieFailure.contains(actualCookieFailure));
@@ -110,33 +133,34 @@ public class LdapImpalaShellTest {
   /**
    * Tests ldap authentication using impala-shell.
    */
-  protected void testShellLdapAuthImpl() throws Exception {
+  protected void testShellLdapAuthImpl(String extra_cookie) throws Exception {
     String query = "select logged_in_user()";
     // Templated shell commands to test a simple 'show tables' command.
     // 1. Valid username, password and default http_cookie_names. Should succeed with
     // cookies are being used.
     String[] validCommand = {"impala-shell.sh", "", "--ldap", "--auth_creds_ok_in_clear",
+        "--verbose",
         String.format("--user=%s", TEST_USER_1),
         String.format("--ldap_password_cmd=printf %s", TEST_PASSWORD_1),
         String.format("--query=%s", query)};
     // 2. Valid username, password and matching http_cookie_names. Should succeed with
     // cookies are being used.
     String[] validCommandMatchingCookieNames = {"impala-shell.sh", "", "--ldap",
-        "--auth_creds_ok_in_clear", "--http_cookie_names=impala.auth",
+        "--auth_creds_ok_in_clear", "--verbose", "--http_cookie_names=impala.auth",
         String.format("--user=%s", TEST_USER_1),
         String.format("--ldap_password_cmd=printf %s", TEST_PASSWORD_1),
         String.format("--query=%s", query)};
     // 3. Valid username and password, but not matching http_cookie_names. Should succeed
     // with cookies are not being used.
     String[] validCommandMismatchingCookieNames = {"impala-shell.sh", "", "--ldap",
-        "--auth_creds_ok_in_clear", "--http_cookie_names=impala.conn",
+        "--auth_creds_ok_in_clear", "--verbose", "--http_cookie_names=impala.conn",
         String.format("--user=%s", TEST_USER_1),
         String.format("--ldap_password_cmd=printf %s", TEST_PASSWORD_1),
         String.format("--query=%s", query)};
     // 4. Valid username and password, but empty http_cookie_names. Should succeed with
     // cookies are not being used.
     String[] validCommandEmptyCookieNames = {"impala-shell.sh", "", "--ldap",
-        "--auth_creds_ok_in_clear", "--http_cookie_names=",
+        "--auth_creds_ok_in_clear", "--verbose", "--http_cookie_names=",
         String.format("--user=%s", TEST_USER_1),
         String.format("--ldap_password_cmd=printf %s", TEST_PASSWORD_1),
         String.format("--query=%s", query)};
@@ -148,41 +172,54 @@ public class LdapImpalaShellTest {
     String[] commandWithoutAuth = {
         "impala-shell.sh", "", String.format("--query=%s", query)};
     String protocolTemplate = "--protocol=%s";
-    List<String> protocolsToTest = Arrays.asList("beeswax", "hs2");
-    if (pythonSupportsSSLContext()) {
-      // http transport tests will fail with older python versions (IMPALA-8873)
-      protocolsToTest = Arrays.asList("beeswax", "hs2", "hs2-http");
-    }
 
-    for (String p : protocolsToTest) {
+    // Sorted list of cookies for validCommand, where all cookies are preserved.
+    List<String> preservedCookiesList = new ArrayList<>();
+    preservedCookiesList.add("impala.auth");
+    if (extra_cookie != null) {
+      preservedCookiesList.add(extra_cookie);
+    }
+    Collections.sort(preservedCookiesList);
+    String preservedCookies = String.join(", ", preservedCookiesList);
+
+    for (String p : getProtocolsToTest()) {
       String protocol = String.format(protocolTemplate, p);
       validCommand[1] = protocol;
-      RunShellCommand.Run(validCommand, /*shouldSucceed*/ true, TEST_USER_1,
+      RunShellCommand.Output result = RunShellCommand.Run(validCommand,
+          /*shouldSucceed*/ true, TEST_USER_1,
           "Starting Impala Shell with LDAP-based authentication");
       if (p.equals("hs2-http")) {
         // Check that cookies are being used.
         verifyMetrics(Range.atLeast(1L), zero, Range.atLeast(1L), zero);
+        assertTrue(result.stderr,
+            result.stderr.contains("Preserving cookies: " + preservedCookies));
       }
       validCommandMatchingCookieNames[1] = protocol;
-      RunShellCommand.Run(validCommandMatchingCookieNames, /*shouldSucceed*/ true,
-          TEST_USER_1, "Starting Impala Shell with LDAP-based authentication");
+      result = RunShellCommand.Run(validCommandMatchingCookieNames,
+          /*shouldSucceed*/ true, TEST_USER_1,
+          "Starting Impala Shell with LDAP-based authentication");
       if (p.equals("hs2-http")) {
         // Check that cookies are being used.
         verifyMetrics(Range.atLeast(2L), zero, Range.atLeast(2L), zero);
+        assertTrue(result.stderr,
+            result.stderr.contains("Preserving cookies: impala.auth"));
       }
       validCommandMismatchingCookieNames[1] = protocol;
-      RunShellCommand.Run(validCommandMismatchingCookieNames, /*shouldSucceed*/ true,
-          TEST_USER_1, "Starting Impala Shell with LDAP-based authentication");
+      result = RunShellCommand.Run(validCommandMismatchingCookieNames,
+          /*shouldSucceed*/ true, TEST_USER_1,
+          "Starting Impala Shell with LDAP-based authentication");
       if (p.equals("hs2-http")) {
         // Check that cookies are NOT being used.
         verifyMetrics(Range.atLeast(2L), zero, Range.atLeast(2L), zero);
+        assertFalse(result.stderr, result.stderr.contains("Preserving cookies:"));
       }
       validCommandEmptyCookieNames[1] = protocol;
-      RunShellCommand.Run(validCommandEmptyCookieNames, /*shouldSucceed*/ true,
+      result = RunShellCommand.Run(validCommandEmptyCookieNames, /*shouldSucceed*/ true,
           TEST_USER_1, "Starting Impala Shell with LDAP-based authentication");
       if (p.equals("hs2-http")) {
         // Check that cookies are NOT being used.
         verifyMetrics(Range.atLeast(2L), zero, Range.atLeast(2L), zero);
+        assertFalse(result.stderr, result.stderr.contains("Preserving cookies:"));
       }
 
       invalidCommand[1] = protocol;

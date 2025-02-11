@@ -48,6 +48,7 @@ import org.apache.impala.catalog.HdfsStorageDescriptor;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.PrunablePartition;
 import org.apache.impala.catalog.SqlConstraints;
+import org.apache.impala.catalog.VirtualColumn;
 import org.apache.impala.catalog.local.MetaProvider.PartitionMetadata;
 import org.apache.impala.catalog.local.MetaProvider.PartitionRef;
 import org.apache.impala.catalog.local.MetaProvider.TableMetaRef;
@@ -121,7 +122,7 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
    * as a table property. Such a schema is used when querying Avro partitions
    * of non-Avro tables.
    */
-  private final String avroSchema_;
+  private String avroSchema_;
 
   /**
    * True if this table is marked as cached by hdfs caching. Does not necessarily mean
@@ -182,6 +183,7 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
 
     avroSchema_ = explicitAvroSchema;
     isMarkedCached_ = (ref != null && ref.isMarkedCached());
+    if (ref != null) addVirtualColumns(ref.getVirtualColumns());
   }
 
   private static String loadAvroSchema(Table msTbl) throws AnalysisException {
@@ -313,6 +315,19 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
   @Override
   public TTableDescriptor toThriftDescriptor(int tableId,
       Set<Long> referencedPartitions) {
+    TTableDescriptor tableDesc = new TTableDescriptor(tableId, TTableType.HDFS_TABLE,
+        FeCatalogUtils.getTColumnDescriptors(this),
+        getNumClusteringCols(), name_, db_.getName());
+    tableDesc.setHdfsTable(toTHdfsTable(referencedPartitions,
+        ThriftObjectType.DESCRIPTOR_ONLY));
+    return tableDesc;
+  }
+
+  public THdfsTable toTHdfsTable(ThriftObjectType type) {
+    return toTHdfsTable(null, type);
+  }
+
+  private THdfsTable toTHdfsTable(Set<Long> referencedPartitions, ThriftObjectType type) {
     if (referencedPartitions == null) {
       // null means "all partitions".
       referencedPartitions = getPartitionIds();
@@ -321,16 +336,18 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
     List<? extends FeFsPartition> partitions = loadPartitions(referencedPartitions);
     for (FeFsPartition partition : partitions) {
       idToPartition.put(partition.getId(),
-          FeCatalogUtils.fsPartitionToThrift(partition,
-              ThriftObjectType.DESCRIPTOR_ONLY));
+          FeCatalogUtils.fsPartitionToThrift(partition, type));
     }
 
+    // Prototype partition has no partition values and file descriptors etc.
+    // So we always use DESCRIPTOR_ONLY here.
     THdfsPartition tPrototypePartition = FeCatalogUtils.fsPartitionToThrift(
         createPrototypePartition(), ThriftObjectType.DESCRIPTOR_ONLY);
 
     THdfsTable hdfsTable = new THdfsTable(getHdfsBaseDir(), getColumnNames(),
         getNullPartitionKeyValue(), nullColumnValue_, idToPartition,
         tPrototypePartition);
+    hdfsTable.setHas_full_partitions(true);
 
     if (avroSchema_ != null) {
       hdfsTable.setAvroSchema(avroSchema_);
@@ -343,10 +360,6 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
     if (AcidUtils.isFullAcidTable(getMetaStoreTable().getParameters())) {
       hdfsTable.setIs_full_acid(true);
     }
-
-    TTableDescriptor tableDesc = new TTableDescriptor(tableId, TTableType.HDFS_TABLE,
-        FeCatalogUtils.getTColumnDescriptors(this),
-        getNumClusteringCols(), name_, db_.getName());
     // 'ref_' can be null when this table is the target of a CTAS statement.
     if (ref_ != null) {
       TValidWriteIdList validWriteIdList =
@@ -354,8 +367,11 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
       if (validWriteIdList != null) hdfsTable.setValid_write_ids(validWriteIdList);
       hdfsTable.setPartition_prefixes(ref_.getPartitionPrefixes());
     }
-    tableDesc.setHdfsTable(hdfsTable);
-    return tableDesc;
+    if (type == ThriftObjectType.FULL) {
+      hdfsTable.setNetwork_addresses(hostIndex_.getList());
+      hdfsTable.setSql_constraints(getSqlConstraints().toThrift());
+    }
+    return hdfsTable;
   }
 
   private static boolean isAvroFormat(Table msTbl) {
@@ -369,6 +385,20 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
       if (p.getFileFormat() == HdfsFileFormat.AVRO) return true;
     }
     return false;
+  }
+
+  protected void setAvroSchema(Table msTbl) {
+    if (avroSchema_ == null) {
+      // No Avro schema was explicitly set in the table metadata, so infer the Avro
+      // schema from the column definitions.
+      Schema inferredSchema = AvroSchemaConverter.convertFieldSchemas(
+          msTbl.getSd().getCols(), msTbl.getDbName() + "." + msTbl.getTableName());
+      avroSchema_ = inferredSchema.toString();
+    }
+  }
+
+  protected String getAvroSchema() {
+    return avroSchema_;
   }
 
   public LocalFsPartition createPrototypePartition() {
@@ -542,6 +572,7 @@ public class LocalFsTable extends LocalTable implements FeFsTable {
    * Populate constraint information by making a request to MetaProvider.
    */
   private void loadConstraints() throws TException {
+    if (sqlConstraints_ != null) return;
     sqlConstraints_ = db_.getCatalog().getMetaProvider().loadConstraints(ref_, msTable_);
   }
 

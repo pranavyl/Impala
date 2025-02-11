@@ -72,6 +72,9 @@ class DictEncoderBase {
   /// The number of entries in the dictionary.
   virtual int num_entries() const = 0;
 
+  /// Returns true if the dictionary is full.
+  virtual bool IsFull() const = 0;
+
   /// Clears all the indices (but leaves the dictionary).
   void ClearIndices() { buffered_indices_.clear(); }
 
@@ -184,9 +187,14 @@ class DictEncoder : public DictEncoderBase {
     return sizeof(Node) * nodes_.size();
   }
 
-  virtual void WriteDict(uint8_t* buffer);
+  void WriteDict(uint8_t* buffer) override;
 
-  virtual int num_entries() const { return nodes_.size(); }
+  int num_entries() const override { return nodes_.size(); }
+
+  /// Returns true if the dictionary is full.
+  bool IsFull() const override {
+    return nodes_.size() >= Node::INVALID_INDEX;
+  }
 
   /// Execute 'func' for each key that is present in the dictionary. Stops execution the
   /// first time 'func' returns an error, propagating the error. Returns OK otherwise.
@@ -226,6 +234,7 @@ class DictEncoder : public DictEncoderBase {
 
     /// The maximum number of values in the dictionary.  Chosen to be around 60% of
     /// HASH_TABLE_SIZE to limit the expected length of the chains.
+    /// Changing this value will require re-tuning test_parquet_page_index.py.
     enum { INVALID_INDEX = 40000 };
   };
 
@@ -447,7 +456,14 @@ inline uint32_t DictEncoder<T>::Hash(const T& value) const {
 
 template<>
 inline uint32_t DictEncoder<StringValue>::Hash(const StringValue& value) const {
-  return HashUtil::Hash(value.ptr, value.len, 0);
+  return HashUtil::Hash(value.Ptr(), value.Len(), 0);
+}
+
+template<>
+inline uint32_t DictEncoder<TimestampValue>::Hash(const TimestampValue& value) const {
+  // TimestampValue needs to use its own hash function, because it has padding
+  // that must be ignored for consistency.
+  return value.Hash();
 }
 
 template<typename T>
@@ -465,9 +481,10 @@ inline int DictEncoder<T>::AddToTable(const T& value, NodeIndex* bucket) {
 template<>
 inline int DictEncoder<StringValue>::AddToTable(const StringValue& value,
     NodeIndex* bucket) {
-  char* ptr_copy = reinterpret_cast<char*>(pool_->Allocate(value.len));
-  Ubsan::MemCpy(ptr_copy, value.ptr, value.len);
-  StringValue sv(ptr_copy, value.len);
+  StringValue::SimpleString value_s = value.ToSimpleString();
+  char* ptr_copy = reinterpret_cast<char*>(pool_->Allocate(value_s.len));
+  Ubsan::MemCpy(ptr_copy, value_s.ptr, value_s.len);
+  StringValue sv(ptr_copy, value_s.len);
   Node node(sv, *bucket);
   ConsumeBytes(sizeof(node));
   // Prepend the new node to this bucket's chain.

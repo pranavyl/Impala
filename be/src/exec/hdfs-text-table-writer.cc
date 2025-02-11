@@ -25,6 +25,7 @@
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "runtime/string-value.inline.h"
+#include "util/coding-util.h"
 #include "util/hdfs-util.h"
 #include "util/runtime-profile-counters.h"
 
@@ -35,7 +36,7 @@
 
 namespace impala {
 
-HdfsTextTableWriter::HdfsTextTableWriter(HdfsTableSink* parent,
+HdfsTextTableWriter::HdfsTextTableWriter(TableSinkBase* parent,
     RuntimeState* state, OutputPartition* output,
     const HdfsPartitionDescriptor* partition,
     const HdfsTableDescriptor* table_desc)
@@ -75,8 +76,8 @@ Status HdfsTextTableWriter::AppendRows(
   COUNTER_ADD(parent_->rows_inserted_counter(), limit);
 
   bool all_rows = row_group_indices.empty();
-  int num_non_partition_cols =
-      table_desc_->num_cols() - table_desc_->num_clustering_cols();
+  int num_partition_cols = table_desc_->num_clustering_cols();
+  int num_non_partition_cols = table_desc_->num_cols() - num_partition_cols;
   DCHECK_GE(output_expr_evals_.size(), num_non_partition_cols) << parent_->DebugString();
 
   {
@@ -99,7 +100,14 @@ Status HdfsTextTableWriter::AppendRows(
             StringValue sv(val_ptr, StringValue::UnpaddedCharLength(val_ptr, type.len));
             PrintEscaped(&sv);
           } else if (type.IsVarLenStringType()) {
-            PrintEscaped(reinterpret_cast<const StringValue*>(value));
+            const StringValue* string_value = reinterpret_cast<const StringValue*>(value);
+            if (type.IsBinaryType()) {
+              // TODO: try to find a more efficient implementation
+              Base64Encode(
+                  string_value->Ptr() , string_value->Len(), &rowbatch_stringstream_);
+            } else {
+              PrintEscaped(string_value);
+            }
           } else {
             output_expr_evals_[j]->PrintValue(value, &rowbatch_stringstream_);
           }
@@ -154,14 +162,15 @@ Status HdfsTextTableWriter::Flush() {
 }
 
 inline void HdfsTextTableWriter::PrintEscaped(const StringValue* str_val) {
-  for (int i = 0; i < str_val->len; ++i) {
+  StringValue::SimpleString s = str_val->ToSimpleString();
+  for (int i = 0; i < s.len; ++i) {
     if (escape_char_ == '\0') {
-      rowbatch_stringstream_ << str_val->ptr[i];
+      rowbatch_stringstream_ << s.ptr[i];
     } else {
-      if (UNLIKELY(str_val->ptr[i] == field_delim_ || str_val->ptr[i] == escape_char_)) {
+      if (UNLIKELY(s.ptr[i] == field_delim_ || s.ptr[i] == escape_char_)) {
         rowbatch_stringstream_ << escape_char_;
       }
-      rowbatch_stringstream_ << str_val->ptr[i];
+      rowbatch_stringstream_ << s.ptr[i];
     }
   }
 }

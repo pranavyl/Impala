@@ -26,14 +26,12 @@ class StatestoreSubscriberClientWrapper : public StatestoreSubscriberClient {
   public:
    StatestoreSubscriberClientWrapper(
        std::shared_ptr<::apache::thrift::protocol::TProtocol> prot)
-     : StatestoreSubscriberClient(prot) {
-   }
+     : StatestoreSubscriberClient(move(prot)) {}
 
    StatestoreSubscriberClientWrapper(
        std::shared_ptr<::apache::thrift::protocol::TProtocol> iprot,
        std::shared_ptr<::apache::thrift::protocol::TProtocol> oprot)
-     : StatestoreSubscriberClient(iprot, oprot) {
-   }
+     : StatestoreSubscriberClient(move(iprot), move(oprot)) {}
 
 /// We intentionally disable this clang warning as we intend to hide the
 /// the same-named functions defined in the base class.
@@ -54,6 +52,22 @@ class StatestoreSubscriberClientWrapper : public StatestoreSubscriberClient {
      send_UpdateState(params);
      *send_done = true;
      recv_UpdateState(_return);
+   }
+
+   void UpdateCatalogd(TUpdateCatalogdResponse& _return,
+       const TUpdateCatalogdRequest& params, bool* send_done) {
+     DCHECK(!*send_done);
+     send_UpdateCatalogd(params);
+     *send_done = true;
+     recv_UpdateCatalogd(_return);
+   }
+
+   void UpdateStatestoredRole(TUpdateStatestoredRoleResponse& _return,
+       const TUpdateStatestoredRoleRequest& params, bool* send_done) {
+     DCHECK(!*send_done);
+     send_UpdateStatestoredRole(params);
+     *send_done = true;
+     recv_UpdateStatestoredRole(_return);
    }
 
 #pragma clang diagnostic pop

@@ -1,7 +1,6 @@
 *~
 *.pyc
 derby.log
-thirdparty
 compile_commands.json
 cscope.files
 cscope.out
@@ -17,6 +16,7 @@ bin/impala-config-local.sh
 .cdh
 .cdp
 .pep8
+apache-maven-*-bin.tar.gz
 
 # distcc options
 .impala_compiler_opts*
@@ -39,6 +39,11 @@ build.ninja
 rules.ninja
 CMakeDoxyfile.in
 CMakeDoxygenDefaults.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+_CPack_Packages
+install_manifest.txt
+package/build/
 
 # Build timestamp files
 .*timestamp
@@ -49,8 +54,6 @@ docker/docker-images.txt
 
 Testing/
 llvm-ir/
-shell/gen-py/
-shell/build/
 benchmark_results*.json
 target
 

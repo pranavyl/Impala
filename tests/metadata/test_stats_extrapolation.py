@@ -15,13 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 from os import path
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.skip import SkipIfEC
 from tests.common.test_dimensions import (
-    create_exec_option_dimension,
     create_single_exec_option_dimension,
     create_uncompressed_text_dimension)
+
 
 class TestStatsExtrapolation(ImpalaTestSuite):
   """Test stats extrapolation and compute stats tablesample. Stats extrapolation is
@@ -145,7 +147,7 @@ class TestStatsExtrapolation(ImpalaTestSuite):
     col_names = [fs.name.upper() for fs in actual.schema.fieldSchemas]
     rows_col_idx = col_names.index("#ROWS")
     extrap_rows_col_idx = col_names.index("EXTRAP #ROWS")
-    for i in xrange(0, len(actual.data)):
+    for i in range(0, len(actual.data)):
       act_cols = actual.data[i].split("\t")
       exp_cols = expected.data[i].split("\t")
       assert int(exp_cols[rows_col_idx]) >= 0
@@ -172,7 +174,7 @@ class TestStatsExtrapolation(ImpalaTestSuite):
     assert len(actual.schema.fieldSchemas) == len(expected.schema.fieldSchemas)
     col_names = [fs.name.upper() for fs in actual.schema.fieldSchemas]
     ndv_col_idx = col_names.index("#DISTINCT VALUES")
-    for i in xrange(0, len(actual.data)):
+    for i in range(0, len(actual.data)):
       act_cols = actual.data[i].split("\t")
       exp_cols = expected.data[i].split("\t")
       assert int(exp_cols[ndv_col_idx]) >= 0

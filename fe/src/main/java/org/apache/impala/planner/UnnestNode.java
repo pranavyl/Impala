@@ -17,11 +17,18 @@
 
 package org.apache.impala.planner;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.CollectionTableRef;
 import org.apache.impala.analysis.Expr;
+import org.apache.impala.analysis.SlotDescriptor;
+import org.apache.impala.analysis.SlotRef;
+import org.apache.impala.analysis.ToSqlUtils;
+import org.apache.impala.analysis.TupleDescriptor;
+import org.apache.impala.analysis.TupleId;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPlanNode;
@@ -51,22 +58,22 @@ public class UnnestNode extends PlanNode {
 
   public UnnestNode(PlanNodeId id, SubplanNode containingSubplanNode,
       List<CollectionTableRef> tblRefs) {
-    super(id, "UNNEST", tblRefs);
+    super(id, "UNNEST");
     containingSubplanNode_ = containingSubplanNode;
     tblRefs_ = tblRefs;
-    collectionExprs_ = getCollectionExprs(tblRefs_);
+    Preconditions.checkState(tblRefs.size() > 0);
+    collectionExprs_ = Lists.newArrayList();
+    for (CollectionTableRef ref : tblRefs) {
+      SlotRef collectionSlotRef = (SlotRef)ref.getCollectionExpr();
+      collectionExprs_.add(collectionSlotRef);
+      tupleIds_.add(collectionSlotRef.getDesc().getItemTupleDesc().getId());
+      tblRefIds_.add(collectionSlotRef.getDesc().getItemTupleDesc().getId());
+    }
     // Assume the collection exprs have been fully resolved in analysis.
     for (Expr collectionExpr : collectionExprs_) {
       Preconditions.checkState(
           collectionExpr.isBoundByTupleIds(containingSubplanNode.getChild(0).tupleIds_));
     }
-  }
-
-  private List<Expr> getCollectionExprs(List<CollectionTableRef> collectionRefs) {
-    Preconditions.checkState(collectionRefs.size() > 0);
-    List<Expr> result = Lists.newArrayList();
-    for (CollectionTableRef ref : collectionRefs) result.add(ref.getCollectionExpr());
-    return result;
   }
 
   @Override
@@ -77,7 +84,65 @@ public class UnnestNode extends PlanNode {
     // Unnest is like a scan and must materialize the slots of its conjuncts.
     analyzer.materializeSlots(conjuncts_);
     computeMemLayout(analyzer);
+
+    checkUnnestFromUnionWithPredicate(analyzer);
   }
+
+  // Filtering an unnested collection that comes from a UNION [ALL] is not supported, see
+  // IMPALA-12753.
+  private void checkUnnestFromUnionWithPredicate(Analyzer analyzer)
+      throws AnalysisException {
+    PlanNode subplanInputNode = containingSubplanNode_.getChild(0);
+    if (!(subplanInputNode instanceof UnionNode)) return;
+
+    UnionNode union = (UnionNode) subplanInputNode;
+
+    // Tuple descriptors of the UNION and their descendants (for complex types).
+    List<TupleDescriptor> unionDescs = new ArrayList<>();
+    for (TupleId tid : union.getTupleIds()) {
+      TupleDescriptor tuple = analyzer.getDescTbl().getTupleDesc(tid);
+      getCollTupleDescs(tuple, unionDescs);
+    }
+
+    for (CollectionTableRef collTblRef : tblRefs_) {
+      final TupleDescriptor collItemTupleDesc = collTblRef.getDesc();
+
+      if (!unionDescs.contains(collItemTupleDesc)) continue;
+
+      List<Expr> predicates = analyzer.getConjuncts();
+      for (Expr pred : predicates) {
+        if (!pred.isAuxExpr()) {
+          List<Expr> matching = new ArrayList();
+          pred.collect(expr -> (expr instanceof SlotRef) &&
+              ((SlotRef) expr).getDesc().getParent().equals(collItemTupleDesc),
+              matching);
+          if (!matching.isEmpty()) {
+            throw new AnalysisException("Filtering an unnested collection that comes " +
+                "from a UNION [ALL] is not supported yet.");
+          }
+        }
+      }
+    }
+  }
+
+  // Returns the TupleDescriptors contained by 'tuple' (includes item tuple descs of
+  // collections).
+  private void getCollTupleDescs(TupleDescriptor tuple,
+      List<TupleDescriptor> tupleList) {
+    tupleList.add(tuple);
+    for (SlotDescriptor slot : tuple.getSlots()) {
+      if (slot.getType().isCollectionType()) {
+        TupleDescriptor itemTuple = slot.getItemTupleDesc();
+        Preconditions.checkNotNull(itemTuple);
+        tupleList.add(itemTuple);
+        // TODO: Continue recursively (for collections and probably also
+        // structs) once IMPALA-12751 is solved.
+      }
+    }
+  }
+
+  @Override
+  protected boolean shouldPickUpZippingUnnestConjuncts() { return true; }
 
   @Override
   public void computeStats(Analyzer analyzer) {
@@ -88,6 +153,12 @@ public class UnnestNode extends PlanNode {
     numNodes_ = containingSubplanNode_.getChild(0).getNumNodes();
     numInstances_ = containingSubplanNode_.getChild(0).getNumInstances();
     cardinality_ = capCardinalityAtLimit(cardinality_);
+  }
+
+  @Override
+  public void computeProcessingCost(TQueryOptions queryOptions) {
+    processingCost_ = ProcessingCost.basicCost(
+        getDisplayLabel(), containingSubplanNode_.getChild(0).getCardinality(), 0);
   }
 
   @Override
@@ -119,6 +190,11 @@ public class UnnestNode extends PlanNode {
   protected String getDisplayLabelDetail() {
     StringBuilder strBuilder = new StringBuilder();
     boolean first = true;
+    tblRefs_.sort( (CollectionTableRef t1, CollectionTableRef t2) -> {
+      String path1 = ToSqlUtils.getPathSql(t1.getPath());
+      String path2 = ToSqlUtils.getPathSql(t2.getPath());
+      return path1.compareTo(path2);
+    });
     for (CollectionTableRef tblRef : tblRefs_) {
       if (!first) strBuilder.append(", ");
       strBuilder.append(Joiner.on(".").join(tblRef.getPath()));

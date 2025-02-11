@@ -27,6 +27,7 @@
 
 #include "exprs/anyval-util.h"
 #include "exprs/scalar-expr.h"
+#include "gen-cpp/Metrics_types.h"
 #include "gutil/strings/charset.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/string-value.inline.h"
@@ -42,6 +43,7 @@
 
 using namespace impala_udf;
 using std::bitset;
+using std::any_of;
 
 // NOTE: be careful not to use string::append.  It is not performant.
 namespace impala {
@@ -49,11 +51,15 @@ namespace impala {
 const char* ERROR_CHARACTER_LIMIT_EXCEEDED =
   "$0 is larger than allowed limit of $1 character data.";
 
+uint64_t StringFunctions::re2_mem_limit_ = 8 << 20;
+
 // This behaves identically to the mysql implementation, namely:
 //  - 1-indexed positions
 //  - supported negative positions (count from the end of the string)
 //  - [optional] len.  No len indicates longest substr possible
-StringVal StringFunctions::Substring(FunctionContext* context,
+// Marks as IR_ALWAYS_INLINE since this is called in other overloads.
+// So the overloads can also replace GetConstFnAttr() calls in codegen.
+IR_ALWAYS_INLINE StringVal StringFunctions::Substring(FunctionContext* context,
     const StringVal& str, const BigIntVal& pos, const BigIntVal& len) {
   if (str.is_null || pos.is_null || len.is_null) return StringVal::null();
   if (context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE)) {
@@ -149,8 +155,8 @@ StringVal StringFunctions::Space(FunctionContext* context, const BigIntVal& len)
   if (len.val <= 0) return StringVal();
   if (len.val > StringVal::MAX_LENGTH) {
     context->SetError(Substitute(ERROR_CHARACTER_LIMIT_EXCEEDED,
-         "space() result",
-         PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
+        "space() result",
+        PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
     return StringVal::null();
   }
   StringVal result(context, len.val);
@@ -261,7 +267,6 @@ IntVal StringFunctions::Length(FunctionContext* context, const StringVal& str) {
 IntVal StringFunctions::Bytes(FunctionContext* context,const StringVal& str){
   if(str.is_null) return IntVal::null();
   return IntVal(str.len);
-
 }
 
 IntVal StringFunctions::CharLength(FunctionContext* context, const StringVal& str) {
@@ -285,8 +290,19 @@ IntVal StringFunctions::Utf8Length(FunctionContext* context, const StringVal& st
   return IntVal(CountUtf8Chars(str.ptr, str.len));
 }
 
-StringVal StringFunctions::Lower(FunctionContext* context, const StringVal& str) {
+// Marks as IR_ALWAYS_INLINE since this is called in MaskFunctions::MaskHash().
+// So the caller can also replace GetConstFnAttr() calls in codegen.
+IR_ALWAYS_INLINE StringVal StringFunctions::Lower(FunctionContext* context,
+    const StringVal& str) {
   if (str.is_null) return StringVal::null();
+  if (context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE)) {
+    return LowerUtf8(context, str);
+  }
+  return LowerAscii(context, str);
+}
+
+StringVal StringFunctions::LowerAscii(FunctionContext* context, const StringVal& str) {
+  // Not in UTF-8 mode, only English alphabetic characters will be converted.
   StringVal result(context, str.len);
   if (UNLIKELY(result.is_null)) return StringVal::null();
   for (int i = 0; i < str.len; ++i) {
@@ -297,6 +313,14 @@ StringVal StringFunctions::Lower(FunctionContext* context, const StringVal& str)
 
 StringVal StringFunctions::Upper(FunctionContext* context, const StringVal& str) {
   if (str.is_null) return StringVal::null();
+  if (context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE)) {
+    return UpperUtf8(context, str);
+  }
+  return UpperAscii(context, str);
+}
+
+StringVal StringFunctions::UpperAscii(FunctionContext* context, const StringVal& str) {
+  // Not in UTF-8 mode, only English alphabetic characters will be converted.
   StringVal result(context, str.len);
   if (UNLIKELY(result.is_null)) return StringVal::null();
   for (int i = 0; i < str.len; ++i) {
@@ -311,6 +335,13 @@ StringVal StringFunctions::Upper(FunctionContext* context, const StringVal& str)
 // will return NULL
 StringVal StringFunctions::InitCap(FunctionContext* context, const StringVal& str) {
   if (str.is_null) return StringVal::null();
+  if (context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE)) {
+    return InitCapUtf8(context, str);
+  }
+  return InitCapAscii(context, str);
+}
+
+StringVal StringFunctions::InitCapAscii(FunctionContext* context, const StringVal& str) {
   StringVal result(context, str.len);
   if (UNLIKELY(result.is_null)) return StringVal::null();
   uint8_t* result_ptr = result.ptr;
@@ -325,6 +356,115 @@ StringVal StringFunctions::InitCap(FunctionContext* context, const StringVal& st
     }
   }
   return result;
+}
+
+/// Reports the error in parsing multibyte characters with leading bytes and current
+/// locale. Used in Utf8CaseConversion().
+static void ReportErrorBytes(FunctionContext* context, const StringVal& str,
+    int current_idx) {
+  DCHECK_LT(current_idx, str.len);
+  stringstream ss;
+  ss << "[0x" << std::hex << (int)DCHECK_NOTNULL(str.ptr)[current_idx];
+  for (int k = 1; k < 4 && current_idx + k < str.len; ++k) {
+    ss << ", 0x" << std::hex << (int)str.ptr[current_idx + k];
+  }
+  ss << "]";
+  context->AddWarning(Substitute(
+      "Illegal multi-byte character in string. Leading bytes: $0. Current locale: $1",
+      ss.str(), std::locale("").name()).c_str());
+}
+
+/// Converts string based on the transform function 'fn'. The unit of the conversion is
+/// a wchar_t (i.e. uint32_t) which is parsed from multi bytes using std::mbtowc().
+/// The transform function 'fn' accepts two parameters: the original wchar_t and a flag
+/// indicating whether it's the first character of a word.
+/// After the transformation, the wchar_t is converted back to bytes.
+static StringVal Utf8CaseConversion(FunctionContext* context, const StringVal& str,
+    uint32_t (*fn)(uint32_t, bool*)) {
+  // Usually the upper/lower cases have the same size in bytes. Here we add 4 bytes
+  // buffer in case of illegal Unicodes.
+  int max_result_bytes = str.len + 4;
+  StringVal result(context, max_result_bytes);
+  if (UNLIKELY(result.is_null)) return StringVal::null();
+  wchar_t wc;
+  int wc_bytes;
+  bool word_start = true;
+  uint8_t* result_ptr = result.ptr;
+  std::mbstate_t wc_state{};
+  std::mbstate_t mb_state{};
+  for (int i = 0; i < str.len; i += wc_bytes) {
+    // std::mbtowc converts a multibyte sequence to a wide character. It's not
+    // thread safe. Here we use std::mbrtowc instead.
+    wc_bytes = std::mbrtowc(&wc, reinterpret_cast<char*>(str.ptr + i), str.len - i,
+        &wc_state);
+    bool needs_conversion = true;
+    if (wc_bytes == 0) {
+      // std::mbtowc returns 0 when hitting '\0'.
+      wc = 0;
+      wc_bytes = 1;
+    } else if (wc_bytes < 0) {
+      ReportErrorBytes(context, str, i);
+      // Replace it to the replacement character (U+FFFD)
+      wc = 0xFFFD;
+      needs_conversion = false;
+      // Jump to the next legal UTF-8 start byte.
+      wc_bytes = 1;
+      while (i + wc_bytes < str.len && !BitUtil::IsUtf8StartByte(str.ptr[i + wc_bytes])) {
+        wc_bytes++;
+      }
+    }
+    if (needs_conversion) wc = fn(wc, &word_start);
+    // std::wctomb converts a wide character to a multibyte sequence. It's not
+    // thread safe. Here we use std::wcrtomb instead.
+    int res_bytes = std::wcrtomb(reinterpret_cast<char*>(result_ptr), wc, &mb_state);
+    if (res_bytes <= 0) {
+      if (needs_conversion) {
+        context->AddWarning(Substitute(
+            "Ignored illegal wide character in results: $0. Current locale: $1",
+            wc, std::locale("").name()).c_str());
+      }
+      continue;
+    }
+    result_ptr += res_bytes;
+    if (result_ptr - result.ptr > max_result_bytes - 4) {
+      // Double the result buffer for overflow
+      max_result_bytes *= 2;
+      max_result_bytes = min<int>(StringVal::MAX_LENGTH,
+          static_cast<int>(BitUtil::RoundUpToPowerOfTwo(max_result_bytes)));
+      int offset = result_ptr - result.ptr;
+      if (UNLIKELY(!result.Resize(context, max_result_bytes))) return StringVal::null();
+      result_ptr = result.ptr + offset;
+    }
+  }
+  result.len = result_ptr - result.ptr;
+  return result;
+}
+
+StringVal StringFunctions::LowerUtf8(FunctionContext* context, const StringVal& str) {
+  return Utf8CaseConversion(context, str,
+      [](uint32_t wide_char, bool* word_start) {
+        return std::towlower(wide_char);
+      });
+}
+
+StringVal StringFunctions::UpperUtf8(FunctionContext* context, const StringVal& str) {
+  return Utf8CaseConversion(context, str,
+      [](uint32_t wide_char, bool* word_start) {
+        return std::towupper(wide_char);
+      });
+}
+
+StringVal StringFunctions::InitCapUtf8(FunctionContext* context, const StringVal& str) {
+  return Utf8CaseConversion(context, str,
+      [](uint32_t wide_char, bool* word_start) {
+        if (UNLIKELY(iswspace(wide_char))) {
+          *word_start = true;
+          return wide_char;
+        }
+        uint32_t res = *word_start ? std::towupper(wide_char) : std::towlower(wide_char);
+        *word_start = false;
+        return res;
+      });
 }
 
 struct ReplaceContext {
@@ -389,28 +529,30 @@ StringVal StringFunctions::Replace(FunctionContext* context, const StringVal& st
   // No match?  Skip everything.
   if (match_pos < 0) return str;
 
+  StringValue::SimpleString haystack_s = haystack.ToSimpleString();
+
   DCHECK_GT(pattern.len, 0);
-  DCHECK_GE(haystack.len, pattern.len);
+  DCHECK_GE(haystack_s.len, pattern.len);
   int buffer_space;
   const int delta = replace.len - pattern.len;
   // MAX_LENGTH is unsigned, so convert back to int to do correctly signed compare
   DCHECK_LE(delta, static_cast<int>(StringVal::MAX_LENGTH) - 1);
-  if ((delta > 0 && delta < 128) && haystack.len <= 128) {
+  if ((delta > 0 && delta < 128) && haystack_s.len <= 128) {
     // Quick estimate for potential matches - this heuristic is needed to win
     // over regexp_replace on expanding patterns.  128 is arbitrarily chosen so
     // we can't massively over-estimate the buffer size.
     int matches_possible = 0;
     char c = pattern.ptr[0];
-    for (int i = 0; i <= haystack.len - pattern.len; ++i) {
-      if (haystack.ptr[i] == c) ++matches_possible;
+    for (int i = 0; i <= haystack_s.len - pattern.len; ++i) {
+      if (haystack_s.ptr[i] == c) ++matches_possible;
     }
-    buffer_space = haystack.len + matches_possible * delta;
+    buffer_space = haystack_s.len + matches_possible * delta;
   } else {
     // Note - cannot overflow because pattern.len is at least one
     static_assert(StringVal::MAX_LENGTH - 1 + StringVal::MAX_LENGTH <=
         std::numeric_limits<decltype(buffer_space)>::max(),
         "Buffer space computation can overflow");
-    buffer_space = haystack.len + delta;
+    buffer_space = haystack_s.len + delta;
   }
 
   StringVal result(context, buffer_space);
@@ -419,10 +561,10 @@ StringVal StringFunctions::Replace(FunctionContext* context, const StringVal& st
 
   uint8_t* ptr = result.ptr;
   int consumed = 0;
-  while (match_pos + pattern.len <= haystack.len) {
+  while (match_pos + pattern.len <= haystack_s.len) {
     // Copy in original string
     const int unmatched_bytes = match_pos - consumed;
-    memcpy(ptr, &haystack.ptr[consumed], unmatched_bytes);
+    memcpy(ptr, &haystack_s.ptr[consumed], unmatched_bytes);
     DCHECK_LE(ptr - result.ptr + unmatched_bytes, buffer_space);
     ptr += unmatched_bytes;
 
@@ -444,7 +586,7 @@ StringVal StringFunctions::Replace(FunctionContext* context, const StringVal& st
     // If we had an enlarging pattern, we may need more space
     if (delta > 0) {
       const int bytes_produced = ptr - result.ptr;
-      const int bytes_remaining = haystack.len - consumed;
+      const int bytes_remaining = haystack_s.len - consumed;
       DCHECK_LE(bytes_produced, StringVal::MAX_LENGTH);
       DCHECK_LE(bytes_remaining, StringVal::MAX_LENGTH - 1);
       // Note: by above, cannot overflow
@@ -477,10 +619,10 @@ StringVal StringFunctions::Replace(FunctionContext* context, const StringVal& st
   }
 
   // Copy in remainder and re-adjust size
-  const int bytes_remaining = haystack.len - consumed;
+  const int bytes_remaining = haystack_s.len - consumed;
   result.len = ptr - result.ptr + bytes_remaining;
   DCHECK_LE(result.len, buffer_space);
-  memcpy(ptr, &haystack.ptr[consumed], bytes_remaining);
+  memcpy(ptr, &haystack_s.ptr[consumed], bytes_remaining);
 
   return result;
 }
@@ -555,35 +697,90 @@ StringVal StringFunctions::Translate(FunctionContext* context, const StringVal& 
   return result;
 }
 
-void StringFunctions::TrimPrepare(
-    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+void StringFunctions::TrimContext::Reset(const StringVal& chars_to_trim) {
+  single_byte_chars_.reset();
+  double_byte_chars_.clear();
+  triple_byte_chars_.clear();
+  quadruple_byte_chars_.clear();
+
+  if (!utf8_mode_) {
+    for (size_t i = 0; i < chars_to_trim.len; ++i) {
+      single_byte_chars_.set(chars_to_trim.ptr[i], true);
+    }
+    return;
+  }
+
+  for (size_t i = 0, char_size = 0; i < chars_to_trim.len; i += char_size) {
+    char_size = BitUtil::NumBytesInUtf8Encoding(chars_to_trim.ptr[i]);
+
+    // If the remaining number of bytes does not match the number of bytes specified by
+    // the UTF-8 character, we may have encountered an illegal UTF-8 character.
+    // In order to prevent subsequent data access from going out of bounds, restrictions
+    // are placed here to ensure that accessing pointers to multi-byte characters is
+    // always safe.
+    if (UNLIKELY(i + char_size > chars_to_trim.len)) {
+      char_size = chars_to_trim.len - i;
+    }
+
+    switch (char_size) {
+      case 1: single_byte_chars_.set(chars_to_trim.ptr[i], true); break;
+      case 2: double_byte_chars_.push_back(&chars_to_trim.ptr[i]); break;
+      case 3: triple_byte_chars_.push_back(&chars_to_trim.ptr[i]); break;
+      case 4: quadruple_byte_chars_.push_back(&chars_to_trim.ptr[i]); break;
+      default: DCHECK(false); break;
+    }
+  }
+}
+
+bool StringFunctions::TrimContext::Contains(const uint8_t* utf8_char, int len) const {
+  auto eq = [&](const uint8_t* c){ return memcmp(c, utf8_char, len) == 0; };
+  switch (len) {
+    case 1: return single_byte_chars_.test(*utf8_char);
+    case 2: return any_of(double_byte_chars_.begin(), double_byte_chars_.end(), eq);
+    case 3: return any_of(triple_byte_chars_.begin(), triple_byte_chars_.end(), eq);
+    case 4: return any_of(quadruple_byte_chars_.begin(), quadruple_byte_chars_.end(), eq);
+    default: DCHECK(false); return false;
+  }
+}
+
+void StringFunctions::TrimPrepare(FunctionContext* context,
+    FunctionContext::FunctionStateScope scope) {
+  bool utf8_mode = context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE);
+  DoTrimPrepare(context, scope, utf8_mode);
+}
+
+void StringFunctions::Utf8TrimPrepare(FunctionContext* context,
+    FunctionContext::FunctionStateScope scope) {
+  DoTrimPrepare(context, scope, true /* utf8_mode */);
+}
+
+void StringFunctions::DoTrimPrepare(FunctionContext* context,
+    FunctionContext::FunctionStateScope scope, bool utf8_mode) {
   if (scope != FunctionContext::THREAD_LOCAL) return;
-  // Create a bitset to hold the unique characters to trim.
-  bitset<256>* unique_chars = new bitset<256>();
-  context->SetFunctionState(scope, unique_chars);
+  TrimContext* trim_ctx = new TrimContext(utf8_mode);
+  context->SetFunctionState(scope, trim_ctx);
+
   // If the caller didn't specify the set of characters to trim, it means
   // that we're only trimming whitespace. Return early in that case.
   // There can be either 1 or 2 arguments.
   DCHECK(context->GetNumArgs() == 1 || context->GetNumArgs() == 2);
   if (context->GetNumArgs() == 1) {
-    unique_chars->set(static_cast<int>(' '), true);
+    trim_ctx->Reset(StringVal(" "));
     return;
   }
   if (!context->IsArgConstant(1)) return;
   DCHECK_EQ(context->GetArgType(1)->type, FunctionContext::TYPE_STRING);
   StringVal* chars_to_trim = reinterpret_cast<StringVal*>(context->GetConstantArg(1));
   if (chars_to_trim->is_null) return; // We shouldn't peek into Null StringVals
-  for (int32_t i = 0; i < chars_to_trim->len; ++i) {
-    unique_chars->set(static_cast<int>(chars_to_trim->ptr[i]), true);
-  }
+  trim_ctx->Reset(*chars_to_trim);
 }
 
 void StringFunctions::TrimClose(
     FunctionContext* context, FunctionContext::FunctionStateScope scope) {
   if (scope != FunctionContext::THREAD_LOCAL) return;
-  bitset<256>* unique_chars = reinterpret_cast<bitset<256>*>(
-      context->GetFunctionState(scope));
-  delete unique_chars;
+  TrimContext* trim_ctx =
+      reinterpret_cast<TrimContext*>(context->GetFunctionState(scope));
+  delete trim_ctx;
   context->SetFunctionState(scope, nullptr);
 }
 
@@ -591,34 +788,67 @@ template <StringFunctions::TrimPosition D, bool IS_IMPLICIT_WHITESPACE>
 StringVal StringFunctions::DoTrimString(FunctionContext* ctx,
     const StringVal& str, const StringVal& chars_to_trim) {
   if (str.is_null) return StringVal::null();
-  bitset<256>* unique_chars = reinterpret_cast<bitset<256>*>(
+  TrimContext* trim_ctx = reinterpret_cast<TrimContext*>(
       ctx->GetFunctionState(FunctionContext::THREAD_LOCAL));
-  // When 'chars_to_trim' is unique for each element (e.g. when 'chars_to_trim'
-  // is each element of a table column), we need to prepare a bitset of unique
-  // characters here instead of using the bitset from function context.
+
+  // When 'chars_to_trim' is not a constant, we need to reset TrimContext with new
+  // 'chars_to_trim'.
   if (!IS_IMPLICIT_WHITESPACE && !ctx->IsArgConstant(1)) {
     if (chars_to_trim.is_null) return str;
-    unique_chars->reset();
-    for (int32_t i = 0; i < chars_to_trim.len; ++i) {
-      unique_chars->set(static_cast<int>(chars_to_trim.ptr[i]), true);
-    }
+    trim_ctx->Reset(chars_to_trim);
   }
-  // Find new starting position.
+
+  // When dealing with UTF-8 characters in UTF-8 mode, use DoUtf8TrimString().
+  if (trim_ctx->utf8_mode()) {
+    return DoUtf8TrimString<D>(str, *trim_ctx);
+  }
+
+  // Otherwise, we continue to maintain the old behavior.
   int32_t begin = 0;
   int32_t end = str.len - 1;
-  if (D == LEADING || D == BOTH) {
-    while (begin < str.len &&
-        unique_chars->test(static_cast<int>(str.ptr[begin]))) {
+  // Find new starting position.
+  if constexpr (D == LEADING || D == BOTH) {
+    while (begin < str.len && trim_ctx->Contains(str.ptr[begin])) {
       ++begin;
     }
   }
   // Find new ending position.
-  if (D == TRAILING || D == BOTH) {
-    while (end >= begin && unique_chars->test(static_cast<int>(str.ptr[end]))) {
+  if constexpr (D == TRAILING || D == BOTH) {
+    while (end >= begin && trim_ctx->Contains(str.ptr[end])) {
       --end;
     }
   }
   return StringVal(str.ptr + begin, end - begin + 1);
+}
+
+template <StringFunctions::TrimPosition D>
+StringVal StringFunctions::DoUtf8TrimString(const StringVal& str,
+    const TrimContext& trim_ctx) {
+  if (UNLIKELY(str.len == 0)) return str;
+
+  const uint8_t* begin = str.ptr;
+  const uint8_t* end = begin + str.len;
+  // Find new starting position.
+  if constexpr (D == LEADING || D == BOTH) {
+    while (begin < end) {
+      size_t char_size = BitUtil::NumBytesInUtf8Encoding(*begin);
+      if (UNLIKELY(begin + char_size > end)) char_size = end - begin;
+      if (!trim_ctx.Contains(begin, char_size)) break;
+      begin += char_size;
+    }
+  }
+  // Find new ending position.
+  if constexpr (D == TRAILING || D == BOTH) {
+    while (begin < end) {
+      int char_index = FindUtf8PosBackward(begin, end - begin, 0);
+      DCHECK_NE(char_index, -1);
+      const uint8_t* char_begin = begin + char_index;
+      if (!trim_ctx.Contains(char_begin, end - char_begin)) break;
+      end = char_begin;
+    }
+  }
+
+  return StringVal(const_cast<uint8_t*>(begin), end - begin);
 }
 
 StringVal StringFunctions::Trim(FunctionContext* context, const StringVal& str) {
@@ -654,8 +884,10 @@ IntVal StringFunctions::Ascii(FunctionContext* context, const StringVal& str) {
   return IntVal((str.len == 0) ? 0 : static_cast<int32_t>(str.ptr[0]));
 }
 
-IntVal StringFunctions::Instr(FunctionContext* context, const StringVal& str,
-    const StringVal& substr, const BigIntVal& start_position,
+// Marks as IR_ALWAYS_INLINE since this is called in other overloads.
+// So the overloads can also replace GetConstFnAttr() calls in codegen.
+IR_ALWAYS_INLINE IntVal StringFunctions::Instr(FunctionContext* context,
+    const StringVal& str, const StringVal& substr, const BigIntVal& start_position,
     const BigIntVal& occurrence) {
   if (str.is_null || substr.is_null || start_position.is_null || occurrence.is_null) {
     return IntVal::null();
@@ -670,7 +902,9 @@ IntVal StringFunctions::Instr(FunctionContext* context, const StringVal& str,
 
   bool utf8_mode = context->impl()->GetConstFnAttr(FunctionContextImpl::UTF8_MODE);
   StringValue haystack = StringValue::FromStringVal(str);
+  StringValue::SimpleString haystack_s = haystack.ToSimpleString();
   StringValue needle = StringValue::FromStringVal(substr);
+  StringValue::SimpleString needle_s = needle.ToSimpleString();
   StringSearch search(&needle);
   int match_pos = -1;
   if (start_position.val > 0) {
@@ -679,9 +913,9 @@ IntVal StringFunctions::Instr(FunctionContext* context, const StringVal& str,
     if (utf8_mode) {
       search_start_pos = FindUtf8PosForward(str.ptr, str.len, search_start_pos);
     }
-    if (search_start_pos >= haystack.len) return IntVal(0);
+    if (search_start_pos >= haystack_s.len) return IntVal(0);
     for (int match_num = 0; match_num < occurrence.val; ++match_num) {
-      DCHECK_LE(search_start_pos, haystack.len);
+      DCHECK_LE(search_start_pos, haystack_s.len);
       StringValue haystack_substring = haystack.Substring(search_start_pos);
       int match_pos_in_substring = search.Search(&haystack_substring);
       if (match_pos_in_substring < 0) return IntVal(0);
@@ -692,17 +926,17 @@ IntVal StringFunctions::Instr(FunctionContext* context, const StringVal& str,
     // A negative starting position indicates searching from the right.
     int search_start_pos = utf8_mode ?
         FindUtf8PosBackward(str.ptr, str.len, -start_position.val - 1) :
-        haystack.len + start_position.val;
+        haystack_s.len + start_position.val;
     // The needle must fit between search_start_pos and the end of the string
-    if (search_start_pos + needle.len > haystack.len) {
-      search_start_pos = haystack.len - needle.len;
+    if (search_start_pos + needle_s.len > haystack_s.len) {
+      search_start_pos = haystack_s.len - needle_s.len;
     }
     if (search_start_pos < 0) return IntVal(0);
     for (int match_num = 0; match_num < occurrence.val; ++match_num) {
-      DCHECK_GE(search_start_pos + needle.len, 0);
-      DCHECK_LE(search_start_pos + needle.len, haystack.len);
+      DCHECK_GE(search_start_pos + needle_s.len, 0);
+      DCHECK_LE(search_start_pos + needle_s.len, haystack_s.len);
       StringValue haystack_substring =
-          haystack.Substring(0, search_start_pos + needle.len);
+          haystack.Substring(0, search_start_pos + needle_s.len);
       match_pos = search.RSearch(&haystack_substring);
       if (match_pos < 0) return IntVal(0);
       search_start_pos = match_pos - 1;
@@ -749,6 +983,8 @@ re2::RE2* CompileRegex(const StringVal& pattern, string* error_str,
   options.set_log_errors(false);
   // Return the leftmost longest match (rather than the first match).
   options.set_longest_match(true);
+  // Set the maximum memory used by re2's regex engine for storage
+  StringFunctions::SetRE2MemOpt(&options);
   if (!match_parameter.is_null &&
       !StringFunctions::SetRE2Options(match_parameter, error_str, &options)) {
     return NULL;
@@ -793,6 +1029,19 @@ bool StringFunctions::SetRE2Options(const StringVal& match_parameter,
     }
   }
   return true;
+}
+
+void StringFunctions::SetRE2MemLimit(int64_t re2_mem_limit) {
+  // TODO: include the memory requirement for re2 in the memory planner estimates
+  DCHECK(re2_mem_limit > 0);
+  StringFunctions::re2_mem_limit_ = re2_mem_limit;
+}
+
+// Set the maximum memory used by re2's regex engine for a compiled regex expression's
+// storage. By default, it uses 8 MiB. This can be used to avoid DFA state cache flush
+// resulting in slower execution
+void StringFunctions::SetRE2MemOpt(re2::RE2::Options* opts) {
+  opts->set_max_mem(StringFunctions::re2_mem_limit_);
 }
 
 void StringFunctions::RegexpPrepare(
@@ -1006,8 +1255,8 @@ StringVal StringFunctions::Concat(
 
   if (total_size > StringVal::MAX_LENGTH) {
     context->SetError(Substitute(ERROR_CHARACTER_LIMIT_EXCEEDED,
-         "Concatenated string length",
-         PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
+        "Concatenated string length",
+        PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
     return StringVal::null();
   }
 
@@ -1054,8 +1303,8 @@ StringVal StringFunctions::ConcatWs(FunctionContext* context, const StringVal& s
 
   if (total_size > StringVal::MAX_LENGTH) {
     context->SetError(Substitute(ERROR_CHARACTER_LIMIT_EXCEEDED,
-         "Concatenated string length",
-         PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
+        "Concatenated string length",
+        PrettyPrinter::Print(StringVal::MAX_LENGTH, TUnit::BYTES)).c_str());
     return StringVal::null();
   }
 
@@ -1186,7 +1435,7 @@ StringVal StringFunctions::ParseUrlKey(FunctionContext* ctx, const StringVal& ur
 
   StringValue result;
   if (!UrlParser::ParseUrlKey(StringValue::FromStringVal(url), url_part,
-                              StringValue::FromStringVal(key), &result)) {
+      StringValue::FromStringVal(key), &result)) {
     // url is malformed, or url_part is invalid.
     if (url_part == UrlParser::INVALID) {
       stringstream ss;
@@ -1287,7 +1536,7 @@ StringVal StringFunctions::Base64Encode(FunctionContext* ctx, const StringVal& s
   }
   StringVal result(ctx, out_max);
   if (UNLIKELY(result.is_null)) return result;
-  int64_t out_len = 0;
+  unsigned out_len = 0;
   if (UNLIKELY(!impala::Base64Encode(
           reinterpret_cast<const char*>(str.ptr), str.len,
           out_max, reinterpret_cast<char*>(result.ptr), &out_len))) {
@@ -1316,7 +1565,7 @@ StringVal StringFunctions::Base64Decode(FunctionContext* ctx, const StringVal& s
   }
   StringVal result(ctx, out_max);
   if (UNLIKELY(result.is_null)) return result;
-  int64_t out_len = 0;
+  unsigned out_len = 0;
   if (UNLIKELY(!impala::Base64Decode(
           reinterpret_cast<const char*>(str.ptr), static_cast<int64_t>(str.len),
           out_max, reinterpret_cast<char*>(result.ptr), &out_len))) {
@@ -1466,8 +1715,8 @@ DoubleVal StringFunctions::JaroSimilarity(
   }
   double m = static_cast<double>(matching_characters);
   double jaro_similarity = 1.0 / 3.0  * ( m / static_cast<double>(s1len)
-                                        + m / static_cast<double>(s2len)
-                                        + (m - transpositions) / m );
+      + m / static_cast<double>(s2len)
+      + (m - transpositions) / m );
 
   ctx->Free(reinterpret_cast<uint8_t*>(s1_matching));
   ctx->Free(reinterpret_cast<uint8_t*>(s2_matching));
@@ -1485,27 +1734,27 @@ DoubleVal StringFunctions::JaroDistance(
 }
 
 DoubleVal StringFunctions::JaroWinklerDistance(FunctionContext* ctx,
-      const StringVal& s1, const StringVal& s2) {
+    const StringVal& s1, const StringVal& s2) {
   return StringFunctions::JaroWinklerDistance(ctx, s1, s2,
-    DoubleVal(0.1), DoubleVal(0.7));
+      DoubleVal(0.1), DoubleVal(0.7));
 }
 
 DoubleVal StringFunctions::JaroWinklerDistance(FunctionContext* ctx,
-      const StringVal& s1, const StringVal& s2,
-      const DoubleVal& scaling_factor) {
+    const StringVal& s1, const StringVal& s2,
+    const DoubleVal& scaling_factor) {
   return StringFunctions::JaroWinklerDistance(ctx, s1, s2,
-    scaling_factor, DoubleVal(0.7));
+      scaling_factor, DoubleVal(0.7));
 }
 
 // Based on https://en.wikipedia.org/wiki/Jaro%E2%80%93Winkler_distance
 // Implements Jaro-Winkler distance
 // Extended with boost_theshold: Winkler's modification only applies if Jaro exceeds it
 DoubleVal StringFunctions::JaroWinklerDistance(FunctionContext* ctx,
-      const StringVal& s1, const StringVal& s2,
-      const DoubleVal& scaling_factor, const DoubleVal& boost_threshold) {
+    const StringVal& s1, const StringVal& s2,
+    const DoubleVal& scaling_factor, const DoubleVal& boost_threshold) {
 
   DoubleVal jaro_winkler_similarity = StringFunctions::JaroWinklerSimilarity(
-    ctx, s1, s2, scaling_factor, boost_threshold);
+      ctx, s1, s2, scaling_factor, boost_threshold);
 
   if (jaro_winkler_similarity.is_null) return DoubleVal::null();
   if (jaro_winkler_similarity.val == -1.0) return DoubleVal(-1.0);
@@ -1513,24 +1762,24 @@ DoubleVal StringFunctions::JaroWinklerDistance(FunctionContext* ctx,
 }
 
 DoubleVal StringFunctions::JaroWinklerSimilarity(FunctionContext* ctx,
-      const StringVal& s1, const StringVal& s2) {
+    const StringVal& s1, const StringVal& s2) {
   return StringFunctions::JaroWinklerSimilarity(ctx, s1, s2,
-    DoubleVal(0.1), DoubleVal(0.7));
+      DoubleVal(0.1), DoubleVal(0.7));
 }
 
 DoubleVal StringFunctions::JaroWinklerSimilarity(FunctionContext* ctx,
-      const StringVal& s1, const StringVal& s2,
-      const DoubleVal& scaling_factor) {
+    const StringVal& s1, const StringVal& s2,
+    const DoubleVal& scaling_factor) {
   return StringFunctions::JaroWinklerSimilarity(ctx, s1, s2,
-    scaling_factor, DoubleVal(0.7));
+      scaling_factor, DoubleVal(0.7));
 }
 
 // Based on https://en.wikipedia.org/wiki/Jaro%E2%80%93Winkler_distance
 // Implements Jaro-Winkler similarity
 // Extended with boost_theshold: Winkler's modification only applies if Jaro exceeds it
 DoubleVal StringFunctions::JaroWinklerSimilarity(FunctionContext* ctx,
-      const StringVal& s1, const StringVal& s2,
-      const DoubleVal& scaling_factor, const DoubleVal& boost_threshold) {
+    const StringVal& s1, const StringVal& s2,
+    const DoubleVal& scaling_factor, const DoubleVal& boost_threshold) {
 
   constexpr int MAX_PREFIX_LENGTH = 4;
   int s1len = s1.len;
@@ -1564,12 +1813,12 @@ DoubleVal StringFunctions::JaroWinklerSimilarity(FunctionContext* ctx,
     int common_length = std::min(MAX_PREFIX_LENGTH, std::min(s1len, s2len));
     int common_prefix = 0;
     while (common_prefix < common_length &&
-           s1.ptr[common_prefix] == s2.ptr[common_prefix]) {
+        s1.ptr[common_prefix] == s2.ptr[common_prefix]) {
       common_prefix++;
     }
 
     jaro_winkler_similarity += common_prefix * scaling_factor.val *
-      (1.0 - jaro_similarity.val);
+        (1.0 - jaro_similarity.val);
   }
   return DoubleVal(jaro_winkler_similarity);
 }
@@ -1632,8 +1881,8 @@ IntVal StringFunctions::DamerauLevenshtein(
         l_cost = 1;
       }
       d[i][j] = std::min(d[i - 1][j - 1] + l_cost, // substitution
-                         std::min(d[i][j - 1] + 1, // insertion
-                                  d[i - 1][j] + 1) // deletion
+          std::min(d[i][j - 1] + 1, // insertion
+              d[i - 1][j] + 1) // deletion
       );
       if (i > 1 && j > 1 && s1.ptr[i - 1] == s2.ptr[j - 2]
           && s1.ptr[i - 2] == s2.ptr[j - 1]) {
@@ -1646,5 +1895,77 @@ IntVal StringFunctions::DamerauLevenshtein(
   ctx->Free(reinterpret_cast<uint8_t*>(d));
   ctx->Free(reinterpret_cast<uint8_t*>(rows));
   return IntVal(result);
+}
+
+template <typename T>
+static StringVal prettyPrint(FunctionContext* context, const T& int_val,
+    const TUnit::type& unit) {
+  if (int_val.is_null) {
+    return StringVal::null();
+  }
+
+  const string& fmt_str = PrettyPrinter::Print(int_val.val, unit);
+
+  StringVal result(context, fmt_str.size());
+  if (UNLIKELY(result.is_null)) return StringVal::null();
+  uint8_t* ptr = result.ptr;
+  memcpy(ptr, fmt_str.c_str(), fmt_str.size());
+
+  return result;
+}
+
+StringVal StringFunctions::PrettyPrintMemory(FunctionContext* context,
+    const BigIntVal& bytes) {
+  return prettyPrint(context, bytes, TUnit::BYTES);
+}
+
+StringVal StringFunctions::PrettyPrintMemory(FunctionContext* context,
+    const IntVal& bytes) {
+  return prettyPrint(context, bytes, TUnit::BYTES);
+}
+
+StringVal StringFunctions::PrettyPrintMemory(FunctionContext* context,
+    const SmallIntVal& bytes) {
+  return prettyPrint(context, bytes, TUnit::BYTES);
+}
+
+StringVal StringFunctions::PrettyPrintMemory(FunctionContext* context,
+    const TinyIntVal& bytes) {
+  return prettyPrint(context, bytes, TUnit::BYTES);
+}
+
+// The state is a bool used to reduce excessive logs.
+void StringFunctions::AesPrepare(FunctionContext* context,
+    FunctionContext::FunctionStateScope scope) {
+  if (scope != FunctionContext::THREAD_LOCAL) return;
+  bool* state = reinterpret_cast<bool*>(context->Allocate(sizeof(bool)));
+  if (state == nullptr) {
+    context->AddWarning("Failed to allocate memory for function state.");
+    return;
+  }
+  *state = false;
+  context->SetFunctionState(scope, state);
+}
+
+void StringFunctions::AesClose(FunctionContext* context,
+    FunctionContext::FunctionStateScope scope) {
+  if (scope != FunctionContext::THREAD_LOCAL) return;
+  bool* state = reinterpret_cast<bool*>(
+      context->GetFunctionState(FunctionContext::THREAD_LOCAL));
+  if (state != nullptr) {
+    context->Free(reinterpret_cast<uint8_t*>(state));
+    context->SetFunctionState(scope, nullptr);
+  }
+}
+
+// Implementation details and comments are provided in string-functions.cc file.
+StringVal StringFunctions::AesDecrypt(FunctionContext* ctx, const StringVal& expr,
+    const StringVal& key, const StringVal& mode, const StringVal& iv) {
+  return AesDecryptImpl(ctx, expr, key, mode, iv);
+}
+
+StringVal StringFunctions::AesEncrypt(FunctionContext* ctx, const StringVal& expr,
+    const StringVal& key, const StringVal& mode, const StringVal& iv) {
+  return AesEncryptImpl(ctx, expr, key, mode, iv);
 }
 }

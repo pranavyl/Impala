@@ -17,6 +17,7 @@
 
 package org.apache.impala.analysis;
 
+import java.util.Objects;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -98,8 +99,13 @@ public class LikePredicate extends Predicate {
   }
 
   @Override
-  public boolean localEquals(Expr that) {
+  protected boolean localEquals(Expr that) {
     return super.localEquals(that) && ((LikePredicate) that).op_ == op_;
+  }
+
+  @Override
+  protected int localHash() {
+    return Objects.hash(super.localHash(), op_);
   }
 
   @Override
@@ -113,14 +119,18 @@ public class LikePredicate extends Predicate {
     msg.node_type = TExprNodeType.FUNCTION_CALL;
   }
 
+  private static boolean isLikeableType(Type type) {
+    return (type.isStringType() && !type.isBinary()) || type.isNull();
+  }
+
   @Override
   protected void analyzeImpl(Analyzer analyzer) throws AnalysisException {
     super.analyzeImpl(analyzer);
-    if (!getChild(0).getType().isStringType() && !getChild(0).getType().isNull()) {
+    if (!isLikeableType(getChild(0).getType())) {
       throw new AnalysisException(
           "left operand of " + op_.toString() + " must be of type STRING: " + toSql());
     }
-    if (!getChild(1).getType().isStringType() && !getChild(1).getType().isNull()) {
+    if (!isLikeableType(getChild(1).getType())) {
       throw new AnalysisException(
           "right operand of " + op_.toString() + " must be of type STRING: " + toSql());
     }
@@ -142,7 +152,7 @@ public class LikePredicate extends Predicate {
             "invalid regular expression in '" + this.toSql() + "'");
       }
     }
-    castForFunctionCall(false, analyzer.isDecimalV2());
+    castForFunctionCall(false, analyzer.getRegularCompatibilityLevel());
   }
 
   @Override
@@ -168,4 +178,8 @@ public class LikePredicate extends Predicate {
   public Expr clone() { return new LikePredicate(this); }
 
   public Operator getOp() { return op_; }
+
+  // Return false since comparison can be expensive.
+  @Override
+  public boolean shouldConvertToCNF() { return false; }
 }

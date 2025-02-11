@@ -100,13 +100,6 @@ class PlanRootSink : public DataSink {
   virtual void Cancel(RuntimeState* state) = 0;
 
  protected:
-  /// Validates that all collection-typed slots in the given batch are set to NULL
-  /// See SubplanNode for details on when collection-typed slots are set to NULL.
-  /// TODO: This validation will become obsolete when we can return collection values.
-  /// We will then need a different mechanism to assert the correct behavior of the
-  /// SubplanNode with respect to setting collection-slots to NULL.
-  void ValidateCollectionSlots(const RowDescriptor& row_desc, RowBatch* batch);
-
   /// Check to ensure that the number of rows produced by query execution does not exceed
   /// the NUM_ROWS_PRODUCED_LIMIT query option. Returns an error Status if the given
   /// batch causes the limit to be exceeded. Updates the value of num_rows_produced_.
@@ -127,6 +120,9 @@ class PlanRootSink : public DataSink {
   /// The rate at which rows are sent to this PlanRootSink via Send(). Initialized in
   /// Prepare().
   RuntimeProfile::Counter* rows_sent_rate_ = nullptr;
+
+  /// Measures the amount of time spend converting results to the client protocol
+  RuntimeProfile::Counter* create_result_set_timer_ = nullptr;
 
  private:
   /// Limit on the number of rows produced by this query, initialized by the constructor.

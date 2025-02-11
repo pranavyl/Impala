@@ -30,6 +30,7 @@
 #include "transport/TSasl.h"
 #include "rpc/authentication.h"
 #include "rpc/thrift-server.h"
+#include "rpc/thrift-util.h"
 #include "gen-cpp/Types_types.h"
 
 DECLARE_string(principal);
@@ -39,9 +40,7 @@ namespace impala {
 /// Super class for templatized thrift clients.
 class ThriftClientImpl {
  public:
-  ~ThriftClientImpl() {
-    Close();
-  }
+  virtual ~ThriftClientImpl() { Close(); }
 
   const TNetworkAddress& address() const { return address_; }
 
@@ -63,10 +62,13 @@ class ThriftClientImpl {
   /// Set send timeout on the underlying TSocket.
   void setSendTimeout(int32_t ms) { socket_->setSendTimeout(ms); }
 
+  /// Set connect timeout on the underlying TSocket.
+  void setConnTimeout(int32_t ms) { socket_->setConnTimeout(ms); }
+
   Status init_status() { return init_status_; }
 
  protected:
-  ThriftClientImpl(const std::string& ipaddress, int port, bool ssl);
+  ThriftClientImpl(const std::string& ipaddress, int port, bool ssl, bool disable_tls12);
 
   /// Create a new socket without opening it. Returns an error if the socket could not
   /// be created.
@@ -78,6 +80,10 @@ class ThriftClientImpl {
   /// True if ssl encryption is enabled on this connection.
   bool ssl_;
 
+  /// Whether to disable TLSv1.2. This is used to test TLSv1.3 ciphersuites.
+  /// TODO: Remove this when Thrift supports ssl_minimum_version=tlsv1.3.
+  bool disable_tls12_;
+
   Status init_status_;
 
   /// Sasl Client object.  Contains client kerberos identification data.
@@ -87,7 +93,7 @@ class ThriftClientImpl {
   /// This factory sets up the openSSL library state and needs to be alive as long as its
   /// owner(a ThriftClientImpl instance) does. Otherwise the OpenSSL state is lost
   /// (refer IMPALA-2747).
-  boost::scoped_ptr<apache::thrift::transport::TSSLSocketFactory> ssl_factory_;
+  boost::scoped_ptr<ImpalaTlsSocketFactory> ssl_factory_;
 
   /// All shared pointers, because Thrift requires them to be
   std::shared_ptr<apache::thrift::transport::TSocket> socket_;
@@ -109,9 +115,11 @@ class ThriftClient : public ThriftClientImpl {
   ///  - auth_provider: Authentication scheme to use. If NULL, use the global default
   ///    client<->demon authentication scheme.
   ///  - ssl: if true, SSL is enabled on this connection
+  ///  - disable_tls12: If true, disable TLS 1.2. This is used for testing TLS 1.3.
+  ///    It can be removed when Thrift supports ssl_minimum_version=tlsv1.3.
   ThriftClient(const std::string& ipaddress, int port,
       const std::string& service_name = "", AuthProvider* auth_provider = NULL,
-      bool ssl = false);
+      bool ssl = false, bool disable_tls12 = false);
 
   /// Returns the object used to actually make RPCs against the remote server
   InterfaceType* iface() { return iface_.get(); }
@@ -124,8 +132,9 @@ class ThriftClient : public ThriftClientImpl {
 
 template <class InterfaceType>
 ThriftClient<InterfaceType>::ThriftClient(const std::string& ipaddress, int port,
-    const std::string& service_name, AuthProvider* auth_provider, bool ssl)
-    : ThriftClientImpl(ipaddress, port, ssl),
+    const std::string& service_name, AuthProvider* auth_provider, bool ssl,
+    bool disable_tls12)
+  : ThriftClientImpl(ipaddress, port, ssl, disable_tls12),
       iface_(new InterfaceType(protocol_)),
       auth_provider_(auth_provider) {
 
@@ -145,7 +154,7 @@ ThriftClient<InterfaceType>::ThriftClient(const std::string& ipaddress, int port
   }
 
   // transport_ is created by wrapping the socket_ in the TTransport provided by the
-  // auth_provider_ and then a TBufferedTransport (IMPALA-1928).
+  // auth_provider_ and then a ThriftServer::BufferedTransport (IMPALA-1928).
   transport_ = socket_;
   init_status_ = auth_provider_->WrapClientTransport(address_.hostname, transport_,
       service_name, &transport_);

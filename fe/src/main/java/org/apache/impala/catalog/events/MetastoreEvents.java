@@ -17,6 +17,7 @@
 
 package org.apache.impala.catalog.events;
 
+import com.codahale.metrics.Timer;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
@@ -31,20 +32,21 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hive.metastore.api.Database;
-import org.apache.hadoop.hive.metastore.api.GetAllWriteEventInfoRequest;
+import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.NotificationEvent;
 import org.apache.hadoop.hive.metastore.api.Partition;
+import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.TxnToWriteId;
-import org.apache.hadoop.hive.metastore.api.WriteEventInfo;
 import org.apache.hadoop.hive.metastore.messaging.AbortTxnMessage;
 import org.apache.hadoop.hive.metastore.messaging.AddPartitionMessage;
 import org.apache.hadoop.hive.metastore.messaging.AllocWriteIdMessage;
 import org.apache.hadoop.hive.metastore.messaging.AlterPartitionMessage;
-import org.apache.hadoop.hive.metastore.messaging.CommitTxnMessage;
 import org.apache.hadoop.hive.metastore.messaging.CreateTableMessage;
 import org.apache.hadoop.hive.metastore.messaging.DropPartitionMessage;
 import org.apache.hadoop.hive.metastore.messaging.json.JSONAlterDatabaseMessage;
@@ -59,24 +61,30 @@ import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.CatalogServiceCatalog;
 import org.apache.impala.catalog.DatabaseNotFoundException;
 import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.FileMetadataLoadOpts;
 import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.MetaStoreClientPool;
 import org.apache.impala.catalog.IncompleteTable;
+import org.apache.impala.catalog.MetastoreClientInstantiationException;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.catalog.TableNotFoundException;
 import org.apache.impala.catalog.TableNotLoadedException;
 import org.apache.impala.catalog.TableWriteId;
 import org.apache.impala.common.Metrics;
+import org.apache.impala.common.PrintUtils;
 import org.apache.impala.common.Reference;
 import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.hive.common.MutableValidWriteIdList;
+
+import static org.apache.impala.catalog.Table.TBL_EVENTS_PROCESS_DURATION;
 
 import org.apache.impala.service.BackendConfig;
 import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.thrift.TPartitionKeyValue;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.util.AcidUtils;
-import org.apache.thrift.TException;
+import org.apache.impala.util.DebugUtils;
+import org.apache.impala.util.MetaStoreUtil;
+import org.apache.impala.util.NoOpEventSequence;
 import org.slf4j.LoggerFactory;
 import org.slf4j.Logger;
 
@@ -123,9 +131,11 @@ public class MetastoreEvents {
     DROP_PARTITION("DROP_PARTITION"),
     INSERT("INSERT"),
     INSERT_PARTITIONS("INSERT_PARTITIONS"),
+    RELOAD("RELOAD"),
     ALLOC_WRITE_ID_EVENT("ALLOC_WRITE_ID_EVENT"),
     COMMIT_TXN("COMMIT_TXN"),
     ABORT_TXN("ABORT_TXN"),
+    COMMIT_COMPACTION("COMMIT_COMPACTION_EVENT"),
     OTHER("OTHER");
 
     private final String eventType_;
@@ -191,7 +201,7 @@ public class MetastoreEvents {
           case ALLOC_WRITE_ID_EVENT:
             return new AllocWriteIdEvent(catalogOpExecutor_, metrics, event);
           case COMMIT_TXN:
-            return new CommitTxnEvent(catalogOpExecutor_, metrics, event);
+            return new MetastoreShim.CommitTxnEvent(catalogOpExecutor_, metrics, event);
           case ABORT_TXN:
             return new AbortTxnEvent(catalogOpExecutor_, metrics, event);
         }
@@ -215,8 +225,12 @@ public class MetastoreEvents {
           return new DropPartitionEvent(catalogOpExecutor_, metrics, event);
         case ALTER_PARTITION:
           return new AlterPartitionEvent(catalogOpExecutor_, metrics, event);
+        case RELOAD:
+          return new ReloadEvent(catalogOpExecutor_, metrics, event);
         case INSERT:
           return new InsertEvent(catalogOpExecutor_, metrics, event);
+        case COMMIT_COMPACTION:
+          return new CommitCompactionEvent(catalogOpExecutor_, metrics, event);
         default:
           // ignore all the unknown events by creating a IgnoredEvent
           return new IgnoredEvent(catalogOpExecutor_, metrics, event);
@@ -246,6 +260,11 @@ public class MetastoreEvents {
       Preconditions.checkNotNull(events);
       if (events.isEmpty()) return Collections.emptyList();
 
+      if (StringUtils.isNotEmpty(BackendConfig.INSTANCE.debugActions())) {
+        DebugUtils.executeDebugAction(
+            BackendConfig.INSTANCE.debugActions(), DebugUtils.GET_FILTERED_EVENTS_DELAY);
+      }
+
       List<MetastoreEvent> metastoreEvents = new ArrayList<>(events.size());
       for (NotificationEvent event : events) {
         metastoreEvents.add(get(event, metrics));
@@ -259,8 +278,7 @@ public class MetastoreEvents {
         String catalogName = currentEvent.getCatalogName();
         String eventDb = currentEvent.getDbName();
         String eventTbl = currentEvent.getTableName();
-        if (catalogName != null && !MetastoreShim.getDefaultCatalogName()
-            .equalsIgnoreCase(catalogName)) {
+        if (catalogName != null && !MetastoreShim.isDefaultCatalog(catalogName)) {
           // currently Impala doesn't support custom hive catalogs and hence we should
           // ignore all the events which are on non-default catalog namespaces.
           LOG.debug(currentEvent.debugString(
@@ -283,53 +301,196 @@ public class MetastoreEvents {
       }
       LOG.info(String.format("Total number of events received: %d Total number of events "
           + "filtered out: %d", sizeBefore, numFilteredEvents));
-      metrics.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
-              .inc(numFilteredEvents);
-      LOG.debug("Incremented skipped metric to " + metrics
-          .getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).getCount());
+      if (numFilteredEvents > 0) {
+        metrics.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+            .inc(numFilteredEvents);
+        LOG.debug("Incremented skipped metric to "
+            + metrics.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+                  .getCount());
+      }
       return createBatchEvents(metastoreEvents, metrics);
     }
 
     /**
-     * This method batches together any eligible consecutive elements from the given
-     * list of {@code MetastoreEvent}. The returned list may or may not contain batch
+     * This method flushes all in-progress batches for tables from the specified
+     * database from the pendingTableEventsMap to the sortedFinalBatches.
+     */
+    void flushBatchesForDb(
+        Map<String, Map<String, MetastoreEvent>> pendingTableEventsMap,
+        TreeMap<Long, MetastoreEvent> sortedFinalBatches, String dbName) {
+      String lowerDbName = dbName.toLowerCase();
+      Map<String, MetastoreEvent> dbMap = pendingTableEventsMap.get(lowerDbName);
+      if (dbMap != null) {
+        // Flush out any pending events in the database map and delete it
+        for (MetastoreEvent event : dbMap.values()) {
+          sortedFinalBatches.put(event.getEventId(), event);
+        }
+        pendingTableEventsMap.remove(lowerDbName);
+      }
+    }
+
+    /**
+     * This method flushes any in-progress batch for the specified table
+     * from the pendingTableEventsMap to the sortedFinalBatches.
+     */
+    void flushBatchForTable(
+        Map<String, Map<String, MetastoreEvent>> pendingTableEventsMap,
+        TreeMap<Long, MetastoreEvent> sortedFinalBatches, Table table) {
+      // Produce the lower-cased fully qualified table name
+      String dbName = table.getDbName().toLowerCase();
+      String tableName = table.getTableName().toLowerCase();
+      Map<String, MetastoreEvent> dbMap = pendingTableEventsMap.get(dbName);
+      if (dbMap != null) {
+        MetastoreEvent tableEvent = dbMap.get(tableName);
+        if (tableEvent != null) {
+          sortedFinalBatches.put(tableEvent.getEventId(), tableEvent);
+          dbMap.remove(tableName);
+          // If this was the last table, delete the DB map
+          if (dbMap.isEmpty()) {
+            pendingTableEventsMap.remove(dbName);
+          }
+        }
+      }
+    }
+
+    /**
+     * Event batching is done on a per-table basis to allow more batching in
+     * interleaved circumstances. Single-table events still follow the same rules
+     * for batching, but certain events cross table boundaries and should cut
+     * batches across multiple tables. This method detects cross-table events and
+     * cuts the appropriate batches. Currently, it handles drop database, alter
+     * database, and alter table rename. It is a no-op for events that are not
+     * cross-table.
+     */
+    void cutBatchesForCrossTableEvents(MetastoreEvent event,
+        Map<String, Map<String, MetastoreEvent>> pendingTableEventsMap,
+        TreeMap<Long, MetastoreEvent> sortedFinalBatches) {
+      // drop database - cuts any existing batches for tables in that database
+      // alter database - cuts any existing batches for tables in the database
+      // alter table rename - cuts any existing batches for the source or destination
+      //   table
+      if (event instanceof DropDatabaseEvent || event instanceof AlterDatabaseEvent) {
+        // Any batched events for tables from this database need to be flushed
+        // before emitting the AlterDatabaseEvent or DropDatabaseEvent.
+        flushBatchesForDb(pendingTableEventsMap, sortedFinalBatches, event.getDbName());
+      } else if (event instanceof AlterTableEvent) {
+        AlterTableEvent alterTable = (AlterTableEvent) event;
+        if (alterTable.isRename()) {
+          // Flush any batched events for the source table.
+          Table beforeTable = alterTable.getBeforeTable();
+          flushBatchForTable(pendingTableEventsMap, sortedFinalBatches, beforeTable);
+
+          // Flush any batched events for the destination table. Given that the
+          // destination table must not exist when doing this rename, valid sequences
+          // are already handled implicitly by the existing batch-breaking logic
+          // (combined with the sorting of the final batches). This does the flushing
+          // explicitly in case there are any edge cases not handled by the existing
+          // mechanisms.
+          Table afterTable = alterTable.getAfterTable();
+          flushBatchForTable(pendingTableEventsMap, sortedFinalBatches, afterTable);
+        }
+      }
+    }
+
+    /**
+     * This method batches together any eligible events from the given list of
+     * {@code MetastoreEvent}. The returned list may or may not contain batch
      * events depending on whether it finds any events which could be batched together.
+     * Events on a table do not need to be contiguous to be batched, but there must
+     * not be an intervening event that cuts the batch.
      */
     @VisibleForTesting
     List<MetastoreEvent> createBatchEvents(List<MetastoreEvent> events, Metrics metrics) {
       if (events.size() < 2) return events;
-      int i = 0, j = 1;
-      List<MetastoreEvent> batchedEventList = new ArrayList<>();
-      MetastoreEvent current = events.get(i);
-      // startEventId points to the current event's or the start of the batch
-      // in case current is a batch event.
-      long startEventId = current.getEventId();
-      while (j < events.size()) {
-        MetastoreEvent next = events.get(j);
-        // check if the current metastore event and the next can be batched together
-        if (!current.canBeBatched(next)) {
-          // events cannot be batched, add the current event under consideration to the
-          // list and update current to the next
-          if (current.getNumberOfEvents() > 1) {
-            current.infoLog("Created a batch event for {} events from {} to {}",
-                current.getNumberOfEvents(), startEventId, current.getEventId());
-            metrics.getCounter(MetastoreEventsProcessor.NUMBER_OF_BATCH_EVENTS).inc();
-          }
-          batchedEventList.add(current);
-          current = next;
-          startEventId = next.getEventId();
-        } else {
-          // next can be batched into current event
-          current = Preconditions.checkNotNull(current.addToBatchEvents(next));
+      // We can batch certain events on the same table as long as there is no
+      // intervening event that cuts the batch. To allow this non-contiguous batching,
+      // we keep state for each table separately. This is a two-level structure with
+      // the first layer keyed on the database name and the second layer keyed on the
+      // table name. This makes it possible to flush all entries for a database
+      // efficiently. Both database name and table name are lowercased to make this case
+      // insensitive.
+      //
+      // Entries in this hash map are still pending and can accept more entries into
+      // a batch when eligible. Each time an event is added a batch, it changes the
+      // ending Event ID, so this holds the pending batches until the batch is finalized.
+      // When the batch is finalized (either by an event that cuts the batch or by
+      // running out of events), it is moved to the sortedFinalBatches.
+      Map<String, Map<String, MetastoreEvent>> pendingTableEventsMap = new HashMap<>();
+
+      // The output events need to be monotonically increasing in their Event IDs,
+      // so we insert the resulting batches into a TreeMap and use that to produce
+      // the output list. Examples:
+      // 1. Basic ordering
+      // Suppose there are inserts on 4 different tables (Event ID in parens):
+      // A(1), B(2), C(3), D(4)
+      // The sorting will emit those in the same order they arrived. This also applies
+      // to any contiguous batching.
+      // 2. Interleaved events
+      // Suppose there are interleaved events that can be batched for different tables:
+      // A(1), B(2), A(3), B(4)
+      // The sorting will emit the batches in order of ascending ending Event ID, i.e.
+      // A(1-3), B(2-4)
+      // Since the ending Event ID of a batch changes each time an extra event is added,
+      // this structure should only contain finalized batches that can't change.
+      TreeMap<Long, MetastoreEvent> sortedFinalBatches = new TreeMap<>();
+
+      for (MetastoreEvent next : events) {
+        // Events that impact multiple tables need special handling to cut event batches
+        // for all impacted tables. This logic is in addition to the regular branch
+        // cutting logic that happens on a single-table basis.
+        cutBatchesForCrossTableEvents(next, pendingTableEventsMap, sortedFinalBatches);
+
+        if (!(next instanceof MetastoreTableEvent)) {
+          // No batching for non-table events
+          sortedFinalBatches.put(next.getEventId(), next);
+          continue;
         }
-        j++;
+        String dbName = next.getDbName().toLowerCase();
+        String tableName = next.getTableName().toLowerCase();
+        // First, lookup the dbMap or create it if it doesn't exist
+        Map<String, MetastoreEvent> dbMap =
+            pendingTableEventsMap.computeIfAbsent(dbName, k -> new HashMap<>());
+        // Second, find the table entry in the dbMap
+        MetastoreEvent current = dbMap.get(tableName);
+        if (current != null) {
+          // Check if the next metastore event for the table can be batched into the
+          // current event for the table.
+          if (!current.canBeBatched(next)) {
+            // Events cannot be batched. Flush the current event in the table map to the
+            // output and put the next element into the table map.
+            sortedFinalBatches.put(current.getEventId(), current);
+            dbMap.put(tableName, next);
+          } else {
+            // next can be batched into current event
+            dbMap.put(tableName,
+                      Preconditions.checkNotNull(current.addToBatchEvents(next)));
+          }
+        } else {
+          // New entry for this table
+          dbMap.put(tableName, next);
+        }
       }
-      if (current.getNumberOfEvents() > 1) {
-        current.infoLog("Created a batch event for {} events from {} to {}",
-            current.getNumberOfEvents(), startEventId, current.getEventId());
-        metrics.getCounter(MetastoreEventsProcessor.NUMBER_OF_BATCH_EVENTS).inc();
+      // Flush out any pending events
+      for (Map<String, MetastoreEvent> dbMap : pendingTableEventsMap.values()) {
+        for (MetastoreEvent event : dbMap.values()) {
+          sortedFinalBatches.put(event.getEventId(), event);
+        }
       }
-      batchedEventList.add(current);
+
+      // We defer logging about the batches created until the end so that we can output
+      // them in the sorted order used for the actual output list.
+      List<MetastoreEvent> batchedEventList =
+          new ArrayList<>(sortedFinalBatches.values());
+      for (MetastoreEvent event : batchedEventList) {
+        if (event.getNumberOfEvents() > 1) {
+          Preconditions.checkState(event instanceof BatchPartitionEvent);
+          BatchPartitionEvent batchEvent = (BatchPartitionEvent) event;
+          batchEvent.infoLog("Created a batch event for {} events between {} and {}",
+              batchEvent.getNumberOfEvents(), batchEvent.getFirstEventId(),
+              batchEvent.getLastEventId());
+          metrics.getCounter(MetastoreEventsProcessor.NUMBER_OF_BATCH_EVENTS).inc();
+        }
+      }
       return batchedEventList;
     }
   }
@@ -424,6 +585,8 @@ public class MetastoreEvents {
     // logger format compatible string to prepend to a log formatted message
     private static final String LOG_FORMAT_EVENT_ID_TYPE = "EventId: {} EventType: {} ";
 
+    protected static final String CLUSTER_WIDE_TARGET = "CLUSTER_WIDE";
+
     // CatalogServiceCatalog instance on which the event needs to be acted upon
     protected final CatalogServiceCatalog catalog_;
 
@@ -457,7 +620,7 @@ public class MetastoreEvents {
     // metrics registry so that events can add metrics
     protected final Metrics metrics_;
 
-    MetastoreEvent(CatalogOpExecutor catalogOpExecutor, Metrics metrics,
+    protected MetastoreEvent(CatalogOpExecutor catalogOpExecutor, Metrics metrics,
         NotificationEvent event) {
       this.catalogOpExecutor_ = catalogOpExecutor;
       this.catalog_ = catalogOpExecutor_.getCatalog();
@@ -473,6 +636,8 @@ public class MetastoreEvents {
     }
 
     public long getEventId() { return eventId_; }
+
+    public long getEventTime() { return event_.getEventTime(); }
 
     public MetastoreEventType getEventType() { return eventType_; }
 
@@ -490,6 +655,25 @@ public class MetastoreEvents {
     public String getDbName() { return dbName_; }
 
     public String getTableName() { return tblName_; }
+
+    public String getTargetName() {
+      if (dbName_ == null && tblName_ == null) return CLUSTER_WIDE_TARGET;
+      if (tblName_ == null) return dbName_;
+      return dbName_ + "." + tblName_;
+    }
+
+    /**
+     * Method to inject error randomly for certain events during the processing.
+     * It is used for testing purpose.
+     */
+    private void injectErrorIfNeeded() {
+      if (catalog_.getFailureEventsForTesting().contains(eventType_.toString())) {
+        double random = Math.random();
+        if (random < BackendConfig.INSTANCE.getProcessEventFailureRatio()) {
+          throw new RuntimeException("Event processing failed due to error injection");
+        }
+      }
+    }
 
     /**
      * Process this event if it is enabled based on the flags on this object
@@ -512,7 +696,10 @@ public class MetastoreEvents {
           return;
         }
       }
+      DebugUtils.executeDebugAction(
+          BackendConfig.INSTANCE.debugActions(), DebugUtils.EVENT_PROCESSING_DELAY);
       process();
+      injectErrorIfNeeded();
     }
 
     /**
@@ -575,6 +762,25 @@ public class MetastoreEvents {
      */
     protected abstract void process()
         throws MetastoreNotificationException, CatalogException;
+
+    /**
+     * Process event failure handles the exception occurred during processing.
+     * @param e Exception occurred during process
+     * @return Returns true when failure is handled. Otherwise, false
+     */
+    protected abstract boolean onFailure(Exception e);
+
+    protected boolean canInvalidateTable(Exception e) {
+      if (e instanceof MetastoreClientInstantiationException) {
+        // All runtime exceptions except this exception are considered for invalidation.
+        return false;
+      }
+      // This RuntimeException covers all the exceptions from
+      // com.google.common.base.Preconditions methods. IllegalStateException is one such
+      // exception seen in IMPALA-12827.
+      return (e instanceof RuntimeException) || (e instanceof CatalogException)
+          || (e instanceof MetastoreNotificationNeedsInvalidateException);
+    }
 
     /**
      * Helper method to get debug string with helpful event information prepended to the
@@ -641,6 +847,28 @@ public class MetastoreEvents {
           new StringBuilder(LOG_FORMAT_EVENT_ID_TYPE).append(logFormattedStr).toString();
       Object[] formatArgs = getLogFormatArgs(args);
       LOG.trace(formatString, formatArgs);
+    }
+
+    /**
+     * Similar to infoLog excepts logs at warn level
+     */
+    protected void warnLog(String logFormattedStr, Object... args) {
+      if (!LOG.isWarnEnabled()) return;
+      String formatString =
+          new StringBuilder(LOG_FORMAT_EVENT_ID_TYPE).append(logFormattedStr).toString();
+      Object[] formatArgs = getLogFormatArgs(args);
+      LOG.warn(formatString, formatArgs);
+    }
+
+    /**
+     * Method to log error for an event
+     */
+    protected void errorLog(String logFormattedStr, Object... args) {
+      if (!LOG.isErrorEnabled()) return;
+      String formatString =
+          new StringBuilder(LOG_FORMAT_EVENT_ID_TYPE).append(logFormattedStr).toString();
+      Object[] formatArgs = getLogFormatArgs(args);
+      LOG.error(formatString, formatArgs);
     }
 
     /**
@@ -713,6 +941,14 @@ public class MetastoreEvents {
     public String toString() {
       return String.format(STR_FORMAT_EVENT_ID_TYPE, eventId_, eventType_);
     }
+
+    protected boolean isOlderThanLastSyncEventId(MetastoreEvent event) {
+      org.apache.impala.catalog.Table tbl = catalog_.getTableNoThrow(dbName_, tblName_);
+      if (tbl != null && tbl.getLastSyncedEventId() >= event.getEventId()) {
+        return true;
+      }
+      return false;
+    }
   }
 
   public static String getStringProperty(
@@ -731,6 +967,10 @@ public class MetastoreEvents {
     // tbl object from the Notification event, corresponds to the before tableObj in
     // case of alter events
     protected org.apache.hadoop.hive.metastore.api.Table msTbl_;
+
+    // A boolean flag used in alter table event to record if the file metadata reload
+    // can be skipped for certain type of alter table statements
+    protected boolean skipFileMetadataReload_ = false;
 
     // in case of partition batch events, this method can be overridden to return
     // the partition object from the events which are batched together.
@@ -833,7 +1073,8 @@ public class MetastoreEvents {
         throws CatalogException {
       try {
         if (!catalog_.reloadTableIfExists(dbName_, tblName_,
-            "Processing " + operation + " event from HMS", getEventId())) {
+            "Processing " + operation + " event from HMS", getEventId(),
+            skipFileMetadataReload_)) {
           debugLog("Automatic refresh on table {} failed as the table "
                   + "either does not exist anymore or is not in loaded state.",
               getFullyQualifiedTblName());
@@ -858,31 +1099,91 @@ public class MetastoreEvents {
      * Reloads the partitions provided, only if the table is loaded and if the partitions
      * exist in catalogd.
      * @param partitions the list of Partition objects which need to be reloaded.
-     * @param loadFileMetadata
+     * @param fileMetadataLoadOpts: describes how to reload file metadata for partitions
      * @param reason The reason for reload operation which is used for logging by
      *               catalogd.
+     * @param batch flag to show if the function is called by the batch event process
      */
-    protected void reloadPartitions(List<Partition> partitions, boolean loadFromEvent,
-        boolean loadFileMetadata, String reason) throws CatalogException {
+    protected void reloadPartitions(List<Partition> partitions,
+        FileMetadataLoadOpts fileMetadataLoadOpts, String reason, boolean batch)
+        throws CatalogException {
+      int skippedEvent = batch ? partitions.size() : 1;
       try {
-        int numPartsRefreshed;
-        if (loadFromEvent) {
-          numPartsRefreshed = catalogOpExecutor_.reloadPartitionsFromEvent(getEventId(),
-              dbName_, tblName_, partitions, loadFileMetadata, reason);
-        } else {
-          numPartsRefreshed = catalogOpExecutor_.reloadPartitionsIfExist(getEventId(),
-              dbName_, tblName_, partitions, reason);
-        }
+        int numPartsRefreshed = catalogOpExecutor_.reloadPartitionsIfExist(getEventId(),
+            getEventType().toString(), dbName_, tblName_, partitions, reason,
+            fileMetadataLoadOpts);
         if (numPartsRefreshed > 0) {
           metrics_.getCounter(MetastoreEventsProcessor.NUMBER_OF_PARTITION_REFRESHES)
               .inc(numPartsRefreshed);
+        } else if (numPartsRefreshed == -1) {
+          debugLog("Ignoring the event since table {} is not loadded or " +
+              "table was removed latter in catalog or table is synced."
+              , getFullyQualifiedTblName());
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+              .inc(skippedEvent);
         }
       } catch (TableNotLoadedException e) {
         debugLog("Ignoring the event since table {} is not loaded",
             getFullyQualifiedTblName());
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+            .inc(skippedEvent);
       } catch (DatabaseNotFoundException | TableNotFoundException e) {
         debugLog("Ignoring the event since table {} is not found",
             getFullyQualifiedTblName());
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+            .inc(skippedEvent);
+      }
+    }
+
+    /**
+     * Reloads partitions from the event if they exist. Does not fetch those partitions
+     * from HMS. Does NOT reload file metadata
+     * @param partitions: Partitions to be reloaded
+     * @param reason: Reason for reloading. Mainly used for logging in catalogD
+     * @throws CatalogException
+     */
+    protected void reloadPartitionsFromEvent(List<Partition> partitions, String reason)
+        throws CatalogException {
+      try {
+        int numPartsRefreshed = catalogOpExecutor_.reloadPartitionsFromEvent(getEventId(),
+            dbName_, tblName_, partitions, reason);
+        if (numPartsRefreshed > 0) {
+          metrics_.getCounter(MetastoreEventsProcessor.NUMBER_OF_PARTITION_REFRESHES)
+              .inc(numPartsRefreshed);
+        } else if (numPartsRefreshed == -1) {
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+        }
+      } catch (TableNotLoadedException e) {
+        debugLog("Ignoring the event since table {} is not loaded",
+            getFullyQualifiedTblName());
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+      } catch (DatabaseNotFoundException | TableNotFoundException e) {
+        debugLog("Ignoring the event since table {} is not found",
+            getFullyQualifiedTblName());
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+      }
+    }
+
+    protected void reloadPartitionsFromNames(List<String> partitionNames, String reason,
+        FileMetadataLoadOpts fileMetadataLoadOpts) throws CatalogException {
+      try {
+        int numPartsRefreshed = catalogOpExecutor_.reloadPartitionsFromNamesIfExists(
+            getEventId(), getEventType().toString(), dbName_, tblName_, partitionNames,
+            reason, fileMetadataLoadOpts);
+        if (numPartsRefreshed > 0) {
+          metrics_.getCounter(MetastoreEventsProcessor.NUMBER_OF_PARTITION_REFRESHES)
+                  .inc(numPartsRefreshed);
+        } else if (numPartsRefreshed == -1) {
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+        }
+      } catch (TableNotLoadedException e) {
+        debugLog("Ignoring the event since table {} is not loaded",
+            getFullyQualifiedTblName());
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+      } catch (DatabaseNotFoundException | TableNotFoundException e) {
+        debugLog("Ignoring the event since table {} is not found",
+            getFullyQualifiedTblName());
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
       }
     }
 
@@ -974,6 +1275,91 @@ public class MetastoreEvents {
       }
       return true;
     }
+
+    protected boolean isOlderEvent(Partition partitionEventObj) {
+      if (!BackendConfig.INSTANCE.enableSkippingOlderEvents()) {
+        return false;
+      }
+      org.apache.impala.catalog.Table tbl = null;
+      try {
+        tbl = catalog_.getTable(dbName_, tblName_);
+        if (tbl == null || tbl instanceof IncompleteTable) {
+          return false;
+        }
+        if (getEventId() > 0 && getEventId() <= tbl.getCreateEventId()) {
+          // Older event, so this event will be skipped.
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+          infoLog("Table: {} createEventId: {} is >= to the current " +
+              "eventId: {}. Incremented skipped metric to {}", tbl.getFullName(),
+              tbl.getCreateEventId(), getEventId(),
+              metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+                  .getCount());
+          return true;
+        }
+        // Always check the lastRefreshEventId on the table first for table level refresh
+        boolean canSkip = tbl.getLastRefreshEventId() >= getEventId();
+        try {
+          if (!canSkip && partitionEventObj != null) {
+            tbl.takeReadLock();
+            canSkip = catalog_.isPartitionLoadedAfterEvent(dbName_, tblName_,
+                partitionEventObj, getEventId());
+          }
+          if (canSkip) {
+            metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+                .inc(getNumberOfEvents());
+            String messageStr = partitionEventObj == null ? "Skipping the event since " +
+                "the table " + dbName_ + "." + tblName_ + " has last refresh id as " +
+                tbl.getLastRefreshEventId() + ". Comparing it with current event " +
+                getEventId() + ". " : "";
+            infoLog("{}Incremented events skipped counter to {}", messageStr,
+                metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+                    .getCount());
+            return true;
+          }
+        } finally {
+          if (tbl.isReadLockedByCurrentThread()) {
+            tbl.releaseReadLock();
+          }
+        }
+      } catch (CatalogException e) {
+        debugLog("ignoring exception while checking if it is an older event "
+            + "on table {}.{}", dbName_, tblName_, e);
+      }
+      return false;
+    }
+
+    @Override
+    protected void process() throws MetastoreNotificationException, CatalogException {
+      Timer.Context context = null;
+      org.apache.impala.catalog.Table tbl = catalog_.getTableNoThrow(dbName_, tblName_);
+      if (tbl != null) {
+        context = tbl.getMetrics().getTimer(TBL_EVENTS_PROCESS_DURATION).time();
+      }
+      try {
+        processTableEvent();
+      } finally {
+        if (context != null) {
+          context.stop();
+        }
+      }
+    }
+
+    @Override
+    protected boolean onFailure(Exception e) {
+      if (!BackendConfig.INSTANCE.isInvalidateMetadataOnEventProcessFailureEnabled()) {
+        return false;
+      }
+      boolean isInvalidate = canInvalidateTable(e);
+      if (isInvalidate) {
+        errorLog("Invalidate table {}.{} due to exception during event processing",
+            dbName_, tblName_, e);
+        catalog_.invalidateTableIfExists(dbName_, tblName_);
+      }
+      return isInvalidate;
+    }
+
+    protected abstract void processTableEvent() throws MetastoreNotificationException,
+        CatalogException;
   }
 
   /**
@@ -1039,6 +1425,12 @@ public class MetastoreEvents {
       }
       return true;
     }
+
+    @Override
+    protected boolean onFailure(Exception e) {
+      // TODO: Need to check db event failure in future
+      return false;
+    }
   }
 
   /**
@@ -1046,7 +1438,7 @@ public class MetastoreEvents {
    */
   public static class CreateTableEvent extends MetastoreTableEvent {
 
-    public static final String CREATE_TABLE_EVENT_TYPE = "CREATE_TABLE";
+    public static final String EVENT_TYPE = "CREATE_TABLE";
     /**
      * Prevent instantiation from outside should use MetastoreEventFactory instead
      */
@@ -1081,7 +1473,7 @@ public class MetastoreEvents {
      * overridden. Else, it will ignore the event
      */
     @Override
-    public void process() throws MetastoreNotificationException {
+    public void processTableEvent() throws MetastoreNotificationException {
       // check if the table exists already. This could happen in corner cases of the
       // table being dropped and recreated with the same name or in case this event is
       // a self-event (see description of self-event in the class documentation of
@@ -1095,13 +1487,23 @@ public class MetastoreEvents {
           debugLog("Incremented skipped metric to " + metrics_
               .getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).getCount());
         }
+      } catch (DatabaseNotFoundException ex) {
+        // This is an incorrect setup where DB is not found in cache for a table event.
+        // Don't put the event processor into error state, instead ignore this event.
+        errorLog("Create table {}.{} failed because the database does not exist cache." +
+            " Ignoring the CREATE_TABLE event", dbName_, tblName_, ex);
       } catch (CatalogException e) {
         // if a DatabaseNotFoundException is caught here it means either we incorrectly
         // determined that the event needs to be processed instead of skipped, or we
         // somehow missed the previous create database event.
         throw new MetastoreNotificationException(
-            debugString("Unable to process event", e));
+            debugString("Unable to process event"), e);
       }
+    }
+
+    @Override
+    protected boolean onFailure(Exception e) {
+      return false;
     }
 
     @Override
@@ -1187,9 +1589,8 @@ public class MetastoreEvents {
     @Override
     public boolean canBeBatched(MetastoreEvent event) {
       if (!(event instanceof InsertEvent)) return false;
+      if (isOlderThanLastSyncEventId(event)) return false;
       InsertEvent insertEvent = (InsertEvent) event;
-      // batched events must have consecutive event ids
-      if (event.getEventId() != 1 + getEventId()) return false;
       // make sure that the event is on the same table
       if (!getFullyQualifiedTblName().equalsIgnoreCase(
           insertEvent.getFullyQualifiedTblName())) {
@@ -1229,9 +1630,15 @@ public class MetastoreEvents {
     }
 
     @Override
-    public void process() throws MetastoreNotificationException {
+    public void processTableEvent() throws MetastoreNotificationException {
       if (isSelfEvent()) {
-        infoLog("Not processing the event as it is a self-event");
+        infoLog("Not processing the insert event as it is a self-event");
+        return;
+      }
+
+      if (isOlderEvent(insertPartition_)) {
+        infoLog("Not processing the insert event {} as it is an older event",
+            getEventId());
         return;
       }
       // Reload the whole table if it's a transactional table or materialized view.
@@ -1259,7 +1666,10 @@ public class MetastoreEvents {
         // Ignore event if table or database is not in catalog. Throw exception if
         // refresh fails. If the partition does not exist in metastore the reload
         // method below removes it from the catalog
-        reloadPartitions(Arrays.asList(insertPartition_), false, true, "INSERT event");
+        // forcing file metadata reload so that new files (due to insert) are reflected
+        // HdfsPartition
+        reloadPartitions(Arrays.asList(insertPartition_),
+            FileMetadataLoadOpts.FORCE_LOAD, "INSERT event", false);
       } catch (CatalogException e) {
         throw new MetastoreNotificationNeedsInvalidateException(debugString("Refresh "
                 + "partition on table {} partition {} failed. Event processing cannot "
@@ -1276,7 +1686,10 @@ public class MetastoreEvents {
       // For non-partitioned tables, refresh the whole table.
       Preconditions.checkState(insertPartition_ == null);
       try {
-        reloadTableFromCatalog("INSERT event", false);
+        boolean notSkipped = reloadTableFromCatalog("INSERT event", false);
+        if (!notSkipped) {
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+        }
       } catch (CatalogException e) {
         throw new MetastoreNotificationNeedsInvalidateException(
             debugString("Refresh table {} failed. Event processing "
@@ -1290,6 +1703,7 @@ public class MetastoreEvents {
    * MetastoreEvent for ALTER_TABLE event type
    */
   public static class AlterTableEvent extends MetastoreTableEvent {
+    public static final String EVENT_TYPE = "ALTER_TABLE";
     protected org.apache.hadoop.hive.metastore.api.Table tableBefore_;
     // the table object after alter operation, as parsed from the NotificationEvent
     protected org.apache.hadoop.hive.metastore.api.Table tableAfter_;
@@ -1301,6 +1715,8 @@ public class MetastoreEvents {
     private final Boolean eventSyncAfterFlag_;
     // value of the db flag at the time of event creation
     private final boolean dbFlagVal;
+    // true if this alter event was due to a truncate operation in metastore
+    private final boolean isTruncateOp_;
 
     /**
      * Prevent instantiation from outside should use MetastoreEventFactory instead
@@ -1317,6 +1733,7 @@ public class MetastoreEvents {
         msTbl_ = Preconditions.checkNotNull(alterTableMessage.getTableObjBefore());
         tableAfter_ = Preconditions.checkNotNull(alterTableMessage.getTableObjAfter());
         tableBefore_ = Preconditions.checkNotNull(alterTableMessage.getTableObjBefore());
+        isTruncateOp_ = alterTableMessage.getIsTruncateOp();
       } catch (Exception e) {
         throw new MetastoreNotificationException(
             debugString("Unable to parse the alter table message"), e);
@@ -1352,16 +1769,20 @@ public class MetastoreEvents {
           .renameTableFromEvent(getEventId(), tableBefore_, tableAfter_, oldTblRemoved,
               newTblAdded);
 
-      if (oldTblRemoved.getRef()) {
-        metrics_.getCounter(MetastoreEventsProcessor.NUMBER_OF_TABLES_REMOVED).inc();
-      }
-      if (newTblAdded.getRef()) {
-        metrics_.getCounter(MetastoreEventsProcessor.NUMBER_OF_TABLES_ADDED).inc();
-      }
-      if (!oldTblRemoved.getRef() || !newTblAdded.getRef()) {
+      // Only bump the skipped metric if the old table is not removed and the new table
+      // is not added. Not doing this in other cases since we need to either remove the
+      // old table or add the new table, which is processing the event.
+      if (!oldTblRemoved.getRef() && !newTblAdded.getRef()) {
         metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
         debugLog("Incremented skipped metric to " + metrics_
-            .getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).getCount());
+                .getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).getCount());
+      } else {
+        if (oldTblRemoved.getRef()) {
+          metrics_.getCounter(MetastoreEventsProcessor.NUMBER_OF_TABLES_REMOVED).inc();
+        }
+        if (newTblAdded.getRef()) {
+          metrics_.getCounter(MetastoreEventsProcessor.NUMBER_OF_TABLES_ADDED).inc();
+        }
       }
     }
 
@@ -1387,7 +1808,8 @@ public class MetastoreEvents {
      * table on the tblName from the event
      */
     @Override
-    public void process() throws MetastoreNotificationException, CatalogException {
+    public void processTableEvent() throws MetastoreNotificationException,
+        CatalogException {
       if (isRename_) {
         processRename();
         return;
@@ -1402,30 +1824,232 @@ public class MetastoreEvents {
       // Ignore the event if this is a trivial event. See javadoc for
       // canBeSkipped() for examples.
       if (canBeSkipped()) {
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
         infoLog("Not processing this event as it only modifies some table parameters "
             + "which can be ignored.");
         return;
       }
-      // in case of table level alters from external systems it is better to do a full
-      // refresh  eg. this could be due to as simple as adding a new parameter or a
-      // full blown adding or changing column type
-      // rename is already handled above
-      if (!reloadTableFromCatalog("ALTER_TABLE", false)) {
-        if (wasEventSyncTurnedOn()) {
-          // we received this alter table event on a non-existing table. We also
-          // detect that event sync was turned on in this event. This may mean that
-          // the table creation was skipped earlier because event sync was turned off
-          // we don't really know how many of events we have skipped till now because
-          // the sync was disabled all this while before we receive such a event. We
-          // error on the side of caution by stopping the event processing and
-          // letting the user to issue a invalidate metadata to reset the state
-          throw new MetastoreNotificationNeedsInvalidateException(debugString(
-              "Detected that event sync was turned on for the table %s "
-                  + "and the table does not exist. Event processing cannot be "
-                  + "continued further. Issue a invalidate metadata command to reset "
-                  + "the event processing state", getFullyQualifiedTblName()));
+
+      if (isOlderEvent(null)) {
+        infoLog("Not processing the alter table event {} as it is an older event",
+            getEventId());
+        return;
+      }
+      skipFileMetadataReload_ = !isTruncateOp_ && canSkipFileMetadataReload(tableBefore_,
+          tableAfter_);
+      long startNs = System.nanoTime();
+      if (wasEventSyncTurnedOn()) {
+        handleEventSyncTurnedOn();
+      } else {
+        // in case of table level alters from external systems it is better to do a full
+        // refresh, eg. this could be due to as simple as adding a new parameter or a
+        // full blown adding or changing column type
+        // rename is already handled above
+        boolean notSkipped = reloadTableFromCatalog("ALTER_TABLE", false);
+        if (!notSkipped) {
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
         }
       }
+      long durationNs = System.nanoTime() - startNs;
+      // Log event details for those triggered slow reload.
+      if (durationNs > HdfsTable.LOADING_WARNING_TIME_NS) {
+        warnLog("Slow event processing. Duration: {}. TableBefore: {}. " +
+            "TableAfter: {}", PrintUtils.printTimeNs(durationNs),
+            tableBefore_.toString(), tableAfter_.toString());
+      }
+    }
+
+    @Override
+    protected boolean onFailure(Exception e) {
+      if (!BackendConfig.INSTANCE.isInvalidateMetadataOnEventProcessFailureEnabled()
+          || !canInvalidateTable(e)) {
+        return false;
+      }
+      if (isRename()) {
+        /* In case of rename table, not invalidating tables due of following reasons:
+        1. When failure happened before old table is removed from catalog,
+        invalidateTableIfExists may trigger table load for a non-existing table later.
+        2. When failure happened before adding new table to catalog,
+        invalidateTableIfExists does not invalidate table
+        */
+        errorLog(
+            "Rename table {}.{} to {}.{} failed due to exception during event processing",
+            tableBefore_.getDbName(), tableBefore_.getTableName(), dbName_, tblName_, e);
+        return false;
+      }
+      return super.onFailure(e);
+    }
+
+    private void handleEventSyncTurnedOn() throws DatabaseNotFoundException,
+        MetastoreNotificationNeedsInvalidateException {
+      // check if the table exists or not. 1) if the table doesn't exist create an
+      // incomplete instance of the table. 2) If the table exists, there can be two
+      // scenarios a) current table eventId is greater than table's createEventId,
+      // then we should mark the table as stale. b) current table eventId <= table's
+      // createEventId, then we should ignore the event as it is an older event.
+      org.apache.impala.catalog.Table tbl = catalog_.getTableNoThrow(dbName_, tblName_);
+      if (tbl == null) { // table doesn't exist. Go with option (1)
+        if (catalogOpExecutor_.addTableIfNotRemovedLater(getEventId(), msTbl_)) {
+          infoLog("Successfully added table {}", getFullyQualifiedTblName());
+          metrics_.getCounter(MetastoreEventsProcessor.NUMBER_OF_TABLES_ADDED).inc();
+        } else {
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+          debugLog("Incremented skipped metric to " +
+              metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+                  .getCount());
+        }
+      } else if (tbl instanceof IncompleteTable) {
+        // No-Op
+      } else if (getEventId() > tbl.getCreateEventId()) {
+        catalog_.invalidateTable(tbl.getTableName().toThrift(), new Reference<>(),
+            new Reference<>(), NoOpEventSequence.INSTANCE, getEventId());
+        LOG.info("Table " + tbl.getFullName() + " is invalidated from catalog cache" +
+            " since eventSync is turned on for this table.");
+      } else {
+        // Unknown state of metadata object, make event processor go into error state
+        throw new MetastoreNotificationNeedsInvalidateException(debugString(
+            "Detected that event sync was turned on for the table %s "
+                + "with createEventId %s. This event should have been skipped as stale "
+                + "event. Event processing cannot be continued further. Issue a "
+                + "invalidate metadata command to reset the event processing state",
+            getFullyQualifiedTblName(), tbl.getCreateEventId()));
+      }
+    }
+
+    /**
+     * This method checks if the reloading of file metadata can be skipped for an alter
+     * statement. This method accepts two arguments, 1) pre-modified HMS table instance
+     * 2) post-modified HMS table instance and compare what really changed in the alter
+     * event.
+     */
+    private boolean canSkipFileMetadataReload(
+        org.apache.hadoop.hive.metastore.api.Table beforeTable,
+        org.apache.hadoop.hive.metastore.api.Table afterTable) {
+      Set<String> whitelistedTblProperties = catalog_.getWhitelistedTblProperties();
+      // If the whitelisted table properties are empty, then we skip this optimization
+      if (whitelistedTblProperties.isEmpty()) {
+        return false;
+      }
+
+      boolean incrementalAcidRefresh =
+          BackendConfig.INSTANCE.getHMSEventIncrementalRefreshTransactionalTable();
+      boolean unpartitioned = afterTable.getPartitionKeysSize() == 0;
+      if (!incrementalAcidRefresh && unpartitioned
+          && AcidUtils.isTransactionalTable(afterTable.getParameters())) {
+        // In case of ACID tables no INSERT event is generated. If flag
+        // hms_event_incremental_refresh_transactional_table is false, then transaction
+        // related events are ignored (including COMMIT_TXN), so Impala has to rely on
+        // ALTER_TABLE events to detect INSERTs to unpartitioned tables (IMPALA-12835).
+        return false;
+      }
+
+      // There are lot of other alter statements which doesn't require file metadata
+      // reload but these are the most common types for alter statements.
+      if (!Objects.equals(beforeTable.getSd(), afterTable.getSd())) {
+        if (!isTrivialSdPropsChanged(beforeTable.getSd(), afterTable.getSd())) {
+          return false;
+        }
+      }
+      if (isCustomTblPropsChanged(whitelistedTblProperties, beforeTable, afterTable)) {
+        return false;
+      }
+      infoLog("Skipping reloading of file metadata for table {}.{} since SD and " +
+          "whitelistedTblProperties has not changed.", dbName_, tblName_);
+      return true;
+    }
+
+    private boolean isFieldSchemaChanged(
+        org.apache.hadoop.hive.metastore.api.Table beforeTable,
+        org.apache.hadoop.hive.metastore.api.Table afterTable) {
+      List<FieldSchema> beforeCols = beforeTable.getSd().getCols();
+      List<FieldSchema> afterCols = afterTable.getSd().getCols();
+      // check if columns are added or removed
+      if (beforeCols.size() != afterCols.size()) {
+        infoLog("Change in number of columns detected for table {}.{} from {} to {}. " +
+            "So file metadata reload can be skipped.", dbName_, tblName_,
+            beforeCols.size(), afterCols.size());
+        return true;
+      }
+      // check if columns are replaced or column definition is changed
+      // Field schema's comment is rarely used, so it'll be ignored
+      for (int i = 0; i < beforeCols.size(); i++) {
+        if (!beforeCols.get(i).getName().equals(afterCols.get(i).getName()) ||
+            !beforeCols.get(i).getType().equals(afterCols.get(i).getType())) {
+          infoLog("Change in table schema detected for table {}.{} from {} ({}) " +
+              "to {} ({}). So file metadata reload can be skipped.", dbName_, tblName_,
+              beforeCols.get(i).getName(), beforeCols.get(i).getType(),
+              afterCols.get(i).getName(), afterCols.get(i).getType());
+          return true;
+        }
+      }
+      return false;
+    }
+
+    private boolean isTableOwnerChanged(String ownerBefore, String ownerAfter) {
+      if (!Objects.equals(ownerBefore, ownerAfter)) {
+        infoLog("Change in Ownership detected for table {}.{}, oldOwner: {}, " +
+            "newOwner: {}. So file metadata reload can be skipped.",
+            dbName_, tblName_, ownerBefore, ownerAfter);
+        return true;
+      }
+      return false;
+    }
+
+    // Check if the whitelisted properties are changed during the alter statement
+    private boolean isCustomTblPropsChanged(Set<String> whitelistedTblProperties,
+        org.apache.hadoop.hive.metastore.api.Table beforeTable,
+        org.apache.hadoop.hive.metastore.api.Table afterTable) {
+      for (String whitelistConfig : whitelistedTblProperties) {
+        String configBefore = beforeTable.getParameters().get(whitelistConfig);
+        String configAfter = afterTable.getParameters().get(whitelistConfig);
+        if (!Objects.equals(configBefore, configAfter)) {
+          infoLog("Change in whitelisted table properties detected for table {}.{} " +
+              "whitelisted config: {}, value before: {}, value after: {}. So file " +
+              "metadata should be reloaded.", dbName_, tblName_, whitelistConfig,
+              configBefore, configAfter);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // Check if the trivial SD properties are changed during the alter statement.
+    // Also, the caller should make sure that 'beforeSd' and 'afterSd' are not equal.
+    private boolean isTrivialSdPropsChanged(StorageDescriptor beforeSd,
+        StorageDescriptor afterSd) {
+      Preconditions.checkNotNull(beforeSd, "beforeSd is null");
+      Preconditions.checkNotNull(afterSd, "afterSd is null");
+      StorageDescriptor previousSD = normalizeStorageDescriptor(beforeSd.deepCopy());
+      StorageDescriptor currentSD = normalizeStorageDescriptor(afterSd.deepCopy());
+      if (!Objects.equals(previousSD, currentSD)) {
+        infoLog("Non-trivial change in table storage descriptor (SD) detected for " +
+            "table {}.{}. So file metadata should be reloaded. SD before: {}, SD " +
+            "after: {}", dbName_, tblName_, beforeSd.toString(), afterSd.toString());
+        return false;
+      }
+      infoLog("Trivial changes in table storage descriptor (SD) detected for table " +
+          "{}.{}. So file metadata reload can be skipped.", dbName_, tblName_);
+      return true;
+    }
+
+    /**
+     * Normalize the storage descriptor by unsetting the trivial fields in SD like
+     * columns, compressed, numBuckets, bucketCols,SkewedInfo, and
+     * setStoredAsSubDirectories.
+     */
+    private StorageDescriptor normalizeStorageDescriptor(StorageDescriptor sd) {
+      sd.unsetCols();
+      sd.unsetCompressed();
+      sd.unsetNumBuckets();
+      sd.unsetBucketCols();
+      sd.unsetSortCols();
+      sd.unsetSkewedInfo();
+      // setStoredAsSubDirectories = null or 'false' are trivial changes, so we normalize
+      // this value to false if it is null.
+      if (!sd.isSetStoredAsSubDirectories()) {
+        sd.setStoredAsSubDirectories(false);
+      }
+      return sd;
     }
 
     /**
@@ -1448,6 +2072,11 @@ public class MetastoreEvents {
       // along with insert events. Check if the alter table event is such a trivial
       // event by setting those parameters equal before and after the event and
       // comparing the objects.
+
+      // alter table event from truncate ops always can't be skipped.
+      if (isTruncateOp_) {
+        return false;
+      }
 
       // Avoid modifying the object from event.
       org.apache.hadoop.hive.metastore.api.Table tblAfter = tableAfter_.deepCopy();
@@ -1493,7 +2122,7 @@ public class MetastoreEvents {
    */
   public static class DropTableEvent extends MetastoreTableEvent {
 
-    public static final String DROP_TABLE_EVENT_TYPE = "DROP_TABLE";
+    public static final String EVENT_TYPE = "DROP_TABLE";
 
     /**
      * Prevent instantiation from outside should use MetastoreEventFactory instead
@@ -1534,9 +2163,10 @@ public class MetastoreEvents {
      * not a huge problem since the tables will eventually be created when the
      * create events are processed but there will be a non-zero amount of time when the
      * table will not be existing in catalog.
+     * TODO: IMPALA-12646, to track average process time for drop operations.
      */
     @Override
-    public void process() throws MetastoreNotificationException {
+    public void processTableEvent() throws MetastoreNotificationException {
       Reference<Boolean> tblRemovedLater = new Reference<>();
       boolean removedTable;
       removedTable = catalogOpExecutor_
@@ -1551,6 +2181,11 @@ public class MetastoreEvents {
             .getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).getCount());
       }
     }
+
+    @Override
+    protected boolean onFailure(Exception e) {
+      return false;
+    }
   }
 
   /**
@@ -1558,7 +2193,7 @@ public class MetastoreEvents {
    */
   public static class CreateDatabaseEvent extends MetastoreDatabaseEvent {
 
-    public static final String CREATE_DATABASE_EVENT_TYPE = "CREATE_DATABASE";
+    public static final String EVENT_TYPE = "CREATE_DATABASE";
     // metastore database object as parsed from NotificationEvent message
     private final Database createdDatabase_;
 
@@ -1707,7 +2342,7 @@ public class MetastoreEvents {
    */
   public static class DropDatabaseEvent extends MetastoreDatabaseEvent {
 
-    public static final String DROP_DATABASE_EVENT_TYPE = "DROP_DATABASE";
+    public static final String EVENT_TYPE = "DROP_DATABASE";
     // Metastore database object as parsed from NotificationEvent message
     private final Database droppedDatabase_;
     /**
@@ -1724,7 +2359,8 @@ public class MetastoreEvents {
               .getDropDatabaseMessage(event.getMessage());
       try {
         droppedDatabase_ =
-            Preconditions.checkNotNull(dropDatabaseMessage.getDatabaseObject());
+            Preconditions
+                .checkNotNull(MetastoreShim.getDatabaseObject(dropDatabaseMessage));
       } catch (Exception e) {
         throw new MetastoreNotificationException(debugString(
             "Database object is null in the event. "
@@ -1807,7 +2443,7 @@ public class MetastoreEvents {
   }
   public static class AddPartitionEvent extends MetastoreTableEvent {
 
-    public static final String ADD_PARTITION_EVENT_TYPE = "ADD_PARTITION";
+    public static final String EVENT_TYPE = "ADD_PARTITION";
     private final List<Partition> addedPartitions_;
     private final List<List<TPartitionKeyValue>> partitionKeyVals_;
 
@@ -1830,6 +2466,7 @@ public class MetastoreEvents {
         // it is possible that the added partitions is empty in certain cases. See
         // IMPALA-8847 for example
         msTbl_ = addPartitionMessage_.getTableObj();
+        MetaStoreUtil.replaceSchemaFromTable(addedPartitions_, msTbl_);
         partitionKeyVals_ = new ArrayList<>(addedPartitions_.size());
         for (Partition part : addedPartitions_) {
           partitionKeyVals_.add(getTPartitionSpecFromHmsPartition(msTbl_, part));
@@ -1859,9 +2496,11 @@ public class MetastoreEvents {
     }
 
     @Override
-    public void process() throws MetastoreNotificationException, CatalogException {
+    public void processTableEvent() throws MetastoreNotificationException,
+        CatalogException {
       // bail out early if there are not partitions to process
       if (addedPartitions_.isEmpty()) {
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
         infoLog("Partition list is empty. Ignoring this event.");
         return;
       }
@@ -1875,7 +2514,10 @@ public class MetastoreEvents {
             BackendConfig.INSTANCE.getHMSEventIncrementalRefreshTransactionalTable();
         if ((AcidUtils.isTransactionalTable(msTbl_.getParameters()) && !isSelfEvent() &&
             !incrementalRefresh) || MetaStoreUtils.isMaterializedViewTable(msTbl_)) {
-          reloadTableFromCatalog("ADD_PARTITION", true);
+           boolean notSkipped = reloadTableFromCatalog("ADD_PARTITION", true);
+           if (!notSkipped) {
+             metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+           }
         } else {
           // HMS adds partitions in a transactional way. This means there may be multiple
           // HMS partition objects in an add_partition event. We try to do the same here
@@ -1892,13 +2534,14 @@ public class MetastoreEvents {
                 .inc(numPartsAdded);
           } else {
             metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
-            debugLog("Incremented skipped metric to " + metrics_
-                .getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).getCount());
+            debugLog("Incremented skipped metric to {} since no partitions were added.",
+            metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+                .getCount());
           }
         }
       } catch (CatalogException e) {
         throw new MetastoreNotificationNeedsInvalidateException(debugString("Failed to "
-                + "refresh newly added partitions of table {}. Event processing cannot "
+                + "refresh newly added partitions of table '%s'. Event processing cannot "
                 + "continue. Issue an invalidate metadata command to reset event "
                 + "processor.", getFullyQualifiedTblName()), e);
       }
@@ -1910,6 +2553,7 @@ public class MetastoreEvents {
   }
 
   public static class AlterPartitionEvent extends MetastoreTableEvent {
+    public static final String EVENT_TYPE = "ALTER_PARTITION";
     // the Partition object before alter operation, as parsed from the NotificationEvent
     private final org.apache.hadoop.hive.metastore.api.Partition partitionBefore_;
     // the Partition object after alter operation, as parsed from the NotificationEvent
@@ -1918,6 +2562,8 @@ public class MetastoreEvents {
     private final long versionNumberFromEvent_;
     // the service id from the partition parameters of the event.
     private final String serviceIdFromEvent_;
+    // true if this alter event was due to a truncate operation in metastore
+    private final boolean isTruncateOp_;
 
     /**
      * Prevent instantiation from outside should use MetastoreEventFactory instead
@@ -1936,6 +2582,7 @@ public class MetastoreEvents {
             Preconditions.checkNotNull(alterPartitionMessage.getPtnObjBefore());
         partitionAfter_ =
             Preconditions.checkNotNull(alterPartitionMessage.getPtnObjAfter());
+        isTruncateOp_ = alterPartitionMessage.getIsTruncateOp();
         msTbl_ = alterPartitionMessage.getTableObj();
         Map<String, String> parameters = partitionAfter_.getParameters();
         versionNumberFromEvent_ = Long.parseLong(
@@ -1960,8 +2607,8 @@ public class MetastoreEvents {
     @Override
     public boolean canBeBatched(MetastoreEvent event) {
       if (!(event instanceof AlterPartitionEvent)) return false;
+      if (isOlderThanLastSyncEventId(event)) return false;
       AlterPartitionEvent alterPartitionEvent = (AlterPartitionEvent) event;
-      if (event.getEventId() != 1 + getEventId()) return false;
       // make sure that the event is on the same table
       if (!getFullyQualifiedTblName().equalsIgnoreCase(
           alterPartitionEvent.getFullyQualifiedTblName())) {
@@ -1994,7 +2641,8 @@ public class MetastoreEvents {
     }
 
     @Override
-    public void process() throws MetastoreNotificationException, CatalogException {
+    public void processTableEvent() throws MetastoreNotificationException,
+        CatalogException {
       if (isSelfEvent()) {
         infoLog("Not processing the event as it is a self-event");
         return;
@@ -2003,15 +2651,22 @@ public class MetastoreEvents {
       // Ignore the event if this is a trivial event. See javadoc for
       // isTrivialAlterPartitionEvent() for examples.
       if (canBeSkipped()) {
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
         infoLog("Not processing this event as it only modifies some partition "
             + "parameters which can be ignored.");
         return;
       }
 
+      if (isOlderEvent(partitionBefore_)) {
+        infoLog("Not processing the alter partition event {} as it is an older event",
+            getEventId());
+        return;
+      }
       // Reload the whole table if it's a transactional table or materialized view.
-      // Materialized views are treated as a special case because it's possible to receive
-      // partition event on MVs, but they are regular views in Impala. That cause problems
-      // on the reloading partition logic which expects it to be a HdfsTable.
+      // Materialized views are treated as a special case because it's possible to
+      // receive partition event on MVs, but they are regular views in Impala. That
+      // cause problems on the reloading partition logic which expects it to be a
+      // HdfsTable.
       if (AcidUtils.isTransactionalTable(msTbl_.getParameters())
           || MetaStoreUtils.isMaterializedViewTable(msTbl_)) {
         reloadTransactionalTable();
@@ -2021,14 +2676,20 @@ public class MetastoreEvents {
         List<TPartitionKeyValue> tPartSpec = getTPartitionSpecFromHmsPartition(msTbl_,
             partitionAfter_);
         try {
-          reloadPartitions(Arrays.asList(partitionAfter_), false, true,
-              "ALTER_PARTITION event");
+          // load file metadata only if storage descriptor of partitionAfter_ differs
+          // from sd of HdfsPartition. If the alter_partition event type is of truncate
+          // then force load the file metadata.
+          FileMetadataLoadOpts fileMetadataLoadOpts =
+              isTruncateOp_ ? FileMetadataLoadOpts.FORCE_LOAD :
+                  FileMetadataLoadOpts.LOAD_IF_SD_CHANGED;
+          reloadPartitions(Arrays.asList(partitionAfter_), fileMetadataLoadOpts,
+              "ALTER_PARTITION event", false);
         } catch (CatalogException e) {
-          throw new MetastoreNotificationNeedsInvalidateException(debugString("Refresh "
-                  + "partition on table {} partition {} failed. Event processing cannot "
-                  + "continue. Issue an invalidate command to reset the event processor "
-                  + "state.", getFullyQualifiedTblName(),
-              HdfsTable.constructPartitionName(tPartSpec)), e);
+          throw new MetastoreNotificationNeedsInvalidateException(
+              debugString("Refresh partition on table {} partition {} failed. Event " +
+                  "processing cannot continue. Issue an invalidate command to reset " +
+                  "the event processor state.", getFullyQualifiedTblName(),
+                  HdfsTable.constructPartitionName(tPartSpec)), e);
         }
       }
     }
@@ -2040,6 +2701,11 @@ public class MetastoreEvents {
       // along with insert events. Check if the alter table event is such a trivial
       // event by setting those parameters equal before and after the event and
       // comparing the objects.
+
+      // alter partition event from truncate ops always can't be skipped.
+      if (isTruncateOp_) {
+        return false;
+      }
 
       // Avoid modifying the object from event.
       Partition afterPartition = partitionAfter_.deepCopy();
@@ -2059,10 +2725,13 @@ public class MetastoreEvents {
       boolean incrementalRefresh =
           BackendConfig.INSTANCE.getHMSEventIncrementalRefreshTransactionalTable();
       if (incrementalRefresh) {
-        reloadPartitions(Collections.singletonList(partitionAfter_), true, false,
-            "ALTER_PARTITION");
+        reloadPartitionsFromEvent(Collections.singletonList(partitionAfter_),
+            "ALTER_PARTITION EVENT FOR TRANSACTIONAL TABLE");
       } else {
-        reloadTableFromCatalog("ALTER_PARTITION", true);
+        boolean notSkipped = reloadTableFromCatalog("ALTER_PARTITION", true);
+        if (!notSkipped) {
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+        }
       }
     }
   }
@@ -2110,6 +2779,15 @@ public class MetastoreEvents {
     }
 
     /**
+     * Same as the above but returns the event time.
+     */
+    @Override
+    public long getEventTime() {
+      Preconditions.checkState(!batchedEvents_.isEmpty());
+      return batchedEvents_.get(batchedEvents_.size() - 1).getEventTime();
+    }
+
+    /**
      *
      * @param event The event under consideration to be batched into this event. It can
      *              be added to the batch if it can be batched into the last event of the
@@ -2126,30 +2804,51 @@ public class MetastoreEvents {
     List<T> getBatchEvents() { return batchedEvents_; }
 
     @Override
-    protected void process() throws MetastoreNotificationException, CatalogException {
+    protected void processTableEvent() throws MetastoreNotificationException,
+        CatalogException {
       if (isSelfEvent()) {
         infoLog("Not processing the event as it is a self-event");
         return;
       }
-
       // Ignore the event if this is a trivial event. See javadoc for
       // isTrivialAlterPartitionEvent() for examples.
       List<T> eventsToProcess = new ArrayList<>();
+      List<Partition> partitionEventsToForceReload = new ArrayList<>();
       for (T event : batchedEvents_) {
-        if (!event.canBeSkipped()) {
+        if (isOlderEvent(event.getPartitionForBatching())) {
+          infoLog("Not processing the current event id {} as it is an older event",
+              event.getEventId());
+          continue;
+        }
+        boolean isTruncateOp = (event instanceof AlterPartitionEvent &&
+            ((AlterPartitionEvent)event).isTruncateOp_);
+        if (isTruncateOp) {
+          partitionEventsToForceReload.add(event.getPartitionForBatching());
+        } else if (!event.canBeSkipped()){
           eventsToProcess.add(event);
         }
       }
-      if (eventsToProcess.isEmpty()) {
+      int notSkippedNum = eventsToProcess.size() + partitionEventsToForceReload.size();
+      int skippedNum = batchedEvents_.size() - notSkippedNum;
+      if (skippedNum > 0) {
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+            .inc(skippedNum);
+      }
+      if (eventsToProcess.isEmpty() && partitionEventsToForceReload.isEmpty()) {
         LOG.info(
-            "Ignoring events from event id {} to {} since they modify parameters "
-            + " which can be ignored", getFirstEventId(), getLastEventId());
+            "Ignoring {} events between event id {} and {} since they modify parameters"
+            + " which can be ignored", getNumberOfEvents(), getFirstEventId(),
+            getLastEventId());
         return;
       }
 
       // Reload the whole table if it's a transactional table.
       if (AcidUtils.isTransactionalTable(msTbl_.getParameters())) {
-        reloadTableFromCatalog(getEventType().toString(), true);
+        boolean notSkipped = reloadTableFromCatalog(getEventType().toString(), true);
+        if (!notSkipped) {
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+              .inc(eventsToProcess.size() + partitionEventsToForceReload.size());
+        }
       } else {
         // Reload the partitions from the batch.
         List<Partition> partitions = new ArrayList<>();
@@ -2157,12 +2856,33 @@ public class MetastoreEvents {
           partitions.add(event.getPartitionForBatching());
         }
         try {
-          reloadPartitions(partitions, false, true, getEventType().toString() + " event");
+          if (baseEvent_ instanceof InsertEvent) {
+            // for insert event, always reload file metadata so that new files
+            // are reflected in HdfsPartition
+            reloadPartitions(partitions, FileMetadataLoadOpts.FORCE_LOAD,
+                getEventType().toString() + " event", true);
+          } else {
+            if (!partitionEventsToForceReload.isEmpty()) {
+              // force reload truncated partitions
+              reloadPartitions(partitionEventsToForceReload,
+                  FileMetadataLoadOpts.FORCE_LOAD, getEventType().toString()
+                  + " event", true);
+            }
+            if (!partitions.isEmpty()) {
+              // alter partition event. Reload file metadata of only those partitions
+              // for which sd has changed
+              reloadPartitions(partitions,
+                  FileMetadataLoadOpts.LOAD_IF_SD_CHANGED, getEventType().toString()
+                  + " event", true);
+            }
+          }
         } catch (CatalogException e) {
           throw new MetastoreNotificationNeedsInvalidateException(String.format(
-              "Refresh partitions on table %s failed when processing event ids %s-%s. "
+              "Refresh partitions on table %s failed when processing a batch of %s "
+              + "events between event ids %s and %s. "
               + "Issue an invalidate command to reset the event processor state.",
-              getFullyQualifiedTblName(), getFirstEventId(), getLastEventId()), e);
+              getFullyQualifiedTblName(), getNumberOfEvents(), getFirstEventId(),
+              getLastEventId()), e);
         }
       }
     }
@@ -2233,12 +2953,15 @@ public class MetastoreEvents {
     }
 
     @Override
-    public void process() throws MetastoreNotificationException, CatalogException {
+    public void processTableEvent() throws MetastoreNotificationException,
+        CatalogException {
       // we have seen cases where a add_partition event is generated with empty
       // partition list (see IMPALA-8547 for details. Make sure that droppedPartitions
       // list is not empty
       if (droppedPartitions_.isEmpty()) {
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
         infoLog("Partition list is empty. Ignoring this event.");
+        return;
       }
       try {
         // Reload the whole table if it's a transactional table or materialized view.
@@ -2250,7 +2973,10 @@ public class MetastoreEvents {
             BackendConfig.INSTANCE.getHMSEventIncrementalRefreshTransactionalTable();
         if ((AcidUtils.isTransactionalTable(msTbl_.getParameters()) &&
             !incrementalRefresh) || MetaStoreUtils.isMaterializedViewTable(msTbl_)) {
-          reloadTableFromCatalog("DROP_PARTITION", true);
+          boolean notSkipped = reloadTableFromCatalog("DROP_PARTITION", true);
+          if (!notSkipped) {
+            metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+          }
         } else {
           int numPartsRemoved = catalogOpExecutor_
               .removePartitionsIfNotAddedLater(getEventId(), dbName_, tblName_,
@@ -2287,7 +3013,6 @@ public class MetastoreEvents {
    */
   public static class AllocWriteIdEvent extends MetastoreTableEvent {
     private final List<TxnToWriteId> txnToWriteIdList_;
-    private org.apache.impala.catalog.Table tbl_;
 
     private AllocWriteIdEvent(CatalogOpExecutor catalogOpExecutor,
         Metrics metrics, NotificationEvent event) throws MetastoreNotificationException {
@@ -2299,34 +3024,13 @@ public class MetastoreEvents {
           MetastoreEventsProcessor.getMessageDeserializer().getAllocWriteIdMessage(
               event.getMessage());
       txnToWriteIdList_ = allocWriteIdMessage.getTxnToWriteIdList();
-      try {
-        // We need to retrieve msTbl_ from catalog because the AllocWriteIdEvent
-        // doesn't bring the table object. However, we need msTbl_ for
-        // MetastoreTableEvent.isEventProcessingDisabled() to determine if event
-        // processing is disabled for the table.
-        tbl_ = catalog_.getTable(dbName_, tblName_);
-        if (tbl_ != null && tbl_.getCreateEventId() < getEventId()) {
-          msTbl_ = tbl_.getMetaStoreTable();
-        }
-      } catch (DatabaseNotFoundException e) {
-        // do nothing
-      } catch (Exception e) {
-        throw new MetastoreNotificationException(debugString("Unable to retrieve table "
-            + "object for AllocWriteIdEvent: {}", getEventId()), e);
-      }
     }
 
     @Override
-    protected void process() throws MetastoreNotificationException {
-      if (msTbl_ == null) {
-        debugLog("Ignoring the event since table {} is not found",
-            getFullyQualifiedTblName());
-        return;
-      }
-      // For non-partitioned tables, we can just reload the whole table without
-      // keeping track of write ids.
-      if (msTbl_.getPartitionKeysSize() == 0) {
-        debugLog("Ignoring the event since table {} is non-partitioned",
+    protected void processTableEvent() throws MetastoreNotificationException {
+      org.apache.impala.catalog.Table tbl = catalog_.getTableNoThrow(dbName_, tblName_);
+      if (tbl == null) {
+        debugLog("Ignoring the event since table {} does not exist",
             getFullyQualifiedTblName());
         return;
       }
@@ -2337,9 +3041,11 @@ public class MetastoreEvents {
         catalog_.addWriteIdsToTable(dbName_, tblName_, getEventId(), writeIds,
             MutableValidWriteIdList.WriteIdStatus.OPEN);
         for (TxnToWriteId txnToWriteId : txnToWriteIdList_) {
-          TableWriteId tableWriteId = new TableWriteId(dbName_, tblName_,
-              tbl_.getCreateEventId(), txnToWriteId.getWriteId());
+          TableWriteId tableWriteId = new TableWriteId(
+              dbName_, tblName_, tbl.getCreateEventId(), txnToWriteId.getWriteId());
           catalog_.addWriteId(txnToWriteId.getTxnId(), tableWriteId);
+          infoLog("Added write id {} on table {}.{} for txn {}",
+              txnToWriteId.getWriteId(), dbName_, tblName_, txnToWriteId.getTxnId());
         }
       } catch (CatalogException e) {
         throw new MetastoreNotificationNeedsInvalidateException("Failed to mark open "
@@ -2356,6 +3062,13 @@ public class MetastoreEvents {
 
     @Override
     protected boolean isEventProcessingDisabled() {
+      // TODO:  Have an init method to set fields that cannot be initialized in the
+      // event constructors and invoke it as a first step before processing event. It
+      // can be useful for other such events.
+      org.apache.impala.catalog.Table tbl = catalog_.getTableNoThrow(dbName_, tblName_);
+      if (tbl != null && tbl.getCreateEventId() < getEventId()) {
+        msTbl_ = tbl.getMetaStoreTable();
+      }
       if (msTbl_ == null) {
         return false;
       }
@@ -2364,126 +3077,155 @@ public class MetastoreEvents {
   }
 
   /**
-   * Metastore event handler for COMMIT_TXN events. Handles commit event for transactional
-   * tables.
+   *  Metastore event handler for Reload events. A reload event can be generated by
+   *  refresh table/partition or invalidate table event. Handles reload events at both
+   *  table and partition scopes (If applicable).
    */
-  public static class CommitTxnEvent extends MetastoreEvent {
-    private final CommitTxnMessage commitTxnMessage_;
-    private final long txnId_;
+  public static class ReloadEvent extends MetastoreTableEvent {
 
-    CommitTxnEvent(CatalogOpExecutor catalogOpExecutor, Metrics metrics,
-        NotificationEvent event) {
-      super(catalogOpExecutor, metrics, event);
-      Preconditions.checkState(getEventType().equals(MetastoreEventType.COMMIT_TXN));
-      Preconditions.checkNotNull(event.getMessage());
-      commitTxnMessage_ = MetastoreEventsProcessor.getMessageDeserializer()
-          .getCommitTxnMessage(event.getMessage());
-      txnId_ = commitTxnMessage_.getTxnId();
-    }
+    // The partition for this reload event. Null if the table is unpartitioned
+    private Partition reloadPartition_;
 
-    @Override
-    protected void process() throws MetastoreNotificationException {
-      // To ensure no memory leaking in case an exception is thrown, we remove entries
-      // at first.
-      Set<TableWriteId> committedWriteIds = catalog_.removeWriteIds(txnId_);
-      // Via getAllWriteEventInfo, we can get data insertion info for transactional tables
-      // even though there are no insert events generated for transactional tables. Note
-      // that we cannot get DDL info from this API.
-      List<WriteEventInfo> writeEventInfoList;
-      try (MetaStoreClientPool.MetaStoreClient client = catalog_.getMetaStoreClient()) {
-        writeEventInfoList = client.getHiveClient().getAllWriteEventInfo(
-            new GetAllWriteEventInfoRequest(txnId_));
-      } catch (TException e) {
-        throw new MetastoreNotificationNeedsInvalidateException(debugString("Failed to "
-            + "get write event infos for txn {}. Event processing cannot continue. Issue "
-            + "an invalidate metadata command to reset event processor.", txnId_), e);
-      }
+    // if isRefresh_ is set to true then it is refresh query, else it is invalidate query
+    private boolean isRefresh_;
 
-      try {
-        if (writeEventInfoList != null && !writeEventInfoList.isEmpty()) {
-          commitTxnMessage_.addWriteEventInfo(writeEventInfoList);
-          addCommittedWriteIdsAndRefreshPartitions();
-        }
-        // committed write ids for DDL need to be added here
-        addCommittedWriteIdsToTables(committedWriteIds);
-      } catch (Exception e) {
-        throw new MetastoreNotificationNeedsInvalidateException(debugString("Failed to "
-            + "mark committed write ids and refresh partitions for txn {}. Event "
-            + "processing cannot continue. Issue an invalidate metadata command to reset "
-            + "event processor.", txnId_), e);
-      }
-    }
-
-    private void addCommittedWriteIdsToTables(Set<TableWriteId> tableWriteIds)
-        throws CatalogException {
-      for (TableWriteId tableWriteId: tableWriteIds) {
-        catalog_.addWriteIdsToTable(tableWriteId.getDbName(), tableWriteId.getTblName(),
-            getEventId(),
-            Collections.singletonList(tableWriteId.getWriteId()),
-            MutableValidWriteIdList.WriteIdStatus.COMMITTED);
-      }
-    }
-
-    private void addCommittedWriteIdsAndRefreshPartitions() throws Exception {
-      Preconditions.checkNotNull(commitTxnMessage_.getWriteIds());
-      List<Long> writeIds = Collections.unmodifiableList(commitTxnMessage_.getWriteIds());
-      List<Partition> parts = new ArrayList<>();
-      // To load partitions together for the same table, indexes are grouped by table name
-      Map<TableName, List<Integer>> tableNameToIdxs = new HashMap<>();
-      for (int i = 0; i < writeIds.size(); i++) {
-        org.apache.hadoop.hive.metastore.api.Table tbl = commitTxnMessage_.getTableObj(i);
-        TableName tableName = new TableName(tbl.getDbName(), tbl.getTableName());
-        parts.add(commitTxnMessage_.getPartitionObj(i));
-        tableNameToIdxs.computeIfAbsent(tableName, k -> new ArrayList<>()).add(i);
-      }
-      for (Map.Entry<TableName, List<Integer>> entry : tableNameToIdxs.entrySet()) {
-        org.apache.hadoop.hive.metastore.api.Table tbl =
-            commitTxnMessage_.getTableObj(entry.getValue().get(0));
-        List<Long> writeIdsForTable = entry.getValue().stream()
-            .map(i -> writeIds.get(i))
-            .collect(Collectors.toList());
-        List<Partition> partsForTable = entry.getValue().stream()
-            .map(i -> parts.get(i))
-            .collect(Collectors.toList());
-        if (tbl.getPartitionKeysSize() > 0
-            && !MetaStoreUtils.isMaterializedViewTable(tbl)) {
-          try {
-            catalogOpExecutor_.addCommittedWriteIdsAndReloadPartitionsIfExist(
-                getEventId(), entry.getKey().getDb(), entry.getKey().getTbl(),
-                writeIdsForTable, partsForTable, "Processing event id: " +
-                    getEventId() + ", event type: " + getEventType());
-          } catch (TableNotLoadedException e) {
-            debugLog("Ignoring reloading since table {} is not loaded",
-                entry.getKey());
-          } catch (DatabaseNotFoundException | TableNotFoundException e) {
-            debugLog("Ignoring reloading since table {} is not found",
-                entry.getKey());
-          }
-        } else {
-          catalog_.reloadTableIfExists(entry.getKey().getDb(), entry.getKey().getTbl(),
-              "CommitTxnEvent", getEventId());
-        }
-      }
-    }
-
-    @Override
-    protected boolean isEventProcessingDisabled() {
-      return false;
-    }
-
-    @Override
-    protected SelfEventContext getSelfEventContext() {
-      throw new UnsupportedOperationException("Self-event evaluation is not needed for "
-          + "this event type");
-    }
-
-    /*
-    Not skipping the event since there can be multiple tables involved. The actual
-    processing of event would skip or process the event on a table by table basis
+    /**
+     * Prevent instantiation from outside should use MetastoreEventFactory instead
      */
+    @VisibleForTesting
+    ReloadEvent(CatalogOpExecutor catalogOpExecutor, Metrics metrics,
+        NotificationEvent event) throws MetastoreNotificationException {
+      super(catalogOpExecutor, metrics, event);
+      Preconditions.checkArgument(MetastoreEventType.RELOAD.equals(getEventType()));
+      try {
+        Map<String, Object> updatedFields =
+            MetastoreShim.getFieldsFromReloadEvent(event);
+        msTbl_ = (org.apache.hadoop.hive.metastore.api.Table)Preconditions.checkNotNull(
+            updatedFields.get("table"));
+        reloadPartition_ = (Partition)updatedFields.get("partition");
+        isRefresh_ = (boolean)updatedFields.get("isRefresh");
+      } catch (Exception e) {
+        throw new MetastoreNotificationException(debugString("Unable to "
+                + "parse reload message"), e);
+      }
+    }
+
     @Override
-    protected boolean shouldSkipWhenSyncingToLatestEventId() {
-      return false;
+    public SelfEventContext getSelfEventContext() {
+      throw new UnsupportedOperationException("Self-event evaluation is unnecessary for"
+          + " this event type");
+    }
+
+    @Override
+    public void processTableEvent() throws MetastoreNotificationException {
+      if (isOlderEvent()) {
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+            .inc(getNumberOfEvents());
+        infoLog("Incremented events skipped counter to {}",
+            metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC)
+                .getCount());
+        return;
+      }
+      if (isRefresh_) {
+        if (reloadPartition_ != null) {
+          processPartitionReload();
+        } else {
+          processTableReload();
+        }
+      } else {
+        processTableInvalidate();
+      }
+    }
+
+    private boolean isOlderEvent() {
+      org.apache.impala.catalog.Table tbl = catalog_.getTableNoThrow(dbName_, tblName_);
+      if (tbl == null || tbl instanceof IncompleteTable) { return false; }
+      // Always check the lastRefreshEventId on the table first for table level refresh
+      boolean canSkip = tbl.getLastRefreshEventId() >= getEventId();
+      try {
+        if (!canSkip && reloadPartition_ != null) {
+          tbl.takeReadLock();
+          canSkip = catalog_.isPartitionLoadedAfterEvent(dbName_, tblName_,
+              reloadPartition_, getEventId());
+        }
+        return canSkip;
+      } finally {
+        if (tbl.isReadLockedByCurrentThread()) {
+          tbl.releaseReadLock();
+        }
+      }
+    }
+
+    /**
+     * Process partition reload
+     */
+    private void processPartitionReload() throws MetastoreNotificationException {
+      // For partitioned table, refresh the partition only.
+      Preconditions.checkNotNull(reloadPartition_);
+      try {
+        // Ignore event if table or database is not in catalog. Throw exception if
+        // refresh fails. If the partition does not exist in metastore the reload
+        // method below removes it from the catalog
+        // forcing file metadata reload so that new files (due to refresh) are reflected
+        // HdfsPartition
+        reloadPartitions(Arrays.asList(reloadPartition_),
+            FileMetadataLoadOpts.FORCE_LOAD, "RELOAD event", false);
+      } catch (CatalogException e) {
+        throw new MetastoreNotificationNeedsInvalidateException(debugString("Refresh "
+            + "partition on table {} partition {} failed. Event processing cannot "
+            + "continue. Issue an invalidate metadata command to reset the event "
+            + "processor state.", getFullyQualifiedTblName(),
+            Joiner.on(',').join(reloadPartition_.getValues())), e);
+      }
+    }
+
+    /**
+     *  Process unpartitioned table reload
+     */
+    private void processTableReload() throws MetastoreNotificationException {
+      // For non-partitioned tables, refresh the whole table.
+      Preconditions.checkState(reloadPartition_ == null);
+      try {
+        // we always treat the table as non-transactional so all the files are reloaded
+        boolean notSkipped = reloadTableFromCatalog("RELOAD event", false);
+        if (!notSkipped) {
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+        }
+      } catch (CatalogException e) {
+        throw new MetastoreNotificationNeedsInvalidateException(
+            debugString("Refresh table {} failed. Event processing "
+            + "cannot continue. Issue an invalidate metadata " +
+            "command to reset the event processor state.",
+            getFullyQualifiedTblName()), e);
+      }
+    }
+
+    private void processTableInvalidate() throws MetastoreNotificationException {
+      Reference<Boolean> tblWasRemoved = new Reference<>();
+      Reference<Boolean> dbWasAdded = new Reference<>();
+      org.apache.impala.catalog.Table tbl = null;
+      try {
+        tbl = catalog_.getTable(dbName_, tblName_);
+        if (tbl == null) {
+          infoLog("Skipping on table {}.{} since it does not exist in cache", dbName_,
+              tblName_);
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+          return ;
+        }
+        if (tbl instanceof IncompleteTable) {
+          infoLog("Skipping on an incomplete table {}", tbl.getFullName());
+          metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+          return ;
+        }
+      } catch (DatabaseNotFoundException e) {
+        infoLog("Skipping on table {} because db {} not found in cache", tblName_,
+            dbName_);
+        metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+        return ;
+      }
+      catalog_.invalidateTable(tbl.getTableName().toThrift(),
+          tblWasRemoved, dbWasAdded, NoOpEventSequence.INSTANCE, getEventId());
+      LOG.info("Table " + tbl.getFullName() + " is invalidated from catalog cache");
     }
   }
 
@@ -2493,6 +3235,7 @@ public class MetastoreEvents {
    */
   public static class AbortTxnEvent extends MetastoreEvent {
     private final long txnId_;
+    private Set<TableWriteId> tableWriteIds_ = Collections.emptySet();
 
     AbortTxnEvent(CatalogOpExecutor catalogOpExecutor, Metrics metrics,
         NotificationEvent event) {
@@ -2503,12 +3246,15 @@ public class MetastoreEvents {
           MetastoreEventsProcessor.getMessageDeserializer().getAbortTxnMessage(
               event.getMessage());
       txnId_ = abortTxnMessage.getTxnId();
+      infoLog("Received AbortTxnEvent for transaction " + txnId_);
     }
 
     @Override
     protected void process() throws MetastoreNotificationException {
       try {
-        addAbortedWriteIdsToTables(catalog_.getWriteIds(txnId_));
+        tableWriteIds_ = catalog_.getWriteIds(txnId_);
+        infoLog("Adding {} aborted write ids", tableWriteIds_.size());
+        addAbortedWriteIdsToTables(tableWriteIds_);
       } catch (CatalogException e) {
         throw new MetastoreNotificationNeedsInvalidateException(debugString("Failed to "
             + "mark aborted write ids to table for txn {}. Event processing cannot "
@@ -2517,6 +3263,26 @@ public class MetastoreEvents {
       } finally {
         catalog_.removeWriteIds(txnId_);
       }
+    }
+
+    @Override
+    protected boolean onFailure(Exception e) {
+      if (!BackendConfig.INSTANCE.isInvalidateMetadataOnEventProcessFailureEnabled()
+          || !canInvalidateTable(e)) {
+        return false;
+      }
+      errorLog(
+          "Invalidating tables in transaction due to exception during event processing",
+          e);
+      Set<TableName> tableNames =
+          tableWriteIds_.stream()
+              .map(writeId -> new TableName(writeId.getDbName(), writeId.getTblName()))
+              .collect(Collectors.toSet());
+      for (TableName tableName : tableNames) {
+        errorLog("Invalidate table {}.{}", tableName.getDb(), tableName.getTbl());
+        catalog_.invalidateTableIfExists(tableName.getDb(), tableName.getTbl());
+      }
+      return true;
     }
 
     private void addAbortedWriteIdsToTables(Set<TableWriteId> tableWriteIds)
@@ -2546,6 +3312,66 @@ public class MetastoreEvents {
     @Override
     protected boolean shouldSkipWhenSyncingToLatestEventId() {
       return false;
+    }
+  }
+
+  /**
+   * Metastore event handler for COMMIT_COMPACTION events. Handles
+   * COMMIT_COMPACTION event for transactional tables.
+   */
+  public static class CommitCompactionEvent extends MetastoreTableEvent {
+    private String partitionName_;
+
+    CommitCompactionEvent(CatalogOpExecutor catalogOpExecutor, Metrics metrics,
+        NotificationEvent event) throws MetastoreNotificationException {
+      super(catalogOpExecutor, metrics, event);
+      Preconditions.checkState(
+          getEventType().equals(MetastoreEventType.COMMIT_COMPACTION));
+      Preconditions.checkNotNull(event.getMessage());
+      try {
+        partitionName_ =
+            MetastoreShim.getPartitionNameFromCommitCompactionEvent(event);
+      } catch (Exception ex) {
+        warnLog("Unable to parse commit compaction message: {}", ex.getMessage());
+      }
+    }
+
+    @Override
+    protected void processTableEvent() throws MetastoreNotificationException {
+      try {
+        if (partitionName_ == null) {
+          boolean notSkipped = reloadTableFromCatalog("Commit Compaction event", true);
+          if (!notSkipped) {
+            metrics_.getCounter(MetastoreEventsProcessor.EVENTS_SKIPPED_METRIC).inc();
+          }
+        } else {
+          reloadPartitionsFromNames(Arrays.asList(partitionName_),
+                  "Commit compaction event", FileMetadataLoadOpts.FORCE_LOAD);
+        }
+      } catch (CatalogException e) {
+        throw new MetastoreNotificationNeedsInvalidateException(debugString("Failed to "
+            + "commit compaction for the table {}. Event processing cannot "
+            + "continue. Issue an invalidate metadata command to reset " +
+            "event processor.", tblName_), e);
+      }
+    }
+
+    @Override
+    protected SelfEventContext getSelfEventContext() {
+      throw new UnsupportedOperationException("Self-event evaluation is not needed for "
+          + "this event type");
+    }
+
+    @Override
+    protected boolean isEventProcessingDisabled() {
+      org.apache.impala.catalog.Table tbl = catalog_.getTableNoThrow(dbName_, tblName_);
+      if (tbl != null && tbl.getCreateEventId() < getEventId()) {
+        msTbl_ = tbl.getMetaStoreTable();
+      }
+      if (msTbl_ == null) {
+        return false;
+      }
+      return super.isEventProcessingDisabled();
     }
   }
 
@@ -2582,6 +3408,11 @@ public class MetastoreEvents {
     protected SelfEventContext getSelfEventContext() {
       throw new UnsupportedOperationException("Self-event evaluation is not needed for "
           + "this event type");
+    }
+
+    @Override
+    protected boolean onFailure(Exception e) {
+      return false;
     }
   }
 }

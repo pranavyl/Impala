@@ -25,6 +25,7 @@ import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.catalog.TableLoadingException;
+import org.apache.impala.catalog.iceberg.IcebergMetadataTable;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TDescribeOutputStyle;
 import org.apache.impala.thrift.TDescribeTableParams;
@@ -84,6 +85,15 @@ public class DescribeTableStmt extends StatementBase {
   public FeTable getTable() { return table_; }
   public TDescribeOutputStyle getOutputStyle() { return outputStyle_; }
 
+
+  /**
+   * Returns true if this statement is to describe a table and not a complex type.
+   */
+  public boolean targetsTable() {
+    Preconditions.checkState(isAnalyzed());
+    return path_.destTable() != null;
+  }
+
   @Override
   public void collectTableRefs(List<TableRef> tblRefs) {
     tblRefs.add(new TableRef(rawPath_, null));
@@ -91,6 +101,9 @@ public class DescribeTableStmt extends StatementBase {
 
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
+    if (isAnalyzed()) return;
+    super.analyze(analyzer);
+
     try {
       path_ = analyzer.resolvePath(rawPath_, PathType.ANY);
     } catch (AnalysisException ae) {
@@ -124,29 +137,40 @@ public class DescribeTableStmt extends StatementBase {
     // all columns returning an empty result due to insufficient VIEW_METADATA privilege.
     analyzer.getTable(table_.getTableName(), /* add column-level privilege */ true,
         Privilege.ANY);
+    checkMinimalForIcebergMetadataTable();
 
-    // Describing a table.
-    if (path_.destTable() != null) return;
+    if (!targetsTable()) analyzeComplexType(analyzer);
+  }
 
+  private void analyzeComplexType(Analyzer analyzer) throws AnalysisException {
     analyzer.registerPrivReq(builder ->
         builder.onColumn(path_.getRootTable().getDb().getName(),
-            path_.getRootTable().getName(),
-            path_.getRawPath().get(0), path_.getRootTable().getOwnerUser())
-            .any()
-            .build());
+          path_.getRootTable().getName(),
+          path_.getRawPath().get(0), path_.getRootTable().getOwnerUser())
+        .any()
+        .build());
 
-    if (path_.destType().isComplexType()) {
-      if (outputStyle_ == TDescribeOutputStyle.FORMATTED ||
-          outputStyle_ == TDescribeOutputStyle.EXTENDED) {
-        throw new AnalysisException("DESCRIBE FORMATTED|EXTENDED must refer to a table");
-      }
-      // Describing a nested collection.
-      Preconditions.checkState(outputStyle_ == TDescribeOutputStyle.MINIMAL);
-      resultStruct_ = Path.getTypeAsStruct(path_.destType());
-    } else {
+    if (!path_.destType().isComplexType()) {
       throw new AnalysisException("Cannot describe path '" +
           Joiner.on('.').join(rawPath_) + "' targeting scalar type: " +
           path_.destType().toSql());
+    }
+
+    if (outputStyle_ == TDescribeOutputStyle.FORMATTED ||
+        outputStyle_ == TDescribeOutputStyle.EXTENDED) {
+      throw new AnalysisException("DESCRIBE FORMATTED|EXTENDED must refer to a table");
+    }
+
+    // Describing a complex type.
+    Preconditions.checkState(outputStyle_ == TDescribeOutputStyle.MINIMAL);
+    resultStruct_ = Path.getTypeAsStruct(path_.destType());
+  }
+
+  private void checkMinimalForIcebergMetadataTable() throws AnalysisException {
+    if (table_ instanceof IcebergMetadataTable &&
+        outputStyle_ != TDescribeOutputStyle.MINIMAL) {
+      throw new AnalysisException("DESCRIBE FORMATTED|EXTENDED cannot refer to a "
+          + "metadata table.");
     }
   }
 
@@ -158,6 +182,10 @@ public class DescribeTableStmt extends StatementBase {
     } else {
       Preconditions.checkNotNull(table_);
       params.setTable_name(table_.getTableName().toThrift());
+      if (table_ instanceof IcebergMetadataTable) {
+        params.setMetadata_table_name(((IcebergMetadataTable)table_).
+            getMetadataTableName());
+      }
     }
     return params;
   }

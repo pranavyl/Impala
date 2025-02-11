@@ -22,13 +22,13 @@ import static java.lang.String.format;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.impala.catalog.FeIcebergTable;
+import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.planner.DataSink;
-import org.apache.impala.planner.TableSink;
-import org.apache.impala.thrift.TSortingOrder;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableList;
 
 /**
  * Representation of an Update statement.
@@ -45,7 +45,7 @@ import com.google.common.collect.ImmutableList;
  * clause. The type of the right-hand side of each assignments must be
  * assignment compatible with the left-hand side column type.
  *
- * Currently, only Kudu tables can be updated.
+ * Currently, only Kudu and Iceberg tables can be updated.
  */
 public class UpdateStmt extends ModifyStmt {
   public UpdateStmt(List<String> targetTablePath, FromClause tableRefs,
@@ -58,19 +58,28 @@ public class UpdateStmt extends ModifyStmt {
         new ArrayList<>(), other.wherePredicate_);
   }
 
+  @Override
+  protected void createModifyImpl() {
+    // Currently Kudu and Iceberg tables are supported.
+    if (table_ instanceof FeKuduTable) {
+      modifyImpl_ = new KuduUpdateImpl(this);
+    } else if (table_ instanceof FeIcebergTable) {
+      modifyImpl_ = new IcebergUpdateImpl(this);
+    }
+  }
+
+  @Override
+  public void substituteResultExprs(ExprSubstitutionMap smap, Analyzer analyzer) {
+    modifyImpl_.substituteResultExprs(smap, analyzer);
+  }
+
   /**
    * Return an instance of a KuduTableSink specialized as an Update operation.
    */
   @Override
-  public DataSink createDataSink(List<Expr> resultExprs) {
+  public DataSink createDataSink() {
     // analyze() must have been called before.
-    Preconditions.checkState(table_ != null);
-    DataSink dataSink = TableSink.create(table_, TableSink.Op.UPDATE,
-        ImmutableList.<Expr>of(), resultExprs, referencedColumns_, false, false,
-        new Pair<>(ImmutableList.<Integer>of(), TSortingOrder.LEXICAL), -1, kuduTxnToken_,
-        0);
-    Preconditions.checkState(!referencedColumns_.isEmpty());
-    return dataSink;
+    return modifyImpl_.createDataSink();
   }
 
   @Override

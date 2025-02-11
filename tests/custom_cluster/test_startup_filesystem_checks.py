@@ -17,14 +17,15 @@
 #
 # Tests for the behavior of startup_filesystem_check_directories
 
+from __future__ import absolute_import, division, print_function
 import logging
 import pytest
 import os
-import tempfile
 
 from impala_py_lib.helpers import find_all_files, is_core_dump
 from tests.common.file_utils import assert_file_in_dir_contains
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
+from tests.util.filesystem_utils import get_fs_path
 
 LOG = logging.getLogger('test_startup_filesystem_checks')
 
@@ -38,60 +39,75 @@ class TestStartupFilesystemChecks(CustomClusterTestSuite):
   setup_method().
   """
 
-  NONEXISTENT_PATH = "/nonexistent_path"
-  NONDIRECTORY_PATH = "/test-warehouse/alltypes/year=2009/month=1/090101.txt"
-  VALID_SUBDIRECTORY = "/test-warehouse"
+  # Use get_fs_path because testdata in Ozone requires a volume prefix and does not
+  # accept underscore as a bucket name (the first element after volume prefix).
+  NONEXISTENT_PATH = get_fs_path("/nonexistent-path")
+  NONDIRECTORY_PATH = \
+      get_fs_path("/test-warehouse/alltypes/year=2009/month=1/090101.txt")
+  VALID_SUBDIRECTORY = get_fs_path("/test-warehouse")
   # Test multiple valid directories along with an empty entry
-  MULTIPLE_VALID_DIRECTORIES = \
-      "/,/test-warehouse/zipcode_incomes,,/test-warehouse/alltypes"
-  LOG_DIR = tempfile.mkdtemp(prefix="test_startup_filesystem_checks_",
-                             dir=os.getenv("LOG_DIR"))
-  MINIDUMP_PATH = tempfile.mkdtemp()
+  MULTIPLE_VALID_DIRECTORIES = ",".join([
+    "/",
+    get_fs_path("/test-warehouse/zipcode_incomes"),
+    "",
+    get_fs_path("/test-warehouse/alltypes")]
+  )
+  LOG_DIR = "startup_filesystem_checks"
+  MINIDUMP_PATH = "minidump_path"
+  LOG_DIR_PLACEHOLDER = "{" + LOG_DIR + "}"
+  MINIDUMP_PLACEHOLDER = "--minidump_path={" + MINIDUMP_PATH + "}"
 
-  IMPALAD_ARGS = "--startup_filesystem_check_directories={0} --minidump_path={1}"
+  IMPALAD_ARGS = "--startup_filesystem_check_directories={0} "
 
   pre_test_cores = None
 
-  @pytest.mark.execute_serially
-  @CustomClusterTestSuite.with_args(
-      impala_log_dir=LOG_DIR,
-      impalad_args=IMPALAD_ARGS.format(NONEXISTENT_PATH, MINIDUMP_PATH))
-  def test_nonexistent_path(self, unique_name):
-    # parse log file for expected exception
-    assert_file_in_dir_contains(TestStartupFilesystemChecks.LOG_DIR,
-        "Invalid path specified for startup_filesystem_check_directories: " +
-        "{0} does not exist.".format(TestStartupFilesystemChecks.NONEXISTENT_PATH))
+  def get_log_dir(self):
+    return self.get_tmp_dir(self.LOG_DIR)
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impala_log_dir=LOG_DIR,
-      impalad_args=IMPALAD_ARGS.format(NONDIRECTORY_PATH, MINIDUMP_PATH))
-  def test_nondirectory_path(self, unique_name):
+      impala_log_dir=LOG_DIR_PLACEHOLDER,
+      impalad_args=IMPALAD_ARGS.format(NONEXISTENT_PATH) + MINIDUMP_PLACEHOLDER,
+      tmp_dir_placeholders=[LOG_DIR, MINIDUMP_PATH])
+  def test_nonexistent_path(self):
     # parse log file for expected exception
-    assert_file_in_dir_contains(TestStartupFilesystemChecks.LOG_DIR,
-        "Invalid path specified for startup_filesystem_check_directories: " +
-        "{0} is not a directory.".format(TestStartupFilesystemChecks.NONDIRECTORY_PATH))
+    assert_file_in_dir_contains(self.get_log_dir(),
+        ("Invalid path specified for startup_filesystem_check_directories: "
+         "{0} does not exist.").format(self.NONEXISTENT_PATH))
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impala_log_dir=LOG_DIR,
-      impalad_args=IMPALAD_ARGS.format(VALID_SUBDIRECTORY, MINIDUMP_PATH))
-  def test_valid_subdirectory(self, unique_name):
+      impala_log_dir=LOG_DIR_PLACEHOLDER,
+      impalad_args=IMPALAD_ARGS.format(NONDIRECTORY_PATH) + MINIDUMP_PLACEHOLDER,
+      tmp_dir_placeholders=[LOG_DIR, MINIDUMP_PATH])
+  def test_nondirectory_path(self):
+    # parse log file for expected exception
+    assert_file_in_dir_contains(self.get_log_dir(),
+        ("Invalid path specified for startup_filesystem_check_directories: "
+         "{0} is not a directory.").format(self.NONDIRECTORY_PATH))
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impala_log_dir=LOG_DIR_PLACEHOLDER,
+      impalad_args=IMPALAD_ARGS.format(VALID_SUBDIRECTORY) + MINIDUMP_PLACEHOLDER,
+      tmp_dir_placeholders=[LOG_DIR, MINIDUMP_PATH])
+  def test_valid_subdirectory(self):
     # parse log file for expected log message showing success
-    assert_file_in_dir_contains(TestStartupFilesystemChecks.LOG_DIR,
-        "Successfully listed {0}".format(TestStartupFilesystemChecks.VALID_SUBDIRECTORY))
+    assert_file_in_dir_contains(self.get_log_dir(),
+        "Successfully listed {0}".format(self.VALID_SUBDIRECTORY))
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impala_log_dir=LOG_DIR,
-      impalad_args=IMPALAD_ARGS.format(MULTIPLE_VALID_DIRECTORIES, MINIDUMP_PATH))
-  def test_multiple_valid_dirs(self, unique_name):
-    valid_directories = TestStartupFilesystemChecks.MULTIPLE_VALID_DIRECTORIES.split(",")
+      impala_log_dir=LOG_DIR_PLACEHOLDER,
+      impalad_args=IMPALAD_ARGS.format(MULTIPLE_VALID_DIRECTORIES) + MINIDUMP_PLACEHOLDER,
+      tmp_dir_placeholders=[LOG_DIR, MINIDUMP_PATH])
+  def test_multiple_valid_dirs(self):
+    valid_directories = self.MULTIPLE_VALID_DIRECTORIES.split(",")
     for valid_dir in valid_directories:
       if len(valid_dir) == 0:
         continue
       # parse log file for expected log message showing success
-      assert_file_in_dir_contains(TestStartupFilesystemChecks.LOG_DIR,
+      assert_file_in_dir_contains(self.get_log_dir(),
         "Successfully listed {0}".format(valid_dir))
 
   def setup_method(self, method):

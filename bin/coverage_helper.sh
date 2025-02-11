@@ -66,6 +66,10 @@ fi
 if [ ${REPORT_ACTION} -eq 1 ]; then
   mkdir -p "${REPORT_DIRECTORY}"
   rm -f "${REPORT_DIRECTORY}"/index*.html
+  # Use gcov from the toolchain's GCC directory, so the gcov version always matches
+  # our toolchain compiler version.
+  export PATH="$IMPALA_TOOLCHAIN_PACKAGES_HOME/gcc-$IMPALA_GCC_VERSION/bin:$PATH"
+  echo "Using gcov at `which gcov`"
   # src/util/bit-packing.inline.h gets lots of hits, so generating a detailed report
   # for it takes several minutes. Exclude it to keep the execution time down.
   # gcovr excludes are buggy, so on some environments these excludes won't work.
@@ -75,7 +79,8 @@ if [ ${REPORT_ACTION} -eq 1 ]; then
     --exclude=".*src/benchmarks.*" \
     --exclude=".*generated-sources/gen-cpp.*" \
     --exclude=".*src/util/bit-packing.inline.h.*" \
-    --html --html-details -o "${REPORT_DIRECTORY}/index.html" > "${REPORT_DIRECTORY}/gcovr.out"
+    --html --html-details -o "${REPORT_DIRECTORY}/index.html" \
+    > "${REPORT_DIRECTORY}/gcovr.out" 2>&1
 fi
 
 if [ ${ZERO_COUNTERS_ACTION} -eq 1 ]; then

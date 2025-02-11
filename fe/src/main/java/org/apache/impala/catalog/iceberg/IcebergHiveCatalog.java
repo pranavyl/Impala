@@ -17,18 +17,21 @@
 
 package org.apache.impala.catalog.iceberg;
 
+import static org.apache.impala.catalog.Table.TBL_PROP_EXTERNAL_TABLE_PURGE;
+import static org.apache.impala.catalog.Table.TBL_PROP_EXTERNAL_TABLE_PURGE_DEFAULT;
+
 import java.util.Map;
+
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.hadoop.ConfigProperties;
 import org.apache.iceberg.hive.HiveCatalog;
 import org.apache.impala.catalog.FeIcebergTable;
+import org.apache.impala.catalog.IcebergTableLoadingException;
 import org.apache.impala.catalog.TableLoadingException;
-import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.thrift.TIcebergCatalog;
 import org.apache.impala.util.IcebergUtil;
 
@@ -47,12 +50,16 @@ public class IcebergHiveCatalog implements IcebergCatalog {
     return instance_;
   }
 
-  private HiveCatalog hiveCatalog_;
+  private final HiveCatalog hiveCatalog_;
 
   private IcebergHiveCatalog() {
+    setContextClassLoader();
     HiveConf conf = new HiveConf(IcebergHiveCatalog.class);
     conf.setBoolean(ConfigProperties.ENGINE_HIVE_ENABLED, true);
-    hiveCatalog_ = new HiveCatalog(conf);
+    hiveCatalog_ = new HiveCatalog();
+    hiveCatalog_.setConf(conf);
+    Map<String, String> properties = IcebergUtil.composeCatalogProperties();
+    hiveCatalog_.initialize("ImpalaHiveCatalog", properties);
   }
 
   @Override
@@ -62,7 +69,8 @@ public class IcebergHiveCatalog implements IcebergCatalog {
       PartitionSpec spec,
       String location,
       Map<String, String> properties) {
-    properties.put("external.table.purge", "TRUE");
+    properties.put(TBL_PROP_EXTERNAL_TABLE_PURGE, properties.getOrDefault(
+        TBL_PROP_EXTERNAL_TABLE_PURGE, TBL_PROP_EXTERNAL_TABLE_PURGE_DEFAULT));
     return hiveCatalog_.createTable(identifier, schema, spec, location, properties);
   }
 
@@ -76,12 +84,12 @@ public class IcebergHiveCatalog implements IcebergCatalog {
 
   @Override
   public Table loadTable(TableIdentifier tableId, String tableLocation,
-      Map<String, String> properties) throws TableLoadingException {
+      Map<String, String> properties) throws IcebergTableLoadingException {
     Preconditions.checkState(tableId != null);
     try {
       return hiveCatalog_.loadTable(tableId);
     } catch (Exception e) {
-      throw new TableLoadingException(String.format(
+      throw new IcebergTableLoadingException(String.format(
           "Failed to load Iceberg table with id: %s", tableId), e);
     }
   }
@@ -92,6 +100,11 @@ public class IcebergHiveCatalog implements IcebergCatalog {
         feTable.getIcebergCatalog() == TIcebergCatalog.HIVE_CATALOG);
     TableIdentifier tableId = IcebergUtil.getIcebergTableIdentifier(feTable);
     return hiveCatalog_.dropTable(tableId, purge);
+  }
+
+  @Override
+  public boolean dropTable(String dbName, String tblName, boolean purge) {
+    return hiveCatalog_.dropTable(TableIdentifier.of(dbName, tblName), purge);
   }
 
   @Override

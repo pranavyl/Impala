@@ -37,6 +37,9 @@ import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.util.BitUtil;
+import org.apache.impala.util.ExprUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.MoreObjects;
@@ -48,6 +51,16 @@ import com.google.common.base.Preconditions;
  * inversion (for outer/semi/cross joins) it could also be the left child.
  */
 public class HashJoinNode extends JoinNode {
+  private final static Logger LOG = LoggerFactory.getLogger(HashJoinNode.class);
+
+  // Coefficients for estimating hash join CPU processing cost.  Derived from
+  // benchmarking. Probe side cost per input row consumed
+  private static final double COST_COEFFICIENT_PROBE_INPUT = 0.2565;
+  // Probe side cost per output row produced
+  private static final double COST_COEFFICIENT_HASH_JOIN_OUTPUT = 0.1812;
+  // Build side cost per input row consumed
+  private static final double COST_COEFFICIENT_BUILD_INPUT = 1.0;
+
   public HashJoinNode(PlanNode outer, PlanNode inner, boolean isStraightJoin,
       DistributionMode distrMode, JoinOperator joinOp,
       List<BinaryPredicate> eqJoinConjuncts, List<Expr> otherJoinConjuncts) {
@@ -55,6 +68,7 @@ public class HashJoinNode extends JoinNode {
         otherJoinConjuncts, "HASH JOIN");
     Preconditions.checkNotNull(eqJoinConjuncts);
     Preconditions.checkState(joinOp_ != JoinOperator.CROSS_JOIN);
+    Preconditions.checkState(joinOp_ != JoinOperator.ICEBERG_DELETE_JOIN);
   }
 
   @Override
@@ -84,7 +98,7 @@ public class HashJoinNode extends JoinNode {
               t0.toSql() + " to " + t1.toSql() + " in join predicate.");
         }
         Type compatibleType = Type.getAssignmentCompatibleType(
-            t0, t1, false, analyzer.isDecimalV2());
+            t0, t1, analyzer.getRegularCompatibilityLevel());
         if (compatibleType.isInvalid()) {
           throw new InternalException(String.format(
               "Unable create a hash join with equi-join predicate %s " +
@@ -175,7 +189,8 @@ public class HashJoinNode extends JoinNode {
       }
     }
     if (detailLevel.ordinal() > TExplainLevel.MINIMAL.ordinal()) {
-      if (!isAcidJoin_ || detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
+      if (!isDeleteRowsJoin_ ||
+          detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
         output.append(detailPrefix + "hash predicates: ");
         for (int i = 0; i < eqJoinConjuncts_.size(); ++i) {
           Expr eqConjunct = eqJoinConjuncts_.get(i);
@@ -280,12 +295,17 @@ public class HashJoinNode extends JoinNode {
         computeMaxSpillableBufferSize(bufferSize, queryOptions.getMax_row_size());
     long perInstanceBuildMinMemReservation =
         bufferSize * (minBuildBuffers - 2) + maxRowBufferSize * 2;
-    if (queryOptions.mt_dop > 0 && canShareBuild()) {
+    if (Planner.useMTFragment(queryOptions) && canShareBuild()) {
       // Ensure we reserve enough memory to hand off to the PartitionedHashJoinNodes for
-      // probe streams when spilling. mt_dop is an upper bound on the number of
-      // PartitionedHashJoinNodes per builder.
+      // probe streams when spilling. numInstancePerHost is an upper bound on the number
+      // of PartitionedHashJoinNodes per builder.
       // TODO: IMPALA-9416: be less conservative here
-      perInstanceBuildMinMemReservation *= queryOptions.mt_dop;
+      // TODO: In case of compute_processing_cost=false, it is probably OK to stil use
+      //     getNumInstancesPerHost(). Leave this for future work to avoid regression.
+      int numInstancePerHost = queryOptions.compute_processing_cost ?
+          fragment_.getNumInstancesPerHost(queryOptions) :
+          queryOptions.getMt_dop();
+      perInstanceBuildMinMemReservation *= numInstancePerHost;
     }
     // Most reservation for probe buffers is obtained from the join builder when
     // spilling. However, for NAAJ, two additional probe streams are needed that
@@ -312,5 +332,36 @@ public class HashJoinNode extends JoinNode {
         .setSpillableBufferBytes(bufferSize)
         .setMaxRowBufferBytes(maxRowBufferSize).build();
     return Pair.create(probeProfile, buildProfile);
+  }
+
+  @Override
+  public Pair<ProcessingCost, ProcessingCost> computeJoinProcessingCost() {
+    // Compute the processing cost for lhs. Benchmarking suggests we can estimate the
+    // probe cost as a linear function combining the probe input cardinality and the
+    // estimated output cardinality.
+    long outputCardinality = Math.max(0, getCardinality());
+    double totalProbeCost =
+        (getProbeCardinalityForCosting() * COST_COEFFICIENT_PROBE_INPUT)
+        + (outputCardinality * COST_COEFFICIENT_HASH_JOIN_OUTPUT);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("Probe CPU cost estimate: " + totalProbeCost + ", Input Card: "
+          + getProbeCardinalityForCosting() + ", Output Card: " + outputCardinality);
+    }
+    ProcessingCost probeProcessingCost =
+        ProcessingCost.basicCost(getDisplayLabel(), totalProbeCost);
+
+    // Compute the processing cost for rhs.
+    // TODO: For broadcast join builds we're underestimating cost here because we're using
+    // the overall plan cardinality without accounting for the fact that the broadcast
+    // effectively multiplies the cardinality by the number of hosts.
+    // In the end this probably doesn't matter to the CPU resource allocation since the
+    // build fragment count is fixed for broadcast(at num hosts) regardless of the cost
+    // computed here. But we should clean up the costing here to avoid any future
+    // confusion.
+    long buildCardinality = Math.max(0, getChild(1).getFilteredCardinality());
+    double totalBuildCost = buildCardinality * COST_COEFFICIENT_BUILD_INPUT;
+    ProcessingCost buildProcessingCost =
+        ProcessingCost.basicCost(getDisplayLabel() + " Build side", totalBuildCost);
+    return Pair.create(probeProcessingCost, buildProcessingCost);
   }
 }

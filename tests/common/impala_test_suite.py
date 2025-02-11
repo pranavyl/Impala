@@ -17,8 +17,11 @@
 #
 # The base class that should be used for almost all Impala tests
 
+from __future__ import absolute_import, division, print_function
+from builtins import range, round
 import glob
 import grp
+import hashlib
 import json
 import logging
 import os
@@ -33,8 +36,10 @@ import time
 import string
 from functools import wraps
 from getpass import getuser
+from impala.hiveserver2 import HiveServer2Cursor
 from random import choice
 from subprocess import check_call
+import tests.common
 from tests.common.base_test_suite import BaseTestSuite
 from tests.common.environ import (
     HIVE_MAJOR_VERSION,
@@ -45,34 +50,39 @@ from tests.common.impala_connection import create_connection
 from tests.common.impala_service import ImpaladService
 from tests.common.test_dimensions import (
     ALL_BATCH_SIZES,
-    ALL_CLUSTER_SIZES,
     ALL_DISABLE_CODEGEN_OPTIONS,
     ALL_NODES_ONLY,
     TableFormatInfo,
     create_exec_option_dimension,
+    default_client_protocol_dimension,
     get_dataset_from_workload,
     load_table_info_dimension)
 from tests.common.test_result_verifier import (
+    error_msg_expected,
     try_compile_regex,
     verify_lineage,
     verify_raw_results,
     verify_runtime_profile)
-from tests.common.test_vector import ImpalaTestDimension
+from tests.common.test_vector import ImpalaTestDimension, EXEC_OPTION_KEY
 from tests.performance.query import Query
 from tests.performance.query_exec_functions import execute_using_jdbc
 from tests.performance.query_executor import JdbcQueryExecConfig
 from tests.util.filesystem_utils import (
     IS_S3,
+    IS_OZONE,
     IS_ABFS,
     IS_ADLS,
     IS_GCS,
     IS_COS,
+    IS_OSS,
+    IS_OBS,
     IS_HDFS,
     S3_BUCKET_NAME,
     S3GUARD_ENABLED,
     ADLS_STORE_NAME,
     FILESYSTEM_PREFIX,
-    FILESYSTEM_NAME)
+    FILESYSTEM_NAME,
+    FILESYSTEM_URI_SCHEME)
 
 from tests.util.hdfs_util import (
   HdfsConfig,
@@ -86,10 +96,14 @@ from tests.util.test_file_parser import (
   parse_query_test_file,
   write_test_file)
 from tests.util.thrift_util import create_transport
+from tests.util.retry import retry
 
 # Imports required for Hive Metastore Client
 from hive_metastore import ThriftHiveMetastore
 from thrift.protocol import TBinaryProtocol
+
+# Import to validate query option names
+from ImpalaService.ttypes import TImpalaQueryOptions
 
 # Initializing the logger before conditional imports, since we will need it
 # for them.
@@ -107,12 +121,30 @@ IMPALAD_HOST_PORT_LIST = pytest.config.option.impalad.split(',')
 assert len(IMPALAD_HOST_PORT_LIST) > 0, 'Must specify at least 1 impalad to target'
 IMPALAD = IMPALAD_HOST_PORT_LIST[0]
 IMPALAD_HOSTNAME = IMPALAD.split(':')[0]
-
+IMPALAD_HOSTNAME_LIST = [s.split(':')[0] for s in IMPALAD_HOST_PORT_LIST]
+IMPALAD_BEESWAX_PORT_LIST = [int(s.split(':')[1]) for s in IMPALAD_HOST_PORT_LIST]
+IMPALAD_BEESWAX_PORT = IMPALAD_BEESWAX_PORT_LIST[0]
 IMPALAD_BEESWAX_HOST_PORT = IMPALAD_HOST_PORT_LIST[0]
-IMPALAD_HS2_HOST_PORT =\
-    IMPALAD_HOSTNAME + ":" + pytest.config.option.impalad_hs2_port
-IMPALAD_HS2_HTTP_HOST_PORT =\
-    IMPALAD_HOSTNAME + ":" + pytest.config.option.impalad_hs2_http_port
+
+IMPALAD_HS2_PORT = int(pytest.config.option.impalad_hs2_port)
+IMPALAD_HS2_HOST_PORT = IMPALAD_HOSTNAME + ":" + str(IMPALAD_HS2_PORT)
+# Calculate the hs2 ports based on the first hs2 port and the deltas of the beeswax ports
+IMPALAD_HS2_HOST_PORT_LIST = [
+    IMPALAD_HOSTNAME_LIST[i] + ':'
+    + str(IMPALAD_BEESWAX_PORT_LIST[i] - IMPALAD_BEESWAX_PORT + IMPALAD_HS2_PORT)
+    for i in range(len(IMPALAD_HOST_PORT_LIST))
+]
+
+IMPALAD_HS2_HTTP_PORT = int(pytest.config.option.impalad_hs2_http_port)
+IMPALAD_HS2_HTTP_HOST_PORT = IMPALAD_HOSTNAME + ":" + str(IMPALAD_HS2_HTTP_PORT)
+# Calculate the hs2-http ports based on the first hs2-http port and the deltas of the
+# beeswax ports
+IMPALAD_HS2_HTTP_HOST_PORT_LIST = [
+    IMPALAD_HOSTNAME_LIST[i] + ':'
+    + str(IMPALAD_BEESWAX_PORT_LIST[i] - IMPALAD_BEESWAX_PORT + IMPALAD_HS2_HTTP_PORT)
+    for i in range(len(IMPALAD_HOST_PORT_LIST))
+]
+
 STRICT_HS2_HOST_PORT =\
     IMPALAD_HOSTNAME + ":" + pytest.config.option.strict_hs2_port
 STRICT_HS2_HTTP_HOST_PORT =\
@@ -126,6 +158,7 @@ INTERNAL_LISTEN_HOST = os.getenv("INTERNAL_LISTEN_HOST")
 # Some tests use the IP instead of the host.
 INTERNAL_LISTEN_IP = socket.gethostbyname_ex(INTERNAL_LISTEN_HOST)[2][0]
 EE_TEST_LOGS_DIR = os.getenv("IMPALA_EE_TEST_LOGS_DIR")
+IMPALA_LOGS_DIR = os.getenv("IMPALA_LOGS_DIR")
 # Match any SET statement. Assume that query options' names
 # only contain alphabets, underscores and digits after position 1.
 # The statement may include SQL line comments starting with --, which we need to
@@ -137,10 +170,23 @@ SET_PATTERN = re.compile(
 METRICS_URL = 'http://{0}:25000/metrics?json'.format(IMPALAD_HOSTNAME)
 VARZ_URL = 'http://{0}:25000/varz?json'.format(IMPALAD_HOSTNAME)
 
+JSON_TABLE_OBJECT_URL =\
+    "http://{0}:25020/catalog_object?".format(IMPALAD_HOSTNAME) +\
+    "json&object_type=TABLE&object_name={0}.{1}"
+
 GROUP_NAME = grp.getgrgid(pwd.getpwnam(getuser()).pw_gid).gr_name
+
+EXEC_OPTION_NAMES = set([val.lower()
+  for val in TImpalaQueryOptions._VALUES_TO_NAMES.values()])
+
 
 # Base class for Impala tests. All impala test cases should inherit from this class
 class ImpalaTestSuite(BaseTestSuite):
+
+  # If True, call to assert_log_contains() will print WARN log for possibility of
+  # not disabling glog buffering (--logbuflevel=-1).
+  _warn_assert_log = False
+
   @classmethod
   def add_test_dimensions(cls):
     """
@@ -155,7 +201,7 @@ class ImpalaTestSuite(BaseTestSuite):
     cls.ImpalaTestMatrix.add_dimension(cls.__create_exec_option_dimension())
     # Execute tests through Beeswax by default. Individual tests that have been converted
     # to work with the HS2 client can add HS2 in addition to or instead of beeswax.
-    cls.ImpalaTestMatrix.add_dimension(ImpalaTestDimension('protocol', 'beeswax'))
+    cls.ImpalaTestMatrix.add_dimension(default_client_protocol_dimension())
 
   @staticmethod
   def create_hive_client(port):
@@ -179,6 +225,7 @@ class ImpalaTestSuite(BaseTestSuite):
   def setup_class(cls):
     """Setup section that runs before each test suite"""
     cls.client = None
+    cls.beeswax_client = None
     cls.hive_client = None
     cls.hs2_client = None
     cls.hs2_http_client = None
@@ -251,6 +298,14 @@ class ImpalaTestSuite(BaseTestSuite):
     elif IS_COS:
       # COS is implemented via HDFS command line client
       cls.filesystem_client = HadoopFsCommandLineClient("COS")
+    elif IS_OSS:
+      # OSS is implemented via HDFS command line client
+      cls.filesystem_client = HadoopFsCommandLineClient("OSS")
+    elif IS_OBS:
+      # OBS is implemented via HDFS command line client
+      cls.filesystem_client = HadoopFsCommandLineClient("OBS")
+    elif IS_OZONE:
+      cls.filesystem_client = HadoopFsCommandLineClient("Ozone")
 
     # Override the shell history path so that commands run by any tests
     # don't write any history into the developer's file.
@@ -265,8 +320,9 @@ class ImpalaTestSuite(BaseTestSuite):
     cls.close_impala_clients()
 
   @classmethod
-  def create_impala_client(cls, host_port=None, protocol='beeswax',
-      is_hive=False):
+  def create_impala_client(cls, host_port=None,
+                           protocol=pytest.config.option.default_test_protocol,
+                           is_hive=False):
     if host_port is None:
       host_port = cls.__get_default_host_port(protocol)
     client = create_connection(host_port=host_port,
@@ -277,13 +333,21 @@ class ImpalaTestSuite(BaseTestSuite):
 
   @classmethod
   def get_impalad_cluster_size(cls):
-    return len(cls.__get_cluster_host_ports('beeswax'))
+    return len(cls.__get_cluster_host_ports(pytest.config.option.default_test_protocol))
 
   @classmethod
-  def create_client_for_nth_impalad(cls, nth=0):
-    # TODO Extended it to other protocols
-    protocol = 'beeswax'
-    host_port = cls.__get_cluster_host_ports(protocol)[nth]
+  def create_client_for_nth_impalad(cls, nth=0,
+                                    protocol=pytest.config.option.default_test_protocol):
+    host_ports = cls.__get_cluster_host_ports(protocol)
+    if nth < len(IMPALAD_HOST_PORT_LIST):
+      host_port = host_ports[nth]
+    else:
+      # IMPALAD_HOST_PORT_LIST just has 3 items. When we start more impalads, calculate
+      # the ports based on the first item.
+      host_port = host_ports[0]
+      host, port = host_port.split(':')
+      port = str(int(port) + nth)
+      host_port = host + ':' + port
     return ImpalaTestSuite.create_impala_client(host_port, protocol=protocol)
 
   @classmethod
@@ -291,33 +355,49 @@ class ImpalaTestSuite(BaseTestSuite):
     """Creates Impala clients for all supported protocols."""
     # The default connection (self.client) is Beeswax so that existing tests, which assume
     # Beeswax do not need modification (yet).
-    cls.client = cls.create_impala_client(protocol='beeswax')
+    cls.beeswax_client = cls.create_impala_client(protocol='beeswax')
     cls.hs2_client = None
     try:
       cls.hs2_client = cls.create_impala_client(protocol='hs2')
-    except Exception, e:
+    except Exception as e:
       # HS2 connection can fail for benign reasons, e.g. running with unsupported auth.
       LOG.info("HS2 connection setup failed, continuing...: {0}".format(e))
     cls.hs2_http_client = None
     try:
       cls.hs2_http_client = cls.create_impala_client(protocol='hs2-http')
-    except Exception, e:
+    except Exception as e:
       # HS2 HTTP connection can fail for benign reasons, e.g. running with unsupported
       # auth.
       LOG.info("HS2 HTTP connection setup failed, continuing...: {0}".format(e))
+    cls.client = cls.default_impala_client(pytest.config.option.default_test_protocol)
 
   @classmethod
   def close_impala_clients(cls):
     """Closes Impala clients created by create_impala_clients()."""
-    if cls.client:
-      cls.client.close()
-      cls.client = None
+    if cls.beeswax_client:
+      cls.beeswax_client.close()
+      cls.beeswax_client = None
     if cls.hs2_client:
       cls.hs2_client.close()
       cls.hs2_client = None
     if cls.hs2_http_client:
       cls.hs2_http_client.close()
       cls.hs2_http_client = None
+    # cls.client should be equal to one of above, unless test method implicitly override.
+    # Closing twice should be OK.
+    if cls.client:
+      cls.client.close()
+      cls.client = None
+
+  @classmethod
+  def default_impala_client(cls, protocol):
+    if protocol == 'beeswax':
+      return cls.beeswax_client
+    if protocol == 'hs2':
+      return cls.hs2_client
+    if protocol == 'hs2-http':
+      return cls.hs2_http_client
+    raise Exception("unknown protocol: {0}".format(protocol))
 
   @classmethod
   def __get_default_host_port(cls, protocol):
@@ -334,13 +414,12 @@ class ImpalaTestSuite(BaseTestSuite):
     """Return a list of host/port combinations for all impalads in the cluster."""
     if protocol == 'beeswax':
       return IMPALAD_HOST_PORT_LIST
+    elif protocol == 'hs2':
+      return IMPALAD_HS2_HOST_PORT_LIST
+    elif protocol == 'hs2-http':
+      return IMPALAD_HS2_HTTP_HOST_PORT_LIST
     else:
-      assert protocol in ('hs2', 'hs2-http')
-      # TODO: support running tests against multiple coordinators for HS2. It should work,
-      # we just need to update all test runners to pass in all host/port combinations for
-      # the cluster and then handle it here.
-      raise NotImplementedError(
-          "Not yet implemented: only one HS2 host/port can be configured")
+      raise NotImplementedError("Not yet implemented: protocol=" + protocol)
 
   @classmethod
   def create_impala_service(
@@ -368,9 +447,13 @@ class ImpalaTestSuite(BaseTestSuite):
 
   @classmethod
   def cleanup_db(cls, db_name, sync_ddl=1):
-    cls.client.execute("use default")
-    cls.client.set_configuration({'sync_ddl': sync_ddl})
-    cls.client.execute("drop database if exists `" + db_name + "` cascade")
+    # Create a new client to avoid polluting query options of existing clients.
+    client = cls.create_impala_client()
+    client.set_configuration({'sync_ddl': sync_ddl})
+    try:
+      client.execute("drop database if exists `" + db_name + "` cascade")
+    finally:
+      client.close()
 
   def __restore_query_options(self, query_options_changed, impalad_client):
     """
@@ -379,12 +462,12 @@ class ImpalaTestSuite(BaseTestSuite):
     # Populate the default query option if it's empty.
     if not self.default_query_options:
       query_options = impalad_client.get_default_configuration()
-      for key, value in query_options.iteritems():
+      for key, value in query_options.items():
         self.default_query_options[key.upper()] = value
     # Restore all the changed query options.
     for query_option in query_options_changed:
       query_option = query_option.upper()
-      if not query_option in self.default_query_options:
+      if query_option not in self.default_query_options:
         continue
       default_val = self.default_query_options[query_option]
       query_str = 'SET ' + query_option + '="' + default_val + '"'
@@ -428,6 +511,19 @@ class ImpalaTestSuite(BaseTestSuite):
       result.append(tuple(result_fields))
     return result
 
+  def get_partition_id_set(self, db_name, tbl_name):
+    obj_url = JSON_TABLE_OBJECT_URL.format(db_name, tbl_name)
+    response = requests.get(obj_url)
+    assert response.status_code == requests.codes.ok
+    json_response = json.loads(response.text)
+    assert "json_string" in json_response, json_response
+    catalog_obj = json.loads(json_response["json_string"])
+    assert "table" in catalog_obj, catalog_obj
+    assert "hdfs_table" in catalog_obj["table"], catalog_obj["table"]
+    tbl_obj = catalog_obj["table"]["hdfs_table"]
+    assert "partitions" in tbl_obj, tbl_obj
+    return set(tbl_obj["partitions"].keys())
+
   def get_debug_page(self, page_url):
     """Returns the content of the debug page 'page_url' as json."""
     response = requests.get(page_url)
@@ -439,7 +535,7 @@ class ImpalaTestSuite(BaseTestSuite):
     # Parse the /varz endpoint to get the flag information.
     varz = self.get_debug_page(VARZ_URL)
     assert 'flags' in varz.keys()
-    filtered_varz = filter(lambda flag: flag['name'] == var, varz['flags'])
+    filtered_varz = [flag for flag in varz['flags'] if flag['name'] == var]
     assert len(filtered_varz) == 1
     assert 'current' in filtered_varz[0].keys()
     return filtered_varz[0]['current'].strip()
@@ -461,9 +557,15 @@ class ImpalaTestSuite(BaseTestSuite):
 
   def __do_replacements(self, s, use_db=None, extra=None):
     globs = globals()
+    # following assignment are purposefully redundant to avoid flake8 warnings (F401).
+    globs['FILESYSTEM_PREFIX'] = FILESYSTEM_PREFIX
+    globs['FILESYSTEM_URI_SCHEME'] = FILESYSTEM_URI_SCHEME
+    globs['S3_BUCKET_NAME'] = S3_BUCKET_NAME
+    globs['S3GUARD_ENABLED'] = S3GUARD_ENABLED
     repl = dict(('$' + k, globs[k]) for k in [
         "FILESYSTEM_PREFIX",
         "FILESYSTEM_NAME",
+        "FILESYSTEM_URI_SCHEME",
         "GROUP_NAME",
         "NAMENODE",
         "IMPALA_HOME",
@@ -472,7 +574,9 @@ class ImpalaTestSuite(BaseTestSuite):
         "MANAGED_WAREHOUSE_DIR",
         "EXTERNAL_WAREHOUSE_DIR"])
     repl.update({
-        '$SECONDARY_FILESYSTEM': os.environ.get("SECONDARY_FILESYSTEM", ""),
+        '$ERASURECODE_POLICY': os.getenv("ERASURECODE_POLICY", "NONE"),
+        '$SECONDARY_FILESYSTEM': os.getenv("SECONDARY_FILESYSTEM", ""),
+        '$WAREHOUSE_LOCATION_PREFIX': os.getenv("WAREHOUSE_LOCATION_PREFIX", ""),
         '$USER': getuser()})
 
     if use_db:
@@ -481,15 +585,14 @@ class ImpalaTestSuite(BaseTestSuite):
       raise AssertionError("Query contains $DATABASE but no use_db specified")
 
     if extra:
-      for k, v in extra.iteritems():
+      for k, v in extra.items():
         if k in repl:
           raise RuntimeError("Key {0} is reserved".format(k))
         repl[k] = v
 
-    for k, v in repl.iteritems():
+    for k, v in repl.items():
       s = s.replace(k, v)
     return s
-
 
   def __verify_exceptions(self, expected_strs, actual_str, use_db):
     """
@@ -539,7 +642,8 @@ class ImpalaTestSuite(BaseTestSuite):
                                      .replace('$EXTERNAL_WAREHOUSE_DIR',
                                               EXTERNAL_WAREHOUSE_DIR)
         if use_db:
-          test_section[section_name] = test_section[section_name].replace('$DATABASE', use_db)
+          test_section[section_name] = test_section[section_name].replace(
+              '$DATABASE', use_db)
     result_section, type_section = 'RESULTS', 'TYPES'
     if vector.get_value('protocol').startswith('hs2'):
       # hs2 or hs2-http
@@ -552,7 +656,6 @@ class ImpalaTestSuite(BaseTestSuite):
     verify_raw_results(test_section, result, vector.get_value('table_format').file_format,
                        result_section, type_section, pytest.config.option.update_results,
                        replace_filenames_with_placeholder)
-
 
   def run_test_case(self, test_file_name, vector, use_db=None, multiple_impalad=False,
       encoding=None, test_file_vars=None):
@@ -573,8 +676,9 @@ class ImpalaTestSuite(BaseTestSuite):
     values in queries before they are executed. Callers need to avoid using reserved key
     names, see 'reserved_keywords' below.
     """
+    self.validate_exec_option_dimension(vector)
     table_format_info = vector.get_value('table_format')
-    exec_options = vector.get_value('exec_option')
+    exec_options = vector.get_value(EXEC_OPTION_KEY)
     protocol = vector.get_value('protocol')
 
     target_impalad_clients = list()
@@ -583,13 +687,7 @@ class ImpalaTestSuite(BaseTestSuite):
           [ImpalaTestSuite.create_impala_client(host_port, protocol=protocol)
            for host_port in self.__get_cluster_host_ports(protocol)]
     else:
-      if protocol == 'beeswax':
-        target_impalad_clients = [self.client]
-      elif protocol == 'hs2-http':
-        target_impalad_clients = [self.hs2_http_client]
-      else:
-        assert protocol == 'hs2'
-        target_impalad_clients = [self.hs2_client]
+      target_impalad_clients = [self.default_impala_client(protocol)]
 
     # Change the database to reflect the file_format, compression codec etc, or the
     # user specified database for all targeted impalad.
@@ -617,11 +715,12 @@ class ImpalaTestSuite(BaseTestSuite):
         for query in query.split(';'):
           set_pattern_match = SET_PATTERN.match(query)
           if set_pattern_match:
-            query_options_changed.append(set_pattern_match.groups()[0])
-            assert set_pattern_match.groups()[0] not in vector.get_value("exec_option"), \
-                "%s cannot be set in  the '.test' file since it is in the test vector. " \
-                "Consider deepcopy()-ing the vector and removing this option in the " \
-                "python test." % set_pattern_match.groups()[0]
+            option_name = set_pattern_match.groups()[0]
+            query_options_changed.append(option_name)
+            assert option_name not in vector.get_value(EXEC_OPTION_KEY), (
+                "{} cannot be set in  the '.test' file since it is in the test vector. "
+                "Consider deepcopy()-ing the vector and removing this option in the "
+                "python test.".format(option_name))
           result = self.__execute_query(target_impalad_client, query, user=user)
       finally:
         if len(query_options_changed) > 0:
@@ -647,130 +746,182 @@ class ImpalaTestSuite(BaseTestSuite):
         encoding=encoding)
     # Assumes that it is same across all the coordinators.
     lineage_log_dir = self.get_var_current_val('lineage_event_log_dir')
+    failed_count = 0
+    total_count = 0
+    result_list = []
     for test_section in sections:
-      if 'HIVE_MAJOR_VERSION' in test_section:
-        needed_hive_major_version = int(test_section['HIVE_MAJOR_VERSION'])
-        assert needed_hive_major_version in [2, 3]
-        assert HIVE_MAJOR_VERSION in [2, 3]
-        if needed_hive_major_version != HIVE_MAJOR_VERSION:
-          continue
-
-      if 'SHELL' in test_section:
-        assert len(test_section) == 1, \
-            "SHELL test sections can't contain other sections"
-        cmd = self.__do_replacements(test_section['SHELL'], use_db=use_db,
-            extra=test_file_vars)
-        LOG.info("Shell command: " + cmd)
-        check_call(cmd, shell=True)
-        continue
-
-      if 'QUERY' in test_section:
-        query_section = test_section['QUERY']
-        exec_fn = __exec_in_impala
-      elif 'HIVE_QUERY' in test_section:
-        query_section = test_section['HIVE_QUERY']
-        exec_fn = __exec_in_hive
-      else:
-        assert 0, ('Error in test file %s. Test cases require a ' +
-            '-- QUERY or HIVE_QUERY section.\n%s') %\
-            (test_file_name, pprint.pformat(test_section))
-
-      # TODO: support running query tests against different scale factors
-      query = QueryTestSectionReader.build_query(
-          self.__do_replacements(query_section, use_db=use_db, extra=test_file_vars))
-
-      if 'QUERY_NAME' in test_section:
-        LOG.info('Query Name: \n%s\n' % test_section['QUERY_NAME'])
-
-      result = None
+      current_error = None
       try:
-        result = exec_fn(query, user=test_section.get('USER', '').strip() or None)
-        user = None
-        if 'USER' in test_section:
-          user = test_section['USER'].strip()
-      except Exception as e:
-        if 'CATCH' in test_section:
-          self.__verify_exceptions(test_section['CATCH'], str(e), use_db)
-          continue
-        raise
+        if 'HIVE_MAJOR_VERSION' in test_section:
+          needed_hive_major_version = int(test_section['HIVE_MAJOR_VERSION'])
+          assert needed_hive_major_version in [2, 3]
+          assert HIVE_MAJOR_VERSION in [2, 3]
+          if needed_hive_major_version != HIVE_MAJOR_VERSION:
+            continue
 
-      if 'CATCH' in test_section and '__NO_ERROR__' not in test_section['CATCH']:
-        expected_str = self.__do_replacements(" or ".join(test_section['CATCH']).strip(),
+        if 'IS_HDFS_ONLY' in test_section and not IS_HDFS:
+          continue
+
+        if 'SHELL' in test_section:
+          assert len(test_section) == 1, \
+              "SHELL test sections can't contain other sections"
+          cmd = self.__do_replacements(test_section['SHELL'], use_db=use_db,
+              extra=test_file_vars)
+          LOG.info("Shell command: " + cmd)
+          check_call(cmd, shell=True)
+          continue
+
+        if 'QUERY' in test_section:
+          query_section = test_section['QUERY']
+          exec_fn = __exec_in_impala
+        elif 'HIVE_QUERY' in test_section:
+          query_section = test_section['HIVE_QUERY']
+          exec_fn = __exec_in_hive
+        else:
+          assert 0, ('Error in test file {}. Test cases require a '
+              '-- QUERY or HIVE_QUERY section.\n{}').format(
+                  test_file_name, pprint.pformat(test_section))
+
+        # TODO: support running query tests against different scale factors
+        query = QueryTestSectionReader.build_query(
+            self.__do_replacements(query_section, use_db=use_db, extra=test_file_vars))
+
+        if 'QUERY_NAME' in test_section:
+          LOG.info('Query Name: \n%s\n' % test_section['QUERY_NAME'])
+
+        result = None
+        try:
+          result = exec_fn(query, user=test_section.get('USER', '').strip() or None)
+        except Exception as e:
+          if 'CATCH' in test_section:
+            self.__verify_exceptions(test_section['CATCH'], str(e), use_db)
+            assert error_msg_expected(str(e))
+            continue
+          raise
+
+        if 'CATCH' in test_section and '__NO_ERROR__' not in test_section['CATCH']:
+          expected_str = self.__do_replacements(
+              " or ".join(test_section['CATCH']).strip(),
               use_db=use_db,
               extra=test_file_vars)
-        assert False, "Expected exception: {0}\n\nwhen running:\n\n{1}".format(
-            expected_str, query)
+          assert False, "Expected exception: {0}\n\nwhen running:\n\n{1}".format(
+              expected_str, query)
 
-      assert result is not None
-      assert result.success, "Query failed: {0}".format(result.data)
+        assert result is not None
+        assert result.success, "Query failed: {0}".format(result.data)
 
-      # Decode the results read back if the data is stored with a specific encoding.
-      if encoding: result.data = [row.decode(encoding) for row in result.data]
-      # Replace $NAMENODE in the expected results with the actual namenode URI.
-      if 'RESULTS' in test_section:
-        # Combining 'RESULTS' with 'DML_RESULTS" is currently unsupported because
-        # __verify_results_and_errors calls verify_raw_results which always checks
-        # ERRORS, TYPES, LABELS, etc. which doesn't make sense if there are two
-        # different result sets to consider (IMPALA-4471).
-        assert 'DML_RESULTS' not in test_section
-        test_section['RESULTS'] = self.__do_replacements(
-            test_section['RESULTS'], use_db=use_db, extra=test_file_vars)
-        self.__verify_results_and_errors(vector, test_section, result, use_db)
-      else:
-        # TODO: Can't validate errors without expected results for now.
-        assert 'ERRORS' not in test_section,\
-          "'ERRORS' sections must have accompanying 'RESULTS' sections"
-      # If --update_results, then replace references to the namenode URI with $NAMENODE.
-      # TODO(todd) consider running do_replacements in reverse, though that may cause
-      # some false replacements for things like username.
-      if pytest.config.option.update_results and 'RESULTS' in test_section:
-        test_section['RESULTS'] = test_section['RESULTS'] \
-            .replace(NAMENODE, '$NAMENODE') \
-            .replace(IMPALA_HOME, '$IMPALA_HOME') \
-            .replace(INTERNAL_LISTEN_HOST, '$INTERNAL_LISTEN_HOST') \
-            .replace(INTERNAL_LISTEN_IP, '$INTERNAL_LISTEN_IP')
-      rt_profile_info = None
-      if 'RUNTIME_PROFILE_%s' % table_format_info.file_format in test_section:
-        # If this table format has a RUNTIME_PROFILE section specifically for it, evaluate
-        # that section and ignore any general RUNTIME_PROFILE sections.
-        rt_profile_info = 'RUNTIME_PROFILE_%s' % table_format_info.file_format
-      elif 'RUNTIME_PROFILE' in test_section:
-        rt_profile_info = 'RUNTIME_PROFILE'
+        # Decode the results read back if the data is stored with a specific encoding.
+        if encoding: result.data = [row.decode(encoding) for row in result.data]
+        # Replace $NAMENODE in the expected results with the actual namenode URI.
+        if 'RESULTS' in test_section:
+          # Combining 'RESULTS' with 'DML_RESULTS" is currently unsupported because
+          # __verify_results_and_errors calls verify_raw_results which always checks
+          # ERRORS, TYPES, LABELS, etc. which doesn't make sense if there are two
+          # different result sets to consider (IMPALA-4471).
+          assert 'DML_RESULTS' not in test_section
+          test_section['RESULTS'] = self.__do_replacements(
+              test_section['RESULTS'], use_db=use_db, extra=test_file_vars)
+          self.__verify_results_and_errors(vector, test_section, result, use_db)
+        else:
+          # TODO: Can't validate errors without expected results for now.
+          assert 'ERRORS' not in test_section,\
+            "'ERRORS' sections must have accompanying 'RESULTS' sections"
+        # If --update_results, then replace references to the namenode URI with $NAMENODE.
+        # TODO(todd) consider running do_replacements in reverse, though that may cause
+        # some false replacements for things like username.
+        if pytest.config.option.update_results and 'RESULTS' in test_section:
+          test_section['RESULTS'] = test_section['RESULTS'] \
+              .replace(NAMENODE, '$NAMENODE') \
+              .replace(IMPALA_HOME, '$IMPALA_HOME') \
+              .replace(INTERNAL_LISTEN_HOST, '$INTERNAL_LISTEN_HOST') \
+              .replace(INTERNAL_LISTEN_IP, '$INTERNAL_LISTEN_IP')
+        rt_profile_info = None
+        if 'RUNTIME_PROFILE_%s' % table_format_info.file_format in test_section:
+          # If this table format has a RUNTIME_PROFILE section specifically for it,
+          # evaluate that section and ignore any general RUNTIME_PROFILE sections.
+          rt_profile_info = 'RUNTIME_PROFILE_%s' % table_format_info.file_format
+        elif 'RUNTIME_PROFILE' in test_section:
+          rt_profile_info = 'RUNTIME_PROFILE'
 
-      if rt_profile_info is not None:
-        rt_profile = verify_runtime_profile(test_section[rt_profile_info],
-                               result.runtime_profile,
-                               update_section=pytest.config.option.update_results)
-        if pytest.config.option.update_results:
-          test_section[rt_profile_info] = "".join(rt_profile)
+        if rt_profile_info is not None:
+          if test_file_vars:
+            # only do test_file_vars replacement if it exist.
+            test_section[rt_profile_info] = self.__do_replacements(
+                test_section[rt_profile_info], extra=test_file_vars)
+          rt_profile = verify_runtime_profile(test_section[rt_profile_info],
+              result.runtime_profile,
+              update_section=pytest.config.option.update_results)
+          if pytest.config.option.update_results:
+            test_section[rt_profile_info] = "".join(rt_profile)
 
-      if 'LINEAGE' in test_section:
-         # Lineage flusher thread runs every 5s by default and is not configurable. Wait
-         # for that period. (TODO) Get rid of this for faster test execution.
-         time.sleep(5)
-         current_query_lineage = self.get_query_lineage(result.query_id, lineage_log_dir)
-         assert current_query_lineage is not "",\
-             "No lineage found for query %s in dir %s" %\
-             (result.query_id, lineage_log_dir)
-         if pytest.config.option.update_results:
-           test_section['LINEAGE'] = json.dumps(current_query_lineage, indent=2,
-               separators=(',', ': '))
-         else:
-           verify_lineage(json.loads(test_section['LINEAGE']), current_query_lineage)
+        if 'LINEAGE' in test_section:
+          # Lineage flusher thread runs every 5s by default and is not configurable. Wait
+          # for that period. (TODO) Get rid of this for faster test execution.
+          time.sleep(5)
+          current_query_lineage = self.get_query_lineage(result.query_id, lineage_log_dir)
+          assert current_query_lineage != "", (
+              "No lineage found for query {} in dir {}".format(
+                result.query_id, lineage_log_dir))
+          if pytest.config.option.update_results:
+            test_section['LINEAGE'] = json.dumps(current_query_lineage, indent=2,
+                separators=(',', ': '))
+          else:
+            verify_lineage(json.loads(test_section['LINEAGE']), current_query_lineage)
 
-      if 'DML_RESULTS' in test_section:
-        assert 'ERRORS' not in test_section
-        # The limit is specified to ensure the queries aren't unbounded. We shouldn't have
-        # test files that are checking the contents of tables larger than that anyways.
-        dml_results_query = "select * from %s limit 1000" % \
-            test_section['DML_RESULTS_TABLE']
-        dml_result = exec_fn(dml_results_query)
-        verify_raw_results(test_section, dml_result,
-            vector.get_value('table_format').file_format, result_section='DML_RESULTS',
-            update_section=pytest.config.option.update_results)
+        if 'DML_RESULTS' in test_section:
+          assert 'ERRORS' not in test_section
+          # The limit is specified to ensure the queries aren't unbounded. We shouldn't
+          # have test files that are checking the contents of tables larger than that
+          # anyways.
+          dml_results_query = "select * from %s limit 1000" % \
+              test_section['DML_RESULTS_TABLE']
+          dml_result = exec_fn(dml_results_query)
+          verify_raw_results(test_section, dml_result,
+              vector.get_value('table_format').file_format, result_section='DML_RESULTS',
+              update_section=pytest.config.option.update_results)
+      except Exception as e:
+        # When the calcite report mode is off, fail fast when hitting an error.
+        if not pytest.config.option.calcite_report_mode:
+          raise
+        current_error = str(e)
+        failed_count += 1
+      finally:
+        if pytest.config.option.calcite_report_mode:
+          result_list.append({"section": test_section, "error": current_error})
+        total_count += 1
+
+    # Write out the output information
+    if pytest.config.option.calcite_report_mode:
+      report = {}
+      report["test_node_id"] = tests.common.nodeid
+      report["test_file"] = os.path.join("testdata", "workloads", self.get_workload(),
+          'queries', test_file_name + '.test')
+      report["results"] = result_list
+      # The node ids are unique, so there should not be hash collisions
+      nodeid_hash = hashlib.sha256(tests.common.nodeid.encode()).hexdigest()
+      output_file = "output_{0}.json".format(nodeid_hash)
+      output_directory = pytest.config.option.calcite_report_output_dir
+      if output_directory is None:
+        output_directory = os.path.join(IMPALA_LOGS_DIR, "calcite_report")
+      if not os.path.exists(output_directory):
+        os.makedirs(output_directory)
+      with open(os.path.join(output_directory, output_file), "w") as f:
+        json.dump(report, f, indent=2)
+
+      # Since the report mode continues after error, we should return an error at
+      # the end if it hit failures
+      if failed_count != 0:
+        raise Exception("{0} out of {1} tests failed".format(failed_count, total_count))
+
     if pytest.config.option.update_results:
-      output_file = os.path.join(EE_TEST_LOGS_DIR,
-                                 test_file_name.replace('/','_') + ".test")
+      # Print updated test results to path like
+      # $EE_TEST_LOGS_DIR/impala_updated_results/tpcds/queries/tpcds-decimal_v2-q98.test
+      output_file = os.path.join(
+        EE_TEST_LOGS_DIR, 'impala_updated_results',
+        self.get_relative_path(self.get_workload(), test_file_name))
+      output_dir = os.path.dirname(output_file)
+      if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
       write_test_file(output_file, sections, encoding=encoding)
 
   def get_query_lineage(self, query_id, lineage_dir):
@@ -802,8 +953,8 @@ class ImpalaTestSuite(BaseTestSuite):
   @classmethod
   def change_database(cls, impala_client, table_format=None,
       db_name=None, scale_factor=None):
-    if db_name == None:
-      assert table_format != None
+    if db_name is None:
+      assert table_format is not None
       db_name = QueryTestSectionReader.get_db_name(table_format,
           scale_factor if scale_factor else '')
     query = 'use %s' % db_name
@@ -840,7 +991,9 @@ class ImpalaTestSuite(BaseTestSuite):
   @execute_wrapper
   def execute_query_expect_success(cls, impalad_client, query, query_options=None,
       user=None):
-    """Executes a query and asserts if the query fails"""
+    """Executes a query and asserts that the query succeded.
+    Remember to pass vector.get_value('exec_option') as 'query_options' argument
+    if the test has one."""
     result = cls.__execute_query(impalad_client, query, query_options, user)
     assert result.success
     return result
@@ -849,11 +1002,13 @@ class ImpalaTestSuite(BaseTestSuite):
   @execute_wrapper
   def execute_query_expect_failure(cls, impalad_client, query, query_options=None,
       user=None):
-    """Executes a query and asserts if the query succeeds"""
+    """Executes a query and asserts that the query failed.
+    Remember to pass vector.get_value('exec_option') as 'query_options' argument
+    if the test has one."""
     result = None
     try:
       result = cls.__execute_query(impalad_client, query, query_options, user)
-    except Exception, e:
+    except Exception as e:
       return e
 
     assert not result.success, "No failure encountered for query %s" % query
@@ -861,10 +1016,16 @@ class ImpalaTestSuite(BaseTestSuite):
 
   @execute_wrapper
   def execute_query_unchecked(self, impalad_client, query, query_options=None, user=None):
+    """Execute a query against sepecific impalad without checking whether the query
+    succeded or failed. Remember to pass vector.get_value('exec_option') as
+    'query_options' argument if the test has one."""
     return self.__execute_query(impalad_client, query, query_options, user)
 
   @execute_wrapper
   def execute_query(self, query, query_options=None):
+    """Execute a query against the default impalad client without checking whether
+    the query succeded or failed. Remember to pass vector.get_value('exec_option')
+    as 'query_options' argument if the test has one."""
     return self.__execute_query(self.client, query, query_options)
 
   def exec_and_time(self, query, query_options=None, impalad=0):
@@ -879,14 +1040,16 @@ class ImpalaTestSuite(BaseTestSuite):
     return end_time - start_time
 
   def execute_query_using_client(self, client, query, vector):
+    self.validate_exec_option_dimension(vector)
     self.change_database(client, vector.get_value('table_format'))
-    query_options = vector.get_value('exec_option')
+    query_options = vector.get_value(EXEC_OPTION_KEY)
     if query_options is not None: client.set_configuration(query_options)
     return client.execute(query)
 
   def execute_query_async_using_client(self, client, query, vector):
+    self.validate_exec_option_dimension(vector)
     self.change_database(client, vector.get_value('table_format'))
-    query_options = vector.get_value('exec_option')
+    query_options = vector.get_value(EXEC_OPTION_KEY)
     if query_options is not None: client.set_configuration(query_options)
     return client.execute_async(query)
 
@@ -904,11 +1067,29 @@ class ImpalaTestSuite(BaseTestSuite):
 
   @execute_wrapper
   def execute_scalar(self, query, query_options=None):
-    result = self.__execute_query(self.client, query, query_options)
-    assert len(result.data) <= 1, 'Multiple values returned from scalar'
+    """Executes a scalar query return the single row result. Only validate that
+    query return at most one row. Return None if query return an empty result.
+    Remember to pass vector.get_value('exec_option') as 'query_options' argument
+    if the test has one. If query_options is not set, the query will be run with
+    long_polling_time_ms=100 to speed up response."""
+    result = self.__execute_scalar(self.client, query, query_options)
     return result.data[0] if len(result.data) == 1 else None
 
-  def exec_and_compare_hive_and_impala_hs2(self, stmt, compare = lambda x, y: x == y):
+  @classmethod
+  @execute_wrapper
+  def execute_scalar_expect_success(cls, impalad_client, query, query_options=None,
+      user=None):
+    """Executes a scalar query return the single row result.
+    Validate that query execution is indeed successful and return just one row.
+    Remember to pass vector.get_value('exec_option') as 'query_options' argument
+    if the test has one. If query_options is not set, the query will be run with
+    long_polling_time_ms=100 to speed up response."""
+    result = cls.__execute_scalar(impalad_client, query, query_options, user)
+    assert result.success
+    assert len(result.data) == 1
+    return result.data[0]
+
+  def exec_and_compare_hive_and_impala_hs2(self, stmt, compare=lambda x, y: x == y):
     """Compare Hive and Impala results when executing the same statment over HS2"""
     # execute_using_jdbc expects a Query object. Convert the query string into a Query
     # object
@@ -942,13 +1123,18 @@ class ImpalaTestSuite(BaseTestSuite):
     # Check the results
     assert (result is not None) and (result == expected)
 
+  def get_relative_path(self, workload, test_file_name):
+    """Return path to [test_file_name].test relative to WORKLOAD_DIR."""
+    return os.path.join(workload, 'queries', test_file_name + '.test')
+
   def load_query_test_file(self, workload, file_name, valid_section_names=None,
       encoding=None):
     """
     Loads/Reads the specified query test file. Accepts the given section names as valid.
     Uses a default list of valid section names if valid_section_names is None.
     """
-    test_file_path = os.path.join(WORKLOAD_DIR, workload, 'queries', file_name + '.test')
+    test_file_path = os.path.join(
+        WORKLOAD_DIR, self.get_relative_path(workload, file_name))
     LOG.info("Loading query test file: %s", test_file_path)
     if not os.path.isfile(test_file_path):
       assert False, 'Test file not found: %s' % file_name
@@ -960,9 +1146,22 @@ class ImpalaTestSuite(BaseTestSuite):
     if query_options is not None: impalad_client.set_configuration(query_options)
     return impalad_client.execute(query, user=user)
 
+  @classmethod
+  def __execute_scalar(cls, impalad_client, query, query_options=None, user=None):
+    """Executes the given scalar query against the specified Impalad.
+    If query_options is not set, the query will be run with long_polling_time_ms=100
+    to speed up response."""
+    if query_options is None:
+      impalad_client.set_configuration_option('long_polling_time_ms', 100)
+    else:
+      impalad_client.set_configuration(query_options)
+    result = impalad_client.execute(query, user=user)
+    assert len(result.data) <= 1, 'Multiple values returned from scalar'
+    return result
+
   def clone_table(self, src_tbl, dst_tbl, recover_partitions, vector):
     src_loc = self._get_table_location(src_tbl, vector)
-    self.client.execute("create external table {0} like {1} location '{2}'"\
+    self.client.execute("create external table {0} like {1} location '{2}'"
         .format(dst_tbl, src_tbl, src_loc))
     if recover_partitions:
       self.client.execute("alter table {0} recover partitions".format(dst_tbl))
@@ -970,7 +1169,7 @@ class ImpalaTestSuite(BaseTestSuite):
   def appx_equals(self, a, b, diff_perc):
     """Returns True if 'a' and 'b' are within 'diff_perc' percent of each other,
     False otherwise. 'diff_perc' must be a float in [0,1]."""
-    if a == b: return True # Avoid division by 0
+    if a == b: return True  # Avoid division by 0
     assert abs(a - b) / float(max(abs(a), abs(b))) <= diff_perc
 
   def _get_table_location(self, table_name, vector):
@@ -983,11 +1182,25 @@ class ImpalaTestSuite(BaseTestSuite):
     # This should never happen.
     assert 0, 'Unable to get location for table: ' + table_name
 
+  def run_impala_stmt_in_beeline(self, stmt, username=None, default_db='default'):
+    """ Run a statement in impala by Beeline. """
+    url = 'jdbc:hive2://localhost:' + pytest.config.option.impalad_hs2_port + '/'\
+      + default_db + ";auth=noSasl"
+    return self.run_stmt_in_beeline(url, username, stmt)
+
   # TODO(todd) make this use Thrift to connect to HS2 instead of shelling
   # out to beeline for better performance
-  def run_stmt_in_hive(self, stmt, username=None):
+  @classmethod
+  def run_stmt_in_hive(cls, stmt, username=None):
+    """Run a statement in Hive by Beeline."""
+    LOG.info("-- executing in HiveServer2\n\n" + stmt + "\n")
+    url = 'jdbc:hive2://' + pytest.config.option.hive_server2
+    return cls.run_stmt_in_beeline(url, username, stmt)
+
+  @classmethod
+  def run_stmt_in_beeline(cls, url, username, stmt):
     """
-    Run a statement in Hive, returning stdout if successful and throwing
+    Run a statement by Beeline, returning stdout if successful and throwing
     RuntimeError(stderr) if not.
     """
     # Remove HADOOP_CLASSPATH from environment. Beeline doesn't need it,
@@ -1000,8 +1213,10 @@ class ImpalaTestSuite(BaseTestSuite):
     env.pop("HADOOP_CLASSPATH", None)
     call = subprocess.Popen(
         ['beeline',
+         # TODO IMPALA-2228: Prevents query output from being confused with log.
+         '--silent=true',
          '--outputformat=csv2',
-         '-u', 'jdbc:hive2://' + pytest.config.option.hive_server2,
+         '-u', url,
          '-n', username or getuser(),
          '-e', stmt],
         stdout=subprocess.PIPE,
@@ -1010,7 +1225,8 @@ class ImpalaTestSuite(BaseTestSuite):
         # is specified; explicitly make sure there's nothing to
         # read to avoid hanging, especially when running interactively
         # with py.test.
-        stdin=file("/dev/null"),
+        stdin=open("/dev/null"),
+        universal_newlines=True,
         env=env)
     (stdout, stderr) = call.communicate()
     call.wait()
@@ -1042,7 +1258,7 @@ class ImpalaTestSuite(BaseTestSuite):
     # If 'skip_hbase' is specified or the filesystem is isilon, s3, GCS(gs), COS(cosn) or
     # local, we don't need the hbase dimension.
     if pytest.config.option.skip_hbase or TARGET_FILESYSTEM.lower() \
-        in ['s3', 'isilon', 'local', 'abfs', 'adls', 'gs', 'cosn']:
+        in ['s3', 'isilon', 'local', 'abfs', 'adls', 'gs', 'cosn', 'ozone', 'obs']:
       for tf_dimension in tf_dimensions:
         if tf_dimension.value.file_format == "hbase":
           tf_dimensions.remove(tf_dimension)
@@ -1051,13 +1267,13 @@ class ImpalaTestSuite(BaseTestSuite):
 
   @classmethod
   def __create_exec_option_dimension(cls):
-    cluster_sizes = ALL_CLUSTER_SIZES
+    # TODO IMPALA-12394: switch to ALL_CLUSTER_SIZES for exhaustive runs
+    cluster_sizes = ALL_NODES_ONLY
     disable_codegen_options = ALL_DISABLE_CODEGEN_OPTIONS
     batch_sizes = ALL_BATCH_SIZES
     exec_single_node_option = [0]
     if cls.exploration_strategy() == 'core':
       disable_codegen_options = [False]
-      cluster_sizes = ALL_NODES_ONLY
     return create_exec_option_dimension(cluster_sizes, disable_codegen_options,
                                         batch_sizes,
                                         exec_single_node_option=exec_single_node_option,
@@ -1071,7 +1287,7 @@ class ImpalaTestSuite(BaseTestSuite):
       for workload_strategy in workload_strategies:
         workload_strategy = workload_strategy.split(':')
         if len(workload_strategy) != 2:
-          raise ValueError, 'Invalid workload:strategy format: %s' % workload_strategy
+          raise ValueError('Invalid workload:strategy format: %s' % workload_strategy)
         if cls.get_workload() == workload_strategy[0]:
           return workload_strategy[1]
     return default_strategy
@@ -1096,9 +1312,10 @@ class ImpalaTestSuite(BaseTestSuite):
       actual_state = client.get_state(handle)
       time.sleep(0.5)
     if actual_state not in expected_states:
-      raise Timeout("query {0} did not reach one of the expected states {1}, "
-                    "last known state {2}".format(handle.get_handle().id, expected_states,
-                    actual_state))
+      timeout_msg = "query '{0}' did not reach one of the expected states {1}, last " \
+          "known state {2}".format(self.__get_id_or_query_from_handle(handle),
+          expected_states, actual_state)
+      raise Timeout(timeout_msg)
     return actual_state
 
   def wait_for_progress(self, handle, expected_progress, timeout, client=None):
@@ -1112,15 +1329,32 @@ class ImpalaTestSuite(BaseTestSuite):
       time.sleep(0.5)
     actual_progress = self.__get_query_progress_rate(summary.progress)
     if actual_progress <= expected_progress:
-      raise Timeout("query {0} did not reach the expected progress {1}, "
-                    "current progress {2}".format(handle.get_handle().id,
-                    expected_progress, actual_progress))
+      timeout_msg = "query '{0}' did not reach the expected progress {1}, current " \
+          "progress {2}".format(self.__get_id_or_query_from_handle(handle),
+          expected_progress, actual_progress)
+      raise Timeout(timeout_msg)
     return actual_progress
 
   def __get_query_progress_rate(self, progress):
     if progress is None:
       return 0
     return float(progress.num_completed_scan_ranges) / progress.total_scan_ranges
+
+  def __get_id_or_query_from_handle(self, handle):
+    """Returns a query identifier, for QueryHandlers it returns the query id. However,
+    Impyla handle is a HiveServer2Cursor that does not have query id, returns the query
+    string instead."""
+    if isinstance(handle.get_handle(), HiveServer2Cursor):
+      return handle.get_handle().query_string
+    elif hasattr(handle.get_handle(), 'id'):
+      return handle.get_handle().id
+    else:
+      return "UNIDENTIFIED"
+
+  @classmethod
+  def has_value(cls, value, lines):
+    """Check if lines contain value."""
+    return any([line.find(value) != -1 for line in lines])
 
   def wait_for_db_to_appear(self, db_name, timeout_s):
     """Wait until the database with 'db_name' is present in the impalad's local catalog.
@@ -1159,8 +1393,8 @@ class ImpalaTestSuite(BaseTestSuite):
         self.client.execute("describe `{db_name}`.`{table_name}`".format(
                             db_name=db_name, table_name=table_name))
         return
-      except Exception, ex:
-        print str(ex)
+      except Exception as ex:
+        print(str(ex))
         time.sleep(0.2)
         continue
     raise Exception("Table {0}.{1} didn't show up after {2}s", db_name, table_name,
@@ -1184,20 +1418,49 @@ class ImpalaTestSuite(BaseTestSuite):
         "Check failed to return True after {0} tries and {1} seconds{2}".format(
           count, timeout_s, error_msg_str))
 
-  def assert_impalad_log_contains(self, level, line_regex, expected_count=1, timeout_s=6):
+  def assert_impalad_log_contains(self, level, line_regex, expected_count=1, timeout_s=6,
+      dry_run=False):
     """
     Convenience wrapper around assert_log_contains for impalad logs.
     """
-    self.assert_log_contains("impalad", level, line_regex, expected_count, timeout_s)
+    return self.assert_log_contains(
+        "impalad", level, line_regex, expected_count, timeout_s, dry_run)
+
+  def assert_catalogd_ha_contains(self, level, line_regex, timeout_s=6):
+    """
+    When running catalogd in ha mode, asserts that the specified line_regex is found at
+    least once across all instances of catalogd.
+    Returns a list of the results of calling assert_catalogd_log_contains for each
+    catalogd daemon. If no matches were found for a daemon, the list index for that daemon
+    will be None.
+    """
+
+    matches = []
+    for node_idx in range(len(self.cluster.catalogds())):
+      try:
+        matches.append(self.assert_catalogd_log_contains(level, line_regex, -1, timeout_s,
+            node_index=node_idx))
+      except AssertionError:
+        matches.append(None)
+
+    assert not all(elem is None for elem in matches), "No log lines found in any " \
+        "catalogd instances for regex: {}".format(line_regex)
+    return matches
 
   def assert_catalogd_log_contains(self, level, line_regex, expected_count=1,
-      timeout_s=6):
+      timeout_s=6, dry_run=False, node_index=0):
     """
     Convenience wrapper around assert_log_contains for catalogd logs.
     """
-    self.assert_log_contains("catalogd", level, line_regex, expected_count, timeout_s)
+    daemon = "catalogd"
+    if node_index > 0:
+      daemon += "_node{}".format(node_index)
 
-  def assert_log_contains(self, daemon, level, line_regex, expected_count=1, timeout_s=6):
+    return self.assert_log_contains(
+        daemon, level, line_regex, expected_count, timeout_s, dry_run)
+
+  def assert_log_contains(self, daemon, level, line_regex, expected_count=1, timeout_s=6,
+      dry_run=False):
     """
     Assert that the daemon log with specified level (e.g. ERROR, WARNING, INFO) contains
     expected_count lines with a substring matching the regex. When expected_count is -1,
@@ -1208,32 +1471,46 @@ class ImpalaTestSuite(BaseTestSuite):
     make sure that log buffering has been disabled, for example by adding
     '-logbuflevel=-1' to the daemon startup options or set timeout_s to a value higher
     than the log flush interval.
+
+    Returns the result of the very last call to line_regex.search or None if
+    expected_count is 0 or the line_regex did not match any lines.
     """
+    if (self._warn_assert_log):
+      LOG.warning(
+          "{} calls assert_log_contains() with timeout_s={}. Make sure that glog "
+          "buffering has been disabled (--logbuflevel=-1), or "
+          "CustomClusterTestSuite.with_args is set with disable_log_buffering=True, "
+          "or timeout_s is sufficient.".format(self.__class__.__name__, timeout_s))
+
     pattern = re.compile(line_regex)
     start_time = time.time()
     while True:
       try:
         found = 0
-        if hasattr(self, "impala_log_dir"):
-          log_dir = self.impala_log_dir
-        else:
-          log_dir = EE_TEST_LOGS_DIR
-        log_file_path = os.path.join(log_dir, daemon + "." + level)
-        # Resolve symlinks to make finding the file easier.
-        log_file_path = os.path.realpath(log_file_path)
-        with open(log_file_path) as log_file:
+        log_file_path = self.__build_log_path(daemon, level)
+        last_re_result = None
+        with open(log_file_path, 'rb') as log_file:
           for line in log_file:
-            if pattern.search(line):
+            # The logs could contain invalid unicode (and end-to-end tests don't control
+            # the logs from other tests). Skip lines with invalid unicode.
+            try:
+              line = line.decode()
+            except UnicodeDecodeError:
+              continue
+            re_result = pattern.search(line)
+            if re_result:
               found += 1
-        if expected_count == -1:
-          assert found > 0, "Expected at least one line in file %s matching regex '%s'"\
-            ", but found none." % (log_file_path, line_regex)
-        else:
-          assert found == expected_count, \
-            "Expected %d lines in file %s matching regex '%s', but found %d lines. "\
-            "Last line was: \n%s" %\
-            (expected_count, log_file_path, line_regex, found, line)
-        return
+              last_re_result = re_result
+        if not dry_run:
+          if expected_count == -1:
+            assert found > 0, "Expected at least one line in file %s matching regex '%s'"\
+              ", but found none." % (log_file_path, line_regex)
+          else:
+            assert found == expected_count, \
+              "Expected %d lines in file %s matching regex '%s', but found %d lines. "\
+              "Last line was: \n%s" %\
+              (expected_count, log_file_path, line_regex, found, line)
+        return last_re_result
       except AssertionError as e:
         # Re-throw the exception to the caller only when the timeout is expired. Otherwise
         # sleep before retrying.
@@ -1243,6 +1520,74 @@ class ImpalaTestSuite(BaseTestSuite):
             str(e))
         time.sleep(1)
 
+  def validate_exec_option_dimension(self, vector):
+    """Validate that test dimension with name matching query option name is
+    also registered in 'exec_option' dimension."""
+    option_dim_names = []
+    exec_option = dict()
+    for vector_value in vector.vector_values:
+      if vector_value.name == EXEC_OPTION_KEY:
+        exec_option = vector.get_value(EXEC_OPTION_KEY)
+      elif vector_value.name.lower() in EXEC_OPTION_NAMES:
+        option_dim_names.append(vector_value.name.lower())
+
+    if not option_dim_names:
+      return
+
+    for name in option_dim_names:
+      # TODO: enforce these warnings by changing them into pytest.fail()
+      if name not in exec_option:
+        pytest.fail("Exec option {} declared as independent dimension but not inserted "
+            "into {} dimension. Consider using helper function "
+            "add_exec_option_dimension or add_mandatory_exec_option "
+            "to declare it.".format(name, EXEC_OPTION_KEY))
+      elif vector.get_value(name) != exec_option[name]:
+        pytest.fail("{}[{}]={} does not match against dimension {}={}.".format(
+          EXEC_OPTION_KEY, name, exec_option[name], name, vector.get_value(name)))
+
+  def __build_log_path(self, daemon, level):
+    """Builds a path to a log file for a particular daemon. Does not assert that file
+       actually exists.
+
+       Parameters:
+         - daemon: name of the daemon (e.g. catalog, impalad, statestored)
+         - level:  level of the logfile (e.g. INFO, ERROR, FATAL)
+
+        Return: String containing the full path to the log file for the specified daemon
+                and level. Symlinks are resolved to their real path.
+    """
+    if hasattr(self, "impala_log_dir"):
+      log_dir = self.impala_log_dir
+    else:
+      log_dir = EE_TEST_LOGS_DIR
+    log_file_path = os.path.join(log_dir, daemon + "." + level)
+
+    # Resolve symlinks to make finding the file easier.
+    return os.path.realpath(log_file_path)
+
+  def wait_for_log_exists(self, daemon, level, max_attempts=30, sleep_time_s=1):
+    """Waits for a log file to exist. If the file does not come into existence in the
+       specified timeframe, an assertion fails.
+
+       Parameters:
+         - daemon:       name of the daemon (e.g. catalog, impalad, statestored)
+         - level:        level of the logfile (e.g. INFO, ERROR, FATAL)
+         - max_attempts: number of times to check if the file exists
+         - sleep_time_s: seconds to sleep between each file existence check
+
+        Return: nothing
+    """
+    actual_log_path = self.__build_log_path(daemon, level)
+
+    def exists_func(is_last_try):
+      if is_last_try:
+        LOG.info("Checking existence of {} for the last time.".format(actual_log_path))
+      return os.path.exists(actual_log_path)
+
+    assert retry(exists_func, max_attempts, sleep_time_s, 1, True), "file '{}' did not " \
+        "come into existence after {}x{} seconds".format(actual_log_path, max_attempts,
+        sleep_time_s)
+
   @staticmethod
   def get_random_name(prefix='', length=5):
     """
@@ -1250,3 +1595,23 @@ class ImpalaTestSuite(BaseTestSuite):
     """
     assert length > 0
     return prefix + ''.join(choice(string.ascii_lowercase) for i in range(length))
+
+  def _get_properties(self, section_name, name, is_db=False):
+    """Extracts the db/table properties mapping from the output of DESCRIBE FORMATTED"""
+    result = self.client.execute("describe {0} formatted {1}".format(
+      "database" if is_db else "", name))
+    match = False
+    properties = dict()
+    for row in result.data:
+      fields = row.split("\t")
+      if fields[0] != '':
+        # Start of new section.
+        if match:
+          # Finished processing matching section.
+          break
+        match = section_name in fields[0]
+      elif match:
+        if fields[1] == 'NULL':
+          break
+        properties[fields[1].rstrip()] = fields[2].rstrip()
+    return properties

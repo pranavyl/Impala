@@ -23,15 +23,19 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 
 import org.apache.hadoop.hive.metastore.api.Database;
+import org.apache.hadoop.hive.metastore.api.PrincipalType;
 import org.apache.impala.analysis.ColumnDef;
 import org.apache.impala.analysis.KuduPartitionParam;
 import org.apache.impala.catalog.events.InFlightEvents;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TBriefTableMeta;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
@@ -41,6 +45,7 @@ import org.apache.impala.thrift.TFunctionBinaryType;
 import org.apache.impala.thrift.TFunctionCategory;
 import org.apache.impala.thrift.TGetPartialCatalogObjectRequest;
 import org.apache.impala.thrift.TGetPartialCatalogObjectResponse;
+import org.apache.impala.thrift.TImpalaTableType;
 import org.apache.impala.thrift.TPartialDbInfo;
 import org.apache.impala.util.FunctionUtils;
 import org.apache.impala.util.PatternMatcher;
@@ -53,8 +58,6 @@ import org.slf4j.LoggerFactory;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
-
-import static org.apache.impala.service.MetadataOp.TABLE_COMMENT_KEY;
 
 /**
  * Internal representation of db-related metadata. Owned by Catalog instance.
@@ -80,6 +83,9 @@ public class Db extends CatalogObjectImpl implements FeDb {
 
   public static final String FUNCTION_INDEX_PREFIX = "impala_registered_function_";
 
+  // Name of the standard system DB. Also used by Hive MetaStore.
+  public static final String SYS = "sys";
+
   // Hive metastore imposes a limit of 4000 bytes on the key and value strings
   // in DB parameters map. We need ensure that this limit isn't crossed
   // while serializing functions to the metastore.
@@ -101,6 +107,9 @@ public class Db extends CatalogObjectImpl implements FeDb {
   private boolean isSystemDb_ = false;
 
   // tracks the in-flight metastore events for this db
+  // Also used as a monitor object to synchronize access to it to avoid blocking on table
+  // lock during self-event check. If both this and dbLock_ or catalog version lock are
+  // taken, inFlightEvents_ must be the last to avoid deadlock.
   private final InFlightEvents inFlightEvents_ = new InFlightEvents();
 
   // lock to make sure modifications to the Db object are atomically done along with
@@ -198,11 +207,23 @@ public class Db extends CatalogObjectImpl implements FeDb {
    */
   public void addTable(Table table) { tableCache_.add(table); }
 
-  /**
-   * Gets all table names in the table cache.
-   */
   @Override
   public List<String> getAllTableNames() {
+    return getAllTableNames(/*tableTypes*/ Collections.emptySet());
+  }
+
+  /**
+   * Gets all table names in the table cache whose corresponding tables are of a table
+   * type specified in 'tableTypes'. Returns all table names if 'tableTypes' is empty.
+   */
+  @Override
+  public List<String> getAllTableNames(Set<TImpalaTableType> tableTypes) {
+    if (!tableTypes.isEmpty()) {
+      return tableCache_.getValues().stream()
+          .filter(table -> tableTypes.contains(table.getTableType()))
+          .map(table -> table.getName())
+          .collect(Collectors.toList());
+    }
     return Lists.newArrayList(tableCache_.keySet());
   }
 
@@ -210,6 +231,11 @@ public class Db extends CatalogObjectImpl implements FeDb {
    * Returns the tables in the cache.
    */
   public List<Table> getTables() { return tableCache_.getValues(); }
+
+  /**
+   * Returns the number of tables in this db.
+   */
+  public int getNumTables() { return tableCache_.size(); }
 
   @Override
   public boolean containsTable(String tableName) {
@@ -240,11 +266,11 @@ public class Db extends CatalogObjectImpl implements FeDb {
 
   @Override
   public FeKuduTable createKuduCtasTarget(
-      org.apache.hadoop.hive.metastore.api.Table msTbl,
-      List<ColumnDef> columnDefs, List<ColumnDef> primaryKeyColumnDefs,
-      List<KuduPartitionParam> kuduPartitionParams) {
-    return KuduTable.createCtasTarget(this, msTbl, columnDefs, primaryKeyColumnDefs,
-        kuduPartitionParams);
+      org.apache.hadoop.hive.metastore.api.Table msTbl, List<ColumnDef> columnDefs,
+      List<ColumnDef> primaryKeyColumnDefs, boolean isPrimaryKeyUnique,
+      List<KuduPartitionParam> kuduPartitionParams) throws ImpalaRuntimeException {
+    return KuduTable.createCtasTarget(this, msTbl, columnDefs, isPrimaryKeyUnique,
+        primaryKeyColumnDefs, kuduPartitionParams);
   }
 
   @Override
@@ -503,6 +529,7 @@ public class Db extends CatalogObjectImpl implements FeDb {
 
   public TCatalogObject toMinimalTCatalogObject() {
     TCatalogObject min = new TCatalogObject(getCatalogObjectType(), getCatalogVersion());
+    min.setLast_modified_time_ms(getLastLoadedTimeMs());
     min.setDb(new TDatabase(getName()));
     return min;
   }
@@ -518,6 +545,7 @@ public class Db extends CatalogObjectImpl implements FeDb {
 
     TGetPartialCatalogObjectResponse resp = new TGetPartialCatalogObjectResponse();
     resp.setObject_version_number(getCatalogVersion());
+    resp.setObject_loaded_time_ms(getLastLoadedTimeMs());
     resp.db_info = new TPartialDbInfo();
     if (selector.want_hms_database) {
       // TODO(todd): we need to deep-copy here because 'addFunction' other DDLs
@@ -530,10 +558,13 @@ public class Db extends CatalogObjectImpl implements FeDb {
           tableCache_.keySet().size());
       for (Table tbl : tableCache_.getValues()) {
         TBriefTableMeta meta = new TBriefTableMeta(tbl.getName());
+        meta.setTblType(tbl.getTableType());
+        meta.setComment(tbl.getTableComment());
         org.apache.hadoop.hive.metastore.api.Table msTbl = tbl.getMetaStoreTable();
         if (msTbl != null) {
+          // This is only used in old versions of impalad. Set it in case of rolling
+          // upgrade.
           meta.setMsType(msTbl.getTableType());
-          meta.setComment(msTbl.getParameters().get(TABLE_COMMENT_KEY));
         }
         briefTableMetaList.add(meta);
       }
@@ -564,10 +595,9 @@ public class Db extends CatalogObjectImpl implements FeDb {
    * @return true if version was successfully removed, false if didn't exist
    */
   public boolean removeFromVersionsForInflightEvents(long versionNumber) {
-    Preconditions.checkState(dbLock_.isHeldByCurrentThread(),
-        "removeFromVersionsForInflightEvents called without getting the db lock for "
-            + getName() + " database.");
-    return inFlightEvents_.remove(false, versionNumber);
+    synchronized (inFlightEvents_) {
+      return inFlightEvents_.remove(false, versionNumber);
+    }
   }
 
   /**
@@ -577,21 +607,28 @@ public class Db extends CatalogObjectImpl implements FeDb {
    * given version and does not add it
    * @param versionNumber version number to add
    */
-  public void addToVersionsForInflightEvents(long versionNumber) {
+  public boolean addToVersionsForInflightEvents(long versionNumber) {
+    // The lock is not needed for thread safety, just verifying existing behavior.
     Preconditions.checkState(dbLock_.isHeldByCurrentThread(),
         "addToVersionsForInFlightEvents called without getting the db lock for "
             + getName() + " database.");
-    if (!inFlightEvents_.add(false, versionNumber)) {
+    boolean added = false;
+    synchronized (inFlightEvents_) {
+      added = inFlightEvents_.add(false, versionNumber);
+    }
+    if (!added) {
       LOG.warn(String.format("Could not add version %s to the list of in-flight "
           + "events. This could cause unnecessary database %s invalidation when the "
           + "event is processed", versionNumber, getName()));
     }
+    return added;
   }
 
   @Override // FeDb
   public String getOwnerUser() {
     org.apache.hadoop.hive.metastore.api.Database db = getMetaStoreDb();
-    return db == null ? null : db.getOwnerName();
+    return db == null ? null :
+        (db.getOwnerType() == PrincipalType.USER ? db.getOwnerName() : null);
   }
 
   /**

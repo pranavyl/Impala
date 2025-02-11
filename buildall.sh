@@ -69,12 +69,14 @@ BUILD_ASAN=0
 BUILD_FE_ONLY=0
 BUILD_TESTS=1
 GEN_CMAKE_ONLY=0
+GEN_PACKAGE=0
 BUILD_RELEASE_AND_DEBUG=0
 BUILD_TIDY=0
 BUILD_UBSAN=0
 BUILD_UBSAN_FULL=0
 BUILD_TSAN=0
 BUILD_TSAN_FULL=0
+BUILD_DEBUG_NOOPT=0
 BUILD_SHARED_LIBS=0
 # Export MAKE_CMD so it is visible in scripts that invoke make, e.g. copy-udfs-udas.sh
 export MAKE_CMD=make
@@ -85,6 +87,9 @@ export MAKE_CMD=make
 : ${CMAKE_BUILD_TYPE:=Debug}
 
 # parse command line options
+# Note: if you add a new build type, please also add it to 'VALID_BUILD_TYPES' in
+# tests/common/environ.py and set correct BUILD_OUTPUT_ROOT_DIRECTORY directory in
+# be/CMakeLists.txt.
 while [ -n "$*" ]
 do
   case "$1" in
@@ -145,8 +150,11 @@ do
     -tsan)
       BUILD_TSAN=1
       ;;
-     -full_tsan)
+    -full_tsan)
       BUILD_TSAN_FULL=1
+      ;;
+    -debug_noopt)
+      BUILD_DEBUG_NOOPT=1
       ;;
     -testpairwise)
       EXPLORATION_STRATEGY=pairwise
@@ -197,6 +205,9 @@ do
     -cmake_only)
       GEN_CMAKE_ONLY=1
       ;;
+    -package)
+      GEN_PACKAGE=1
+      ;;
     -help|*)
       echo "buildall.sh - Builds Impala and runs all tests."
       echo "[-noclean] : Omits cleaning all packages before building. Will not kill"\
@@ -226,6 +237,10 @@ do
       echo "[-full_ubsan] : Undefined behavior sanitizer build, including code generated"\
            "by cross-compilation to LLVM IR. Much slower queries than plain -ubsan"\
            "[Default: False]"
+      echo "[-debug_noopt] : Debug build without optimizations applied. The regular"\
+           "debug build applies basic optimizations, but even these optimizations may"\
+           "impact debuggability, so this is an option to omit the optimizations."\
+           "[Default: False]"
       echo "[-skiptests] : Skips execution of all tests"
       echo "[-notests] : Skips building and execution of all tests"
       echo "[-start_minicluster] : Start test cluster including Impala and all"\
@@ -238,7 +253,7 @@ do
            "test execution time)"
       echo "[-testexhaustive] : Run tests in 'exhaustive' mode, which significantly"\
            "increases test execution time. ONLY APPLIES to suites with workloads:"\
-           "functional-query, targeted-stress"
+           "functional-query, targeted-stress, tpcds-insert"
       echo "[-testdata] : Loads test data. Implied as true if -snapshot_file is"\
            "specified. If -snapshot_file is not specified, data will be regenerated."
       echo "[-snapshot_file <file name>] : Load test data from a snapshot file"
@@ -247,6 +262,7 @@ do
       echo "[-fe_only] : Build just the frontend"
       echo "[-ninja] : Use ninja instead of make"
       echo "[-cmake_only] : Generate makefiles only, instead of doing a full build"
+      echo "[-package] : Generate a package for deployment."
       echo "-----------------------------------------------------------------------------
 Examples of common tasks:
 
@@ -325,6 +341,10 @@ if [[ ${BUILD_TSAN_FULL} -eq 1 ]]; then
   CMAKE_BUILD_TYPE_LIST+=(TSAN_FULL)
   export TSAN_FULL=1
 fi
+if [[ ${BUILD_DEBUG_NOOPT} -eq 1 ]]; then
+  CMAKE_BUILD_TYPE_LIST+=(DEBUG_NOOPT)
+  export DEBUG_NOOPT=1
+fi
 if [[ -n "${CMAKE_BUILD_TYPE_LIST:+1}" ]]; then
   if [[ ${#CMAKE_BUILD_TYPE_LIST[@]} -gt 1 ]]; then
     echo "ERROR: more than one CMake build type defined: ${CMAKE_BUILD_TYPE_LIST[@]}"
@@ -396,33 +416,41 @@ bootstrap_dependencies() {
 
   # Populate necessary thirdparty components unless it's set to be skipped.
   if [[ "${SKIP_TOOLCHAIN_BOOTSTRAP}" = true ]]; then
-    echo "SKIP_TOOLCHAIN_BOOTSTRAP is true, skipping toolchain bootstrap."
-    if [[ "${DOWNLOAD_CDH_COMPONENTS}" = true ]]; then
-      echo ">>> Downloading and extracting cdh components."
+    if ! [ -z "${NATIVE_TOOLCHAIN_HOME}" ]; then
+      if ! [ -d "${NATIVE_TOOLCHAIN_HOME}" ]; then
+        mkdir -p "${NATIVE_TOOLCHAIN_HOME}"
+        pushd "${NATIVE_TOOLCHAIN_HOME}"
+        git init
+        git remote add toolchain "${IMPALA_TOOLCHAIN_REPO}"
+        git fetch toolchain "${IMPALA_TOOLCHAIN_BRANCH}"
+        # Specifying a branch avoids a large message from git about detached HEADs.
+        git checkout "${IMPALA_TOOLCHAIN_COMMIT_HASH}" -b "${IMPALA_TOOLCHAIN_BRANCH}"
+      else
+        pushd "${NATIVE_TOOLCHAIN_HOME}"
+      fi
+      echo "Begin building toolchain, may need several hours, please be patient...."
+      ./buildall.sh
+      popd
+    else
+      echo "SKIP_TOOLCHAIN_BOOTSTRAP is true, skipping toolchain bootstrap."
+    fi
+    if [[ "${DOWNLOAD_CDH_COMPONENTS}" = true ]] || \
+      [[ "${DOWNLOAD_APACHE_COMPONENTS}" = true ]]; then
+      echo ">>> Downloading and extracting cdh or apache components."
       "$IMPALA_HOME/bin/bootstrap_toolchain.py"
     fi
-    # Create soft link to locally builded native-toolchain on aarch64
-    if [[ "$(uname -p)" = "aarch64" ]]; then
-      mkdir -p $IMPALA_TOOLCHAIN_PACKAGES_HOME
-      cd "$IMPALA_TOOLCHAIN_PACKAGES_HOME"
-      ln -f -s ${NATIVE_TOOLCHAIN_HOME}/build/* .
-      cd -
-      if ! [[ -d "$IMPALA_HOME/../hadoopAarch64NativeLibs" ]]; then
-        git clone https://github.com/zhaorenhai/hadoopAarch64NativeLibs \
-          "$IMPALA_HOME/../hadoopAarch64NativeLibs"
-      fi
-      cp $IMPALA_HOME/../hadoopAarch64NativeLibs/lib*  $HADOOP_HOME/lib/native/
-    fi
-
   else
     echo ">>> Downloading and extracting toolchain dependencies."
     "$IMPALA_HOME/bin/bootstrap_toolchain.py"
     echo "Toolchain bootstrap complete."
   fi
-  # HIVE-22915
+  # Use prebuilt Hadoop native binaries for aarch64
+  if [[ "$(uname -p)" = "aarch64" ]]; then
+    cp $IMPALA_TOOLCHAIN_PACKAGES_HOME/hadoop-client-$IMPALA_HADOOP_CLIENT_VERSION/lib/* \
+        $HADOOP_HOME/lib/native/
+  fi
   if [[ "${USE_APACHE_HIVE}" = true ]]; then
-    rm $HIVE_HOME/lib/guava-*jar
-    cp $HADOOP_HOME/share/hadoop/hdfs/lib/guava-*.jar $HIVE_HOME/lib/
+    "$IMPALA_HOME/testdata/bin/patch_hive.sh"
   fi
 }
 
@@ -495,6 +523,9 @@ generate_cmake_files() {
   if [[ $BUILD_SHARED_LIBS -eq 1 ]]; then
     CMAKE_ARGS+=(-DBUILD_SHARED_LIBS=ON)
   fi
+  if [[ "$BUILD_TESTS" -eq 0 && "$GEN_PACKAGE" -eq 1 ]]; then
+    CMAKE_ARGS+=(-DBUILD_WITH_NO_TESTS=ON)
+  fi
   if [[ "${MAKE_CMD}" = "ninja" ]]; then
     CMAKE_ARGS+=(-GNinja)
   fi
@@ -523,6 +554,9 @@ generate_cmake_files() {
     fi
     echo "CACHELINESIZE_AARCH64:$CACHELINESIZE_AARCH64"
     CMAKE_ARGS+=(-DCACHELINESIZE_AARCH64=$CACHELINESIZE_AARCH64)
+  fi
+  if [[ "$GEN_PACKAGE" -eq 1 ]]; then
+    CMAKE_ARGS+=(-DBUILD_PACKAGES=ON)
   fi
 
   cmake . ${CMAKE_ARGS[@]}
@@ -645,6 +679,10 @@ if [[ "$BUILD_RELEASE_AND_DEBUG" -eq 1 ]]; then
   build_all_components ${CMAKE_BUILD_TYPE} 0
 else
   build_all_components $CMAKE_BUILD_TYPE 1
+fi
+
+if [[ "$GEN_PACKAGE" -eq 1 ]]; then
+  ${MAKE_CMD} -j${IMPALA_BUILD_THREADS:-4} package
 fi
 
 if [[ $NEED_MINICLUSTER -eq 1 ]]; then

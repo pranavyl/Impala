@@ -17,8 +17,10 @@
 
 # Test behaviors specific to --use_local_catalog being enabled.
 
+from __future__ import absolute_import, division, print_function
+from builtins import range
 import pytest
-import Queue
+import queue
 import random
 import re
 import threading
@@ -27,15 +29,14 @@ import time
 from multiprocessing.pool import ThreadPool
 
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
-from tests.common.skip import (SkipIfHive2, SkipIfS3, SkipIfABFS, SkipIfGCS, SkipIfCOS,
-                               SkipIfADLS, SkipIfIsilon, SkipIfLocal)
+from tests.common.skip import SkipIfHive2, SkipIfFS
 from tests.util.filesystem_utils import WAREHOUSE
 
 RETRY_PROFILE_MSG = 'Retried query planning due to inconsistent metadata'
 CATALOG_VERSION_LOWER_BOUND = 'catalog.catalog-object-version-lower-bound'
 
 
-class TestCompactCatalogUpdates(CustomClusterTestSuite):
+class TestLocalCatalogCompactUpdates(CustomClusterTestSuite):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
@@ -117,7 +118,8 @@ class TestCompactCatalogUpdates(CustomClusterTestSuite):
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
       impalad_args="--use_local_catalog=true",
-      catalogd_args="--catalog_topic_mode=minimal")
+      catalogd_args="--catalog_topic_mode=minimal",
+      disable_log_buffering=True)
   def test_restart_catalogd(self, unique_database):
     """
     Tests for the behavior of LocalCatalog when catalogd restarts.
@@ -144,13 +146,13 @@ class TestCompactCatalogUpdates(CustomClusterTestSuite):
       # catalog pushes a new topic update.
       self.cluster.catalogd.start()
       NUM_ATTEMPTS = 30
-      for attempt in xrange(NUM_ATTEMPTS):
+      for attempt in range(NUM_ATTEMPTS):
         try:
           self.assert_impalad_log_contains('WARNING', 'Detected catalog service restart')
           err = self.execute_query_expect_failure(client, "select * from %s" % view)
           assert "Could not resolve table reference" in str(err)
           break
-        except Exception, e:
+        except Exception as e:
           assert attempt < NUM_ATTEMPTS - 1, str(e)
         time.sleep(1)
 
@@ -160,8 +162,9 @@ class TestCompactCatalogUpdates(CustomClusterTestSuite):
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
     impalad_args="--use_local_catalog=true",
-    catalogd_args="--catalog_topic_mode=minimal "
-                  "--enable_incremental_metadata_updates=true")
+    catalogd_args=("--catalog_topic_mode=minimal "
+                   "--enable_incremental_metadata_updates=true"),
+    disable_log_buffering=True)
   def test_invalidate_stale_partitions(self, unique_database):
     """
     Test that partition level invalidations are sent from catalogd and processed
@@ -260,7 +263,7 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
     inconsistent_seen = [0]
     inconsistent_seen_lock = threading.Lock()
     # Tracks query failures for all other reasons.
-    failed_queries = Queue.Queue()
+    failed_queries = queue.Queue()
     try:
       client1 = self.cluster.impalads[0].service.create_beeswax_client()
       client2 = self.cluster.impalads[1].service.create_beeswax_client()
@@ -273,8 +276,9 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
           q = random.choice(queries)
           attempt += 1
           try:
+            print('Attempt', attempt, 'client', str(client))
             ret = self.execute_query_unchecked(client, q)
-          except Exception, e:
+          except Exception as e:
             if 'InconsistentMetadataFetchException' in str(e):
               with inconsistent_seen_lock:
                 inconsistent_seen[0] += 1
@@ -287,7 +291,8 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
         t.start()
       for t in threads:
         # When there are failures, they're observed quickly.
-        t.join(30)
+        # 600s is enough for 200 attempts.
+        t.join(600)
 
       assert failed_queries.empty(),\
           "Failed query count non zero: %s" % list(failed_queries.queue)
@@ -318,7 +323,8 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args="--use_local_catalog=true --local_catalog_max_fetch_retries=0",
+      impalad_args="--use_local_catalog=true --local_catalog_max_fetch_retries=0"
+                   " --inject_latency_before_catalog_fetch_ms=500",
       catalogd_args="--catalog_topic_mode=minimal")
   def test_replan_limit(self):
     """
@@ -326,7 +332,8 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
     an inconsistent metadata exception when running concurrent reads/writes
     is seen. With the max retries set to 0, no retries are expected and with
     the concurrent read/write workload, an inconsistent metadata exception is
-    expected.
+    expected. Setting inject_latency_before_catalog_fetch_ms to increases the
+    possibility of a stale request which throws the expected exception.
     """
     queries = [
       'refresh functional.alltypes',
@@ -373,7 +380,7 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
       replans_seen_lock = threading.Lock()
 
       # Queue to propagate exceptions from failed queries, if any.
-      failed_queries = Queue.Queue()
+      failed_queries = queue.Queue()
 
       def stress_thread(client):
         while replans_seen[0] == 0:
@@ -441,10 +448,45 @@ class TestLocalCatalogRetries(CustomClusterTestSuite):
     # Prior to fixing IMPALA-7534, this test would fail within 20-30 iterations,
     # so 100 should be quite reliable as a regression test.
     NUM_ITERS = 100
-    for i in t.imap_unordered(do_table, xrange(NUM_ITERS)):
+    for i in t.imap_unordered(do_table, range(NUM_ITERS)):
       pass
 
-class TestObservability(CustomClusterTestSuite):
+  @CustomClusterTestSuite.with_args(
+      impalad_args="--use_local_catalog=true "
+                   "--inject_failure_ratio_in_catalog_fetch=0.1 "
+                   "--inject_latency_after_catalog_fetch_ms=100",
+      catalogd_args="--catalog_topic_mode=minimal")
+  def test_fetch_metadata_retry_in_piggybacked_failures(self, unique_database):
+    test_self = self
+
+    class ThreadLocalClient(threading.local):
+      def __init__(self):
+        self.c = test_self.create_impala_client()
+
+    NUM_THREADS = 8
+    t = ThreadPool(processes=NUM_THREADS)
+    tls = ThreadLocalClient()
+
+    self.execute_query(
+        "create table {0}.tbl (i int) partitioned by (p int)".format(unique_database))
+    self.execute_query(
+        "insert into {0}.tbl partition(p) values (0,0)".format(unique_database))
+
+    def read_part(i):
+      self.execute_query_expect_success(
+          tls.c, "select * from {0}.tbl where p=0".format(unique_database))
+
+    # Prior to fixing IMPALA-12670, this test would fail within 20 iterations,
+    # so 100 should be quite reliable as a regression test.
+    NUM_ITERS = 100
+    for k in range(NUM_ITERS):
+      # Read the same partition in concurrent queries so requests can be piggybacked.
+      for i in t.imap_unordered(read_part, range(NUM_THREADS)):
+        pass
+      # Refresh to invalidate the partition in local catalog cache
+      self.execute_query("refresh {0}.tbl partition(p=0)".format(unique_database))
+
+class TestLocalCatalogObservability(CustomClusterTestSuite):
   def get_catalog_cache_metrics(self, impalad):
     """ Returns catalog cache metrics as a dict by scraping the json metrics page on the
     given impalad"""
@@ -481,6 +523,8 @@ class TestObservability(CustomClusterTestSuite):
       cache_miss_rate_metric_key = "catalog.cache.miss-rate"
       cache_hit_count_metric_key = "catalog.cache.hit-count"
       cache_request_count_metric_key = "catalog.cache.request-count"
+      cache_entry_median_size_key = "catalog.cache.entry-median-size"
+      cache_entry_99th_size_key = "catalog.cache.entry-99th-size"
       cache_request_count_prev_run = 0
       cache_hit_count_prev_run = 0
       test_table_name = "%s.test_cache_metrics_test_tbl" % unique_database
@@ -489,7 +533,7 @@ class TestObservability(CustomClusterTestSuite):
           "explain select count(*) from functional.alltypes",
           "create table %s (a int)" % test_table_name,
           "drop table %s" % test_table_name]
-      for _ in xrange(0, 10):
+      for _ in range(0, 10):
         for query in queries_to_test:
           ret = self.execute_query_expect_success(client, query)
           assert ret.runtime_profile.count("Frontend:") == 1
@@ -507,11 +551,48 @@ class TestObservability(CustomClusterTestSuite):
           assert cache_request_count > cache_request_count_prev_run,\
              "%s not updated betweeen two query runs, query - %s"\
              % (cache_request_count_metric_key, query)
+
+          cache_entry_median_size = cache_metrics[cache_entry_median_size_key]
+          cache_entry_99th_size = cache_metrics[cache_entry_99th_size_key]
+          assert cache_entry_median_size > 300 and cache_entry_median_size < 3000
+          assert cache_entry_99th_size > 12500 and cache_entry_99th_size < 19000
+
           cache_hit_count_prev_run = cache_hit_count
           cache_request_count_prev_run = cache_request_count
     finally:
       client.close()
 
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args="--use_local_catalog=true",
+      catalogd_args="--catalog_topic_mode=minimal")
+  def test_lightweight_rpc_metrics(self):
+    """Verify catalogd client cache for lightweight RPCs is used correctly"""
+    # Fetching the db and table list should be lightweight requests
+    self.execute_query("describe database functional")
+    self.execute_query("show tables in functional")
+    impalad = self.cluster.impalads[0].service
+    assert 0 == impalad.get_metric_value("catalog.server.client-cache.total-clients")
+    assert 1 == impalad.get_metric_value(
+        "catalog.server.client-cache.total-clients-for-lightweight-rpc")
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+    impalad_args="--use_local_catalog=true",
+    catalogd_args="--catalog_topic_mode=minimal --hms_event_polling_interval_s=0",
+    cluster_size=1, disable_log_buffering=True)
+  def test_invalidate_stale_partition_on_reload(self, unique_database):
+    test_tbl = unique_database + ".test_invalidate_table"
+    self.client.execute(
+        "create table {} (id int) partitioned by (p int)".format(test_tbl))
+    self.client.execute("alter table {} add partition (p=0)".format(test_tbl))
+    # Make the partition loaded in the coordinator, so that one instance needs to be
+    # invalidated when the partition is reloaded.
+    self.client.execute("show partitions {}".format(test_tbl))
+    self.client.execute("refresh {} partition(p=0)".format(test_tbl))
+    log_regex = r"Invalidated objects in cache: \[partition %s:p=0 \(id=0\)\]" \
+        % test_tbl
+    self.assert_impalad_log_contains('INFO', log_regex)
 
 class TestFullAcid(CustomClusterTestSuite):
   @classmethod
@@ -531,13 +612,7 @@ class TestFullAcid(CustomClusterTestSuite):
     assert res.data == ['0', '1', '2', '3', '4', '5', '6', '7']
 
   @SkipIfHive2.acid
-  @SkipIfS3.hive
-  @SkipIfABFS.hive
-  @SkipIfADLS.hive
-  @SkipIfGCS.hive
-  @SkipIfCOS.hive
-  @SkipIfIsilon.hive
-  @SkipIfLocal.hive
+  @SkipIfFS.hive
   @pytest.mark.execute_serially
   def test_full_acid_scans(self, vector, unique_database):
     self.run_test_case('QueryTest/full-acid-scans', vector, use_db=unique_database)

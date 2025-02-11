@@ -17,6 +17,7 @@
 
 # Tests end-to-end codegen behaviour.
 
+from __future__ import absolute_import, division, print_function
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.skip import SkipIf
 from tests.common.test_dimensions import create_exec_option_dimension_from_dict
@@ -46,7 +47,8 @@ class TestCodegen(ImpalaTestSuite):
   def test_select_node_codegen(self, vector):
     """Test that select node is codegened"""
     result = self.execute_query('select * from (select * from functional.alltypes '
-        'limit 1000000) t1 where int_col > 10 limit 10')
+        'limit 1000000) t1 where int_col > 10 limit 10',
+        {'disable_codegen_rows_threshold': 7000})
     exec_options = get_node_exec_options(result.runtime_profile, 1)
     # Make sure test fails if there are no exec options in the profile for the node
     assert len(exec_options) > 0

@@ -21,6 +21,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "common/atomic.h"
 #include "common/compiler-util.h"
@@ -51,6 +52,7 @@ class FragmentState;
 class FragmentInstanceState;
 class InitialReservations;
 class LlvmCodeGen;
+class CodeGenCache;
 class MemTracker;
 class PlanNode;
 class PublishFilterParamsPB;
@@ -62,6 +64,7 @@ class ScalarExpr;
 class ScannerMemLimiter;
 class TmpFileGroup;
 class TRuntimeProfileForest;
+class UpdateFilterParamsPB;
 
 /// Central class for all backend execution state (example: the FragmentInstanceStates
 /// of the individual fragment instances) created for a particular query.
@@ -118,6 +121,20 @@ class TRuntimeProfileForest;
 /// - set up kudu clients in Init(), remove related locking
 class QueryState {
  public:
+  /// Stores information about which file is scheduled to which hosts.
+  struct FileSchedulingInfo {
+    std::string file_path;
+    std::vector<NetworkAddressPB> hosts;
+    bool is_relative_path;
+
+    FileSchedulingInfo(const string& fn, bool is_rel)
+        : file_path(fn), is_relative_path(is_rel) {}
+  };
+
+  /// Stores information about which file is scheduled to which hosts, grouped by scan
+  /// node ID.
+  typedef std::unordered_map<int, std::vector<FileSchedulingInfo>> NodeToFileSchedulings;
+
   /// Use this class to obtain a QueryState for the duration of a function/block,
   /// rather than manually via QueryExecMgr::Get-/ReleaseQueryState().
   /// Pattern:
@@ -150,8 +167,13 @@ class QueryState {
   const TQueryOptions& query_options() const {
     return query_ctx_.client_request.query_options;
   }
+  bool codegen_cache_enabled() const;
+  bool is_initialized();
   MemTracker* query_mem_tracker() const { return query_mem_tracker_; }
   RuntimeProfile* host_profile() const { return host_profile_; }
+  const NodeToFileSchedulings* node_to_file_schedulings() const {
+    return &node_to_file_schedulings_;
+  }
   UniqueIdPB GetCoordinatorBackendId() const;
 
   /// The following getters are only valid after Init().
@@ -214,6 +236,10 @@ class QueryState {
 
   /// Blocks until all fragment instances have finished their Prepare phase.
   void PublishFilter(const PublishFilterParamsPB& params, kudu::rpc::RpcContext* context);
+
+  /// Handle filter update that comes from remote backend executor.
+  void UpdateFilterFromRemote(
+      const UpdateFilterParamsPB& params, kudu::rpc::RpcContext* context);
 
   /// Cancels all actively executing fragment instances. Blocks until all fragment
   /// instances have finished their Prepare phase. Idempotent.
@@ -289,6 +315,20 @@ class QueryState {
   FragmentState* findFragmentState(TFragmentIdx fragmentIdx) {
     auto it = fragment_state_map_.find(fragmentIdx);
     return (it != fragment_state_map_.end()) ? it->second : nullptr;
+  }
+
+  const std::unordered_map<TFragmentIdx, FragmentState*>& FragmentStateMap() {
+    return fragment_state_map_;
+  }
+
+  /// Returns true if the query has reached a terminal state.
+  bool IsTerminalState() const {
+    // Read into local variable to protect against concurrent modification
+    // of backend_exec_state_.
+    BackendExecState exec_state = backend_exec_state_;
+    return exec_state == BackendExecState::FINISHED
+        || exec_state == BackendExecState::CANCELLED
+        || exec_state == BackendExecState::ERROR;
   }
 
  private:
@@ -372,6 +412,9 @@ class QueryState {
   /// Set in Init(). TODO: find a way not to have to copy this
   ExecQueryFInstancesRequestPB exec_rpc_params_;
   TExecPlanFragmentInfo fragment_info_;
+
+  /// Stores which data file is scheduled to which host, grouped by scan node ID.
+  NodeToFileSchedulings node_to_file_schedulings_;
 
   /// Buffer reservation for this query (owned by obj_pool_). Set in Init().
   ReservationTracker* buffer_reservation_ = nullptr;
@@ -462,6 +505,9 @@ class QueryState {
   /// send a status report so that we can cancel after a configurable timeout.
   int64_t failed_report_time_ms_ = 0;
 
+  /// Indicator of whether to disable the codegen cache for the query.
+  bool disable_codegen_cache_ = false;
+
   /// Create QueryState w/ a refcnt of 0 and a memory limit of 'mem_limit' bytes applied
   /// to the query mem tracker. The query is associated with the resource pool set in
   /// 'query_ctx.request_pool' or from 'request_pool', if the former is not set (needed
@@ -511,13 +557,6 @@ class QueryState {
   /// Returns true if the overall backend status is already set with an error.
   bool HasErrorStatus() const {
     return !overall_status_.ok() && !overall_status_.IsCancelled();
-  }
-
-  /// Returns true if the query has reached a terminal state.
-  bool IsTerminalState() const {
-    return backend_exec_state_ == BackendExecState::FINISHED
-        || backend_exec_state_ == BackendExecState::CANCELLED
-        || backend_exec_state_ == BackendExecState::ERROR;
   }
 
   /// Updates the BackendExecState based on 'overall_status_'. Should only be called when

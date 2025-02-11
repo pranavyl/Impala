@@ -18,6 +18,7 @@
 package org.apache.impala.analysis;
 
 import org.apache.impala.authorization.Privilege;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.catalog.FeFsTable;
 import org.apache.impala.catalog.FeTable;
@@ -82,15 +83,23 @@ public abstract class PartitionSpecBase extends StmtNode {
       throw new AnalysisException(e.getMessage(), e);
     }
 
-    // Make sure the target table is partitioned.
-    if (table.getMetaStoreTable().getPartitionKeysSize() == 0) {
+    // Make sure the target table is partitioned. The table format can be either HDFS or
+    // Iceberg, but only HDFS table partition keys are stored in HMS.
+    if (!isPartitioned(table)) {
       throw new AnalysisException("Table is not partitioned: " + tableName_);
     }
 
-    // Only HDFS tables are partitioned.
     Preconditions.checkState(table instanceof FeFsTable);
     table_ = (FeFsTable) table;
     nullPartitionKeyValue_ = table_.getNullPartitionKeyValue();
+  }
+
+  private boolean isPartitioned(FeTable table) {
+    if (table instanceof FeIcebergTable) {
+      return ((FeIcebergTable) table).isPartitioned();
+    } else {
+      return table.getMetaStoreTable().getPartitionKeysSize() != 0;
+    }
   }
 
   @Override
