@@ -11026,13 +11026,16 @@ TEST_P(ExprTest, Utf8MaskTest) {
   executor_->PopExecOption();
 }
 
-void ExprTest::TestBytes() {
+TEST_P(ExprTest, BytesTest) {
   // Verifies Bytes(exp) counts number of bytes.
+
+
   TestIsNull("Bytes(NULL)", TYPE_INT);
   TestValue("Bytes('你好')", TYPE_INT, 6);
   TestValue("Bytes('你好hello')", TYPE_INT, 11);
   TestValue("Bytes('你好 hello 你好')", TYPE_INT, 19);
   TestValue("Bytes('hello')", TYPE_INT, 5);
+
   // BINARY uses "bytes" behind "length"
   TestIsNull("Length(CAST(NULL AS BINARY))", TYPE_INT);
   TestValue("Length(CAST('你好' AS BINARY))", TYPE_INT, 6);
