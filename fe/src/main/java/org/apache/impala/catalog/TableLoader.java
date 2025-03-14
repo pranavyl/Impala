@@ -227,12 +227,19 @@ public class TableLoader {
     } else {
       impala_tbl_props.put("dbcp.username", val);
     }
-    val = msTbl.getParameters().get("hive.sql.table");
-    if (val == null) {
-      throw new TableLoadingException("Required parameter: hive.sql.table" +
-          "is missing.");
-    } else {
-      impala_tbl_props.put("table", val);
+    // Ensure either 'hive.sql.table' or 'hive.sql.query' is set
+    String table = msTbl.getParameters().get("hive.sql.table");
+    String query = msTbl.getParameters().get("hive.sql.query");
+
+    if (table == null && query == null) {
+      throw new TableLoadingException("Either 'hive.sql.table' or 'hive.sql.query' must be set.");
+    }
+
+    if (table != null) {
+      impala_tbl_props.put("table", table);
+    }
+    if (query != null) {
+      impala_tbl_props.put("query", query);
     }
     val = msTbl.getParameters().get("hive.sql.jdbc.driver");
     if (val == null) {

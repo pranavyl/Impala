@@ -301,41 +301,52 @@ public class JdbcDataSource implements ExternalDataSource {
     Map<String, String> columnMapping = getColumnMapping(tableConfig_
         .get(JdbcStorageConfig.COLUMN_MAPPING.getPropertyName()));
     // Build query statement
+    String query;
+
+    String tableName = tableConfig_.get(JdbcStorageConfig.TABLE.getPropertyName());
+    if (tableName != null) { // Ensure 'table' property is not null
     StringBuilder sb = new StringBuilder("SELECT ");
     String project;
     // If cols size equals to 0, it is 'select count(*) from tbl' statement.
     if (schema_.getColsSize() == 0) {
-      project = "*";
+     project = "*";
     } else {
-      project =
-          schema_.getCols().stream().map(
-              TColumnDesc::getName).map(
-              name -> columnMapping.getOrDefault(name, name))
-              .collect(Collectors.joining(", "));
+     project = schema_.getCols().stream().map(
+         TColumnDesc::getName).map(
+         name -> columnMapping.getOrDefault(name, name))
+         .collect(Collectors.joining(", "));
     }
     sb.append(project);
     sb.append(" FROM ");
+
     // Make jdbc table name to be quoted with double quotes if columnMapping is not empty
-    String jdbcTableName = tableConfig_.get(JdbcStorageConfig.TABLE.getPropertyName());
     if (!columnMapping.isEmpty()) {
-      jdbcTableName = dbAccessor_.getCaseSensitiveName(jdbcTableName);
+      tableName = dbAccessor_.getCaseSensitiveName(tableName);
     }
-    sb.append(jdbcTableName);
+    sb.append(tableName);
+
     String condition = QueryConditionUtil
         .buildCondition(params.getPredicates(), columnMapping, dbAccessor_);
     if (StringUtils.isNotBlank(condition)) {
       sb.append(" WHERE ").append(condition);
     }
-    // Execute query and get iterator
-    tableConfig_.set(JdbcStorageConfig.QUERY.getPropertyName(), sb.toString());
-    LOG.trace("JDBC Query: " + sb.toString());
+
+    query = sb.toString();
+    } else {
+      // Use 'query' property if 'table' is null (fix applied)
+      query = tableConfig_.get(JdbcStorageConfig.QUERY.getPropertyName());
+    }
+
+    // Store the generated query
+    tableConfig_.set(JdbcStorageConfig.QUERY.getPropertyName(), query);
+    LOG.trace("JDBC Query: " + query);
 
     if (schema_.getColsSize() != 0) {
-      int limit = -1;
-      if (params.isSetLimit()) limit = (int) params.getLimit();
-      iterator_ = dbAccessor_.getRecordIterator(tableConfig_, limit, 0);
+    int limit = -1;
+    if (params.isSetLimit()) limit = (int) params.getLimit();
+    iterator_ = dbAccessor_.getRecordIterator(tableConfig_, limit, 0);
     } else {
-      totalNumberOfRecords_ = dbAccessor_.getTotalNumberOfRecords(tableConfig_);
+    totalNumberOfRecords_ = dbAccessor_.getTotalNumberOfRecords(tableConfig_);
     }
   }
 
