@@ -21,6 +21,8 @@ import org.apache.impala.planner.DataSourceScanNode;
 import org.apache.impala.planner.PlanFragment;
 import org.apache.impala.planner.PlanNode;
 import org.apache.impala.planner.ScanNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
 
@@ -28,6 +30,8 @@ import com.google.common.base.Preconditions;
  * Returns the maximum number of rows processed by any node in a given plan tree
  */
 public class MaxRowsProcessedVisitor implements Visitor<PlanNode> {
+  private final static Logger LOG = LoggerFactory.getLogger(MaxRowsProcessedVisitor.class);
+
 
   // True if we should abort because we don't have valid estimates
   // for a plan node.
@@ -39,6 +43,10 @@ public class MaxRowsProcessedVisitor implements Visitor<PlanNode> {
   // Max number of rows processed per backend impala daemon for a plan node.
   private long maxRowsProcessedPerNode_ = 0;
 
+  // Number of scan nodes and threads for jdbc table, initialised with -1 for
+  // non jdbc tables.
+  private int jdbcScanNodes = -1;
+
   @Override
   public void visit(PlanNode caller) {
     if (!valid_) return;
@@ -47,6 +55,7 @@ public class MaxRowsProcessedVisitor implements Visitor<PlanNode> {
     int numNodes = fragment == null ? 1 : fragment.getNumNodes();
     if (caller instanceof DataSourceScanNode) {
       // Operations on DataSourceScanNode are processed on coordinator.
+      LOG.info("Inside DataSourceScanNode");
       if (fragment == null) {
         numNodes = ((DataSourceScanNode)caller).getNumNodes();
       }
@@ -55,7 +64,9 @@ public class MaxRowsProcessedVisitor implements Visitor<PlanNode> {
         valid_ = false;
         return;
       }
+      jdbcScanNodes = 10;
     } else if (caller instanceof ScanNode) {
+      LOG.info("Inside ScanNode");
       long numRows = caller.getInputCardinality();
       ScanNode scan = (ScanNode) caller;
       boolean missingStats = scan.isTableMissingStats() || scan.hasCorruptTableStats();
@@ -70,6 +81,7 @@ public class MaxRowsProcessedVisitor implements Visitor<PlanNode> {
       maxRowsProcessedPerNode_ = Math.max(maxRowsProcessedPerNode_,
           (long)Math.ceil(numRows / (double)numNodes));
     } else {
+      LOG.info("Inside");
       long in = caller.getInputCardinality();
       long out = caller.getCardinality();
       if ((in == -1) || (out == -1)) {
@@ -95,6 +107,11 @@ public class MaxRowsProcessedVisitor implements Visitor<PlanNode> {
   public long getMaxRowsProcessedPerNode() {
     Preconditions.checkState(valid_);
     return maxRowsProcessedPerNode_;
+  }
+
+  public int getJdbcScanNodes() {
+    Preconditions.checkState(valid_);
+    return jdbcScanNodes;
   }
 
 }

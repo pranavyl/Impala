@@ -886,17 +886,21 @@ public class Planner {
     // This optimization executes the plan on a single node so the threshold must
     // be based on the total number of rows processed.
     long maxRowsProcessed = visitor.getMaxRowsProcessed();
+    // If it is jdbc table we will get number of threads we want to use else -1
+    int jdbcScanNodes = visitor.getJdbcScanNodes();
     int threshold = ctx.getQueryOptions().exec_single_node_rows_threshold;
     if (maxRowsProcessed < threshold) {
       // Execute on a single node and disable codegen for small results
       LOG.trace("Query is small enough to execute on a single node: maxRowsProcessed = "
           + maxRowsProcessed);
-      ctx.getQueryOptions().setNum_nodes(1);
+      LOG.info("Num_nodes jdbcScanNodes = " + jdbcScanNodes);
+      ctx.getQueryOptions().setNum_nodes(jdbcScanNodes == -1 ? 1 : jdbcScanNodes);
       ctx.getQueryCtx().disable_codegen_hint = true;
       if (maxRowsProcessed < ctx.getQueryOptions().batch_size ||
           maxRowsProcessed < 1024 && ctx.getQueryOptions().batch_size == 0) {
         // Only one scanner thread for small queries
-        ctx.getQueryOptions().setNum_scanner_threads(1);
+        LOG.info("scanner threads jdbcScanNodes = " + jdbcScanNodes);
+        ctx.getQueryOptions().setNum_scanner_threads(jdbcScanNodes == -1 ? 1 : jdbcScanNodes);
       }
       // disable runtime filters
       ctx.getQueryOptions().setRuntime_filter_mode(TRuntimeFilterMode.OFF);
