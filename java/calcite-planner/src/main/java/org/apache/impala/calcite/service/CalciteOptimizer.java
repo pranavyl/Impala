@@ -33,6 +33,7 @@ import org.apache.calcite.tools.RelBuilder;
 import org.apache.impala.calcite.coercenodes.CoerceNodes;
 import org.apache.impala.calcite.rel.node.ConvertToImpalaRelRules;
 import org.apache.impala.calcite.rel.node.ImpalaPlanRel;
+import org.apache.impala.calcite.rules.CombineValuesNodesRule;
 import org.apache.impala.calcite.rules.ConvertToCNFRules;
 import org.apache.impala.calcite.rules.ExtractLiteralAgg;
 import org.apache.impala.calcite.rules.ImpalaMinusToDistinctRule;
@@ -94,7 +95,9 @@ public class CalciteOptimizer implements CompilerStep {
         new ConvertToCNFRules.FilterConvertToCNFRule(),
         new ConvertToCNFRules.JoinConvertToCNFRule(),
         new ConvertToCNFRules.ProjectConvertToCNFRule(),
-        ImpalaMinusToDistinctRule.Config.DEFAULT.toRule()
+        ImpalaMinusToDistinctRule.Config.DEFAULT.toRule(),
+        new CombineValuesNodesRule(),
+        CoreRules.SORT_REMOVE_CONSTANT_KEYS
         ));
 
     builder.addMatchOrder(HepMatchOrder.BOTTOM_UP);
@@ -143,13 +146,12 @@ public class CalciteOptimizer implements CompilerStep {
 
     HepProgramBuilder builder = new HepProgramBuilder();
 
-    // Impala cannot handle the LITERAL_AGG method so we need to create
-    // an equivalent plan
     RelNode retRelNode = plan;
     builder.addMatchOrder(HepMatchOrder.BOTTOM_UP);
     builder.addRuleCollection(ImmutableList.of(
         RewriteRexOverRule.INSTANCE,
-        new ExtractLiteralAgg()
+        new ExtractLiteralAgg(),
+        CoreRules.FILTER_PROJECT_TRANSPOSE
         ));
 
 

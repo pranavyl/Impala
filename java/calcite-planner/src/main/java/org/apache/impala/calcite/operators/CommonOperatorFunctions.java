@@ -49,7 +49,6 @@ import java.util.List;
  * operators.
  */
 public class CommonOperatorFunctions {
-
   // Allow any count because this is used for all functions. Validation for specific
   // number of parameters will be done when Impala function resolving is done.
   public static SqlOperandCountRange ANY_COUNT_RANGE = SqlOperandCountRanges.any();
@@ -63,15 +62,17 @@ public class CommonOperatorFunctions {
     RelDataTypeFactory factory = rexBuilder.getTypeFactory();
 
     // Resolve Impala function through Impala method.
-    Function fn = FunctionResolver.getSupertypeFunction(name, operandTypes);
+    Function fn = getSupertypeFunction(name, operandTypes);
 
     if (fn == null) {
       throw new IllegalArgumentException("Cannot infer return type for "
           + name + "; operand types: " + operandTypes);
     }
 
-    RelDataType returnType =
-        ImpalaTypeConverter.getRelDataType(fn.getReturnType());
+    RelDataType returnType = fn.getReturnType().equals(Type.DECIMAL)
+        ? ImpalaTypeConverter.getCompatibleType(operandTypes, factory)
+        : ImpalaTypeConverter.getRelDataType(fn.getReturnType());
+
     return isNullable(operandTypes)
         ? returnType
         : factory.createTypeWithNullability(returnType, true);
@@ -127,5 +128,31 @@ public class CommonOperatorFunctions {
   // return true if any operand type is nullable.
   public static boolean isNullable(List<RelDataType> operandTypes) {
     return operandTypes.stream().anyMatch(rdt -> rdt.isNullable());
+  }
+
+  private static Function getSupertypeFunction(String name,
+      List<RelDataType> operandTypes) {
+    Function fn = FunctionResolver.getSupertypeFunction(name, operandTypes);
+    if (fn != null) {
+      return fn;
+    }
+
+    // Hack. Calcite treats all string literal types as char. In this phase, a lower
+    // SqlNode may have a literal, but it is showing up as a char when we verify
+    // the function existence. If that function doesn't exist, we change the CHAR
+    // type to a STRING type and look for that prototype. If, for some reason, the
+    // real parameter was a CHAR and not a STRING, this will fail later when retrieving
+    // the exact function at physical conversion time.
+    boolean hasChar = false;
+    List<RelDataType> adjustedTypes = new ArrayList<>();
+    for (RelDataType opType : operandTypes) {
+      if (opType.getSqlTypeName().equals(SqlTypeName.CHAR)) {
+        adjustedTypes.add(ImpalaTypeConverter.getRelDataType(Type.STRING));
+        hasChar = true;
+      } else {
+        adjustedTypes.add(opType);
+      }
+    }
+    return hasChar ? FunctionResolver.getSupertypeFunction(name, adjustedTypes) : null;
   }
 }
