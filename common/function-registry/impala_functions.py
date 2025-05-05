@@ -517,6 +517,7 @@ visible_functions = [
   [['repeat'], 'STRING', ['STRING', 'BIGINT'], 'impala::StringFunctions::Repeat'],
   [['lpad'], 'STRING', ['STRING', 'BIGINT', 'STRING'], 'impala::StringFunctions::Lpad'],
   [['rpad'], 'STRING', ['STRING', 'BIGINT', 'STRING'], 'impala::StringFunctions::Rpad'],
+
   [['ai_generate_text'], 'STRING', ['STRING', 'STRING', 'STRING', 'STRING', 'STRING', 'STRING'],
    'impala::AiFunctions::AiGenerateText'],
   [['ai_generate_text_default'], 'STRING', ['STRING'],
@@ -528,6 +529,9 @@ visible_functions = [
   [['aes_decrypt'], 'STRING', ['STRING', 'STRING', 'STRING', 'STRING'], 'impala::StringFunctions::AesDecrypt',
    '_ZN6impala15StringFunctions10AesPrepareEPN10impala_udf15FunctionContextENS2_18FunctionStateScopeE',
    '_ZN6impala15StringFunctions8AesCloseEPN10impala_udf15FunctionContextENS2_18FunctionStateScopeE'],
+
+  [['Bytes'],'INT',['STRING'], 'impala::StringFunctions::Bytes'],
+
   [['length'], 'INT', ['STRING'], 'impala::StringFunctions::Length'],
   [['length'], 'INT', ['BINARY'], 'impala::StringFunctions::Bytes'],
   [['length'], 'INT', ['CHAR'], 'impala::StringFunctions::CharLength'],
