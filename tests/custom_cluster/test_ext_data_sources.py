@@ -39,28 +39,28 @@ class TestExtDataSources(CustomClusterTestSuite):
   def add_test_dimensions(cls):
     super(TestExtDataSources, cls).add_test_dimensions()
     cls.ImpalaTestMatrix.add_dimension(create_exec_option_dimension(
-        exec_single_node_option=[100]))
+      exec_single_node_option=[100]))
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args="--use_local_catalog=true",
-      catalogd_args="--catalog_topic_mode=minimal")
+    impalad_args="--use_local_catalog=true",
+    catalogd_args="--catalog_topic_mode=minimal")
   def test_data_source_tables(self, vector, unique_database, unique_name):
     """Start Impala cluster in LocalCatalog Mode"""
     self.run_test_case('QueryTest/data-source-tables', vector, use_db=unique_database,
-        test_file_vars={'$UNIQUE_DATASOURCE': unique_name})
+                       test_file_vars={'$UNIQUE_DATASOURCE': unique_name})
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args="--use_local_catalog=true",
-      catalogd_args="--catalog_topic_mode=minimal")
+    impalad_args="--use_local_catalog=true",
+    catalogd_args="--catalog_topic_mode=minimal")
   def test_jdbc_data_source(self, vector, unique_database):
     """Start Impala cluster in LocalCatalog Mode"""
     self.run_test_case('QueryTest/jdbc-data-source', vector, use_db=unique_database)
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args='--data_source_batch_size=2048')
+    impalad_args='--data_source_batch_size=2048')
   def test_data_source_big_batch_size(self, vector, unique_database, unique_name):
     """Run test with batch size greater than default size 1024"""
     self.run_test_case('QueryTest/data-source-tables', vector, use_db=unique_database,
@@ -68,7 +68,7 @@ class TestExtDataSources(CustomClusterTestSuite):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args='--data_source_batch_size=512')
+    impalad_args='--data_source_batch_size=512')
   def test_data_source_small_batch_size(self, vector, unique_database, unique_name):
     """Run test with batch size less than default size 1024"""
     self.run_test_case('QueryTest/data-source-tables', vector, use_db=unique_database,
@@ -244,6 +244,124 @@ class TestHivePostgresJdbcTables(CustomClusterTestSuite):
         "hive.sql.dbcp.password.key" = "hiveuser",
         "hive.sql.table" = "country"
     );
+
+    DROP TABLE IF EXISTS {0}.country_postgres_query;
+    CREATE EXTERNAL TABLE {0}.country_postgres_query
+    (
+        id INT,
+        name STRING,
+        bool_col BOOLEAN,
+        tinyint_col     SMALLINT,
+        smallint_col    SMALLINT,
+        int_col         INT,
+        bigint_col      BIGINT,
+        float_col       FLOAT,
+        double_col      DOUBLE,
+        date_col        DATE,
+        string_col      STRING,
+        timestamp_col   TIMESTAMP
+    )
+    STORED BY 'org.apache.hive.storage.jdbc.JdbcStorageHandler'
+    TBLPROPERTIES (
+        "hive.sql.database.type" = "POSTGRES",
+        "hive.sql.jdbc.driver" = "org.postgresql.Driver",
+        "hive.sql.jdbc.url" = "jdbc:postgresql://localhost:5432/functional",
+        "hive.sql.dbcp.username" = "hiveuser",
+        "hive.sql.dbcp.password" = "password",
+        "hive.sql.query" = "select id,name,bool_col,tinyint_col,smallint_col,
+        int_col,bigint_col,float_col,double_col,date_col,string_col,
+        timestamp_col from country"
+    );
+
+    DROP TABLE IF EXISTS {0}.country_keystore_postgres_query;
+    CREATE EXTERNAL TABLE {0}.country_keystore_postgres_query
+    (
+        id INT,
+        name STRING,
+        bool_col BOOLEAN,
+        tinyint_col     SMALLINT,
+        smallint_col    SMALLINT,
+        int_col         INT,
+        bigint_col      BIGINT,
+        float_col       FLOAT,
+        double_col      DOUBLE,
+        date_col        DATE,
+        string_col      STRING,
+        timestamp_col   TIMESTAMP
+    )
+    STORED BY 'org.apache.hive.storage.jdbc.JdbcStorageHandler'
+    TBLPROPERTIES (
+        "hive.sql.database.type" = "POSTGRES",
+        "hive.sql.jdbc.driver" = "org.postgresql.Driver",
+        "hive.sql.jdbc.url" = "jdbc:postgresql://localhost:5432/functional",
+        "hive.sql.dbcp.username" = "hiveuser",
+        "hive.sql.dbcp.password.keystore" =
+        "jceks://hdfs/test-warehouse/data-sources/test.jceks",
+        "hive.sql.dbcp.password.key" = "hiveuser",
+        "hive.sql.query" = "select id,name,bool_col,tinyint_col,smallint_col,
+        int_col,bigint_col,float_col,double_col,date_col,string_col,
+        timestamp_col from country"
+    );
+    
+    DROP TABLE IF EXISTS {0}.country_postgres_query_table;
+    CREATE EXTERNAL TABLE {0}.country_postgres_query_table
+    (
+        id INT,
+        name STRING,
+        bool_col BOOLEAN,
+        tinyint_col     SMALLINT,
+        smallint_col    SMALLINT,
+        int_col         INT,
+        bigint_col      BIGINT,
+        float_col       FLOAT,
+        double_col      DOUBLE,
+        date_col        DATE,
+        string_col      STRING,
+        timestamp_col   TIMESTAMP
+    )
+    STORED BY 'org.apache.hive.storage.jdbc.JdbcStorageHandler'
+    TBLPROPERTIES (
+        "hive.sql.database.type" = "POSTGRES",
+        "hive.sql.jdbc.driver" = "org.postgresql.Driver",
+        "hive.sql.jdbc.url" = "jdbc:postgresql://localhost:5432/functional",
+        "hive.sql.dbcp.username" = "hiveuser",
+        "hive.sql.dbcp.password" = "password",
+        "hive.sql.table" = "country",
+        "hive.sql.query" = "select id,name,bool_col,tinyint_col,smallint_col,
+        int_col,bigint_col,float_col,double_col,date_col,string_col,
+        timestamp_col from country"
+    );
+
+    DROP TABLE IF EXISTS {0}.country_keystore_postgres_query_table;
+    CREATE EXTERNAL TABLE {0}.country_keystore_postgres_query_table
+    (
+        id INT,
+        name STRING,
+        bool_col BOOLEAN,
+        tinyint_col     SMALLINT,
+        smallint_col    SMALLINT,
+        int_col         INT,
+        bigint_col      BIGINT,
+        float_col       FLOAT,
+        double_col      DOUBLE,
+        date_col        DATE,
+        string_col      STRING,
+        timestamp_col   TIMESTAMP
+    )
+    STORED BY 'org.apache.hive.storage.jdbc.JdbcStorageHandler'
+    TBLPROPERTIES (
+        "hive.sql.database.type" = "POSTGRES",
+        "hive.sql.jdbc.driver" = "org.postgresql.Driver",
+        "hive.sql.jdbc.url" = "jdbc:postgresql://localhost:5432/functional",
+        "hive.sql.dbcp.username" = "hiveuser",
+        "hive.sql.dbcp.password.keystore" =
+        "jceks://hdfs/test-warehouse/data-sources/test.jceks",
+        "hive.sql.dbcp.password.key" = "hiveuser",
+        "hive.sql.table" = "country",
+        "hive.sql.query" = "select id,name,bool_col,tinyint_col,smallint_col,
+        int_col,bigint_col,float_col,double_col,date_col,string_col,
+        timestamp_col from country"
+    );
     """.format(unique_database)
     try:
       self.run_stmt_in_hive(hive_sql)
@@ -253,11 +371,16 @@ class TestHivePostgresJdbcTables(CustomClusterTestSuite):
                         format(unique_database))
     self.client.execute("INVALIDATE METADATA {0}.country_keystore_postgres".
                         format(unique_database))
+    self.client.execute("INVALIDATE METADATA {0}.country_postgres_query".
+                        format(unique_database))
+    self.client.execute("INVALIDATE METADATA {0}.country_keystore_postgres_query".
+                        format(unique_database))
     # Describing postgres hive jdbc table in Impala.
-    self.client.execute("DESCRIBE {0}.country_postgres".format(unique_database))
-    self.client.execute("DESCRIBE {0}.country_keystore_postgres".format(unique_database))
+    self.client.execute("DESCRIBE {0}.country_postgres_query".format(unique_database))
+    self.client.execute("DESCRIBE {0}.country_keystore_postgres_query"
+        .format(unique_database))
 
-  # Select statements are verified in hive-jdbc-postgres-tables.test.
+    # Select statements are verified in hive-jdbc-postgres-tables.test.
     self.run_test_case('QueryTest/hive-jdbc-postgres-tables', vector,
                        use_db=unique_database)
 
@@ -373,6 +496,116 @@ class TestMySqlExtJdbcTables(CustomClusterTestSuite):
         "hive.sql.dbcp.password.key" = "hiveuser",
         "hive.sql.table" = "country"
     );
+
+    DROP TABLE IF EXISTS {0}.country_mysql_query;
+    CREATE EXTERNAL TABLE {0}.country_mysql_query
+    (
+        id INT,
+        name STRING,
+        bool_col BOOLEAN,
+        tinyint_col     SMALLINT,
+        smallint_col    SMALLINT,
+        int_col         INT,
+        bigint_col      BIGINT,
+        float_col       FLOAT,
+        double_col      DOUBLE,
+        date_col        DATE,
+        string_col      STRING,
+        timestamp_col   TIMESTAMP
+    )
+    STORED BY 'org.apache.hive.storage.jdbc.JdbcStorageHandler'
+    TBLPROPERTIES (
+        "hive.sql.database.type" = "MYSQL",
+        "hive.sql.jdbc.driver" = "com.mysql.cj.jdbc.Driver",
+        "hive.sql.jdbc.url" = "jdbc:mysql://localhost:3306/functional",
+        "hive.sql.dbcp.username" = "hiveuser",
+        "hive.sql.dbcp.password" = "password",
+        "hive.sql.query" = "select * from country"
+    );
+
+    DROP TABLE IF EXISTS {0}.country_keystore_mysql_query;
+    CREATE EXTERNAL TABLE {0}.country_keystore_mysql_query
+    (
+        id INT,
+        name STRING,
+        bool_col BOOLEAN,
+        tinyint_col     SMALLINT,
+        smallint_col    SMALLINT,
+        int_col         INT,
+        bigint_col      BIGINT,
+        float_col       FLOAT,
+        double_col      DOUBLE,
+        date_col        DATE,
+        string_col      STRING,
+        timestamp_col   TIMESTAMP
+    )
+    STORED BY 'org.apache.hive.storage.jdbc.JdbcStorageHandler'
+    TBLPROPERTIES (
+        "hive.sql.database.type" = "MYSQL",
+        "hive.sql.jdbc.driver" = "com.mysql.cj.jdbc.Driver",
+        "hive.sql.jdbc.url" = "jdbc:mysql://localhost:3306/functional",
+        "hive.sql.dbcp.username" = "hiveuser",
+        "hive.sql.dbcp.password.keystore" =
+        "jceks://hdfs/test-warehouse/data-sources/test.jceks",
+        "hive.sql.dbcp.password.key" = "hiveuser",
+        "hive.sql.query" = "select * from country"
+    );
+    
+       DROP TABLE IF EXISTS {0}.country_mysql_query_table;
+    CREATE EXTERNAL TABLE {0}.country_mysql_query_table
+    (
+        id INT,
+        name STRING,
+        bool_col BOOLEAN,
+        tinyint_col     SMALLINT,
+        smallint_col    SMALLINT,
+        int_col         INT,
+        bigint_col      BIGINT,
+        float_col       FLOAT,
+        double_col      DOUBLE,
+        date_col        DATE,
+        string_col      STRING,
+        timestamp_col   TIMESTAMP
+    )
+    STORED BY 'org.apache.hive.storage.jdbc.JdbcStorageHandler'
+    TBLPROPERTIES (
+        "hive.sql.database.type" = "MYSQL",
+        "hive.sql.jdbc.driver" = "com.mysql.cj.jdbc.Driver",
+        "hive.sql.jdbc.url" = "jdbc:mysql://localhost:3306/functional",
+        "hive.sql.dbcp.username" = "hiveuser",
+        "hive.sql.dbcp.password" = "password",
+        "hive.sql.table" = "country",
+        "hive.sql.query" = "select * from country"
+    );
+
+    DROP TABLE IF EXISTS {0}.country_keystore_mysql_query_table;
+    CREATE EXTERNAL TABLE {0}.country_keystore_mysql_query_table
+    (
+        id INT,
+        name STRING,
+        bool_col BOOLEAN,
+        tinyint_col     SMALLINT,
+        smallint_col    SMALLINT,
+        int_col         INT,
+        bigint_col      BIGINT,
+        float_col       FLOAT,
+        double_col      DOUBLE,
+        date_col        DATE,
+        string_col      STRING,
+        timestamp_col   TIMESTAMP
+    )
+    STORED BY 'org.apache.hive.storage.jdbc.JdbcStorageHandler'
+    TBLPROPERTIES (
+        "hive.sql.database.type" = "MYSQL",
+        "hive.sql.jdbc.driver" = "com.mysql.cj.jdbc.Driver",
+        "hive.sql.jdbc.url" = "jdbc:mysql://localhost:3306/functional",
+        "hive.sql.dbcp.username" = "hiveuser",
+        "hive.sql.dbcp.password.keystore" =
+        "jceks://hdfs/test-warehouse/data-sources/test.jceks",
+        "hive.sql.dbcp.password.key" = "hiveuser",
+        "hive.sql.table" = "country",
+        "hive.sql.query" = "select * from country"
+    );
     """.format(unique_database)
     try:
       self.run_stmt_in_hive(hive_sql)
@@ -382,11 +615,18 @@ class TestMySqlExtJdbcTables(CustomClusterTestSuite):
                         .format(unique_database))
     self.client.execute("INVALIDATE METADATA {0}.country_keystore_mysql"
                         .format(unique_database))
+    self.client.execute("INVALIDATE METADATA {0}.country_mysql_query"
+                        .format(unique_database))
+    self.client.execute("INVALIDATE METADATA {0}.country_keystore_mysql_query"
+                        .format(unique_database))
     # Describing mysql hive jdbc table in Impala.
     self.client.execute("DESCRIBE {0}.country_mysql".format(unique_database))
     self.client.execute("DESCRIBE {0}.country_keystore_mysql".format(unique_database))
+    self.client.execute("DESCRIBE {0}.country_mysql_query".format(unique_database))
+    self.client.execute("DESCRIBE {0}.country_keystore_mysql_query"
+        .format(unique_database))
 
-  # Select statements are verified in hive-jdbc-mysql-tables.test.
+    # Select statements are verified in hive-jdbc-mysql-tables.test.
     self.run_test_case('QueryTest/hive-jdbc-mysql-tables', vector,
                        use_db=unique_database)
 
@@ -402,13 +642,13 @@ class TestImpalaExtJdbcTables(CustomClusterTestSuite):
   def add_test_dimensions(cls):
     super(TestImpalaExtJdbcTables, cls).add_test_dimensions()
     cls.ImpalaTestMatrix.add_dimension(create_exec_option_dimension(
-        exec_single_node_option=[100]))
+      exec_single_node_option=[100]))
 
   @classmethod
   def _download_impala_jdbc_driver(cls):
     # Download Impala jdbc driver and copy jdbc driver to HDFS.
     script = os.path.join(
-        os.environ['IMPALA_HOME'], 'testdata/bin/download-impala-jdbc-driver.sh')
+      os.environ['IMPALA_HOME'], 'testdata/bin/download-impala-jdbc-driver.sh')
     run_cmd = [script]
     try:
       subprocess.check_call(run_cmd, close_fds=True)
