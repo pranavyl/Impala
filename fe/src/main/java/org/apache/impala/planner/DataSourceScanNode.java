@@ -332,8 +332,14 @@ public class DataSourceScanNode extends ScanNode {
     super.computeStats(analyzer);
     inputCardinality_ = numRowsEstimate_;
     cardinality_ = numRowsEstimate_;
+    // Use estimate from the data source if present
+    if (numRowsEstimate_ > 0) {
+        cardinality_ = numRowsEstimate_;
+    } else {
+        cardinality_ = table_.getNumRows(); // fallback
+    }
     cardinality_ = applyConjunctsSelectivity(cardinality_);
-    cardinality_ = Math.max(1, cardinality_);
+    cardinality_ = Math.max(10, cardinality_);
     cardinality_ = capCardinalityAtLimit(cardinality_);
 
     if (LOG.isTraceEnabled()) {

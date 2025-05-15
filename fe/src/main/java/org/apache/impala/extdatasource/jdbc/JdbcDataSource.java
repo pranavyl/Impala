@@ -130,8 +130,24 @@ public class JdbcDataSource implements ExternalDataSource {
               Lists.newArrayList("Invalid init_string value")));
     }
     List<Integer> acceptedPredicates = acceptedPredicates(params.getPredicates());
+    long numRecords = 0;
+    try {
+      dbAccessor_ = DatabaseAccessorFactory.getAccessor(tableConfig_);
+
+      // Build a COUNT(*) query
+      //String jdbcTableName = tableConfig_.get(JdbcStorageConfig.TABLE.getPropertyName());
+      //tableConfig_.set(JdbcStorageConfig.QUERY.getPropertyName(),
+      //    String.format("SELECT COUNT(*) FROM %s", jdbcTableName));
+
+      // Execute and fetch the count
+      numRecords = dbAccessor_.getTotalNumberOfRecords(tableConfig_);
+      LOG.info(String.format("Estimated number of records: %d", numRecords));
+    } catch (JdbcDatabaseAccessException e) {
+      LOG.error(String.format("Failed to retrieve total number of records: %s", e));
+    }
     return new TPrepareResult(STATUS_OK)
-            .setAccepted_conjuncts(acceptedPredicates);
+        .setAccepted_conjuncts(acceptedPredicates)
+        .setNum_rows_estimate(numRecords);
   }
 
   @Override
