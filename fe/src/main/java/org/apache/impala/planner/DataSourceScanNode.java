@@ -322,6 +322,35 @@ public class DataSourceScanNode extends ScanNode {
       if (!getDisjunctsHelper(conjunct.getChild(0), predicates)) return false;
       if (!getDisjunctsHelper(conjunct.getChild(1), predicates)) return false;
       return true;
+    } else if (conjunct instanceof org.apache.impala.analysis.InPredicate) {
+      org.apache.impala.analysis.InPredicate inPred =
+          (org.apache.impala.analysis.InPredicate) conjunct;
+      // Only support positive IN with a slot-ref LHS and literal RHS values.
+      if (inPred.isNotIn()) return false;
+      Expr colExpr = inPred.getChild(0);
+      if (!(colExpr.unwrapSlotRef(true) instanceof SlotRef)) return false;
+      SlotRef slotRef = colExpr.unwrapSlotRef(true);
+      if (colExpr instanceof CastExpr) {
+        CastExpr castExpr = (CastExpr) colExpr;
+        Preconditions.checkNotNull(castExpr.getType());
+        if (castExpr.getType().isDateOrTimeType()
+            || castExpr.getCompatibility().isUnsafe()) {
+          return false;
+        }
+      }
+      String colName = Joiner.on(".").join(slotRef.getResolvedPath().getRawPath());
+      TColumnDesc col = new TColumnDesc().setName(colName).setType(
+          slotRef.getType().toThrift());
+      // Children from index 1 are IN list values.
+      for (int i = 1; i < inPred.getChildren().size(); ++i) {
+        Expr rhs = inPred.getChild(i);
+        if (!(rhs instanceof LiteralExpr)) return false;
+        TColumnValue val = literalToColumnValue((LiteralExpr) rhs);
+        if (val == null) return false;
+        predicates.add(new TBinaryPredicate().setCol(col)
+            .setOp(TComparisonOp.EQ).setValue(val));
+      }
+      return true;
     } else {
       return false;
     }
